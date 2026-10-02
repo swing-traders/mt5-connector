@@ -19,7 +19,7 @@ Delivery:
 
 - PRs merge to `main`.
 - A release is a `v0.4.0+st.N` tag; CI builds it into a wheel and publishes it on the fork's GitHub Pages package index.
-- The trading repository pins that version exactly from its `environment.yml`.
+- Consumers pin a release exactly, by its full version, from that index.
 
 ---
 
