@@ -1,4 +1,5 @@
 """Auth and terminal routes for the MT5 server."""
+
 from flask import Blueprint, jsonify, request
 
 auth_bp = Blueprint("auth", __name__)
@@ -14,8 +15,7 @@ def _import_mt5():
 def login():
     mt5 = _import_mt5()
     body = request.get_json(silent=True) or {}
-    ok = mt5.login(int(body.get("account", 0)), body.get("password", ""),
-                   body.get("server", ""))
+    ok = mt5.login(int(body.get("account", 0)), body.get("password", ""), body.get("server", ""))
     if ok:
         return jsonify({"ok": True, "error": None})
     code, msg = mt5.last_error()

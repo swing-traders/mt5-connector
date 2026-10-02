@@ -48,12 +48,12 @@ from typing import TYPE_CHECKING
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import (
+    InstrumentProviderConfig,
     LiveDataClientConfig,
     LiveExecClientConfig,
     LiveRiskEngineConfig,
     RoutingConfig,
     TradingNodeConfig,
-    InstrumentProviderConfig,
 )
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 from nautilus_trader.model.identifiers import AccountId
@@ -106,7 +106,7 @@ def _get_or_create_connection(
             f"MT5 factories: creating connection for account={config.account} "
             f"server={config.server}"
         )
-        conn     = MT5Connection(config)
+        conn = MT5Connection(config)
         provider = MT5InstrumentProvider(conn)
 
         conn.connect()
@@ -136,6 +136,7 @@ def clear_connection_registry() -> None:
 # DATA CLIENT FACTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class MT5LiveDataClientFactory(LiveDataClientFactory):
     """
     Factory that builds MT5DataClient instances for NautilusTrader.
@@ -161,7 +162,7 @@ class MT5LiveDataClientFactory(LiveDataClientFactory):
         cls,
         loop: asyncio.AbstractEventLoop,
         name: str,
-        config: "LiveDataClientConfig",
+        config: LiveDataClientConfig,
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
@@ -206,6 +207,7 @@ class MT5LiveDataClientFactory(LiveDataClientFactory):
 # EXECUTION CLIENT FACTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class MT5LiveExecClientFactory(LiveExecClientFactory):
     """
     Factory that builds MT5LiveExecutionClient instances for NautilusTrader.
@@ -227,7 +229,7 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
         cls,
         loop: asyncio.AbstractEventLoop,
         name: str,
-        config: "LiveExecClientConfig",
+        config: LiveExecClientConfig,
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
@@ -275,6 +277,7 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
 # CONVENIENCE BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def build_mt5_node_config(
     mt5_config: MT5Config,
     risk_engine_config: LiveRiskEngineConfig | None = None,
@@ -317,11 +320,11 @@ def build_mt5_node_config(
 
     # ── Side-channel registry (used by factory create() methods) ─────────────
     _mt5_config_registry[venue_str] = {
-        "mt5_config":    mt5_config,
-        "data_factory":  MT5LiveDataClientFactory,
-        "exec_factory":  MT5LiveExecClientFactory,
-        "account_id":    f"MT5-{mt5_config.account}",
-        "load_ids":      [f"{s}.{venue_str}" for s in mt5_config.symbols],
+        "mt5_config": mt5_config,
+        "data_factory": MT5LiveDataClientFactory,
+        "exec_factory": MT5LiveExecClientFactory,
+        "account_id": f"MT5-{mt5_config.account}",
+        "load_ids": [f"{s}.{venue_str}" for s in mt5_config.symbols],
     }
 
     # ── Client configs — tell NT that an MT5 client exists for this venue ─────

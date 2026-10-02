@@ -39,23 +39,18 @@ Test groups:
 """
 
 import asyncio
-import pytest
-from datetime import datetime, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import MetaTrader5 as mt5
-
+import pytest
 from nautilus_trader.model.currencies import Currency
 from nautilus_trader.model.enums import (
     OrderSide,
-    OrderStatus,
     OrderType,
     TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
-    AccountId,
-    ClientId,
     ClientOrderId,
     InstrumentId,
     Symbol,
@@ -64,19 +59,16 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
-from mt5connect.connection import ConnectionState
 from mt5connect.errors import MT5ConnectionError
-from mt5connect.constants import MT5_VENUE
 from mt5connect.execution import (
     MT5LiveExecutionClient,
-    _time_in_force_to_mt5,
     _mt5_retcode_to_str,
-    _nautilus_side_to_mt5_market,
     _nautilus_order_to_mt5_pending,
+    _nautilus_side_to_mt5_market,
     _parse_account_currency,
+    _time_in_force_to_mt5,
 )
 
-UTC = timezone.utc
 MAGIC = 510
 
 
@@ -84,9 +76,11 @@ MAGIC = 510
 # FIXTURES
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def config():
     from mt5connect.config import MT5Config
+
     return MT5Config(
         account=12345678,
         password="test_password",
@@ -122,46 +116,46 @@ def mock_mt5_exec():
         # Successful order_send result
         result = MagicMock()
         result.retcode = mt5.TRADE_RETCODE_DONE
-        result.order   = 99991
+        result.order = 99991
         mock.order_send.return_value = result
 
         # Account info
         account = MagicMock()
-        account.login    = 12345678
-        account.server   = "Exness-MT5Trial1"
-        account.balance  = 10000.0
-        account.equity   = 10050.0
-        account.margin   = 100.0
-        account.margin_free  = 9950.0
+        account.login = 12345678
+        account.server = "Exness-MT5Trial1"
+        account.balance = 10000.0
+        account.equity = 10050.0
+        account.margin = 100.0
+        account.margin_free = 9950.0
         account.margin_level = 10050.0
         account.currency = "USD"
         account.leverage = 2000
-        account.profit   = 50.0
-        account.name     = "Test"
-        account.company  = "TestBroker"
+        account.profit = 50.0
+        account.name = "Test"
+        account.company = "TestBroker"
 
         # MT5 constants
-        mock.TRADE_RETCODE_DONE    = 10009
-        mock.TRADE_RETCODE_PLACED  = 10008
+        mock.TRADE_RETCODE_DONE = 10009
+        mock.TRADE_RETCODE_PLACED = 10008
         mock.TRADE_RETCODE_DONE_PARTIAL = 10010
-        mock.ORDER_TYPE_BUY        = 0
-        mock.ORDER_TYPE_SELL       = 1
-        mock.ORDER_TYPE_BUY_LIMIT  = 2
+        mock.ORDER_TYPE_BUY = 0
+        mock.ORDER_TYPE_SELL = 1
+        mock.ORDER_TYPE_BUY_LIMIT = 2
         mock.ORDER_TYPE_SELL_LIMIT = 3
-        mock.ORDER_TYPE_BUY_STOP   = 4
-        mock.ORDER_TYPE_SELL_STOP  = 5
-        mock.ORDER_TYPE_BUY_STOP_LIMIT  = 6
+        mock.ORDER_TYPE_BUY_STOP = 4
+        mock.ORDER_TYPE_SELL_STOP = 5
+        mock.ORDER_TYPE_BUY_STOP_LIMIT = 6
         mock.ORDER_TYPE_SELL_STOP_LIMIT = 7
-        mock.TRADE_ACTION_DEAL     = 1
-        mock.TRADE_ACTION_PENDING  = 5
-        mock.TRADE_ACTION_REMOVE   = 8
-        mock.TRADE_ACTION_MODIFY   = 6
-        mock.TRADE_ACTION_SLTP     = 3
-        mock.ORDER_TIME_GTC        = 0
-        mock.ORDER_TIME_DAY        = 1
-        mock.ORDER_TIME_SPECIFIED  = 2
-        mock.DEAL_TYPE_BUY         = 0
-        mock.DEAL_TYPE_SELL        = 1
+        mock.TRADE_ACTION_DEAL = 1
+        mock.TRADE_ACTION_PENDING = 5
+        mock.TRADE_ACTION_REMOVE = 8
+        mock.TRADE_ACTION_MODIFY = 6
+        mock.TRADE_ACTION_SLTP = 3
+        mock.ORDER_TIME_GTC = 0
+        mock.ORDER_TIME_DAY = 1
+        mock.ORDER_TIME_SPECIFIED = 2
+        mock.DEAL_TYPE_BUY = 0
+        mock.DEAL_TYPE_SELL = 1
 
         yield mock
 
@@ -192,25 +186,30 @@ def make_instrument(symbol="EURUSD"):
     )
 
 
-def make_mock_order(client_order_id="O-001", symbol="EURUSD",
-                    order_type=OrderType.MARKET, side=OrderSide.BUY,
-                    qty=0.10, price=1.08500):
+def make_mock_order(
+    client_order_id="O-001",
+    symbol="EURUSD",
+    order_type=OrderType.MARKET,
+    side=OrderSide.BUY,
+    qty=0.10,
+    price=1.08500,
+):
     order = MagicMock()
     order.client_order_id = ClientOrderId(client_order_id)
-    order.strategy_id     = MagicMock()
-    order.instrument_id   = InstrumentId.from_str(f"{symbol}.MT5")
-    order.order_type      = order_type
-    order.side            = side
-    order.quantity        = Quantity(qty, 2)
-    order.time_in_force   = TimeInForce.GTC
+    order.strategy_id = MagicMock()
+    order.instrument_id = InstrumentId.from_str(f"{symbol}.MT5")
+    order.order_type = order_type
+    order.side = side
+    order.quantity = Quantity(qty, 2)
+    order.time_in_force = TimeInForce.GTC
     # Market orders have no price
     if order_type == OrderType.MARKET:
         order.price = None
     else:
         order.price = Price(price, 5)
-    order.trigger_price   = None
+    order.trigger_price = None
     order.sl_trigger_price = None
-    order.tp_price        = None
+    order.tp_price = None
     return order
 
 
@@ -219,9 +218,10 @@ def make_provider(instrument=None):
     Build a real MT5InstrumentProvider — NautilusTrader's PyCondition.type()
     rejects MagicMock, so we must use the real class with a mocked connection.
     """
-    from mt5connect.providers import MT5InstrumentProvider
-    from mt5connect.connection import MT5Connection
     from nautilus_trader.common.providers import InstrumentProvider
+
+    from mt5connect.connection import MT5Connection
+    from mt5connect.providers import MT5InstrumentProvider
 
     conn = MagicMock(spec=MT5Connection)
     conn.ensure_connected = MagicMock()
@@ -230,12 +230,12 @@ def make_provider(instrument=None):
 
     provider = MT5InstrumentProvider.__new__(MT5InstrumentProvider)
     InstrumentProvider.__init__(provider)
-    provider._conn           = conn
+    provider._conn = conn
     provider._failed_symbols = []
 
     provider.get_instrument = MagicMock(return_value=inst)
-    provider.load_symbol    = MagicMock(return_value=inst)
-    provider.list_all       = MagicMock(return_value=[inst])
+    provider.load_symbol = MagicMock(return_value=inst)
+    provider.list_all = MagicMock(return_value=[inst])
     provider.load_all_async = AsyncMock()
 
     return provider
@@ -243,8 +243,8 @@ def make_provider(instrument=None):
 
 def make_exec_client(config, mock_mt5_exec) -> MT5LiveExecutionClient:
     """Build an MT5LiveExecutionClient with real NautilusTrader components."""
-    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
     from nautilus_trader.common.component import LiveClock
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
     try:
         loop = asyncio.get_running_loop()
@@ -255,18 +255,18 @@ def make_exec_client(config, mock_mt5_exec) -> MT5LiveExecutionClient:
     conn.is_connected = True
     conn.ensure_connected = MagicMock()
     account_snap = MagicMock()
-    account_snap.balance  = 10000.0
-    account_snap.equity   = 10000.0   # keep equal to balance — no unrealised P&L in tests
+    account_snap.balance = 10000.0
+    account_snap.equity = 10000.0  # keep equal to balance — no unrealised P&L in tests
     account_snap.currency = "USD"
     conn.get_account_info = MagicMock(return_value=account_snap)
-    conn.reconnect_async  = AsyncMock(return_value=True)
+    conn.reconnect_async = AsyncMock(return_value=True)
 
     provider = make_provider()
 
     # Real NT components — MagicMock fails PyCondition type checks
     msgbus = TestComponentStubs.msgbus()
-    cache  = TestComponentStubs.cache()
-    clock  = LiveClock()
+    cache = TestComponentStubs.cache()
+    clock = LiveClock()
 
     client = MT5LiveExecutionClient(
         loop=loop,
@@ -280,7 +280,7 @@ def make_exec_client(config, mock_mt5_exec) -> MT5LiveExecutionClient:
     # Patch the internal generate methods so we can inspect calls
     client.generate_order_accepted = MagicMock()
     client.generate_order_rejected = MagicMock()
-    client.generate_account_state  = MagicMock()
+    client.generate_account_state = MagicMock()
 
     return client
 
@@ -289,11 +289,20 @@ def make_exec_client(config, mock_mt5_exec) -> MT5LiveExecutionClient:
 # 1. HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestTimeInForceToMt5:
-    def test_gtc(self):      assert _time_in_force_to_mt5(TimeInForce.GTC) == mt5.ORDER_TIME_GTC
-    def test_day(self):      assert _time_in_force_to_mt5(TimeInForce.DAY) == mt5.ORDER_TIME_DAY
-    def test_ioc_maps_gtc(self): assert _time_in_force_to_mt5(TimeInForce.IOC) == mt5.ORDER_TIME_GTC
-    def test_fok_maps_gtc(self): assert _time_in_force_to_mt5(TimeInForce.FOK) == mt5.ORDER_TIME_GTC
+    def test_gtc(self):
+        assert _time_in_force_to_mt5(TimeInForce.GTC) == mt5.ORDER_TIME_GTC
+
+    def test_day(self):
+        assert _time_in_force_to_mt5(TimeInForce.DAY) == mt5.ORDER_TIME_DAY
+
+    def test_ioc_maps_gtc(self):
+        assert _time_in_force_to_mt5(TimeInForce.IOC) == mt5.ORDER_TIME_GTC
+
+    def test_fok_maps_gtc(self):
+        assert _time_in_force_to_mt5(TimeInForce.FOK) == mt5.ORDER_TIME_GTC
+
     def test_gtd(self):
         assert _time_in_force_to_mt5(TimeInForce.GTD) == mt5.ORDER_TIME_SPECIFIED
 
@@ -322,25 +331,44 @@ class TestNautilusSideToMt5:
 
 class TestNautilusOrderToMt5Pending:
     def test_buy_limit(self):
-        assert _nautilus_order_to_mt5_pending(OrderType.LIMIT, OrderSide.BUY) == mt5.ORDER_TYPE_BUY_LIMIT
+        assert (
+            _nautilus_order_to_mt5_pending(OrderType.LIMIT, OrderSide.BUY)
+            == mt5.ORDER_TYPE_BUY_LIMIT
+        )
 
     def test_sell_limit(self):
-        assert _nautilus_order_to_mt5_pending(OrderType.LIMIT, OrderSide.SELL) == mt5.ORDER_TYPE_SELL_LIMIT
+        assert (
+            _nautilus_order_to_mt5_pending(OrderType.LIMIT, OrderSide.SELL)
+            == mt5.ORDER_TYPE_SELL_LIMIT
+        )
 
     def test_buy_stop(self):
-        assert _nautilus_order_to_mt5_pending(OrderType.STOP_MARKET, OrderSide.BUY) == mt5.ORDER_TYPE_BUY_STOP
+        assert (
+            _nautilus_order_to_mt5_pending(OrderType.STOP_MARKET, OrderSide.BUY)
+            == mt5.ORDER_TYPE_BUY_STOP
+        )
 
     def test_sell_stop(self):
-        assert _nautilus_order_to_mt5_pending(OrderType.STOP_MARKET, OrderSide.SELL) == mt5.ORDER_TYPE_SELL_STOP
+        assert (
+            _nautilus_order_to_mt5_pending(OrderType.STOP_MARKET, OrderSide.SELL)
+            == mt5.ORDER_TYPE_SELL_STOP
+        )
 
     def test_buy_stop_limit(self):
-        assert _nautilus_order_to_mt5_pending(OrderType.STOP_LIMIT, OrderSide.BUY) == mt5.ORDER_TYPE_BUY_STOP_LIMIT
+        assert (
+            _nautilus_order_to_mt5_pending(OrderType.STOP_LIMIT, OrderSide.BUY)
+            == mt5.ORDER_TYPE_BUY_STOP_LIMIT
+        )
 
     def test_sell_stop_limit(self):
-        assert _nautilus_order_to_mt5_pending(OrderType.STOP_LIMIT, OrderSide.SELL) == mt5.ORDER_TYPE_SELL_STOP_LIMIT
+        assert (
+            _nautilus_order_to_mt5_pending(OrderType.STOP_LIMIT, OrderSide.SELL)
+            == mt5.ORDER_TYPE_SELL_STOP_LIMIT
+        )
 
     def test_unsupported_raises(self):
         from mt5connect.errors import MT5OrderError
+
         with pytest.raises(MT5OrderError):
             _nautilus_order_to_mt5_pending(OrderType.TRAILING_STOP_MARKET, OrderSide.BUY)
 
@@ -348,24 +376,29 @@ class TestNautilusOrderToMt5Pending:
 class TestParseAccountCurrency:
     def test_usd(self):
         from nautilus_trader.model.currencies import USD
+
         assert _parse_account_currency("USD") == USD
 
     def test_eur(self):
         from nautilus_trader.model.currencies import EUR
+
         assert _parse_account_currency("EUR") == EUR
 
     def test_fallback_to_usd(self):
         from nautilus_trader.model.currencies import USD
+
         assert _parse_account_currency("XXXX") == USD
 
     def test_case_insensitive(self):
         from nautilus_trader.model.currencies import USD
+
         assert _parse_account_currency("usd") == USD
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. INITIAL STATE
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestInitialState:
     def test_poll_task_none_initially(self, config, mock_mt5_exec):
@@ -400,6 +433,7 @@ class TestInitialState:
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. CONNECT
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestConnect:
     @pytest.mark.asyncio
@@ -436,6 +470,7 @@ class TestConnect:
 # 4. DISCONNECT
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestDisconnect:
     @pytest.mark.asyncio
     async def test_disconnect_cancels_poll_task(self, config, mock_mt5_exec):
@@ -468,12 +503,13 @@ class TestDisconnect:
 # 5. SUBMIT ORDER — MARKET
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitMarketOrder:
     @pytest.mark.asyncio
     async def test_market_buy_calls_order_send(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.MARKET, side=OrderSide.BUY)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.MARKET, side=OrderSide.BUY)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -481,13 +517,13 @@ class TestSubmitMarketOrder:
         mock_mt5_exec.order_send.assert_called_once()
         req = mock_mt5_exec.order_send.call_args[0][0]
         assert req["action"] == mock_mt5_exec.TRADE_ACTION_DEAL
-        assert req["type"]   == mock_mt5_exec.ORDER_TYPE_BUY
+        assert req["type"] == mock_mt5_exec.ORDER_TYPE_BUY
 
     @pytest.mark.asyncio
     async def test_market_sell_uses_bid_price(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.MARKET, side=OrderSide.SELL)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.MARKET, side=OrderSide.SELL)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -498,8 +534,8 @@ class TestSubmitMarketOrder:
     @pytest.mark.asyncio
     async def test_market_buy_uses_ask_price(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.MARKET, side=OrderSide.BUY)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.MARKET, side=OrderSide.BUY)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -510,8 +546,8 @@ class TestSubmitMarketOrder:
     @pytest.mark.asyncio
     async def test_market_order_records_ticket(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(client_order_id="O-MKTBUY")
-        cmd    = MagicMock()
+        order = make_mock_order(client_order_id="O-MKTBUY")
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -522,8 +558,8 @@ class TestSubmitMarketOrder:
     @pytest.mark.asyncio
     async def test_market_order_emits_accepted(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order()
-        cmd    = MagicMock()
+        order = make_mock_order()
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -532,8 +568,8 @@ class TestSubmitMarketOrder:
     @pytest.mark.asyncio
     async def test_magic_number_set_in_request(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order()
-        cmd    = MagicMock()
+        order = make_mock_order()
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -546,25 +582,26 @@ class TestSubmitMarketOrder:
 # 6. SUBMIT ORDER — LIMIT
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitLimitOrder:
     @pytest.mark.asyncio
     async def test_limit_buy_uses_pending_action(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.LIMIT, side=OrderSide.BUY)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.LIMIT, side=OrderSide.BUY)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
 
         req = mock_mt5_exec.order_send.call_args[0][0]
         assert req["action"] == mock_mt5_exec.TRADE_ACTION_PENDING
-        assert req["type"]   == mock_mt5_exec.ORDER_TYPE_BUY_LIMIT
+        assert req["type"] == mock_mt5_exec.ORDER_TYPE_BUY_LIMIT
 
     @pytest.mark.asyncio
     async def test_limit_sell_type_correct(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.LIMIT, side=OrderSide.SELL)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.LIMIT, side=OrderSide.SELL)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -577,12 +614,13 @@ class TestSubmitLimitOrder:
 # 7. SUBMIT ORDER — STOP
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitStopOrder:
     @pytest.mark.asyncio
     async def test_stop_buy_type_correct(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.STOP_MARKET, side=OrderSide.BUY)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.STOP_MARKET, side=OrderSide.BUY)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -593,8 +631,8 @@ class TestSubmitStopOrder:
     @pytest.mark.asyncio
     async def test_stop_sell_type_correct(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(order_type=OrderType.STOP_MARKET, side=OrderSide.SELL)
-        cmd    = MagicMock()
+        order = make_mock_order(order_type=OrderType.STOP_MARKET, side=OrderSide.SELL)
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -607,17 +645,18 @@ class TestSubmitStopOrder:
 # 8. SUBMIT ORDER — REJECTED
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitOrderRejected:
     @pytest.mark.asyncio
     async def test_rejected_retcode_emits_order_rejected(self, config, mock_mt5_exec):
         result = MagicMock()
         result.retcode = 10019  # Insufficient funds
-        result.order   = 0
+        result.order = 0
         mock_mt5_exec.order_send.return_value = result
 
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order()
-        cmd    = MagicMock()
+        order = make_mock_order()
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -629,12 +668,12 @@ class TestSubmitOrderRejected:
     async def test_rejected_does_not_record_ticket(self, config, mock_mt5_exec):
         result = MagicMock()
         result.retcode = 10006
-        result.order   = 0
+        result.order = 0
         mock_mt5_exec.order_send.return_value = result
 
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order(client_order_id="O-REJECT")
-        cmd    = MagicMock()
+        order = make_mock_order(client_order_id="O-REJECT")
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -646,14 +685,15 @@ class TestSubmitOrderRejected:
 # 9. SUBMIT ORDER — order_send RETURNS NONE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitOrderSendNone:
     @pytest.mark.asyncio
     async def test_none_result_emits_rejected(self, config, mock_mt5_exec):
         mock_mt5_exec.order_send.return_value = None
 
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order()
-        cmd    = MagicMock()
+        order = make_mock_order()
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -665,6 +705,7 @@ class TestSubmitOrderSendNone:
 # 10. SUBMIT ORDER — INSTRUMENT NOT FOUND
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitOrderInstrumentNotFound:
     @pytest.mark.asyncio
     async def test_missing_instrument_emits_rejected(self, config, mock_mt5_exec):
@@ -672,7 +713,7 @@ class TestSubmitOrderInstrumentNotFound:
         client._provider.get_instrument.return_value = None
 
         order = make_mock_order()
-        cmd   = MagicMock()
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -685,14 +726,15 @@ class TestSubmitOrderInstrumentNotFound:
 # 11. SUBMIT ORDER — NO TICK
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSubmitOrderNoTick:
     @pytest.mark.asyncio
     async def test_no_tick_emits_rejected(self, config, mock_mt5_exec):
         mock_mt5_exec.symbol_info_tick.return_value = None
 
         client = make_exec_client(config, mock_mt5_exec)
-        order  = make_mock_order()
-        cmd    = MagicMock()
+        order = make_mock_order()
+        cmd = MagicMock()
         cmd.order = order
 
         await client._submit_order(cmd)
@@ -704,6 +746,7 @@ class TestSubmitOrderNoTick:
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. CANCEL ORDER — PENDING
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestCancelPendingOrder:
     @pytest.mark.asyncio
@@ -720,15 +763,15 @@ class TestCancelPendingOrder:
         client._client_order_id_to_ticket["O-CANCEL"] = 77771
 
         cmd = MagicMock()
-        cmd.client_order_id  = ClientOrderId("O-CANCEL")
-        cmd.venue_order_id   = None
-        cmd.instrument_id    = InstrumentId.from_str("EURUSD.MT5")
+        cmd.client_order_id = ClientOrderId("O-CANCEL")
+        cmd.venue_order_id = None
+        cmd.instrument_id = InstrumentId.from_str("EURUSD.MT5")
 
         await client._cancel_order(cmd)
 
         req = mock_mt5_exec.order_send.call_args[0][0]
         assert req["action"] == mock_mt5_exec.TRADE_ACTION_REMOVE
-        assert req["order"]  == 77771
+        assert req["order"] == 77771
 
     @pytest.mark.asyncio
     async def test_cancel_unknown_ticket_logs_warning(self, config, mock_mt5_exec):
@@ -737,8 +780,8 @@ class TestCancelPendingOrder:
 
         cmd = MagicMock()
         cmd.client_order_id = ClientOrderId("O-UNKNOWN")
-        cmd.venue_order_id  = None
-        cmd.instrument_id   = InstrumentId.from_str("EURUSD.MT5")
+        cmd.venue_order_id = None
+        cmd.instrument_id = InstrumentId.from_str("EURUSD.MT5")
 
         # Should not raise
         await client._cancel_order(cmd)
@@ -748,6 +791,7 @@ class TestCancelPendingOrder:
 # ─────────────────────────────────────────────────────────────────────────────
 # 13. CANCEL ORDER — CLOSE POSITION
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestCancelClosePosition:
     @pytest.mark.asyncio
@@ -760,7 +804,7 @@ class TestCancelClosePosition:
         pos.ticket = 88881
         pos.symbol = "EURUSD"
         pos.volume = 0.10
-        pos.type   = mock_mt5_exec.ORDER_TYPE_BUY  # long → close with SELL
+        pos.type = mock_mt5_exec.ORDER_TYPE_BUY  # long → close with SELL
         mock_mt5_exec.positions_get.return_value = (pos,)
 
         result = MagicMock()
@@ -772,14 +816,14 @@ class TestCancelClosePosition:
 
         cmd = MagicMock()
         cmd.client_order_id = ClientOrderId("O-CLOSE")
-        cmd.venue_order_id  = None
-        cmd.instrument_id   = InstrumentId.from_str("EURUSD.MT5")
+        cmd.venue_order_id = None
+        cmd.instrument_id = InstrumentId.from_str("EURUSD.MT5")
 
         await client._cancel_order(cmd)
 
         req = mock_mt5_exec.order_send.call_args[0][0]
-        assert req["action"]   == mock_mt5_exec.TRADE_ACTION_DEAL
-        assert req["type"]     == mock_mt5_exec.ORDER_TYPE_SELL
+        assert req["action"] == mock_mt5_exec.TRADE_ACTION_DEAL
+        assert req["type"] == mock_mt5_exec.ORDER_TYPE_SELL
         assert req["position"] == 88881
 
 
@@ -787,12 +831,19 @@ class TestCancelClosePosition:
 # 14. CANCEL ALL ORDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestCancelAllOrders:
     @pytest.mark.asyncio
     async def test_cancels_magic_matched_orders(self, config, mock_mt5_exec):
-        o1 = MagicMock(); o1.ticket = 1001; o1.magic = MAGIC
-        o2 = MagicMock(); o2.ticket = 1002; o2.magic = MAGIC
-        o3 = MagicMock(); o3.ticket = 1003; o3.magic = 9999  # not ours
+        o1 = MagicMock()
+        o1.ticket = 1001
+        o1.magic = MAGIC
+        o2 = MagicMock()
+        o2.ticket = 1002
+        o2.magic = MAGIC
+        o3 = MagicMock()
+        o3.ticket = 1003
+        o3.magic = 9999  # not ours
         mock_mt5_exec.orders_get.return_value = (o1, o2, o3)
 
         result = MagicMock()
@@ -824,14 +875,15 @@ class TestCancelAllOrders:
 # 15. MODIFY ORDER
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestModifyOrder:
     @pytest.mark.asyncio
     async def test_modify_pending_order_sends_action_modify(self, config, mock_mt5_exec):
         mt5_order = MagicMock()
-        mt5_order.ticket       = 55551
-        mt5_order.price_open   = 1.08400
-        mt5_order.tp           = 0.0
-        mt5_order.type_time    = 0
+        mt5_order.ticket = 55551
+        mt5_order.price_open = 1.08400
+        mt5_order.tp = 0.0
+        mt5_order.type_time = 0
         mt5_order.time_expiration = 0
         mock_mt5_exec.orders_get.return_value = (mt5_order,)
 
@@ -844,15 +896,15 @@ class TestModifyOrder:
 
         cmd = MagicMock()
         cmd.client_order_id = ClientOrderId("O-MOD")
-        cmd.venue_order_id  = None
-        cmd.price           = Price(1.08300, 5)
-        cmd.trigger_price   = None
+        cmd.venue_order_id = None
+        cmd.price = Price(1.08300, 5)
+        cmd.trigger_price = None
 
         await client._modify_order(cmd)
 
         req = mock_mt5_exec.order_send.call_args[0][0]
         assert req["action"] == mock_mt5_exec.TRADE_ACTION_MODIFY
-        assert req["order"]  == 55551
+        assert req["order"] == 55551
 
     @pytest.mark.asyncio
     async def test_modify_position_sends_action_sltp(self, config, mock_mt5_exec):
@@ -875,9 +927,9 @@ class TestModifyOrder:
 
         cmd = MagicMock()
         cmd.client_order_id = ClientOrderId("O-SLTP")
-        cmd.venue_order_id  = None
-        cmd.price           = None
-        cmd.trigger_price   = Price(1.08000, 5)
+        cmd.venue_order_id = None
+        cmd.price = None
+        cmd.trigger_price = Price(1.08000, 5)
 
         await client._modify_order(cmd)
 
@@ -889,12 +941,13 @@ class TestModifyOrder:
 # 16. POLL EXEC ONCE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestPollExecOnce:
     @pytest.mark.asyncio
     async def test_new_position_added_to_known(self, config, mock_mt5_exec):
         pos = MagicMock()
         pos.ticket = 12301
-        pos.magic  = MAGIC
+        pos.magic = MAGIC
         mock_mt5_exec.positions_get.return_value = (pos,)
 
         client = make_exec_client(config, mock_mt5_exec)
@@ -928,8 +981,8 @@ class TestPollExecOnce:
     @pytest.mark.asyncio
     async def test_deal_with_wrong_magic_ignored(self, config, mock_mt5_exec):
         deal = MagicMock()
-        deal.magic  = 9999  # not ours
-        deal.time   = 1_700_000_100
+        deal.magic = 9999  # not ours
+        deal.time = 1_700_000_100
         deal.ticket = 1
         mock_mt5_exec.history_deals_get.return_value = (deal,)
 
@@ -943,7 +996,7 @@ class TestPollExecOnce:
     async def test_position_with_wrong_magic_ignored(self, config, mock_mt5_exec):
         pos = MagicMock()
         pos.ticket = 55551
-        pos.magic  = 9999  # not ours
+        pos.magic = 9999  # not ours
         mock_mt5_exec.positions_get.return_value = (pos,)
 
         client = make_exec_client(config, mock_mt5_exec)
@@ -955,6 +1008,7 @@ class TestPollExecOnce:
 # ─────────────────────────────────────────────────────────────────────────────
 # 17. EXEC POLL LOOP
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestExecPollLoop:
     @pytest.mark.asyncio
@@ -1001,11 +1055,18 @@ class TestExecPollLoop:
 # 18. RECONCILE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestReconcile:
     @pytest.mark.asyncio
     async def test_reconcile_orders_registers_magic_matched(self, config, mock_mt5_exec):
-        o1 = MagicMock(); o1.ticket = 1001; o1.magic = MAGIC; o1.symbol = "EURUSD"
-        o2 = MagicMock(); o2.ticket = 1002; o2.magic = 9999;  o2.symbol = "EURUSD"
+        o1 = MagicMock()
+        o1.ticket = 1001
+        o1.magic = MAGIC
+        o1.symbol = "EURUSD"
+        o2 = MagicMock()
+        o2.ticket = 1002
+        o2.magic = 9999
+        o2.symbol = "EURUSD"
         mock_mt5_exec.orders_get.return_value = (o1, o2)
 
         client = make_exec_client(config, mock_mt5_exec)
@@ -1016,8 +1077,16 @@ class TestReconcile:
 
     @pytest.mark.asyncio
     async def test_reconcile_positions_registers_magic_matched(self, config, mock_mt5_exec):
-        p1 = MagicMock(); p1.ticket = 2001; p1.magic = MAGIC; p1.symbol = "EURUSD"; p1.volume = 0.1
-        p2 = MagicMock(); p2.ticket = 2002; p2.magic = 9999;  p2.symbol = "EURUSD"; p2.volume = 0.1
+        p1 = MagicMock()
+        p1.ticket = 2001
+        p1.magic = MAGIC
+        p1.symbol = "EURUSD"
+        p1.volume = 0.1
+        p2 = MagicMock()
+        p2.ticket = 2002
+        p2.magic = 9999
+        p2.symbol = "EURUSD"
+        p2.volume = 0.1
         mock_mt5_exec.positions_get.return_value = (p1, p2)
 
         client = make_exec_client(config, mock_mt5_exec)
@@ -1047,6 +1116,7 @@ class TestReconcile:
 # ─────────────────────────────────────────────────────────────────────────────
 # 19. PROPERTIES AND REPR
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestProperties:
     def test_is_polling_false_initially(self, config, mock_mt5_exec):
@@ -1085,6 +1155,7 @@ class TestProperties:
         assert "orders=" in r
         assert "positions=" in r
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FILL EMISSION — _emit_fill and _poll_exec_once deal processing
 #
@@ -1106,11 +1177,12 @@ class TestProperties:
 #   M. _processed_deal_keys cleared on disconnect
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def make_deal(
     ticket=10001,
     order=99991,
     symbol="EURUSD",
-    deal_type=0,          # 0 = DEAL_TYPE_BUY
+    deal_type=0,  # 0 = DEAL_TYPE_BUY
     volume=0.10,
     price=1.08500,
     commission=-0.50,
@@ -1121,17 +1193,17 @@ def make_deal(
 ):
     """Build a minimal MT5 deal MagicMock."""
     deal = MagicMock()
-    deal.ticket     = ticket
-    deal.order      = order
-    deal.symbol     = symbol
-    deal.type       = deal_type
-    deal.volume     = volume
-    deal.price      = price
+    deal.ticket = ticket
+    deal.order = order
+    deal.symbol = symbol
+    deal.type = deal_type
+    deal.volume = volume
+    deal.price = price
     deal.commission = commission
-    deal.profit     = profit
-    deal.currency   = currency
-    deal.magic      = magic
-    deal.time       = time
+    deal.profit = profit
+    deal.currency = currency
+    deal.magic = magic
+    deal.time = time
     return deal
 
 
@@ -1161,7 +1233,7 @@ def register_deal_order(client, deal, client_order_id="O-SESSION-123"):
 def captured_fill_args(client):
     client.generate_order_filled.assert_called_once()
     args = client.generate_order_filled.call_args.args
-    values = dict(zip(FILL_ARG_NAMES, args))
+    values = dict(zip(FILL_ARG_NAMES, args, strict=True))
     values.update(client.generate_order_filled.call_args.kwargs)
     return values
 
@@ -1194,6 +1266,7 @@ class TestEmitFill:
     @pytest.mark.asyncio
     async def test_order_side_is_buy_for_buy_deal(self, config, mock_mt5_exec):
         from nautilus_trader.model.enums import OrderSide
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 
@@ -1207,6 +1280,7 @@ class TestEmitFill:
     @pytest.mark.asyncio
     async def test_order_side_is_sell_for_sell_deal(self, config, mock_mt5_exec):
         from nautilus_trader.model.enums import OrderSide
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 
@@ -1219,7 +1293,7 @@ class TestEmitFill:
 
     @pytest.mark.asyncio
     async def test_price_and_quantity_passed_correctly(self, config, mock_mt5_exec):
-        from nautilus_trader.model.objects import Price, Quantity
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 
@@ -1228,8 +1302,8 @@ class TestEmitFill:
         await client._emit_fill(deal)
 
         kwargs = captured_fill_args(client)
-        assert float(kwargs["last_px"])  == pytest.approx(1.08520, abs=1e-5)
-        assert float(kwargs["last_qty"]) == pytest.approx(0.25,    abs=1e-4)
+        assert float(kwargs["last_px"]) == pytest.approx(1.08520, abs=1e-5)
+        assert float(kwargs["last_qty"]) == pytest.approx(0.25, abs=1e-4)
 
     @pytest.mark.asyncio
     async def test_commission_made_positive(self, config, mock_mt5_exec):
@@ -1259,6 +1333,7 @@ class TestEmitFill:
     @pytest.mark.asyncio
     async def test_trade_id_is_deal_ticket(self, config, mock_mt5_exec):
         from nautilus_trader.model.identifiers import TradeId
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 
@@ -1271,7 +1346,7 @@ class TestEmitFill:
 
     @pytest.mark.asyncio
     async def test_venue_order_id_is_order_ticket(self, config, mock_mt5_exec):
-        from nautilus_trader.model.identifiers import VenueOrderId
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 
@@ -1286,6 +1361,7 @@ class TestEmitFill:
     async def test_client_order_id_recovered_from_session_map(self, config, mock_mt5_exec):
         """If we placed the order this session, the ClientOrderId should come from our map."""
         from nautilus_trader.model.identifiers import ClientOrderId
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 
@@ -1359,6 +1435,7 @@ class TestEmitFill:
     @pytest.mark.asyncio
     async def test_instrument_id_constructed_from_symbol(self, config, mock_mt5_exec):
         from nautilus_trader.model.identifiers import InstrumentId
+
         client = make_exec_client(config, mock_mt5_exec)
         client.generate_order_filled = MagicMock()
 

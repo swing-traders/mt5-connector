@@ -1,4 +1,5 @@
 """Tick relay hub: the MQL5 EA publishes ticks, adapters subscribe."""
+
 import asyncio
 import json
 import logging
@@ -38,7 +39,7 @@ class TickHub:
                 elif self._is_tick(msg):
                     flags = int(msg.get("flags"))
                     # we only need to send the ticks if the bid or the ask price has changed
-                    if bool(flags & TICK_FLAG_BID) or bool( flags & TICK_FLAG_ASK):
+                    if bool(flags & TICK_FLAG_BID) or bool(flags & TICK_FLAG_ASK):
                         await self._broadcast(raw)
                 else:
                     logger.info(f"unkown kind {kind}")
@@ -50,8 +51,7 @@ class TickHub:
 
     @staticmethod
     def _is_tick(msg: dict) -> bool:
-        return "symbol" in msg and (
-            "bid" in msg or "ask" in msg or "time_msec" in msg)
+        return "symbol" in msg and ("bid" in msg or "ask" in msg or "time_msec" in msg)
 
     async def _broadcast(self, raw):
         for a in list(self._adapters):

@@ -1,0 +1,26 @@
+# Runtime environment for the adapter. Workstation tooling lives in environment.dev.yml.
+#
+# Create:
+#   mamba env create -f environment.yml
+#
+# For development, layer the dev tooling on top (same env name):
+#   mamba env update -f environment.dev.yml
+
+name: mt5-connector
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - python=3.12
+  - pip
+
+  - pip:
+      # The fork's index serves the patched `+st` builds; PyPI can never satisfy a local version, so
+      # this pin proves provenance.
+      - --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/
+      - nautilus_trader==1.231.0+st.20
+      - websockets>=17.0.1
+      - python-dotenv>=1.0
+      - -e .

@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mt5-connector"
-version = "0.4.0"
+version = "0.4.0+st.1"
 description = "NautilusTrader adapter for MetaTrader 5 — live trading and backtesting on any MT5 broker"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "mt5-connector contributors" },
 ]
@@ -27,9 +27,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Financial and Insurance Industry",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: Microsoft :: Windows",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Office/Business :: Financial",
@@ -37,24 +36,16 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "nautilus_trader>=1.190.0",
+    "nautilus_trader>=1.231.0",
     "MetaTrader5>=5.0.45 ; platform_system == \"Windows\"",
     "python-dotenv>=1.0",
     "websockets>=17.0.1",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-    "pytest-mock>=3.10",
-]
-
 [project.urls]
-Homepage   = "https://github.com/aulekator/mt5-connector"
-Repository = "https://github.com/aulekator/mt5-connector"
-Issues     = "https://github.com/aulekator/mt5-connector/issues"
-Changelog  = "https://github.com/aulekator/mt5-connector/blob/main/CHANGELOG.md"
+Homepage   = "https://github.com/swing-traders/mt5-connector"
+Repository = "https://github.com/swing-traders/mt5-connector"
+Issues     = "https://github.com/swing-traders/mt5-connector/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mt5connect"]
@@ -62,10 +53,20 @@ packages = ["mt5connect"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths    = ["tests"]
-
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
+extend-exclude = ["scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+extend-exclude = "scripts/"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -ra"
+asyncio_mode = "auto"

@@ -26,39 +26,39 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
-from typing import Union
 
 from nautilus_trader.model.currencies import Currency
+from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Cfd, CryptoPerpetual, CurrencyPair
-from nautilus_trader.model.data import Bar, BarType, BarSpecification, QuoteTick
 from nautilus_trader.model.objects import Price, Quantity
 
 from mt5connect.constants import (
-    MT5_VENUE,
     CRYPTO_SYMBOLS,
     ENERGY_SYMBOLS,
     FX_SYMBOLS,
     INDEX_SYMBOLS,
     METAL_SYMBOLS,
+    MT5_VENUE,
     PRICE_PRECISION_OVERRIDES,
     normalize_symbol,
 )
 from mt5connect.errors import MT5InstrumentError
 
 # Union type for any instrument this adapter produces
-InstrumentAny = Union[CurrencyPair, Cfd, CryptoPerpetual]
+InstrumentAny = CurrencyPair | Cfd | CryptoPerpetual
 
 # MT5 calc_mode constants (from MQL5 docs)
-_CALC_MODE_FOREX   = 0
+_CALC_MODE_FOREX = 0
 _CALC_MODE_FUTURES = 1
-_CALC_MODE_CFD     = 2
+_CALC_MODE_CFD = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INSTRUMENT TYPE DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def detect_instrument_type(symbol: str) -> str:
     """
@@ -94,6 +94,7 @@ def detect_instrument_type(symbol: str) -> str:
 # PRECISION AND INCREMENT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def resolve_price_precision(symbol: str, digits: int) -> int:
     """
     Return the price precision (decimal places) for a symbol.
@@ -117,7 +118,7 @@ def make_price_increment(price_precision: int) -> Price:
         precision=1  ->  Price(0.1,     1)   [US500]
         precision=0  ->  Price(1.0,     0)   [rare]
     """
-    increment = 10 ** -price_precision
+    increment = 10**-price_precision
     return Price(increment, price_precision)
 
 
@@ -165,6 +166,7 @@ def make_margin(margin_value: float) -> Decimal:
 # CURRENCY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def parse_currency(code: str) -> Currency:
     """
     Parse a currency code string into a NautilusTrader Currency object.
@@ -177,20 +179,17 @@ def parse_currency(code: str) -> Currency:
     """
     code = code.strip().upper()
     if not code:
-        raise MT5InstrumentError(
-            "Empty currency code. Check symbol_info().currency_base/profit."
-        )
+        raise MT5InstrumentError("Empty currency code. Check symbol_info().currency_base/profit.")
     try:
         return Currency.from_str(code)
     except Exception as exc:
-        raise MT5InstrumentError(
-            f"Cannot parse currency code '{code}': {exc}"
-        ) from exc
+        raise MT5InstrumentError(f"Cannot parse currency code '{code}': {exc}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN INSTRUMENT PARSER
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def parse_symbol_info(info) -> InstrumentAny:
     """
@@ -228,15 +227,17 @@ def parse_symbol_info(info) -> InstrumentAny:
 
     # Build identifiers
     instrument_id = InstrumentId(Symbol(symbol), MT5_VENUE)
-    raw_symbol    = Symbol(symbol)
+    raw_symbol = Symbol(symbol)
 
     # Lot sizes
-    min_qty = Quantity(info.volume_min,  size_precision)
-    max_qty = Quantity(info.volume_max,  size_precision)
-    lot_size = Quantity(info.trade_contract_size, 0) if info.trade_contract_size >= 1 else Quantity(1.0, 0)
+    min_qty = Quantity(info.volume_min, size_precision)
+    max_qty = Quantity(info.volume_max, size_precision)
+    lot_size = (
+        Quantity(info.trade_contract_size, 0) if info.trade_contract_size >= 1 else Quantity(1.0, 0)
+    )
 
     # Margins
-    margin_init  = make_margin(info.margin_initial)
+    margin_init = make_margin(info.margin_initial)
     margin_maint = make_margin(info.margin_maintenance)
 
     # Timestamp
@@ -244,31 +245,54 @@ def parse_symbol_info(info) -> InstrumentAny:
 
     if instrument_type == "fx":
         return _parse_fx(
-            instrument_id, raw_symbol, info,
-            price_precision, price_increment,
-            size_precision, size_increment,
-            min_qty, max_qty, lot_size,
-            margin_init, margin_maint, ts_now,
+            instrument_id,
+            raw_symbol,
+            info,
+            price_precision,
+            price_increment,
+            size_precision,
+            size_increment,
+            min_qty,
+            max_qty,
+            lot_size,
+            margin_init,
+            margin_maint,
+            ts_now,
         )
 
     elif instrument_type == "crypto":
         return _parse_crypto(
-            instrument_id, raw_symbol, info,
-            price_precision, price_increment,
-            size_precision, size_increment,
-            min_qty, max_qty,
-            margin_init, margin_maint, ts_now,
+            instrument_id,
+            raw_symbol,
+            info,
+            price_precision,
+            price_increment,
+            size_precision,
+            size_increment,
+            min_qty,
+            max_qty,
+            margin_init,
+            margin_maint,
+            ts_now,
         )
 
     else:
         # metal, energy, index, cfd — all become Cfd
         return _parse_cfd(
-            instrument_id, raw_symbol, info,
+            instrument_id,
+            raw_symbol,
+            info,
             instrument_type,
-            price_precision, price_increment,
-            size_precision, size_increment,
-            min_qty, max_qty, lot_size,
-            margin_init, margin_maint, ts_now,
+            price_precision,
+            price_increment,
+            size_precision,
+            size_increment,
+            min_qty,
+            max_qty,
+            lot_size,
+            margin_init,
+            margin_maint,
+            ts_now,
         )
 
 
@@ -276,21 +300,28 @@ def parse_symbol_info(info) -> InstrumentAny:
 # PER-TYPE BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _parse_fx(
-    instrument_id, raw_symbol, info,
-    price_precision, price_increment,
-    size_precision, size_increment,
-    min_qty, max_qty, lot_size,
-    margin_init, margin_maint, ts_now,
+    instrument_id,
+    raw_symbol,
+    info,
+    price_precision,
+    price_increment,
+    size_precision,
+    size_increment,
+    min_qty,
+    max_qty,
+    lot_size,
+    margin_init,
+    margin_maint,
+    ts_now,
 ) -> CurrencyPair:
     """Build a CurrencyPair for FX spot symbols (EURUSD, GBPUSD, etc.)"""
     try:
-        base_currency  = parse_currency(info.currency_base)
+        base_currency = parse_currency(info.currency_base)
         quote_currency = parse_currency(info.currency_profit)
     except MT5InstrumentError as exc:
-        raise MT5InstrumentError(
-            f"FX symbol '{info.name}' has invalid currency: {exc}"
-        ) from exc
+        raise MT5InstrumentError(f"FX symbol '{info.name}' has invalid currency: {exc}") from exc
 
     return CurrencyPair(
         instrument_id=instrument_id,
@@ -318,20 +349,28 @@ def _parse_fx(
 
 
 def _parse_cfd(
-    instrument_id, raw_symbol, info,
+    instrument_id,
+    raw_symbol,
+    info,
     instrument_type,
-    price_precision, price_increment,
-    size_precision, size_increment,
-    min_qty, max_qty, lot_size,
-    margin_init, margin_maint, ts_now,
+    price_precision,
+    price_increment,
+    size_precision,
+    size_increment,
+    min_qty,
+    max_qty,
+    lot_size,
+    margin_init,
+    margin_maint,
+    ts_now,
 ) -> Cfd:
     """Build a Cfd for metals, energies, indices, and unknown CFDs."""
     # Map instrument type to NautilusTrader AssetClass
     asset_class_map = {
-        "metal":  AssetClass.COMMODITY,
+        "metal": AssetClass.COMMODITY,
         "energy": AssetClass.COMMODITY,
-        "index":  AssetClass.INDEX,
-        "cfd":    AssetClass.ALTERNATIVE,
+        "index": AssetClass.INDEX,
+        "cfd": AssetClass.ALTERNATIVE,
     }
     asset_class = asset_class_map.get(instrument_type, AssetClass.ALTERNATIVE)
 
@@ -368,16 +407,23 @@ def _parse_cfd(
 
 
 def _parse_crypto(
-    instrument_id, raw_symbol, info,
-    price_precision, price_increment,
-    size_precision, size_increment,
-    min_qty, max_qty,
-    margin_init, margin_maint, ts_now,
+    instrument_id,
+    raw_symbol,
+    info,
+    price_precision,
+    price_increment,
+    size_precision,
+    size_increment,
+    min_qty,
+    max_qty,
+    margin_init,
+    margin_maint,
+    ts_now,
 ) -> CryptoPerpetual:
     """Build a CryptoPerpetual for crypto CFD symbols (BTCUSD, ETHUSD, etc.)"""
     try:
-        base_currency       = parse_currency(info.currency_base)
-        quote_currency      = parse_currency(info.currency_profit)
+        base_currency = parse_currency(info.currency_base)
+        quote_currency = parse_currency(info.currency_profit)
         settlement_currency = parse_currency(info.currency_profit)
     except MT5InstrumentError as exc:
         raise MT5InstrumentError(
@@ -414,6 +460,7 @@ def _parse_crypto(
 # TICK PARSER  (used by MT5DataClient polling loop)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def parse_quote_tick(symbol_info_tick, instrument: InstrumentAny) -> QuoteTick:
     """
     Convert an MT5 tick into a NautilusTrader QuoteTick.
@@ -444,28 +491,28 @@ def parse_quote_tick(symbol_info_tick, instrument: InstrumentAny) -> QuoteTick:
     # namedtuples and MagicMocks use attribute access
     if type(symbol_info_tick).__name__ == "void":
         # numpy structured array row — use key access
-        bid  = float(symbol_info_tick["bid"])
-        ask  = float(symbol_info_tick["ask"])
+        bid = float(symbol_info_tick["bid"])
+        ask = float(symbol_info_tick["ask"])
         ts_s = int(symbol_info_tick["time"])
         if "time_msc" in symbol_info_tick:
-          ts_event = symbol_info_tick["time_msc"] * 1000 * 1000 # /mili  seconds to nano seconds
-        else: 
-          ts_event = ts_s * 1_000_000_000
+            ts_event = symbol_info_tick["time_msc"] * 1000 * 1000  # /mili  seconds to nano seconds
+        else:
+            ts_event = ts_s * 1_000_000_000
     else:
         # namedtuple (live polling) or MagicMock (tests) — use attribute access
-        bid  = float(symbol_info_tick.bid)
-        ask  = float(symbol_info_tick.ask)
+        bid = float(symbol_info_tick.bid)
+        ask = float(symbol_info_tick.ask)
         ts_s = int(symbol_info_tick.time)
         if hasattr(symbol_info_tick, "time_msc"):
-          ts_event = int(symbol_info_tick.time_msc) * 1000 * 1000
+            ts_event = int(symbol_info_tick.time_msc) * 1000 * 1000
         else:
-          ts_event = ts_s * 1_000_000_000
+            ts_event = ts_s * 1_000_000_000
 
     return QuoteTick(
         instrument_id=instrument.id,
         bid_price=Price(bid, pp),
         ask_price=Price(ask, pp),
-        bid_size=Quantity(1_000_000, 0),   # MT5 doesn't expose depth
+        bid_size=Quantity(1_000_000, 0),  # MT5 doesn't expose depth
         ask_size=Quantity(1_000_000, 0),
         ts_event=ts_event,
         ts_init=time.time_ns(),
@@ -478,27 +525,27 @@ def parse_quote_tick(symbol_info_tick, instrument: InstrumentAny) -> QuoteTick:
 
 # Map MT5 timeframe integers to NautilusTrader BarAggregation + step
 _MT5_TIMEFRAME_MAP: dict[int, tuple[int, BarAggregation]] = {
-    1:     (1,  BarAggregation.MINUTE),   # M1
-    2:     (2,  BarAggregation.MINUTE),   # M2
-    3:     (3,  BarAggregation.MINUTE),   # M3
-    4:     (4,  BarAggregation.MINUTE),   # M4
-    5:     (5,  BarAggregation.MINUTE),   # M5
-    6:     (6,  BarAggregation.MINUTE),   # M6
-    10:    (10, BarAggregation.MINUTE),   # M10
-    12:    (12, BarAggregation.MINUTE),   # M12
-    15:    (15, BarAggregation.MINUTE),   # M15
-    20:    (20, BarAggregation.MINUTE),   # M20
-    30:    (30, BarAggregation.MINUTE),   # M30
-    16385: (1,  BarAggregation.HOUR),     # H1
-    16386: (2,  BarAggregation.HOUR),     # H2
-    16387: (3,  BarAggregation.HOUR),     # H3
-    16388: (4,  BarAggregation.HOUR),     # H4
-    16390: (6,  BarAggregation.HOUR),     # H6
-    16392: (8,  BarAggregation.HOUR),     # H8
-    16396: (12, BarAggregation.HOUR),     # H12
-    16408: (1,  BarAggregation.DAY),      # D1
-    32769: (1,  BarAggregation.WEEK),     # W1
-    49153: (1,  BarAggregation.MONTH),    # MN1
+    1: (1, BarAggregation.MINUTE),  # M1
+    2: (2, BarAggregation.MINUTE),  # M2
+    3: (3, BarAggregation.MINUTE),  # M3
+    4: (4, BarAggregation.MINUTE),  # M4
+    5: (5, BarAggregation.MINUTE),  # M5
+    6: (6, BarAggregation.MINUTE),  # M6
+    10: (10, BarAggregation.MINUTE),  # M10
+    12: (12, BarAggregation.MINUTE),  # M12
+    15: (15, BarAggregation.MINUTE),  # M15
+    20: (20, BarAggregation.MINUTE),  # M20
+    30: (30, BarAggregation.MINUTE),  # M30
+    16385: (1, BarAggregation.HOUR),  # H1
+    16386: (2, BarAggregation.HOUR),  # H2
+    16387: (3, BarAggregation.HOUR),  # H3
+    16388: (4, BarAggregation.HOUR),  # H4
+    16390: (6, BarAggregation.HOUR),  # H6
+    16392: (8, BarAggregation.HOUR),  # H8
+    16396: (12, BarAggregation.HOUR),  # H12
+    16408: (1, BarAggregation.DAY),  # D1
+    32769: (1, BarAggregation.WEEK),  # W1
+    49153: (1, BarAggregation.MONTH),  # MN1
 }
 
 
@@ -519,9 +566,7 @@ def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:
     -------
     Bar
     """
-    step, aggregation = _MT5_TIMEFRAME_MAP.get(
-        timeframe, (1, BarAggregation.DAY)  # safe fallback
-    )
+    step, aggregation = _MT5_TIMEFRAME_MAP.get(timeframe, (1, BarAggregation.DAY))  # safe fallback
     pp = instrument.price_precision
 
     bar_type = BarType(
@@ -533,9 +578,9 @@ def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:
 
     return Bar(
         bar_type=bar_type,
-        open=Price(mt5_rate["open"],  pp),
-        high=Price(mt5_rate["high"],  pp),
-        low=Price(mt5_rate["low"],    pp),
+        open=Price(mt5_rate["open"], pp),
+        high=Price(mt5_rate["high"], pp),
+        low=Price(mt5_rate["low"], pp),
         close=Price(mt5_rate["close"], pp),
         volume=Quantity(float(mt5_rate["tick_volume"]), 0),
         ts_event=ts_event,

@@ -16,8 +16,16 @@ class Fake:
 
 
 def _tick(**kw):
-    base = dict(time=1704067200, bid=1.08, ask=1.0801, last=0.0, volume=0,
-                time_msc=1704067200123, flags=2, volume_real=0.0)
+    base = dict(
+        time=1704067200,
+        bid=1.08,
+        ask=1.0801,
+        last=0.0,
+        volume=0,
+        time_msc=1704067200123,
+        flags=2,
+        volume_real=0.0,
+    )
     base.update(kw)
     return Fake(**base)
 

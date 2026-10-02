@@ -30,18 +30,20 @@ Test groups:
   20. Size precision from volume_step
 """
 
-import time
 from decimal import Decimal
 from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
-
-from nautilus_trader.model.instruments import CurrencyPair, Cfd, CryptoPerpetual
-from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
-from nautilus_trader.model.data import QuoteTick, Bar
+from nautilus_trader.model.data import Bar, QuoteTick
+from nautilus_trader.model.enums import AssetClass, BarAggregation
+from nautilus_trader.model.instruments import Cfd, CryptoPerpetual, CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
+from mt5connect.constants import MT5_VENUE
+from mt5connect.errors import MT5InstrumentError
 from mt5connect.parsing import (
+    _MT5_TIMEFRAME_MAP,
     detect_instrument_type,
     make_margin,
     make_price_increment,
@@ -51,15 +53,12 @@ from mt5connect.parsing import (
     parse_quote_tick,
     parse_symbol_info,
     resolve_price_precision,
-    _MT5_TIMEFRAME_MAP,
 )
-from mt5connect.errors import MT5InstrumentError
-from mt5connect.constants import MT5_VENUE
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS — build fake MT5 symbol_info namedtuples
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def make_symbol_info(
     name="EURUSD",
@@ -79,49 +78,59 @@ def make_symbol_info(
 ):
     """Build a mock MT5 symbol_info namedtuple with sensible defaults."""
     info = MagicMock()
-    info.name               = name
-    info.digits             = digits
-    info.trade_tick_size    = trade_tick_size
-    info.volume_min         = volume_min
-    info.volume_max         = volume_max
-    info.volume_step        = volume_step
+    info.name = name
+    info.digits = digits
+    info.trade_tick_size = trade_tick_size
+    info.volume_min = volume_min
+    info.volume_max = volume_max
+    info.volume_step = volume_step
     info.trade_contract_size = trade_contract_size
-    info.currency_base      = currency_base
-    info.currency_profit    = currency_profit
-    info.currency_margin    = currency_margin
-    info.margin_initial     = margin_initial
+    info.currency_base = currency_base
+    info.currency_profit = currency_profit
+    info.currency_margin = currency_margin
+    info.margin_initial = margin_initial
     info.margin_maintenance = margin_maintenance
-    info.calc_mode          = calc_mode
-    info.description        = description
+    info.calc_mode = calc_mode
+    info.description = description
     return info
 
 
-def make_tick(bid=1.08500, ask=1.08502, last=1.08501, volume=1, time_s=1700000000):
+def make_tick(bid=1.08500, ask=1.08502, last=1.08501, volume=1, time_s=1700000000, time_msc=None):
     tick = MagicMock()
-    tick.bid    = bid
-    tick.ask    = ask
-    tick.last   = last
+    tick.bid = bid
+    tick.ask = ask
+    tick.last = last
     tick.volume = volume
-    tick.time   = time_s
+    tick.time = time_s
+    tick.time_msc = time_msc or (time_s * 1000)
     return tick
 
 
-def make_rate(open_=1.085, high=1.090, low=1.080, close=1.088,
-              tick_volume=1000, spread=2, real_volume=0, time_s=1700000000):
+def make_rate(
+    open_=1.085,
+    high=1.090,
+    low=1.080,
+    close=1.088,
+    tick_volume=1000,
+    spread=2,
+    real_volume=0,
+    time_s=1700000000,
+):
     """Build a numpy structured array row matching mt5.copy_rates_range() output."""
-    dtype = np.dtype([
-        ("time", np.int64),
-        ("open", np.float64),
-        ("high", np.float64),
-        ("low", np.float64),
-        ("close", np.float64),
-        ("tick_volume", np.int64),
-        ("spread", np.int32),
-        ("real_volume", np.int64),
-    ])
+    dtype = np.dtype(
+        [
+            ("time", np.int64),
+            ("open", np.float64),
+            ("high", np.float64),
+            ("low", np.float64),
+            ("close", np.float64),
+            ("tick_volume", np.int64),
+            ("spread", np.int32),
+            ("real_volume", np.int64),
+        ]
+    )
     arr = np.array(
-        [(time_s, open_, high, low, close, tick_volume, spread, real_volume)],
-        dtype=dtype
+        [(time_s, open_, high, low, close, tick_volume, spread, real_volume)], dtype=dtype
     )
     return arr[0]
 
@@ -130,54 +139,105 @@ def make_rate(open_=1.085, high=1.090, low=1.080, close=1.088,
 # 1. detect_instrument_type()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDetectInstrumentType:
 
     # FX symbols
-    def test_eurusd_is_fx(self):     assert detect_instrument_type("EURUSD")  == "fx"
-    def test_gbpusd_is_fx(self):     assert detect_instrument_type("GBPUSD")  == "fx"
-    def test_usdjpy_is_fx(self):     assert detect_instrument_type("USDJPY")  == "fx"
-    def test_audusd_is_fx(self):     assert detect_instrument_type("AUDUSD")  == "fx"
-    def test_nzdusd_is_fx(self):     assert detect_instrument_type("NZDUSD")  == "fx"
-    def test_gbpjpy_is_fx(self):     assert detect_instrument_type("GBPJPY")  == "fx"
-    def test_eurjpy_is_fx(self):     assert detect_instrument_type("EURJPY")  == "fx"
-    def test_usdchf_is_fx(self):     assert detect_instrument_type("USDCHF")  == "fx"
+    def test_eurusd_is_fx(self):
+        assert detect_instrument_type("EURUSD") == "fx"
+
+    def test_gbpusd_is_fx(self):
+        assert detect_instrument_type("GBPUSD") == "fx"
+
+    def test_usdjpy_is_fx(self):
+        assert detect_instrument_type("USDJPY") == "fx"
+
+    def test_audusd_is_fx(self):
+        assert detect_instrument_type("AUDUSD") == "fx"
+
+    def test_nzdusd_is_fx(self):
+        assert detect_instrument_type("NZDUSD") == "fx"
+
+    def test_gbpjpy_is_fx(self):
+        assert detect_instrument_type("GBPJPY") == "fx"
+
+    def test_eurjpy_is_fx(self):
+        assert detect_instrument_type("EURJPY") == "fx"
+
+    def test_usdchf_is_fx(self):
+        assert detect_instrument_type("USDCHF") == "fx"
 
     # Metals
-    def test_xauusd_is_metal(self):  assert detect_instrument_type("XAUUSD")  == "metal"
-    def test_xagusd_is_metal(self):  assert detect_instrument_type("XAGUSD")  == "metal"
-    def test_xptusd_is_metal(self):  assert detect_instrument_type("XPTUSD")  == "metal"
-    def test_xaueur_is_metal(self):  assert detect_instrument_type("XAUEUR")  == "metal"
+    def test_xauusd_is_metal(self):
+        assert detect_instrument_type("XAUUSD") == "metal"
+
+    def test_xagusd_is_metal(self):
+        assert detect_instrument_type("XAGUSD") == "metal"
+
+    def test_xptusd_is_metal(self):
+        assert detect_instrument_type("XPTUSD") == "metal"
+
+    def test_xaueur_is_metal(self):
+        assert detect_instrument_type("XAUEUR") == "metal"
 
     # Energies
-    def test_usoil_is_energy(self):  assert detect_instrument_type("USOIL")   == "energy"
-    def test_ukoil_is_energy(self):  assert detect_instrument_type("UKOIL")   == "energy"
-    def test_ngas_is_energy(self):   assert detect_instrument_type("NGAS")    == "energy"
+    def test_usoil_is_energy(self):
+        assert detect_instrument_type("USOIL") == "energy"
+
+    def test_ukoil_is_energy(self):
+        assert detect_instrument_type("UKOIL") == "energy"
+
+    def test_ngas_is_energy(self):
+        assert detect_instrument_type("NGAS") == "energy"
 
     # Indices
-    def test_us500_is_index(self):   assert detect_instrument_type("US500")   == "index"
-    def test_us30_is_index(self):    assert detect_instrument_type("US30")    == "index"
-    def test_de40_is_index(self):    assert detect_instrument_type("DE40")    == "index"
-    def test_uk100_is_index(self):   assert detect_instrument_type("UK100")   == "index"
+    def test_us500_is_index(self):
+        assert detect_instrument_type("US500") == "index"
+
+    def test_us30_is_index(self):
+        assert detect_instrument_type("US30") == "index"
+
+    def test_de40_is_index(self):
+        assert detect_instrument_type("DE40") == "index"
+
+    def test_uk100_is_index(self):
+        assert detect_instrument_type("UK100") == "index"
 
     # Crypto
-    def test_btcusd_is_crypto(self): assert detect_instrument_type("BTCUSD")  == "crypto"
-    def test_ethusd_is_crypto(self): assert detect_instrument_type("ETHUSD")  == "crypto"
-    def test_solusd_is_crypto(self): assert detect_instrument_type("SOLUSD")  == "crypto"
+    def test_btcusd_is_crypto(self):
+        assert detect_instrument_type("BTCUSD") == "crypto"
+
+    def test_ethusd_is_crypto(self):
+        assert detect_instrument_type("ETHUSD") == "crypto"
+
+    def test_solusd_is_crypto(self):
+        assert detect_instrument_type("SOLUSD") == "crypto"
 
     # Unknown → fallback to cfd
-    def test_unknown_is_cfd(self):        assert detect_instrument_type("AAPL")    == "cfd"
-    def test_unknown2_is_cfd(self):       assert detect_instrument_type("RANDOM")  == "cfd"
-    def test_empty_string_is_cfd(self):   assert detect_instrument_type("")        == "cfd"
+    def test_unknown_is_cfd(self):
+        assert detect_instrument_type("AAPL") == "cfd"
+
+    def test_unknown2_is_cfd(self):
+        assert detect_instrument_type("RANDOM") == "cfd"
+
+    def test_empty_string_is_cfd(self):
+        assert detect_instrument_type("") == "cfd"
 
     # Case insensitive
-    def test_lowercase_eurusd(self):  assert detect_instrument_type("eurusd")  == "fx"
-    def test_lowercase_btcusd(self):  assert detect_instrument_type("btcusd")  == "crypto"
-    def test_mixed_case(self):        assert detect_instrument_type("EurUsd")  == "fx"
+    def test_lowercase_eurusd(self):
+        assert detect_instrument_type("eurusd") == "fx"
+
+    def test_lowercase_btcusd(self):
+        assert detect_instrument_type("btcusd") == "crypto"
+
+    def test_mixed_case(self):
+        assert detect_instrument_type("EurUsd") == "fx"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. resolve_price_precision()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestResolvePricePrecision:
 
@@ -219,6 +279,7 @@ class TestResolvePricePrecision:
 # 3. make_price_increment()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestMakePriceIncrement:
 
     def test_5_decimal_places(self):
@@ -257,6 +318,7 @@ class TestMakePriceIncrement:
 # 4. make_size_increment()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestMakeSizeIncrement:
 
     def test_micro_lots_001(self):
@@ -287,6 +349,7 @@ class TestMakeSizeIncrement:
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. make_margin()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestMakeMargin:
 
@@ -326,6 +389,7 @@ class TestMakeMargin:
 # 6. parse_currency()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestParseCurrency:
 
     def test_eur(self):
@@ -364,6 +428,7 @@ class TestParseCurrency:
 # ═════════════════════════════════════════════════════════════════════════════
 # 7. parse_symbol_info() — FX (CurrencyPair)
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestParseSymbolInfoFX:
 
@@ -413,14 +478,17 @@ class TestParseSymbolInfoFX:
         assert inst.taker_fee == Decimal("0")
 
     def test_gbpusd_base_currency(self):
-        inst = parse_symbol_info(make_symbol_info("GBPUSD",
-            currency_base="GBP", currency_profit="USD"))
+        inst = parse_symbol_info(
+            make_symbol_info("GBPUSD", currency_base="GBP", currency_profit="USD")
+        )
         assert inst.base_currency.code == "GBP"
 
     def test_usdjpy(self):
-        inst = parse_symbol_info(make_symbol_info("USDJPY",
-            digits=3, currency_base="USD", currency_profit="JPY",
-            volume_step=0.01))
+        inst = parse_symbol_info(
+            make_symbol_info(
+                "USDJPY", digits=3, currency_base="USD", currency_profit="JPY", volume_step=0.01
+            )
+        )
         assert isinstance(inst, CurrencyPair)
         assert inst.price_precision == 3
         assert inst.base_currency.code == "USD"
@@ -443,48 +511,85 @@ class TestParseSymbolInfoFX:
 # 8. parse_symbol_info() — Metals (Cfd)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestParseSymbolInfoMetals:
 
     def test_xauusd_returns_cfd(self):
-        info = make_symbol_info("XAUUSD", digits=2, currency_base="XAU",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSD",
+            digits=2,
+            currency_base="XAU",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
 
     def test_xauusd_price_precision_uses_override(self):
         # digits=3 but override forces precision=2
-        info = make_symbol_info("XAUUSD", digits=3, currency_base="XAU",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSD",
+            digits=3,
+            currency_base="XAU",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.price_precision == 2
 
     def test_xauusd_instrument_id(self):
-        info = make_symbol_info("XAUUSD", digits=2, currency_base="XAU",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSD",
+            digits=2,
+            currency_base="XAU",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert str(inst.id) == "XAUUSD.MT5"
 
     def test_xauusd_quote_currency(self):
-        info = make_symbol_info("XAUUSD", digits=2, currency_base="XAU",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSD",
+            digits=2,
+            currency_base="XAU",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.quote_currency.code == "USD"
 
     def test_xauusd_asset_class_commodity(self):
-        info = make_symbol_info("XAUUSD", digits=2, currency_base="XAU",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSD",
+            digits=2,
+            currency_base="XAU",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.asset_class == AssetClass.COMMODITY
 
     def test_xagusd_returns_cfd(self):
-        info = make_symbol_info("XAGUSD", digits=3, currency_base="XAG",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=5000.0, margin_initial=2.0)
+        info = make_symbol_info(
+            "XAGUSD",
+            digits=3,
+            currency_base="XAG",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=5000.0,
+            margin_initial=2.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
 
@@ -493,26 +598,45 @@ class TestParseSymbolInfoMetals:
 # 9. parse_symbol_info() — Energies (Cfd)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestParseSymbolInfoEnergies:
 
     def test_usoil_returns_cfd(self):
-        info = make_symbol_info("USOIL", digits=2, currency_base="USD",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=5.0)
+        info = make_symbol_info(
+            "USOIL",
+            digits=2,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=5.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
 
     def test_usoil_asset_class_commodity(self):
-        info = make_symbol_info("USOIL", digits=2, currency_base="USD",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=5.0)
+        info = make_symbol_info(
+            "USOIL",
+            digits=2,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=5.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.asset_class == AssetClass.COMMODITY
 
     def test_ukoil_instrument_id(self):
-        info = make_symbol_info("UKOIL", digits=2, currency_base="GBP",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=5.0)
+        info = make_symbol_info(
+            "UKOIL",
+            digits=2,
+            currency_base="GBP",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=5.0,
+        )
         inst = parse_symbol_info(info)
         assert str(inst.id) == "UKOIL.MT5"
 
@@ -521,34 +645,59 @@ class TestParseSymbolInfoEnergies:
 # 10. parse_symbol_info() — Indices (Cfd)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestParseSymbolInfoIndices:
 
     def test_us500_returns_cfd(self):
-        info = make_symbol_info("US500", digits=1, currency_base="USD",
-                                currency_profit="USD", volume_step=0.1,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "US500",
+            digits=1,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.1,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
 
     def test_us500_precision_uses_override(self):
         # override forces precision=1
-        info = make_symbol_info("US500", digits=2, currency_base="USD",
-                                currency_profit="USD", volume_step=0.1,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "US500",
+            digits=2,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.1,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.price_precision == 1
 
     def test_us500_asset_class_index(self):
-        info = make_symbol_info("US500", digits=1, currency_base="USD",
-                                currency_profit="USD", volume_step=0.1,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "US500",
+            digits=1,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.1,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.asset_class == AssetClass.INDEX
 
     def test_de40_asset_class_index(self):
-        info = make_symbol_info("DE40", digits=1, currency_base="EUR",
-                                currency_profit="EUR", volume_step=0.1,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "DE40",
+            digits=1,
+            currency_base="EUR",
+            currency_profit="EUR",
+            volume_step=0.1,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.asset_class == AssetClass.INDEX
 
@@ -557,54 +706,97 @@ class TestParseSymbolInfoIndices:
 # 11. parse_symbol_info() — Crypto (CryptoPerpetual)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestParseSymbolInfoCrypto:
 
     def test_btcusd_returns_crypto_perpetual(self):
-        info = make_symbol_info("BTCUSD", digits=2, currency_base="BTC",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSD",
+            digits=2,
+            currency_base="BTC",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, CryptoPerpetual)
 
     def test_btcusd_precision_uses_override(self):
-        info = make_symbol_info("BTCUSD", digits=5, currency_base="BTC",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSD",
+            digits=5,
+            currency_base="BTC",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.price_precision == 2
 
     def test_btcusd_base_currency(self):
-        info = make_symbol_info("BTCUSD", digits=2, currency_base="BTC",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSD",
+            digits=2,
+            currency_base="BTC",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.base_currency.code == "BTC"
 
     def test_btcusd_quote_currency(self):
-        info = make_symbol_info("BTCUSD", digits=2, currency_base="BTC",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSD",
+            digits=2,
+            currency_base="BTC",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.quote_currency.code == "USD"
 
     def test_btcusd_not_inverse(self):
-        info = make_symbol_info("BTCUSD", digits=2, currency_base="BTC",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSD",
+            digits=2,
+            currency_base="BTC",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.is_inverse is False
 
     def test_ethusd_returns_crypto_perpetual(self):
-        info = make_symbol_info("ETHUSD", digits=2, currency_base="ETH",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "ETHUSD",
+            digits=2,
+            currency_base="ETH",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, CryptoPerpetual)
 
     def test_btcusd_instrument_id(self):
-        info = make_symbol_info("BTCUSD", digits=2, currency_base="BTC",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSD",
+            digits=2,
+            currency_base="BTC",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert str(inst.id) == "BTCUSD.MT5"
 
@@ -613,26 +805,45 @@ class TestParseSymbolInfoCrypto:
 # 12. parse_symbol_info() — Unknown → Cfd fallback
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestParseSymbolInfoUnknown:
 
     def test_unknown_symbol_returns_cfd(self):
-        info = make_symbol_info("AAPL", digits=2, currency_base="USD",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=5.0)
+        info = make_symbol_info(
+            "AAPL",
+            digits=2,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=5.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
 
     def test_unknown_asset_class_alternative(self):
-        info = make_symbol_info("AAPL", digits=2, currency_base="USD",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=5.0)
+        info = make_symbol_info(
+            "AAPL",
+            digits=2,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=5.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.asset_class == AssetClass.ALTERNATIVE
 
     def test_unknown_instrument_id_format(self):
-        info = make_symbol_info("RANDOMX", digits=2, currency_base="USD",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=5.0)
+        info = make_symbol_info(
+            "RANDOMX",
+            digits=2,
+            currency_base="USD",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=5.0,
+        )
         inst = parse_symbol_info(info)
         assert str(inst.id) == "RANDOMX.MT5"
 
@@ -640,6 +851,7 @@ class TestParseSymbolInfoUnknown:
 # ═════════════════════════════════════════════════════════════════════════════
 # 13. parse_symbol_info() — Error cases
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestParseSymbolInfoErrors:
 
@@ -667,6 +879,7 @@ class TestParseSymbolInfoErrors:
 # ═════════════════════════════════════════════════════════════════════════════
 # 14. parse_quote_tick()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestParseQuoteTick:
 
@@ -725,9 +938,15 @@ class TestParseQuoteTick:
 
     def test_gold_tick_precision(self):
         """Gold uses price_precision=2 from override."""
-        info = make_symbol_info("XAUUSD", digits=2, currency_base="XAU",
-                                currency_profit="USD", volume_step=0.01,
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSD",
+            digits=2,
+            currency_base="XAU",
+            currency_profit="USD",
+            volume_step=0.01,
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         tick = make_tick(bid=1985.50, ask=1985.75)
         result = parse_quote_tick(tick, inst)
@@ -738,6 +957,7 @@ class TestParseQuoteTick:
 # ═════════════════════════════════════════════════════════════════════════════
 # 15. parse_bar()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestParseBar:
 
@@ -819,6 +1039,7 @@ class TestParseBar:
 # 16. Timeframe mapping completeness
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestTimeframeMapping:
 
     def test_all_minute_timeframes_present(self):
@@ -831,14 +1052,24 @@ class TestTimeframeMapping:
         for tf in hour_tfs:
             assert tf in _MT5_TIMEFRAME_MAP, f"Hour TF {tf} missing"
 
-    def test_d1_present(self):   assert 16408 in _MT5_TIMEFRAME_MAP
-    def test_w1_present(self):   assert 32769 in _MT5_TIMEFRAME_MAP
-    def test_mn1_present(self):  assert 49153 in _MT5_TIMEFRAME_MAP
+    def test_d1_present(self):
+        assert 16408 in _MT5_TIMEFRAME_MAP
+
+    def test_w1_present(self):
+        assert 32769 in _MT5_TIMEFRAME_MAP
+
+    def test_mn1_present(self):
+        assert 49153 in _MT5_TIMEFRAME_MAP
 
     def test_all_aggregations_are_valid(self):
-        valid = {BarAggregation.MINUTE, BarAggregation.HOUR,
-                 BarAggregation.DAY, BarAggregation.WEEK, BarAggregation.MONTH}
-        for tf, (step, agg) in _MT5_TIMEFRAME_MAP.items():
+        valid = {
+            BarAggregation.MINUTE,
+            BarAggregation.HOUR,
+            BarAggregation.DAY,
+            BarAggregation.WEEK,
+            BarAggregation.MONTH,
+        }
+        for _, (step, agg) in _MT5_TIMEFRAME_MAP.items():
             assert agg in valid
             assert step >= 1
 
@@ -847,6 +1078,7 @@ class TestTimeframeMapping:
 # 17. Margin edge cases
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestMarginEdgeCases:
 
     def test_margin_init_stored_as_fraction(self):
@@ -854,16 +1086,16 @@ class TestMarginEdgeCases:
         assert float(inst.margin_init) < 1.0  # must be fraction not percentage
 
     def test_both_margins_zero_both_use_default(self):
-        inst = parse_symbol_info(make_symbol_info(
-            "EURUSD", margin_initial=0.0, margin_maintenance=0.0
-        ))
-        assert float(inst.margin_init)  == pytest.approx(0.01, abs=1e-4)
+        inst = parse_symbol_info(
+            make_symbol_info("EURUSD", margin_initial=0.0, margin_maintenance=0.0)
+        )
+        assert float(inst.margin_init) == pytest.approx(0.01, abs=1e-4)
         assert float(inst.margin_maint) == pytest.approx(0.01, abs=1e-4)
 
     def test_margin_maint_set_correctly(self):
-        inst = parse_symbol_info(make_symbol_info(
-            "EURUSD", margin_initial=3.0, margin_maintenance=2.0
-        ))
+        inst = parse_symbol_info(
+            make_symbol_info("EURUSD", margin_initial=3.0, margin_maintenance=2.0)
+        )
         assert float(inst.margin_maint) == pytest.approx(0.02, abs=1e-4)
 
 
@@ -871,28 +1103,38 @@ class TestMarginEdgeCases:
 # 18. Price increment consistency
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestPriceIncrementConsistency:
 
-    @pytest.mark.parametrize("symbol,digits,expected_inc_str", [
-        ("EURUSD",  5, "0.00001"),
-        ("USDJPY",  3, "0.001"),
-        ("XAUUSD",  2, "0.01"),    # override → 2
-        ("US500",   1, "0.1"),     # override → 1
-        ("BTCUSD",  2, "0.01"),    # override → 2
-    ])
+    @pytest.mark.parametrize(
+        "symbol,digits,expected_inc_str",
+        [
+            ("EURUSD", 5, "0.00001"),
+            ("USDJPY", 3, "0.001"),
+            ("XAUUSD", 2, "0.01"),  # override → 2
+            ("US500", 1, "0.1"),  # override → 1
+            ("BTCUSD", 2, "0.01"),  # override → 2
+        ],
+    )
     def test_price_increment_matches_precision(self, symbol, digits, expected_inc_str):
         # Build appropriate currency info for each symbol type
         currency_map = {
             "EURUSD": ("EUR", "USD"),
             "USDJPY": ("USD", "JPY"),
             "XAUUSD": ("XAU", "USD"),
-            "US500":  ("USD", "USD"),
+            "US500": ("USD", "USD"),
             "BTCUSD": ("BTC", "USD"),
         }
         base, profit = currency_map[symbol]
-        info = make_symbol_info(symbol, digits=digits, currency_base=base,
-                                currency_profit=profit, volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            symbol,
+            digits=digits,
+            currency_base=base,
+            currency_profit=profit,
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert str(inst.price_increment) == expected_inc_str
 
@@ -901,24 +1143,29 @@ class TestPriceIncrementConsistency:
 # 19. Instrument ID format
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestInstrumentIdFormat:
 
-    @pytest.mark.parametrize("symbol", [
-        "EURUSD", "GBPUSD", "XAUUSD", "BTCUSD", "US500", "USOIL"
-    ])
+    @pytest.mark.parametrize("symbol", ["EURUSD", "GBPUSD", "XAUUSD", "BTCUSD", "US500", "USOIL"])
     def test_id_format_is_symbol_dot_mt5(self, symbol):
         currency_map = {
             "EURUSD": ("EUR", "USD"),
             "GBPUSD": ("GBP", "USD"),
             "XAUUSD": ("XAU", "USD"),
             "BTCUSD": ("BTC", "USD"),
-            "US500":  ("USD", "USD"),
-            "USOIL":  ("USD", "USD"),
+            "US500": ("USD", "USD"),
+            "USOIL": ("USD", "USD"),
         }
         base, profit = currency_map[symbol]
-        info = make_symbol_info(symbol, digits=2, currency_base=base,
-                                currency_profit=profit, volume_step=0.01,
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            symbol,
+            digits=2,
+            currency_base=base,
+            currency_profit=profit,
+            volume_step=0.01,
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert str(inst.id) == f"{symbol}.MT5"
 
@@ -927,13 +1174,17 @@ class TestInstrumentIdFormat:
 # 20. Size precision derived from volume_step
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestSizePrecision:
 
-    @pytest.mark.parametrize("volume_step,expected_precision", [
-        (0.01,  2),
-        (0.1,   1),
-        (1.0,   0),
-    ])
+    @pytest.mark.parametrize(
+        "volume_step,expected_precision",
+        [
+            (0.01, 2),
+            (0.1, 1),
+            (1.0, 0),
+        ],
+    )
     def test_size_precision_from_volume_step(self, volume_step, expected_precision):
         info = make_symbol_info("EURUSD", volume_step=volume_step)
         inst = parse_symbol_info(info)
@@ -949,6 +1200,7 @@ class TestSizePrecision:
 # BROKER SUFFIX NORMALISATION (added for multi-broker support)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestNormalizeSymbol:
     """Tests for the normalize_symbol() function in constants.py."""
 
@@ -957,52 +1209,63 @@ class TestNormalizeSymbol:
     # Exness 'm' suffix (standard accounts)
     def test_eurusdm_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("EURUSDm") == "EURUSD"
 
     def test_xauusdm_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("XAUUSDm") == "XAUUSD"
 
     def test_btcusdm_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("BTCUSDm") == "BTCUSD"
 
     def test_ustecm_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("USTECm") == "USTEC"
 
     def test_btcjpym_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("BTCJPYm") == "BTCJPY"
 
     # No suffix (IC Markets, Pepperstone, Exness zero)
     def test_eurusd_no_suffix_unchanged(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("EURUSD") == "EURUSD"
 
     def test_xauusd_no_suffix_unchanged(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("XAUUSD") == "XAUUSD"
 
     # 'c' suffix
     def test_eurusdc_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("EURUSDc") == "EURUSD"
 
     # Trailing dot
     def test_eurusd_dot_normalized(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("EURUSD.") == "EURUSD"
 
     # Output is always uppercase
     def test_output_always_uppercase(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("eurusdm") == "EURUSD"
         assert normalize_symbol("EurUsdM") == "EURUSD"
 
     # Whitespace stripped
     def test_whitespace_stripped(self):
         from mt5connect.constants import normalize_symbol
+
         assert normalize_symbol("  EURUSDm  ") == "EURUSD"
 
 
@@ -1010,24 +1273,49 @@ class TestDetectInstrumentTypeBrokerSuffixes:
     """Instrument type detection works with broker-suffixed symbol names."""
 
     # Exness 'm' suffix
-    def test_eurusdm_is_fx(self):        assert detect_instrument_type("EURUSDm")  == "fx"
-    def test_gbpusdm_is_fx(self):        assert detect_instrument_type("GBPUSDm")  == "fx"
-    def test_usdjpym_is_fx(self):        assert detect_instrument_type("USDJPYm")  == "fx"
-    def test_xauusdm_is_metal(self):     assert detect_instrument_type("XAUUSDm")  == "metal"
-    def test_xagusdm_is_metal(self):     assert detect_instrument_type("XAGUSDm")  == "metal"
-    def test_btcusdm_is_crypto(self):    assert detect_instrument_type("BTCUSDm")  == "crypto"
-    def test_ethusdm_is_crypto(self):    assert detect_instrument_type("ETHUSDm")  == "crypto"
-    def test_ustecm_is_index(self):      assert detect_instrument_type("USTECm")   == "index"
-    def test_btcjpym_is_crypto(self):    assert detect_instrument_type("BTCJPYm")  == "crypto"
+    def test_eurusdm_is_fx(self):
+        assert detect_instrument_type("EURUSDm") == "fx"
+
+    def test_gbpusdm_is_fx(self):
+        assert detect_instrument_type("GBPUSDm") == "fx"
+
+    def test_usdjpym_is_fx(self):
+        assert detect_instrument_type("USDJPYm") == "fx"
+
+    def test_xauusdm_is_metal(self):
+        assert detect_instrument_type("XAUUSDm") == "metal"
+
+    def test_xagusdm_is_metal(self):
+        assert detect_instrument_type("XAGUSDm") == "metal"
+
+    def test_btcusdm_is_crypto(self):
+        assert detect_instrument_type("BTCUSDm") == "crypto"
+
+    def test_ethusdm_is_crypto(self):
+        assert detect_instrument_type("ETHUSDm") == "crypto"
+
+    def test_ustecm_is_index(self):
+        assert detect_instrument_type("USTECm") == "index"
+
+    def test_btcjpym_is_crypto(self):
+        assert detect_instrument_type("BTCJPYm") == "crypto"
 
     # Trailing dot suffix
-    def test_eurusd_dot_is_fx(self):     assert detect_instrument_type("EURUSD.")  == "fx"
-    def test_xauusd_dot_is_metal(self):  assert detect_instrument_type("XAUUSD.")  == "metal"
+    def test_eurusd_dot_is_fx(self):
+        assert detect_instrument_type("EURUSD.") == "fx"
+
+    def test_xauusd_dot_is_metal(self):
+        assert detect_instrument_type("XAUUSD.") == "metal"
 
     # No suffix — still works
-    def test_eurusd_no_suffix(self):     assert detect_instrument_type("EURUSD")   == "fx"
-    def test_xauusd_no_suffix(self):     assert detect_instrument_type("XAUUSD")   == "metal"
-    def test_btcusd_no_suffix(self):     assert detect_instrument_type("BTCUSD")   == "crypto"
+    def test_eurusd_no_suffix(self):
+        assert detect_instrument_type("EURUSD") == "fx"
+
+    def test_xauusd_no_suffix(self):
+        assert detect_instrument_type("XAUUSD") == "metal"
+
+    def test_btcusd_no_suffix(self):
+        assert detect_instrument_type("BTCUSD") == "crypto"
 
 
 class TestResolvePricePrecisionBrokerSuffixes:
@@ -1051,45 +1339,64 @@ class TestParseSymbolInfoBrokerSuffixes:
     """Full parse_symbol_info works end-to-end with broker-suffixed names."""
 
     def test_eurusdm_parses_as_currency_pair(self):
-        info = make_symbol_info("EURUSDm", digits=5,
-                                currency_base="EUR", currency_profit="USD")
+        info = make_symbol_info("EURUSDm", digits=5, currency_base="EUR", currency_profit="USD")
         inst = parse_symbol_info(info)
         assert isinstance(inst, CurrencyPair)
 
     def test_eurusdm_instrument_id_preserves_broker_name(self):
         """The instrument ID uses the BROKER name, not the canonical name."""
-        info = make_symbol_info("EURUSDm", digits=5,
-                                currency_base="EUR", currency_profit="USD")
+        info = make_symbol_info("EURUSDm", digits=5, currency_base="EUR", currency_profit="USD")
         inst = parse_symbol_info(info)
         assert str(inst.id) == "EURUSDm.MT5"
 
     def test_xauusdm_parses_as_cfd(self):
-        info = make_symbol_info("XAUUSDm", digits=2,
-                                currency_base="XAU", currency_profit="USD",
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSDm",
+            digits=2,
+            currency_base="XAU",
+            currency_profit="USD",
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
 
     def test_xauusdm_precision_override_applied(self):
-        info = make_symbol_info("XAUUSDm", digits=3,  # MT5 says 3
-                                currency_base="XAU", currency_profit="USD",
-                                trade_contract_size=100.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "XAUUSDm",
+            digits=3,  # MT5 says 3
+            currency_base="XAU",
+            currency_profit="USD",
+            trade_contract_size=100.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert inst.price_precision == 2  # override forces 2
 
     def test_btcusdm_parses_as_crypto(self):
-        info = make_symbol_info("BTCUSDm", digits=2,
-                                currency_base="BTC", currency_profit="USD",
-                                trade_contract_size=1.0, margin_initial=1.0)
+        info = make_symbol_info(
+            "BTCUSDm",
+            digits=2,
+            currency_base="BTC",
+            currency_profit="USD",
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, CryptoPerpetual)
 
     def test_ustecm_parses_as_cfd_index(self):
         from nautilus_trader.model.enums import AssetClass
-        info = make_symbol_info("USTECm", digits=1,
-                                currency_base="USD", currency_profit="USD",
-                                trade_contract_size=1.0, margin_initial=1.0,
-                                volume_step=0.1)
+
+        info = make_symbol_info(
+            "USTECm",
+            digits=1,
+            currency_base="USD",
+            currency_profit="USD",
+            trade_contract_size=1.0,
+            margin_initial=1.0,
+            volume_step=0.1,
+        )
         inst = parse_symbol_info(info)
         assert isinstance(inst, Cfd)
         assert inst.asset_class == AssetClass.INDEX

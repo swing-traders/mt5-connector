@@ -66,7 +66,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         inst = provider.get_instrument("EURUSD")
     """
 
-    def __init__(self, connection: "MT5Connection") -> None:
+    def __init__(self, connection: MT5Connection) -> None:
         super().__init__()
         self._conn = connection
         # Track symbols that failed to parse — logged but not fatal
@@ -106,13 +106,11 @@ class MT5InstrumentProvider(InstrumentProvider):
         all_symbols = mt5.symbols_get()
         if all_symbols is None:
             code, msg = mt5.last_error()
-            raise MT5ConnectionError(
-                f"mt5.symbols_get() returned None — error {code}: {msg}"
-            )
+            raise MT5ConnectionError(f"mt5.symbols_get() returned None — error {code}: {msg}")
 
-        total    = len(all_symbols)
-        loaded   = 0
-        skipped  = 0
+        total = len(all_symbols)
+        loaded = 0
+        skipped = 0
         filtered = 0
 
         logger.info(f"MT5InstrumentProvider: loading {total} symbols from broker")
@@ -146,9 +144,7 @@ class MT5InstrumentProvider(InstrumentProvider):
                 self.add(instrument)
                 loaded += 1
             except MT5InstrumentError as exc:
-                logger.warning(
-                    f"MT5InstrumentProvider: skipping '{symbol}' — parse error: {exc}"
-                )
+                logger.warning(f"MT5InstrumentProvider: skipping '{symbol}' — parse error: {exc}")
                 self._failed_symbols.append((symbol, str(exc)))
                 skipped += 1
 
@@ -233,7 +229,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         """
         self._conn.ensure_connected()
 
-        symbol = symbol.strip()   # preserve broker casing (EURUSDm, EURUSD, etc.)
+        symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
 
         # Select in Market Watch — required for some brokers
         selected = mt5.symbol_select(symbol, True)
@@ -272,6 +268,7 @@ class MT5InstrumentProvider(InstrumentProvider):
             uppercasing here would break the lookup for those symbols.
         """
         from mt5connect.constants import MT5_VENUE
+
         instrument_id = InstrumentId(
             Symbol(symbol.strip()),
             MT5_VENUE,

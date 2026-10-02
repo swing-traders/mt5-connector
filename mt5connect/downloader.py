@@ -52,19 +52,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 try:
     import MetaTrader5 as mt5
 except ImportError:  # pragma: no cover - Windows-only dependency
     mt5 = None  # bound to the real backend by mt5connect.backend.set_backend()
-import numpy as np
 
-from nautilus_trader.model.data import Bar, QuoteTick
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
-from mt5connect.errors import MT5ConnectionError, MT5SymbolNotFoundError
+from mt5connect.errors import MT5SymbolNotFoundError
 from mt5connect.parsing import parse_bar, parse_quote_tick
 
 if TYPE_CHECKING:
@@ -75,16 +73,17 @@ logger = logging.getLogger(__name__)
 
 # MT5 hard limits per API call
 _MAX_TICKS_PER_CALL = 2_000_000
-_MAX_BARS_PER_CALL  = 100_000
+_MAX_BARS_PER_CALL = 100_000
 
 # Chunk size for tick downloads (1 week per request to stay under MT5 limits)
-_TICK_CHUNK_DAYS  = 7
-_BAR_CHUNK_DAYS   = 365  # bars are much smaller — 1 year per request is fine
+_TICK_CHUNK_DAYS = 7
+_BAR_CHUNK_DAYS = 365  # bars are much smaller — 1 year per request is fine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULT DATACLASS
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class DownloadResult:
@@ -102,6 +101,7 @@ class DownloadResult:
     start : datetime
     end : datetime
     """
+
     symbol: str
     data_type: str
     total_written: int = 0
@@ -129,6 +129,7 @@ class DownloadResult:
 # DOWNLOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class MT5DataDownloader:
     """
     Downloads historical data from MT5 and writes to a Parquet catalog.
@@ -150,17 +151,17 @@ class MT5DataDownloader:
 
     def __init__(
         self,
-        connection: "MT5Connection",
-        provider: "MT5InstrumentProvider",
+        connection: MT5Connection,
+        provider: MT5InstrumentProvider,
         catalog: ParquetDataCatalog,
         chunk_days_ticks: int = _TICK_CHUNK_DAYS,
-        chunk_days_bars: int  = _BAR_CHUNK_DAYS,
+        chunk_days_bars: int = _BAR_CHUNK_DAYS,
     ) -> None:
-        self._conn     = connection
+        self._conn = connection
         self._provider = provider
-        self._catalog  = catalog
+        self._catalog = catalog
         self._chunk_days_ticks = chunk_days_ticks
-        self._chunk_days_bars  = chunk_days_bars
+        self._chunk_days_bars = chunk_days_bars
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -190,10 +191,10 @@ class MT5DataDownloader:
         -------
         DownloadResult
         """
-        symbol  = symbol.strip()   # preserve broker casing (EURUSDm, EURUSD, etc.)
-        start   = _ensure_utc(start)
-        end     = _ensure_utc(end)
-        result  = DownloadResult(symbol=symbol, data_type="ticks", start=start, end=end)
+        symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
+        start = _ensure_utc(start)
+        end = _ensure_utc(end)
+        result = DownloadResult(symbol=symbol, data_type="ticks", start=start, end=end)
 
         self._conn.ensure_connected()
 
@@ -203,8 +204,7 @@ class MT5DataDownloader:
             return result
 
         logger.info(
-            f"Downloader: downloading ticks for {symbol} "
-            f"from {start.date()} to {end.date()}"
+            f"Downloader: downloading ticks for {symbol} " f"from {start.date()} to {end.date()}"
         )
 
         # Chunk by week
@@ -234,14 +234,11 @@ class MT5DataDownloader:
                 result.total_written += len(ticks)
 
                 logger.debug(
-                    f"Downloader: {symbol} {chunk_start.date()} → "
-                    f"{len(ticks):,} ticks written"
+                    f"Downloader: {symbol} {chunk_start.date()} → " f"{len(ticks):,} ticks written"
                 )
 
             except Exception as exc:
-                msg = (
-                    f"Chunk {chunk_start.date()}–{chunk_end.date()} failed: {exc}"
-                )
+                msg = f"Chunk {chunk_start.date()}–{chunk_end.date()} failed: {exc}"
                 logger.error(f"Downloader: {symbol} {msg}")
                 result.errors.append(msg)
 
@@ -279,11 +276,11 @@ class MT5DataDownloader:
         -------
         DownloadResult
         """
-        symbol    = symbol.strip()   # preserve broker casing (EURUSDm, EURUSD, etc.)
-        start     = _ensure_utc(start)
-        end       = _ensure_utc(end)
+        symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
+        start = _ensure_utc(start)
+        end = _ensure_utc(end)
         timeframe = timeframe or mt5.TIMEFRAME_H1
-        result    = DownloadResult(symbol=symbol, data_type="bars", start=start, end=end)
+        result = DownloadResult(symbol=symbol, data_type="bars", start=start, end=end)
 
         self._conn.ensure_connected()
 
@@ -312,8 +309,7 @@ class MT5DataDownloader:
                 if raw is None or len(raw) == 0:
                     result.chunks_empty += 1
                     logger.debug(
-                        f"Downloader: {symbol} TF={timeframe} "
-                        f"{chunk_start.date()} → empty"
+                        f"Downloader: {symbol} TF={timeframe} " f"{chunk_start.date()} → empty"
                     )
                     continue
 
@@ -322,8 +318,7 @@ class MT5DataDownloader:
                 result.total_written += len(bars)
 
                 logger.debug(
-                    f"Downloader: {symbol} {chunk_start.date()} → "
-                    f"{len(bars):,} bars written"
+                    f"Downloader: {symbol} {chunk_start.date()} → " f"{len(bars):,} bars written"
                 )
 
             except Exception as exc:
@@ -343,7 +338,7 @@ class MT5DataDownloader:
         start: datetime,
         end: datetime,
         include_ticks: bool = True,
-        include_bars: bool  = True,
+        include_bars: bool = True,
         timeframes: list[int] | None = None,
     ) -> dict[str, list[DownloadResult]]:
         """
@@ -420,10 +415,11 @@ class MT5DataDownloader:
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _ensure_utc(dt: datetime) -> datetime:
     """Make a datetime timezone-aware (UTC) if it isn't already."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -440,7 +436,7 @@ def _date_chunks(
     """
     chunks = []
     current = start
-    delta   = timedelta(days=days)
+    delta = timedelta(days=days)
 
     while current < end:
         chunk_end = min(current + delta, end)

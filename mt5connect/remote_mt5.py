@@ -5,6 +5,7 @@ Structs support attribute access and ``_asdict()`` so existing call sites
 and parsing.py work unchanged. The live tick stream uses the same ``Tick``
 struct via WebSocket (see mt5connect.ws_stream).
 """
+
 from __future__ import annotations
 
 import json
@@ -258,8 +259,13 @@ def last_error() -> tuple[int, str]:
     return _last_error
 
 
-def _request(method: str, path: str, params: dict | None = None,
-             json_body: dict | None = None, timeout: float | None = None):
+def _request(
+    method: str,
+    path: str,
+    params: dict | None = None,
+    json_body: dict | None = None,
+    timeout: float | None = None,
+):
     """Call the server; returns parsed JSON (dict/list) or None on failure."""
     global _last_error
     url = f"{_server_url}{path}"
@@ -293,9 +299,12 @@ def initialize() -> bool:
 
 def login(login: int, password: str, server: str, timeout: int | None = None) -> bool:
     global _last_error
-    data = _request("POST", "/login", json_body={
-        "account": login, "password": password, "server": server},
-        timeout=timeout / 1000 if timeout else None)
+    data = _request(
+        "POST",
+        "/login",
+        json_body={"account": login, "password": password, "server": server},
+        timeout=timeout / 1000 if timeout else None,
+    )
     if data is None:
         return False
     if not data.get("ok", False):
@@ -322,19 +331,18 @@ def symbols_get() -> list[SymbolInfo] | None:
 
 
 def symbol_select(symbol: str, enable: bool = True) -> bool:
-    data = _request("POST", "/mt5/symbol_select",
-                    json_body={"symbol": symbol, "enabled": bool(enable)})
+    data = _request(
+        "POST", "/mt5/symbol_select", json_body={"symbol": symbol, "enabled": bool(enable)}
+    )
     return bool(data and data.get("ok", False))
 
 
 def symbol_info(symbol: str) -> SymbolInfo | None:
-    return from_dict(
-        SymbolInfo, _request("GET", f"/mt5/symbol_info/{urllib.parse.quote(symbol)}"))
+    return from_dict(SymbolInfo, _request("GET", f"/mt5/symbol_info/{urllib.parse.quote(symbol)}"))
 
 
 def symbol_info_tick(symbol: str) -> Tick | None:
-    return from_dict(
-        Tick, _request("GET", f"/mt5/symbol_info_tick/{urllib.parse.quote(symbol)}"))
+    return from_dict(Tick, _request("GET", f"/mt5/symbol_info_tick/{urllib.parse.quote(symbol)}"))
 
 
 def _dt_param(value) -> str:
@@ -344,15 +352,24 @@ def _dt_param(value) -> str:
 
 
 def copy_rates_range(symbol: str, timeframe: int, start, end) -> list[dict] | None:
-    return _request("GET", "/mt5/copy_rates_range", params={
-        "symbol": symbol, "timeframe": timeframe,
-        "start": _dt_param(start), "end": _dt_param(end)})
+    return _request(
+        "GET",
+        "/mt5/copy_rates_range",
+        params={
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "start": _dt_param(start),
+            "end": _dt_param(end),
+        },
+    )
 
 
 def copy_ticks_range(symbol: str, start, end, flags: int) -> list[Tick] | None:
-    data = _request("GET", "/mt5/copy_ticks_range", params={
-        "symbol": symbol, "start": _dt_param(start), "end": _dt_param(end),
-        "flags": flags})
+    data = _request(
+        "GET",
+        "/mt5/copy_ticks_range",
+        params={"symbol": symbol, "start": _dt_param(start), "end": _dt_param(end), "flags": flags},
+    )
     return from_list(Tick, data)
 
 
