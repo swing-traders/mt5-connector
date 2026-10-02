@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class SettingsError(Exception):
@@ -18,6 +19,10 @@ class Settings:
     api_host: str
     api_port: int
     api_threads: int
+    broker_tz: ZoneInfo
+    broker_offset_hours: int
+    clock_symbol: str
+    clock_check_seconds: int
 
     def __post_init__(self) -> None:
         if self.login_timeout_ms <= 0:
@@ -26,6 +31,8 @@ class Settings:
             raise SettingsError(f"api_port {self.api_port} is not a TCP port")
         elif self.api_threads < 1:
             raise SettingsError(f"api_threads {self.api_threads} is not positive")
+        elif self.clock_check_seconds < 1:
+            raise SettingsError(f"clock_check_seconds {self.clock_check_seconds} is not positive")
 
 
 def read_settings(environ: Mapping[str, str]) -> Settings:
@@ -41,6 +48,14 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         api_host=environ.get("MT5_API_HOST", "0.0.0.0"),
         api_port=_integer("MT5_API_PORT", environ.get("MT5_API_PORT", "5000")),
         api_threads=_integer("MT5_API_THREADS", environ.get("MT5_API_THREADS", "4")),
+        broker_tz=_zone("MT5_BROKER_TZ", environ.get("MT5_BROKER_TZ", "America/New_York")),
+        broker_offset_hours=_integer(
+            "MT5_BROKER_OFFSET_HOURS", environ.get("MT5_BROKER_OFFSET_HOURS", "7")
+        ),
+        clock_symbol=_required(environ, "MT5_CLOCK_SYMBOL"),
+        clock_check_seconds=_integer(
+            "MT5_CLOCK_CHECK_SECONDS", environ.get("MT5_CLOCK_CHECK_SECONDS", "300")
+        ),
     )
 
 
@@ -57,3 +72,10 @@ def _integer(name: str, value: str) -> int:
         return int(value)
     except ValueError:
         raise SettingsError(f"{name} is not an integer") from None
+
+
+def _zone(name: str, value: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise SettingsError(f"{name} {value!r} is not a known time zone") from None

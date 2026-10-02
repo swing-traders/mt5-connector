@@ -1,7 +1,6 @@
 """The remote shim through waitress and the mirror routes to a package double, generated from the
 inventory, plus the contract's pinned cases."""
 
-import calendar
 import threading
 import time
 from datetime import UTC, datetime
@@ -9,7 +8,13 @@ from datetime import UTC, datetime
 import numpy as np
 import pytest
 import requests
-from mirror_samples import PACKAGE_TYPES, argument_samples, result_sample, struct_sample
+from mirror_samples import (
+    PACKAGE_TYPES,
+    argument_samples,
+    in_true_utc,
+    result_sample,
+    struct_sample,
+)
 
 from mt5connect import mirror
 
@@ -52,8 +57,9 @@ def _call_shim(remote, function, arguments):
 
 @pytest.mark.parametrize("function", FUNCTIONS, ids=str)
 def test_shim_round_trips_the_result_into_the_packages_types(remote, stub, function):
-    expected = result_sample(function)
-    getattr(stub, function.name).return_value = expected
+    answered = result_sample(function)
+    getattr(stub, function.name).return_value = answered
+    expected = in_true_utc(answered)
 
     answer = _call_shim(remote, function, argument_samples(function))
 
@@ -151,10 +157,8 @@ def test_shutdown_keeps_the_servers_terminal_session(remote, stub):
                 datetime(2026, 9, 1, tzinfo=UTC), datetime(2026, 9, 2, tzinfo=UTC), group="*USD*"
             ),
             "history_orders_get",
-            (
-                calendar.timegm((2026, 9, 1, 0, 0, 0)),
-                calendar.timegm((2026, 9, 2, 0, 0, 0)),
-            ),
+            # Under EDT the broker's clock runs three hours ahead of UTC.
+            (datetime(2026, 9, 1, 3, tzinfo=UTC), datetime(2026, 9, 2, 3, tzinfo=UTC)),
             {"group": "*USD*"},
         ),
         (
@@ -196,35 +200,35 @@ def test_order_send_result_carries_the_trade_request(remote, stub):
     assert type(result).__name__ == "OrderSendResult"
     assert type(result.request).__name__ == "TradeRequest"
     assert result.request._fields == TRADE_REQUEST_FIELDS
-    assert result.request == stub.order_send.return_value.request
+    assert result.request == in_true_utc(stub.order_send.return_value.request)
 
 
 def test_copy_rates_range_answers_a_structured_array(remote, stub):
     stub.copy_rates_range.return_value = np.array(
-        [(1704067200, 1.1, 1.2, 1.0, 1.15, 120, 2, 0)],
+        [(1_752_580_800, 1.1, 1.2, 1.0, 1.15, 120, 2, 0)],
         dtype=[
             (name, "<f8" if name in ("open", "high", "low", "close") else "<i8")
             for name in RATES_FIELDS
         ],
     )
 
-    rates = remote.copy_rates_range("EURUSD", 16385, 1704067200, 1704070800)
+    rates = remote.copy_rates_range("EURUSD", 16385, 1_752_570_000, 1_752_573_600)
 
     assert rates.dtype.names == RATES_FIELDS
-    assert rates["time"][0] == 1704067200
+    assert rates["time"][0] == 1_752_570_000
     assert rates["close"][0] == 1.15
 
 
 def test_copy_ticks_range_answers_a_structured_array(remote, stub):
     stub.copy_ticks_range.return_value = np.array(
-        [(1704067200, 1.1, 1.1001, 0.0, 0, 1704067200123, 6, 0.0)],
+        [(1_752_580_800, 1.1, 1.1001, 0.0, 0, 1_752_580_800_123, 6, 0.0)],
         dtype=[(name, "<i8") for name in TICKS_FIELDS],
     )
 
-    ticks = remote.copy_ticks_range("EURUSD", 1704067200, 1704070800, -1)
+    ticks = remote.copy_ticks_range("EURUSD", 1_752_570_000, 1_752_573_600, -1)
 
     assert ticks.dtype.names == TICKS_FIELDS
-    assert ticks["time_msc"][0] == 1704067200123
+    assert ticks["time_msc"][0] == 1_752_570_000_123
 
 
 def test_package_calls_never_overlap(served, stub):
