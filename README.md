@@ -540,15 +540,11 @@ Common examples:
 
 ## Dockerized server backend
 
-The adapter can run against a **Dockerized MT5 server** instead of a local
-MetaTrader terminal. The server container runs MT5 under Wine, exposes a
-Flask REST API (`mt5server/app`) plus a WebSocket tick hub, and runs a
-small MQL5 EA that publishes live ticks. The adapter then works on any
-machine — including Linux — by selecting `backend="remote"`.
+The adapter can run against a **Dockerized MT5 server** instead of a local MetaTrader terminal. The server container runs MT5 under Wine, exposes an HTTP API mirroring the `MetaTrader5` package (`mt5server/app`) plus a WebSocket tick hub, and runs a small MQL5 EA that publishes live ticks. The adapter then works on any machine — including Linux — by selecting `backend="remote"`.
 
 ```
 ┌─ your bot (any OS) ────────────────┐      ┌─ MT5 server container ────────┐
-│  mt5-connector (backend="remote")  │      │  Flask REST  :5000             │
+│  mt5-connector (backend="remote")  │      │  HTTP API    :5000             │
 │   └─ WSStreamClient                │──────│  WS tick hub :9000             │
 │      (subscribe/tick messages)     │      │  MT5 terminal (Wine)           │
 └────────────────────────────────────┘      └────────────────────────────────┘
@@ -558,11 +554,37 @@ machine — including Linux — by selecting `backend="remote"`.
 
 - A `backend="remote"` mode on `MT5Config` plus a `server_url` (HTTP) and a
   derived `ws_url` (WebSocket) — see `mt5connect/config.py`.
-- The Docker image builds MT5 + Wine + the Flask API + the WS hub in one
-  container (`mt5server/Dockerfile`), with the EA provisioned automatically.
+- The Docker image builds MT5 + Wine + the HTTP API + the WS hub in one container (`mt5server/Dockerfile`), with the EA provisioned automatically.
 - `set_backend(config)` binds the HTTP/WS client (`mt5connect/remote_mt5.py`,
   `mt5connect/ws_stream.py`) into the adapter, replacing the local
   `MetaTrader5` package — no Windows-only dependency needed.
+
+### HTTP API
+
+The server mirrors the `MetaTrader5` package (5.0.6231), so code written against `import MetaTrader5 as mt5` runs unchanged against `mt5connect.remote_mt5`. Both are generated from one inventory of the package, `mt5connect/mirror.py`.
+
+- `POST /mt5/<function>` for each of the package's 32 functions, its arguments a JSON object keyed by parameter name; datetimes travel as epoch seconds.
+- A package call answers `{"ok": true, "result": ..., "last_error": [code, message]}` or `{"ok": false, "error": {"code": ..., "message": ...}, "last_error": [code, message]}`. `last_error` is the package's `last_error()` read right after the call; a failure's error is that same pair. Structs answer as objects in the package's field order, arrays as lists of objects keyed by the dtype's fields.
+- Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
+- `POST /mt5/shutdown` is the one deliberate departure from the package: it answers `None` without calling the package's `shutdown()`. Every client shares the server's terminal session, and the adapter calls `shutdown()` whenever it disconnects, so passing it on would end the session for every client. `initialize` and `login` pass through unchanged.
+- `GET /health` answers `terminal_info()`, or HTTP 503 with the error when the terminal does not answer.
+- `GET /commissions/<symbol>` answers the commission schedule the terminal's EA relayed for the symbol, or code -4 (`RES_E_NOT_FOUND`) while none has been relayed. No package call answers it, so its envelope carries no `last_error`.
+- Package calls run one at a time; waitress serves the API.
+
+The remote backend raises `ServerUnreachable` when the server cannot be reached or answers outside this contract. Every call sets the remote backend's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
+
+The server reads its settings from the environment once at start, initializes the terminal with them, and exits when that fails:
+
+| Variable | Setting | Default |
+|---|---|---|
+| `MT5_TERMINAL_PATH` | the terminal executable, as Windows names it | set by the image |
+| `MT5_LOGIN` | account number | required |
+| `MT5_PASSWORD` | account password | required |
+| `MT5_SERVER` | trade server name | required |
+| `MT5_LOGIN_TIMEOUT_MS` | initialize timeout | `60000` |
+| `MT5_API_HOST` | bind address | `0.0.0.0` |
+| `MT5_API_PORT` | HTTP port | `5000` |
+| `MT5_API_THREADS` | waitress threads | `4` |
 
 ### Important Security Notice
 
@@ -583,7 +605,7 @@ With docker compose:
 # 0. create an environment file 
 cp .env.example .env   # set MT5_ACCOUNT / MT5_PASSWORD / MT5_SERVER
 
-# 1. Build + start the server (context is the repo root, so mt5ticks/ is copied)
+# 1. Build + start the server (the build context is the repo root; MT5_ACCOUNT becomes MT5_LOGIN)
 source .env
 # environment variables need to be exported in order to be picked up by docker compose
 export MT5_ACCOUNT
@@ -599,14 +621,14 @@ Without docker-compose, build/run directly:
 
 ```bash
 cd mt5server 
-docker build -t mt5-server .
+docker build -t mt5-server -f Dockerfile ..
 source ../.env
 docker run -d --name mt5-server \
   -p 127.0.0.1:5000:5000 -p 127.0.0.1:9000:9000 -p 127.0.0.1:3001:3001 \
   -e MT5_SYMBOLS="${MT5_SYMBOLS}" \
   -e MT5_SERVER="${MT5_SERVER}" \
   -e MT5_PASSWORD="${MT5_PASSWORD}" \
-  -e MT5_ACCOUNT="${MT5_ACCOUNT}" \
+  -e MT5_LOGIN="${MT5_ACCOUNT}" \
   mt5-server
 ```
 
@@ -656,10 +678,7 @@ For now the server *does not provide any authentication and authorization*. That
 and never be exposed over an insecure network, as this will *expose the api and your account* to every one who has access
 to the network. On public machines this is the whole internet. 
 
-Account credentials live only in your local gitignored `.env`. They are only passed to the container via environment 
-variables and used during setup. They are also forwarded to the server at runtime via `POST /login` .
-They  and are never baked into the Docker image. The server's `config/` directory (Wine prefix) is a mounted
-volume owned by the container.
+Account credentials live only in your local gitignored `.env`. They are passed to the container via environment variables, used during setup and by the server's `initialize()` at start, and never baked into the Docker image. The remote backend's `login()` reaches the server as `POST /mt5/login`. The server's `config/` directory (Wine prefix) is a mounted volume owned by the container.
 
 ### Persistence
 
@@ -685,7 +704,12 @@ tests/test_execution.py    — order submission, fills, reconciliation
 tests/test_factories.py    — factory wiring and node config
 tests/test_parsing.py      — symbol info → NautilusTrader instrument conversion
 tests/test_providers.py    — MT5InstrumentProvider loading
+tests/test_remote_mt5.py   — the remote backend's transport and failure classes
+tests/server/              — the server's routes, lifecycle and WS hub, and the remote backend through them
+tests/conformance/         — the inventory against the pinned MetaTrader5 wheel
 ```
+
+The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal when `MT5_LIVE_CONFORMANCE=1`.
 
 ---
 

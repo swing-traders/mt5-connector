@@ -4,7 +4,8 @@ import json
 import pytest
 import websockets
 from websockets.asyncio.server import serve
-from ws_server import TickHub
+
+from mt5server.app.ws_server import TickHub
 
 
 async def _run_hub():
@@ -58,11 +59,13 @@ async def test_multiple_ea_connections_all_relay():
     adapter = await _connect(port, "adapter")
     await asyncio.sleep(0.05)
 
-    await ea1.send(json.dumps({"symbol": "EURUSD", "bid": "1.08", "time_msec": "1"}))
+    await ea1.send(json.dumps({"symbol": "EURUSD", "bid": "1.08", "time_msec": "1", "flags": "2"}))
     m1 = json.loads(await asyncio.wait_for(adapter.recv(), timeout=1))
     assert m1["symbol"] == "EURUSD"
 
-    await ea2.send(json.dumps({"symbol": "XAUUSD", "ask": "2340.5", "time_msec": "2"}))
+    await ea2.send(
+        json.dumps({"symbol": "XAUUSD", "ask": "2340.5", "time_msec": "2", "flags": "4"})
+    )
     m2 = json.loads(await asyncio.wait_for(adapter.recv(), timeout=1))
     assert m2["symbol"] == "XAUUSD"
 
