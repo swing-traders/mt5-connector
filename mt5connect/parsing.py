@@ -494,8 +494,8 @@ def parse_quote_tick(symbol_info_tick, instrument: InstrumentAny) -> QuoteTick:
         bid = float(symbol_info_tick["bid"])
         ask = float(symbol_info_tick["ask"])
         ts_s = int(symbol_info_tick["time"])
-        if "time_msc" in symbol_info_tick:
-            ts_event = symbol_info_tick["time_msc"] * 1000 * 1000  # /mili  seconds to nano seconds
+        if "time_msc" in symbol_info_tick.dtype.names:
+            ts_event = int(symbol_info_tick["time_msc"]) * 1000 * 1000
         else:
             ts_event = ts_s * 1_000_000_000
     else:

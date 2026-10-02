@@ -106,6 +106,23 @@ def make_tick(bid=1.08500, ask=1.08502, last=1.08501, volume=1, time_s=170000000
     return tick
 
 
+def make_tick_row(bid=1.08500, ask=1.08502, time_s=1700000000, time_msc=1700000000123):
+    """Build a numpy structured array row matching mt5.copy_ticks_range() output."""
+    dtype = np.dtype(
+        [
+            ("time", np.int64),
+            ("bid", np.float64),
+            ("ask", np.float64),
+            ("last", np.float64),
+            ("volume", np.uint64),
+            ("time_msc", np.int64),
+            ("flags", np.uint32),
+            ("volume_real", np.float64),
+        ]
+    )
+    return np.array([(time_s, bid, ask, 0.0, 0, time_msc, 6, 0.0)], dtype=dtype)[0]
+
+
 def make_rate(
     open_=1.085,
     high=1.090,
@@ -924,6 +941,11 @@ class TestParseQuoteTick:
         result = parse_quote_tick(tick, inst)
         expected_ns = 1700000000 * 1_000_000_000
         assert result.ts_event == expected_ns
+
+    def test_structured_row_keeps_millisecond_time(self, eurusd):
+        row = make_tick_row(time_s=1700000000, time_msc=1700000000123)
+        result = parse_quote_tick(row, eurusd)
+        assert result.ts_event == 1700000000123 * 1_000_000
 
     def test_bid_size_nominal(self, eurusd):
         """MT5 has no depth — bid_size should be a large nominal value."""

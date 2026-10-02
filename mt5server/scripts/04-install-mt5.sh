@@ -26,7 +26,7 @@ if [ -f ${MT5_LOGIN_SECRET:-/secrets/servers.dat} ]; then
 fi
 
 
-log_message "INFO" "Template setup.ini with for Account ${MT5_ACCOUNT} and server ${MT5_SERVER}."
+log_message "INFO" "Templating setup.ini for the configured account."
 if [ -z "${MT5_PASSWORD}"]; then
     log_message "INFO" "Password is not set"
 else 
@@ -39,11 +39,11 @@ if [ -f ${MT5_CONFIG_SECRET:-/secrets/setup.ini} ]; then
    cp ${MT5_CONFIG_SECRET:-/secrets/setup.ini} /config/.wine/drive_c/setup.ini
    config="/config:C:\setup.ini"
    log_message "INFO" "config set to '$config'"
-elif [[ -n "${MT5_ACCOUNT}" ]]  && [[ -n "${MT5_PASSWORD}" ]] && [[ -n "${MT5_SERVER}" ]]; then
+elif [[ -n "${MT5_LOGIN}" ]]  && [[ -n "${MT5_PASSWORD}" ]] && [[ -n "${MT5_SERVER}" ]]; then
     log_message "INFO" "Environment variables found, templating .ini file"
     cat << EOF > /config/.wine/drive_c/setup.ini
 [Common]
-Login=${MT5_ACCOUNT}
+Login=${MT5_LOGIN}
 Password="${MT5_PASSWORD}"
 Server=${MT5_SERVER}
 AutoConfiguration=true
