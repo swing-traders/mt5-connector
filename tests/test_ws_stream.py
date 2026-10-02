@@ -2,7 +2,6 @@ import asyncio
 import json
 
 import pytest
-import websockets
 from websockets.asyncio.server import serve
 
 from mt5connect.ws_stream import WSStreamClient
@@ -23,8 +22,9 @@ async def test_receives_tick_messages():
     server, port = await _echo_server()
     received = []
 
-    client = WSStreamClient(f"ws://127.0.0.1:{port}", received.append,
-                            initial_delay_s=0.01, max_delay_s=0.05)
+    client = WSStreamClient(
+        f"ws://127.0.0.1:{port}", received.append, initial_delay_s=0.01, max_delay_s=0.05
+    )
     await client.start()
     await asyncio.sleep(0.05)
 
@@ -52,8 +52,9 @@ async def test_pending_subscribe_flushed_on_connect():
     server = await serve(recorder, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
-    client = WSStreamClient(f"ws://127.0.0.1:{port}", lambda m: None,
-                            initial_delay_s=0.01, max_delay_s=0.05)
+    client = WSStreamClient(
+        f"ws://127.0.0.1:{port}", lambda m: None, initial_delay_s=0.01, max_delay_s=0.05
+    )
     await client.send({"type": "subscribe", "symbols": ["EURUSD"]})
     await client.start()
     for _ in range(100):
@@ -78,8 +79,9 @@ async def test_send_replaces_pending_of_same_type():
     server = await serve(recorder, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
-    client = WSStreamClient(f"ws://127.0.0.1:{port}", lambda m: None,
-                            initial_delay_s=0.01, max_delay_s=0.05)
+    client = WSStreamClient(
+        f"ws://127.0.0.1:{port}", lambda m: None, initial_delay_s=0.01, max_delay_s=0.05
+    )
     await client.send({"type": "subscribe", "symbols": ["EURUSD"]})
     await client.send({"type": "subscribe", "symbols": ["EURUSD", "GBPUSD"]})
     await client.start()

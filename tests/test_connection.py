@@ -29,25 +29,31 @@ Test groups:
   20. reconnect() resets attempt counter on success
 """
 
-import asyncio
-import pytest
-from unittest.mock import MagicMock, call, patch
-from mt5connect.connection import MT5Connection, ConnectionState, AccountSnapshot
-from mt5connect.errors import MT5ConnectionError, MT5LoginError
+from unittest.mock import patch
 
+import pytest
+
+from mt5connect.connection import AccountSnapshot, ConnectionState, MT5Connection
+from mt5connect.errors import MT5ConnectionError, MT5LoginError
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. ConnectionState enum
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestConnectionState:
 
     def test_all_states_exist(self):
         states = {s.name for s in ConnectionState}
         assert states == {
-            "DISCONNECTED", "INITIALIZING", "INITIALIZED",
-            "LOGGING_IN", "CONNECTED", "RECONNECTING",
-            "SHUTTING_DOWN", "FAILED",
+            "DISCONNECTED",
+            "INITIALIZING",
+            "INITIALIZED",
+            "LOGGING_IN",
+            "CONNECTED",
+            "RECONNECTING",
+            "SHUTTING_DOWN",
+            "FAILED",
         }
 
     def test_states_are_unique(self):
@@ -58,6 +64,7 @@ class TestConnectionState:
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. Initial state
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestInitialState:
 
@@ -84,6 +91,7 @@ class TestInitialState:
 # ═════════════════════════════════════════════════════════════════════════════
 # 3. Successful connect / disconnect
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestSuccessfulConnect:
 
@@ -143,6 +151,7 @@ class TestSuccessfulConnect:
 # 4. initialize() failure
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestInitializeFailure:
 
     def test_raises_connection_error_when_initialize_fails(self, config, mock_mt5):
@@ -175,6 +184,7 @@ class TestInitializeFailure:
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. login() failure
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestLoginFailure:
 
@@ -216,6 +226,7 @@ class TestLoginFailure:
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. ensure_connected() — all states
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestEnsureConnected:
 
@@ -265,6 +276,7 @@ class TestEnsureConnected:
 # 7. Reconnect (sync) — success path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestReconnectSync:
 
     def test_reconnect_succeeds_first_attempt(self, config, mock_mt5):
@@ -296,9 +308,11 @@ class TestReconnectSync:
     def test_reconnect_succeeds_after_initial_failures(self, config, mock_mt5):
         """Fails first 2 attempts, succeeds on 3rd."""
         call_count = {"n": 0}
+
         def flaky_init():
             call_count["n"] += 1
             return call_count["n"] >= 3  # fail twice, then succeed
+
         mock_mt5.initialize.side_effect = flaky_init
 
         conn = MT5Connection(config)
@@ -310,6 +324,7 @@ class TestReconnectSync:
 # ═════════════════════════════════════════════════════════════════════════════
 # 8. Reconnect (sync) — failure / max attempts
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestReconnectSyncFailure:
 
@@ -349,6 +364,7 @@ class TestReconnectSyncFailure:
 # 9. Reconnect (async) — success path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestReconnectAsync:
 
     @pytest.mark.asyncio
@@ -373,9 +389,11 @@ class TestReconnectAsync:
     @pytest.mark.asyncio
     async def test_async_reconnect_succeeds_after_initial_failures(self, config, mock_mt5):
         call_count = {"n": 0}
+
         def flaky_init():
             call_count["n"] += 1
             return call_count["n"] >= 2
+
         mock_mt5.initialize.side_effect = flaky_init
 
         conn = MT5Connection(config)
@@ -386,6 +404,7 @@ class TestReconnectAsync:
 # ═════════════════════════════════════════════════════════════════════════════
 # 10. Reconnect (async) — failure / max attempts
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestReconnectAsyncFailure:
 
@@ -409,6 +428,7 @@ class TestReconnectAsyncFailure:
 # ═════════════════════════════════════════════════════════════════════════════
 # 11. get_account_info()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestGetAccountInfo:
 
@@ -456,6 +476,7 @@ class TestGetAccountInfo:
 # 12. get_terminal_info()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestGetTerminalInfo:
 
     def test_returns_dict(self, config, mock_mt5):
@@ -488,6 +509,7 @@ class TestGetTerminalInfo:
 # 13. last_error()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestLastError:
 
     def test_returns_tuple(self, config, mock_mt5):
@@ -508,6 +530,7 @@ class TestLastError:
 # ═════════════════════════════════════════════════════════════════════════════
 # 14. uptime_seconds()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestUptime:
 
@@ -530,6 +553,7 @@ class TestUptime:
 # ═════════════════════════════════════════════════════════════════════════════
 # 15. Context manager
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestContextManager:
 
@@ -562,6 +586,7 @@ class TestContextManager:
 # 16. __repr__
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestRepr:
 
     def test_repr_contains_account(self, config, mock_mt5):
@@ -583,6 +608,7 @@ class TestRepr:
 # 17. Backoff delay calculation
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestBackoffDelays:
 
     def test_delay_doubles_each_attempt(self, config, mock_mt5):
@@ -591,9 +617,7 @@ class TestBackoffDelays:
         mock_mt5.last_error.return_value = (5, "IPC timeout")
 
         delays_seen = []
-        original_sleep = __import__("time").sleep
 
-        import time as time_module
         with patch("time.sleep", side_effect=lambda d: delays_seen.append(d)):
             conn = MT5Connection(config)
             conn.reconnect()
@@ -621,6 +645,7 @@ class TestBackoffDelays:
 # 18. Disconnect idempotency
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDisconnectIdempotency:
 
     def test_disconnect_when_already_disconnected_does_not_raise(self, config, mock_mt5):
@@ -639,6 +664,7 @@ class TestDisconnectIdempotency:
 # ═════════════════════════════════════════════════════════════════════════════
 # 19. State integrity after login failure
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestStateIntegrity:
 
@@ -667,6 +693,7 @@ class TestStateIntegrity:
 # ═════════════════════════════════════════════════════════════════════════════
 # 20. AccountSnapshot
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestAccountSnapshot:
 

@@ -1,5 +1,5 @@
 """/mt5/* passthrough routes: turn MetaTrader5 calls into JSON."""
-import sys
+
 from datetime import datetime
 
 import numpy as np
@@ -77,8 +77,11 @@ def mt5_symbol_info_tick(symbol):
 def mt5_copy_rates_range():
     mt5 = _import_mt5()
     records = mt5.copy_rates_range(
-        request.args.get("symbol"), int(request.args.get("timeframe", 0)),
-        _dt(request.args.get("start")), _dt(request.args.get("end")))
+        request.args.get("symbol"),
+        int(request.args.get("timeframe", 0)),
+        _dt(request.args.get("start")),
+        _dt(request.args.get("end")),
+    )
     if records is None:
         return jsonify([])
     return jsonify(_rows(records.tolist(), records.dtype.names))
@@ -88,8 +91,11 @@ def mt5_copy_rates_range():
 def mt5_copy_ticks_range():
     mt5 = _import_mt5()
     records = mt5.copy_ticks_range(
-        request.args.get("symbol"), _dt(request.args.get("start")),
-        _dt(request.args.get("end")), int(request.args.get("flags", 0)))
+        request.args.get("symbol"),
+        _dt(request.args.get("start")),
+        _dt(request.args.get("end")),
+        int(request.args.get("flags", 0)),
+    )
     if records is None:
         return jsonify([])
     return jsonify(_rows(records.tolist(), records.dtype.names))
@@ -105,8 +111,7 @@ def mt5_order_send():
 @mt5_bp.route("/mt5/orders_get", methods=["GET"])
 def mt5_orders_get():
     mt5 = _import_mt5()
-    orders = mt5.orders_get(
-        ticket=_int_arg("ticket"), symbol=request.args.get("symbol"))
+    orders = mt5.orders_get(ticket=_int_arg("ticket"), symbol=request.args.get("symbol"))
     if orders is None:
         return jsonify([])
     return jsonify([o._asdict() for o in orders])
@@ -127,7 +132,8 @@ def mt5_history_deals_get():
     deals = mt5.history_deals_get(
         _dt(request.args.get("from")),
         _dt(request.args.get("to")) if request.args.get("to") else None,
-        position=_int_arg("position"))
+        position=_int_arg("position"),
+    )
     if deals is None:
         return jsonify([])
     return jsonify([d._asdict() for d in deals])

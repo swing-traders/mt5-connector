@@ -7,29 +7,30 @@ Run:
 
 import pathlib
 import sys
-from pathlib import Path
+from datetime import UTC, datetime
 from decimal import Decimal
-from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.backtest.models import FillModel
+from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.enums import (
+    AccountType,
+    OmsType,
+)
+from nautilus_trader.model.identifiers import InstrumentId, TraderId, Venue
+from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import AccountType, OmsType, PriceType, BarAggregation, AggregationSource
-from nautilus_trader.model.identifiers import InstrumentId, Venue, TraderId
-from nautilus_trader.model.objects import Money, Price, Quantity
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-from strategy import FVGStrategy, FVGStrategyConfig
-
-import pandas as pd
-
+from strategy import FVGStrategy, FVGStrategyConfig  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -38,8 +39,8 @@ import pandas as pd
 CATALOG_PATH = "./catalog"
 SYMBOL = "XAUUSD"  # Change to "XAUUSD" if your broker uses no suffix
 VENUE_STR = "MT5"
-START = datetime(2024, 1, 1, tzinfo=timezone.utc)
-END = datetime(2024, 12, 31, tzinfo=timezone.utc)
+START = datetime(2024, 1, 1, tzinfo=UTC)
+END = datetime(2024, 12, 31, tzinfo=UTC)
 
 # Strategy parameters
 FVG_MIN_PIPS = 0.50
@@ -55,6 +56,7 @@ INITIAL_CASH = 10_000.0
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA LOADING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _bar_type_str_from_disk(catalog_path: str, symbol: str) -> str | None:
     """Find the bar folder for this symbol on disk."""
@@ -94,7 +96,9 @@ def _load_bars_from_parquet(
         df = pd.read_parquet(pfile)
 
         ts_col = next((c for c in ["ts_event", "timestamp", "ts_init"] if c in df.columns), None)
-        vol_col = next((c for c in ["volume", "tick_volume", "real_volume"] if c in df.columns), None)
+        vol_col = next(
+            (c for c in ["volume", "tick_volume", "real_volume"] if c in df.columns), None
+        )
 
         if ts_col:
             df = df[(df[ts_col] >= start_ns) & (df[ts_col] <= end_ns)]
@@ -127,20 +131,21 @@ def _load_bars_from_parquet(
 # REPORTING
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def print_summary_report(stats: dict, start: datetime, end: datetime) -> None:
     """Print a clean summary report."""
     print(f"\n{'=' * 70}")
-    print(f"  FAIR VALUE GAP (FVG) BACKTEST SUMMARY")
+    print("  FAIR VALUE GAP (FVG) BACKTEST SUMMARY")
     print(f"{'=' * 70}")
 
-    print(f"\n  📊 TRADE STATISTICS")
+    print("\n  📊 TRADE STATISTICS")
     print(f"  {'─' * 58}")
     print(f"  Total Trades       : {stats['total_trades']}")
     print(f"  Wins               : {stats['wins']}")
     print(f"  Losses             : {stats['losses']}")
     print(f"  Win Rate           : {stats['win_rate']:.1f}%")
 
-    print(f"\n  💰 P&L SUMMARY")
+    print("\n  💰 P&L SUMMARY")
     print(f"  {'─' * 58}")
     print(f"  Net P&L            : ${stats['net_pnl']:>10,.2f}")
     print(f"  Gross Profit       : ${stats['gross_profit']:>10,.2f}")
@@ -149,22 +154,22 @@ def print_summary_report(stats: dict, start: datetime, end: datetime) -> None:
     print(f"  Return             : {stats['return_pct']:.2f}%")
     print(f"  Final Equity       : ${stats['final_equity']:>10,.2f}")
 
-    print(f"\n  📈 TRADE AVERAGES")
+    print("\n  📈 TRADE AVERAGES")
     print(f"  {'─' * 58}")
     print(f"  Average Win        : ${stats['avg_win']:>10,.2f}")
     print(f"  Average Loss       : ${stats['avg_loss']:>10,.2f}")
     print(f"  Best Trade         : ${stats['best_trade']:>10,.2f}")
     print(f"  Worst Trade        : ${stats['worst_trade']:>10,.2f}")
 
-    print(f"\n  ⚠️  RISK METRICS")
+    print("\n  ⚠️  RISK METRICS")
     print(f"  {'─' * 58}")
     print(f"  Max Drawdown       : ${stats['max_drawdown']:>10,.2f}")
     print(f"  Max Drawdown %     : {stats['max_drawdown_pct']:.2f}%")
 
-    print(f"\n  🔍 SIGNAL STATISTICS")
+    print("\n  🔍 SIGNAL STATISTICS")
     print(f"  {'─' * 58}")
     print(f"  Total FVGs Found   : {stats['total_fvgs']}")
-    if stats['total_fvgs'] > 0:
+    if stats["total_fvgs"] > 0:
         print(f"  Trade-to-FVG Ratio : {stats['total_trades']/stats['total_fvgs']:.2f}")
 
     print(f"\n{'=' * 70}")
@@ -181,17 +186,21 @@ def print_last_trades(trade_log, num_trades: int = 10):
     print(f"  {'─' * 70}")
     print(f"  {'#':<3} {'Direction':<8} {'Entry':<8} {'Exit':<8} {'P&L':<10} {'Status':<6}")
     print(f"  {'─' * 70}")
-    
+
     for i, trade in enumerate(trade_log[-num_trades:], 1):
         sign = "+" if trade.pnl >= 0 else ""
-        print(f"  {i:<3} {trade.direction:<8} {trade.entry_price:<8.2f} {trade.exit_price:<8.2f} {sign}${trade.pnl:<8.2f} {trade.status:<6}")
-    
+        print(
+            f"  {i:<3} {trade.direction:<8} {trade.entry_price:<8.2f} "
+            f"{trade.exit_price:<8.2f} {sign}${trade.pnl:<8.2f} {trade.status:<6}"
+        )
+
     print(f"  {'─' * 70}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN BACKTEST RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def run_backtest():
     print(f"\n{'=' * 70}")
@@ -213,14 +222,14 @@ def run_backtest():
 
     if instrument is None:
         print(f"  ERROR: No instrument found for {instrument_id}")
-        print(f"  Run: python examples/download_xauusd.py\n")
+        print("  Run: python examples/download_xauusd.py\n")
         return
 
     # Find bar folder
     bar_type_str = _bar_type_str_from_disk(CATALOG_PATH, SYMBOL)
     if not bar_type_str:
         print(f"  ERROR: No bar folder found for {SYMBOL}")
-        print(f"  Run: python examples/download_xauusd.py\n")
+        print("  Run: python examples/download_xauusd.py\n")
         return
 
     bar_type_obj = BarType.from_str(bar_type_str)
@@ -228,8 +237,8 @@ def run_backtest():
     # Load bars
     bars = _load_bars_from_parquet(bar_type_str, bar_type_obj, instrument, START, END, CATALOG_PATH)
     if not bars:
-        print(f"\n  ERROR: No bars loaded.")
-        print(f"  Run: python examples/download_xauusd.py\n")
+        print("\n  ERROR: No bars loaded.")
+        print("  Run: python examples/download_xauusd.py\n")
         return
 
     print(f"  Loaded {len(bars):,} bars")

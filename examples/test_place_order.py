@@ -20,10 +20,11 @@ import sys
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
 import MetaTrader5 as mt5
+from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+
 
 def _require(key: str) -> str:
     val = os.getenv(key)
@@ -31,12 +32,13 @@ def _require(key: str) -> str:
         sys.exit(f"ERROR: '{key}' not set in .env")
     return val
 
+
 ACCOUNT = int(_require("MT5_ACCOUNT"))
 PASSWORD = _require("MT5_PASSWORD")
-SERVER   = _require("MT5_SERVER")
-SYMBOL   = os.getenv("MT5_SYMBOLS", "XAUUSD").split(",")[0].strip()
-VOLUME   = 0.01
-MAGIC    = 510
+SERVER = _require("MT5_SERVER")
+SYMBOL = os.getenv("MT5_SYMBOLS", "XAUUSD").split(",")[0].strip()
+VOLUME = 0.01
+MAGIC = 510
 
 
 def connect():
@@ -48,7 +50,7 @@ def connect():
         sys.exit(f"mt5.login() failed: {mt5.last_error()}")
     info = mt5.account_info()
     print(f"Connected — balance: {info.balance:.2f} {info.currency}")
-    
+
     # Check AutoTrading status
     terminal_info = mt5.terminal_info()
     if terminal_info:
@@ -78,29 +80,32 @@ def place_order_with_retry(side: str) -> int | None:
         (mt5.ORDER_FILLING_RETURN, "RETURN"),
         (mt5.ORDER_FILLING_FOK, "FOK"),
     ]
-    
+
     for fill_mode, mode_name in filling_modes:
         request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       SYMBOL,
-            "volume":       VOLUME,
-            "type":         order_type,
-            "price":        price,
-            "deviation":    20,
-            "magic":        MAGIC,
-            "comment":      f"test_{side.lower()}",
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": VOLUME,
+            "type": order_type,
+            "price": price,
+            "deviation": 20,
+            "magic": MAGIC,
+            "comment": f"test_{side.lower()}",
             "type_filling": fill_mode,
-            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_time": mt5.ORDER_TIME_GTC,
         }
-        
+
         result = mt5.order_send(request)
-        
+
         if result is None:
             print(f"  order_send returned None with {mode_name}")
             continue
-            
+
         if result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"  ✓ {side} {VOLUME} {SYMBOL} @ {price:.2f}  ticket={result.order} (filling_mode={mode_name})")
+            print(
+                f"  ✓ {side} {VOLUME} {SYMBOL} @ {price:.2f}  "
+                f"ticket={result.order} (filling_mode={mode_name})"
+            )
             return result.order
         elif result.retcode == 10030:  # Unsupported filling mode
             print(f"  {mode_name} not supported (retcode=10030), trying next...")
@@ -109,7 +114,7 @@ def place_order_with_retry(side: str) -> int | None:
             print(f"  Failed with {mode_name}: retcode={result.retcode} comment={result.comment}")
             # Don't continue on other errors
             return None
-    
+
     print(f"ERROR: All filling modes failed for {side} order")
     return None
 
@@ -129,7 +134,7 @@ def close_position_with_retry(ticket: int):
     else:
         close_side = "BUY"
         close_type = mt5.ORDER_TYPE_BUY
-    
+
     tick = mt5.symbol_info_tick(SYMBOL)
     price = tick.bid if close_side == "SELL" else tick.ask
 
@@ -138,28 +143,28 @@ def close_position_with_retry(ticket: int):
         (mt5.ORDER_FILLING_RETURN, "RETURN"),
         (mt5.ORDER_FILLING_FOK, "FOK"),
     ]
-    
+
     for fill_mode, mode_name in filling_modes:
         request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       SYMBOL,
-            "volume":       pos.volume,
-            "type":         close_type,
-            "position":     ticket,
-            "price":        price,
-            "deviation":    20,
-            "magic":        MAGIC,
-            "comment":      "test_close",
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": pos.volume,
+            "type": close_type,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": MAGIC,
+            "comment": "test_close",
             "type_filling": fill_mode,
-            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_time": mt5.ORDER_TIME_GTC,
         }
 
         result = mt5.order_send(request)
-        
+
         if result is None:
             print(f"  order_send returned None with {mode_name}")
             continue
-            
+
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             # Calculate P&L
             deals = mt5.history_deals_get(position=ticket)
@@ -170,8 +175,11 @@ def close_position_with_retry(ticket: int):
             print(f"  Close: {mode_name} not supported (retcode=10030), trying next...")
             continue
         else:
-            print(f"  Close failed with {mode_name}: retcode={result.retcode} comment={result.comment}")
-    
+            print(
+                f"  Close failed with {mode_name}: "
+                f"retcode={result.retcode} comment={result.comment}"
+            )
+
     print(f"ERROR: Could not close position {ticket}")
 
 
@@ -183,21 +191,21 @@ def main():
     if not connect():
         sys.exit(1)
 
-    print(f"\nPlacing BUY order...")
+    print("\nPlacing BUY order...")
     ticket = place_order_with_retry("BUY")
     if ticket is None:
         mt5.shutdown()
         sys.exit(1)
 
-    print(f"\nWaiting 5 seconds...")
+    print("\nWaiting 5 seconds...")
     time.sleep(5)
 
-    print(f"\nClosing position...")
+    print("\nClosing position...")
     close_position_with_retry(ticket)
 
     mt5.shutdown()
     print(f"\n{'─' * 50}")
-    print(f"  Done — execution path confirmed working")
+    print("  Done — execution path confirmed working")
     print(f"{'─' * 50}\n")
 
 

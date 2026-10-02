@@ -1,7 +1,8 @@
 import sys
 
-from conftest import Fake, _tick
 from routes.mt5 import mt5_bp
+
+from conftest import Fake, _tick
 
 
 def test_symbol_info_tick(client_factory, monkeypatch):
@@ -41,9 +42,15 @@ def test_copy_rates_range_raw_epochs(client_factory, monkeypatch):
 
     monkeypatch.setattr(mt5, "copy_rates_range", lambda *a, **k: FakeRates())
     client = client_factory(mt5_bp)
-    resp = client.get("/mt5/copy_rates_range", query_string={
-        "symbol": "EURUSD", "timeframe": 16385,
-        "start": "2024-01-01T00:00:00+00:00", "end": "2024-01-02T00:00:00+00:00"})
+    resp = client.get(
+        "/mt5/copy_rates_range",
+        query_string={
+            "symbol": "EURUSD",
+            "timeframe": 16385,
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-01-02T00:00:00+00:00",
+        },
+    )
     assert resp.status_code == 200
     assert resp.json[0]["time"] == 1704067200
 
@@ -82,9 +89,15 @@ def test_copy_ticks_range(client_factory, monkeypatch):
 
     monkeypatch.setattr(mt5, "copy_ticks_range", lambda *a, **k: FakeTicks())
     client = client_factory(mt5_bp)
-    resp = client.get("/mt5/copy_ticks_range", query_string={
-        "symbol": "EURUSD", "start": "2024-01-01T00:00:00+00:00",
-        "end": "2024-01-02T00:00:00+00:00", "flags": 0})
+    resp = client.get(
+        "/mt5/copy_ticks_range",
+        query_string={
+            "symbol": "EURUSD",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-01-02T00:00:00+00:00",
+            "flags": 0,
+        },
+    )
     assert resp.json[0]["bid"] == 1.08
 
 

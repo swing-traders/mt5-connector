@@ -8,13 +8,20 @@ from mt5connect.data import MT5DataClient
 
 
 def _remote_config():
-    return MT5Config(account=1, password="p", server="s", symbols=["EURUSD"],
-                     backend="remote", server_url="http://127.0.0.1:5000",
-                     ws_url="ws://127.0.0.1:9000")
+    return MT5Config(
+        account=1,
+        password="p",
+        server="s",
+        symbols=["EURUSD"],
+        backend="remote",
+        server_url="http://127.0.0.1:5000",
+        ws_url="ws://127.0.0.1:9000",
+    )
 
 
 def _make_instrument(symbol="EURUSD"):
     from decimal import Decimal
+
     from nautilus_trader.model.currencies import Currency
     from nautilus_trader.model.identifiers import InstrumentId, Symbol
     from nautilus_trader.model.instruments import CurrencyPair
@@ -65,9 +72,10 @@ class FakeStream:
 def _client():
     # Real Nautilus components are required (MagicMock fails PyCondition checks).
     from nautilus_trader.common.component import LiveClock
-    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-    from mt5connect.providers import MT5InstrumentProvider
     from nautilus_trader.common.providers import InstrumentProvider
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
+    from mt5connect.providers import MT5InstrumentProvider
 
     try:
         loop = asyncio.get_running_loop()
@@ -85,8 +93,7 @@ def _client():
     cache = TestComponentStubs.cache()
     clock = LiveClock()
 
-    client = MT5DataClient(loop, conn, msgbus, cache, clock, provider,
-                           _remote_config())
+    client = MT5DataClient(loop, conn, msgbus, cache, clock, provider, _remote_config())
     client._handle_data = MagicMock()
     return client
 
@@ -94,8 +101,7 @@ def _client():
 @pytest.mark.asyncio
 async def test_connect_starts_ws_stream_not_poll_loop():
     client = _client()
-    with patch("mt5connect.ws_stream.WSStreamClient",
-               return_value=FakeStream()) as ws_cls:
+    with patch("mt5connect.ws_stream.WSStreamClient", return_value=FakeStream()) as ws_cls:
         await client._connect()
         assert ws_cls.called
         assert client._ws is not None
@@ -107,14 +113,21 @@ async def test_connect_starts_ws_stream_not_poll_loop():
 async def test_ws_on_message_handles_known_symbol():
     client = _client()
     client._subscribed_symbols.add("EURUSD")
-    payload = {"symbol": "EURUSD", "time": "2024.06.01 10:00:00",
-               "ask": "1.0801", "bid": "1.08", "volume": "0", "last": "0.0",
-               "time_msec": "1704067200123", "flags": "2"}
+    payload = {
+        "symbol": "EURUSD",
+        "time": "2024.06.01 10:00:00",
+        "ask": "1.0801",
+        "bid": "1.08",
+        "volume": "0",
+        "last": "0.0",
+        "time_msec": "1704067200123",
+        "flags": "2",
+    }
     client._ws_on_message(payload)
     client._handle_data.assert_called_once()
     quote = client._handle_data.call_args[0][0]
     assert quote.bid_price.as_double() == 1.08
-    assert quote.ts_event == 1704067200 * 1_000_000_000  # epoch from time_msec
+    assert quote.ts_event == 1704067200123 * 1_000_000  # time_msec, at millisecond precision
 
 
 @pytest.mark.asyncio
@@ -122,8 +135,7 @@ async def test_ws_on_message_ignores_unknown_symbol():
     client = _client()
     client._subscribed_symbols.add("UNKNOWN")
     client._provider.get_instrument.return_value = None
-    payload = {"symbol": "UNKNOWN", "bid": "1.08", "ask": "1.09",
-               "time_msec": "0"}
+    payload = {"symbol": "UNKNOWN", "bid": "1.08", "ask": "1.09", "time_msec": "0"}
     client._ws_on_message(payload)
     client._handle_data.assert_not_called()
 
@@ -131,8 +143,7 @@ async def test_ws_on_message_ignores_unknown_symbol():
 @pytest.mark.asyncio
 async def test_ws_on_message_drops_unsubscribed_symbol():
     client = _client()
-    payload = {"symbol": "EURUSD", "bid": "1.08", "ask": "1.09",
-               "time_msec": "1704067200123"}
+    payload = {"symbol": "EURUSD", "bid": "1.08", "ask": "1.09", "time_msec": "1704067200123"}
     client._ws_on_message(payload)
     client._handle_data.assert_not_called()
 

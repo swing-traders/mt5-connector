@@ -3,24 +3,18 @@ swagger_config = {
     "info": {
         "title": "MetaTrader5 API",
         "description": "API documentation for MetaTrader5 Flask application.",
-        "version": "1.0.0"
+        "version": "1.0.0",
     },
     "basePath": "/",
     "https": True,
-    "schemes": [
-        "https"
-    ],
+    "schemes": ["https"],
     "securityDefinitions": {
-        "ApiKeyAuth": {
-            "type": "apiKey",
-            "name": "Authorization",
-            "in": "header"
-        }
+        "ApiKeyAuth": {"type": "apiKey", "name": "Authorization", "in": "header"}
     },
     "specs": [
         {
-            "endpoint": 'apispec_1',
-            "route": '/apispec_1.json',
+            "endpoint": "apispec_1",
+            "route": "/apispec_1.json",
             "rule_filter": lambda rule: True,  # Include all routes
             "model_filter": lambda tag: True,  # Include all models
         }
@@ -28,5 +22,5 @@ swagger_config = {
     "static_url_path": "/flasgger_static",
     "swagger_ui": True,
     "specs_route": "/apidocs/",
-    "headers": []
+    "headers": [],
 }

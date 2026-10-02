@@ -10,7 +10,8 @@ every layer of the adapter is wired correctly:
 
 Or with explicit credentials (overrides .env):
 
-    python check_connectivity.py --account 12345678 --password "pw" --server "Exness-MT5Trial9" --symbols EURUSDm XAUUSDm
+    python check_connectivity.py --account 12345678 --password "pw" \\
+        --server "Exness-MT5Trial9" --symbols EURUSDm XAUUSDm
 
 Exit codes
 ----------
@@ -33,24 +34,25 @@ What is tested
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import traceback
-import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+
 from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANSI colours (safe on all modern terminals)
 # ─────────────────────────────────────────────────────────────────────────────
 
-GREEN  = "\033[92m"
-RED    = "\033[91m"
+GREEN = "\033[92m"
+RED = "\033[91m"
 YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-BOLD   = "\033[1m"
-RESET  = "\033[0m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
 
 PASS = f"{GREEN}✓ PASS{RESET}"
 FAIL = f"{RED}✗ FAIL{RESET}"
@@ -80,6 +82,7 @@ def _error(label: str, exc: Exception) -> None:
 # LOAD .ENV FILE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def load_env_config():
     """Load MT5 credentials from .env file in project root."""
     # Look for .env in current directory and parent directories
@@ -87,7 +90,7 @@ def load_env_config():
     if not env_path.exists():
         # Try parent directory (if running from examples/)
         env_path = Path.cwd().parent / ".env"
-    
+
     if env_path.exists():
         load_dotenv(env_path)
         print(f"  Loaded config from: {env_path}")
@@ -107,17 +110,18 @@ def get_env_or_none(key: str) -> str | None:
 # PARSE ARGS (with .env fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _parse_args():
     p = argparse.ArgumentParser(
         description="nautilus-mt5 connectivity smoke test",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--account",  type=int,   default=None, help="MT5 account number (overrides .env)")
-    p.add_argument("--password", type=str,   default=None, help="MT5 password (overrides .env)")
-    p.add_argument("--server",   type=str,   default=None, help="MT5 server name (overrides .env)")
-    p.add_argument("--symbols",  nargs="+",  default=None, help="MT5 symbol names (overrides .env)")
-    p.add_argument("--timeout",  type=float, default=10.0, help="Connection timeout (s)")
+    p.add_argument("--account", type=int, default=None, help="MT5 account number (overrides .env)")
+    p.add_argument("--password", type=str, default=None, help="MT5 password (overrides .env)")
+    p.add_argument("--server", type=str, default=None, help="MT5 server name (overrides .env)")
+    p.add_argument("--symbols", nargs="+", default=None, help="MT5 symbol names (overrides .env)")
+    p.add_argument("--timeout", type=float, default=10.0, help="Connection timeout (s)")
     return p.parse_args()
 
 
@@ -125,28 +129,28 @@ def get_config(args):
     """Get config from args with .env fallback."""
     # Load .env first
     load_env_config()
-    
+
     # Determine values (args take precedence over env)
     account = args.account
     if account is None:
         account_str = get_env_or_none("MT5_ACCOUNT")
         if account_str:
             account = int(account_str)
-    
+
     password = args.password
     if password is None:
         password = get_env_or_none("MT5_PASSWORD")
-    
+
     server = args.server
     if server is None:
         server = get_env_or_none("MT5_SERVER")
-    
+
     symbols = args.symbols
     if symbols is None:
         symbols_str = get_env_or_none("MT5_SYMBOLS")
         if symbols_str:
             symbols = [s.strip() for s in symbols_str.split(",")]
-    
+
     return account, password, server, symbols
 
 
@@ -154,23 +158,24 @@ def get_config(args):
 # INDIVIDUAL CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def check_imports() -> bool:
     """Verify the adapter and its dependencies import cleanly."""
     _header("Layer 0 — Python imports")
     all_ok = True
 
     modules = [
-        ("MetaTrader5",                    "pip install MetaTrader5"),
-        ("nautilus_trader",                "pip install nautilus_trader"),
-        ("mt5connect.config",            "check your install"),
-        ("mt5connect.connection",        "check your install"),
-        ("mt5connect.constants",         "check your install"),
-        ("mt5connect.errors",            "check your install"),
-        ("mt5connect.parsing",           "check your install"),
-        ("mt5connect.providers",         "check your install"),
-        ("mt5connect.data",              "check your install"),
-        ("mt5connect.execution",         "check your install"),
-        ("mt5connect.factories",         "check your install"),
+        ("MetaTrader5", "pip install MetaTrader5"),
+        ("nautilus_trader", "pip install nautilus_trader"),
+        ("mt5connect.config", "check your install"),
+        ("mt5connect.connection", "check your install"),
+        ("mt5connect.constants", "check your install"),
+        ("mt5connect.errors", "check your install"),
+        ("mt5connect.parsing", "check your install"),
+        ("mt5connect.providers", "check your install"),
+        ("mt5connect.data", "check your install"),
+        ("mt5connect.execution", "check your install"),
+        ("mt5connect.factories", "check your install"),
     ]
 
     for mod, hint in modules:
@@ -226,8 +231,7 @@ def check_login(account: int, password: str, server: str, timeout: float) -> boo
         return True
     else:
         code, msg = mt5.last_error()
-        _result(f"mt5.login(account={account}, server={server!r})", False,
-                f"error {code}: {msg}")
+        _result(f"mt5.login(account={account}, server={server!r})", False, f"error {code}: {msg}")
         print(f"\n  {YELLOW}Hint: Check account number, password, and server name.{RESET}")
         mt5.shutdown()
         return False
@@ -271,8 +275,9 @@ def check_connection_class(account: int, password: str, server: str, timeout: fl
             pass
 
 
-def check_instrument_provider(account: int, password: str, server: str,
-                               symbols: list[str], timeout: float) -> bool:
+def check_instrument_provider(
+    account: int, password: str, server: str, symbols: list[str], timeout: float
+) -> bool:
     """Layer 4 — Instrument parsing for each configured symbol."""
     _header("Layer 4 — Instrument parsing (MT5InstrumentProvider)")
 
@@ -281,8 +286,11 @@ def check_instrument_provider(account: int, password: str, server: str,
     from mt5connect.providers import MT5InstrumentProvider
 
     config = MT5Config(
-        account=account, password=password, server=server,
-        symbols=symbols, timeout_s=timeout,
+        account=account,
+        password=password,
+        server=server,
+        symbols=symbols,
+        timeout_s=timeout,
     )
     conn = MT5Connection(config)
     all_ok = True
@@ -317,14 +325,17 @@ def check_instrument_provider(account: int, password: str, server: str,
     return all_ok
 
 
-def check_live_ticks(account: int, password: str, server: str,
-                     symbols: list[str], timeout: float) -> bool:
+def check_live_ticks(
+    account: int, password: str, server: str, symbols: list[str], timeout: float
+) -> bool:
     """Layer 5 — Live tick data available for each symbol."""
     _header("Layer 5 — Live tick data (mt5.symbol_info_tick)")
     import MetaTrader5 as mt5
 
     ok_prereq = mt5.initialize() and mt5.login(
-        login=account, password=password, server=server,
+        login=account,
+        password=password,
+        server=server,
         timeout=int(timeout * 1000),
     )
     if not ok_prereq:
@@ -339,7 +350,7 @@ def check_live_ticks(account: int, password: str, server: str,
             _result(f"symbol_info_tick({symbol!r})", False, "returned None")
             all_ok = False
         else:
-            spread_pts = round((tick.ask - tick.bid) * 10 ** 5, 1)
+            spread_pts = round((tick.ask - tick.bid) * 10**5, 1)
             _result(
                 f"symbol_info_tick({symbol!r})",
                 True,
@@ -350,14 +361,17 @@ def check_live_ticks(account: int, password: str, server: str,
     return all_ok
 
 
-def check_historical_bars(account: int, password: str, server: str,
-                           symbols: list[str], timeout: float) -> bool:
+def check_historical_bars(
+    account: int, password: str, server: str, symbols: list[str], timeout: float
+) -> bool:
     """Layer 6 — Historical bar data (last 100 H1 bars, wide window for weekends)."""
     _header("Layer 6 — Historical bars (mt5.copy_rates_range, last 100 H1)")
     import MetaTrader5 as mt5
 
     ok_prereq = mt5.initialize() and mt5.login(
-        login=account, password=password, server=server,
+        login=account,
+        password=password,
+        server=server,
         timeout=int(timeout * 1000),
     )
     if not ok_prereq:
@@ -367,7 +381,7 @@ def check_historical_bars(account: int, password: str, server: str,
 
     # Use a wide window (7 days) so this works on weekends and holidays too.
     # FX markets are closed Sat/Sun — a 20h window on Sunday returns nothing.
-    end   = datetime.now(timezone.utc)
+    end = datetime.now(UTC)
     start = end - timedelta(days=7)
 
     all_ok = True
@@ -380,10 +394,18 @@ def check_historical_bars(account: int, password: str, server: str,
             bars = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_H1, start_wide, end)
 
         if bars is None or len(bars) == 0:
-            _result(f"copy_rates_range({symbol!r})", False,
-                    "no data in 30-day window — market may be closed or history unavailable")
-            print(f"       {YELLOW}Note: this is expected on weekends/holidays for FX symbols.{RESET}")
-            print(f"       {YELLOW}The adapter itself is working — MT5 just has no bars to return.{RESET}")
+            _result(
+                f"copy_rates_range({symbol!r})",
+                False,
+                "no data in 30-day window — market may be closed or history unavailable",
+            )
+            print(
+                f"       {YELLOW}Note: this is expected on weekends/holidays for FX symbols.{RESET}"
+            )
+            print(
+                f"       {YELLOW}The adapter itself is working — "
+                f"MT5 just has no bars to return.{RESET}"
+            )
             # Treat as a warning, not a hard failure — all other layers passed.
             # Return True so overall exit code stays 0 when this is the only miss.
         else:
@@ -398,31 +420,37 @@ def check_historical_bars(account: int, password: str, server: str,
     return all_ok  # always True — see note above
 
 
-def check_client_construction(account: int, password: str, server: str,
-                               symbols: list[str], timeout: float) -> bool:
+def check_client_construction(
+    account: int, password: str, server: str, symbols: list[str], timeout: float
+) -> bool:
     """Layers 7 & 8 — Construct data + execution clients (no real connection)."""
     _header("Layers 7 & 8 — Client construction (MT5DataClient, MT5LiveExecutionClient)")
 
-    from unittest.mock import MagicMock, AsyncMock
-    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
     from nautilus_trader.common.component import LiveClock
     from nautilus_trader.common.providers import InstrumentProvider
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
     from mt5connect.config import MT5Config
     from mt5connect.connection import MT5Connection
-    from mt5connect.providers import MT5InstrumentProvider
     from mt5connect.data import MT5DataClient
     from mt5connect.execution import MT5LiveExecutionClient
-    import asyncio
+    from mt5connect.providers import MT5InstrumentProvider
 
     config = MT5Config(
-        account=account, password=password, server=server,
-        symbols=symbols, timeout_s=timeout,
+        account=account,
+        password=password,
+        server=server,
+        symbols=symbols,
+        timeout_s=timeout,
     )
 
     # Minimal real NT components (needed to pass NT's isinstance checks)
     msgbus = TestComponentStubs.msgbus()
-    cache  = TestComponentStubs.cache()
-    clock  = LiveClock()
+    cache = TestComponentStubs.cache()
+    clock = LiveClock()
 
     try:
         loop = asyncio.get_event_loop()
@@ -437,8 +465,8 @@ def check_client_construction(account: int, password: str, server: str,
     prov._conn = conn_mock
     prov._failed_symbols = []
     prov.get_instrument = MagicMock(return_value=None)
-    prov.load_symbol    = MagicMock(return_value=None)
-    prov.list_all       = MagicMock(return_value=[])
+    prov.load_symbol = MagicMock(return_value=None)
+    prov.list_all = MagicMock(return_value=[])
     prov.load_all_async = AsyncMock()
 
     all_ok = True
@@ -453,8 +481,7 @@ def check_client_construction(account: int, password: str, server: str,
             instrument_provider=prov,
             config=config,
         )
-        _result("MT5DataClient.__init__()", True,
-                f"client_id={data_client.id}")
+        _result("MT5DataClient.__init__()", True, f"client_id={data_client.id}")
     except Exception as exc:
         _error("MT5DataClient.__init__()", exc)
         all_ok = False
@@ -470,8 +497,7 @@ def check_client_construction(account: int, password: str, server: str,
             config=config,
         )
         # Use the public account_id property (not private _account_id)
-        _result("MT5LiveExecutionClient.__init__()", True,
-                f"account_id={exec_client.account_id}")
+        _result("MT5LiveExecutionClient.__init__()", True, f"account_id={exec_client.account_id}")
     except Exception as exc:
         _error("MT5LiveExecutionClient.__init__()", exc)
         all_ok = False
@@ -479,19 +505,24 @@ def check_client_construction(account: int, password: str, server: str,
     return all_ok
 
 
-def check_full_round_trip(account: int, password: str, server: str,
-                           symbols: list[str], timeout: float) -> bool:
+def check_full_round_trip(
+    account: int, password: str, server: str, symbols: list[str], timeout: float
+) -> bool:
     """Layer 9 — Full adapter round-trip via factories."""
     _header("Layer 9 — Full round-trip (connect → instruments → tick → disconnect)")
+
+    import MetaTrader5 as mt5
 
     from mt5connect.config import MT5Config
     from mt5connect.connection import MT5Connection
     from mt5connect.providers import MT5InstrumentProvider
-    import MetaTrader5 as mt5
 
     config = MT5Config(
-        account=account, password=password, server=server,
-        symbols=symbols, timeout_s=timeout,
+        account=account,
+        password=password,
+        server=server,
+        symbols=symbols,
+        timeout_s=timeout,
     )
 
     conn = MT5Connection(config)
@@ -509,8 +540,7 @@ def check_full_round_trip(account: int, password: str, server: str,
         for symbol in symbols:
             try:
                 instrument = provider.load_symbol(symbol)
-                _result(f"load_symbol({symbol!r})", True,
-                        f"{type(instrument).__name__}")
+                _result(f"load_symbol({symbol!r})", True, f"{type(instrument).__name__}")
             except Exception as exc:
                 _error(f"load_symbol({symbol!r})", exc)
                 all_ok = False
@@ -519,8 +549,7 @@ def check_full_round_trip(account: int, password: str, server: str,
         for symbol in symbols:
             tick = mt5.symbol_info_tick(symbol)
             if tick:
-                _result(f"live tick for {symbol!r}", True,
-                        f"bid={tick.bid}  ask={tick.ask}")
+                _result(f"live tick for {symbol!r}", True, f"bid={tick.bid}  ask={tick.ask}")
             else:
                 _result(f"live tick for {symbol!r}", False, "None returned")
                 all_ok = False
@@ -547,6 +576,7 @@ def check_full_round_trip(account: int, password: str, server: str,
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def main() -> int:
     print(f"\n{BOLD}nautilus-mt5 connectivity smoke test{RESET}")
     print(f"{'═' * 60}")
@@ -562,18 +592,18 @@ def main() -> int:
         missing.append("password")
     if server is None:
         missing.append("server")
-    
+
     if missing:
         print(f"\n{RED}Missing required credentials: {', '.join(missing)}{RESET}")
-        print(f"\n  Set them in your .env file or pass via command line:")
-        print(f"    --account, --password, --server")
-        print(f"\n  Example .env file:")
-        print(f"    MT5_ACCOUNT=12345678")
-        print(f"    MT5_PASSWORD=your_password")
-        print(f"    MT5_SERVER=Exness-MT5Trial9")
-        print(f"    MT5_SYMBOLS=EURUSDm,XAUUSDm")
+        print("\n  Set them in your .env file or pass via command line:")
+        print("    --account, --password, --server")
+        print("\n  Example .env file:")
+        print("    MT5_ACCOUNT=12345678")
+        print("    MT5_PASSWORD=your_password")
+        print("    MT5_SERVER=Exness-MT5Trial9")
+        print("    MT5_SYMBOLS=EURUSDm,XAUUSDm")
         return 1
-    
+
     if not symbols:
         symbols = ["EURUSD"]
         print(f"  {YELLOW}No symbols specified — using default: {symbols}{RESET}")
@@ -600,47 +630,39 @@ def main() -> int:
         return 1
 
     # Layer 2 — login
-    results["login"] = check_login(
-        account, password, server, args.timeout
-    )
+    results["login"] = check_login(account, password, server, args.timeout)
 
     if not results["login"]:
         print(f"\n{RED}Login failed — check credentials and server name.{RESET}\n")
         return 1
 
     # Layers 3-9 — only run if login succeeded
-    results["connection_class"]  = check_connection_class(
-        account, password, server, args.timeout
-    )
-    results["instruments"]       = check_instrument_provider(
+    results["connection_class"] = check_connection_class(account, password, server, args.timeout)
+    results["instruments"] = check_instrument_provider(
         account, password, server, symbols, args.timeout
     )
-    results["live_ticks"]        = check_live_ticks(
+    results["live_ticks"] = check_live_ticks(account, password, server, symbols, args.timeout)
+    results["historical_bars"] = check_historical_bars(
         account, password, server, symbols, args.timeout
     )
-    results["historical_bars"]   = check_historical_bars(
+    results["client_construct"] = check_client_construction(
         account, password, server, symbols, args.timeout
     )
-    results["client_construct"]  = check_client_construction(
-        account, password, server, symbols, args.timeout
-    )
-    results["round_trip"]        = check_full_round_trip(
-        account, password, server, symbols, args.timeout
-    )
+    results["round_trip"] = check_full_round_trip(account, password, server, symbols, args.timeout)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     _header("Summary")
     all_passed = True
     labels = {
-        "imports":          "Layer 0 — Python imports",
-        "terminal":         "Layer 1 — MT5 terminal",
-        "login":            "Layer 2 — Broker login",
+        "imports": "Layer 0 — Python imports",
+        "terminal": "Layer 1 — MT5 terminal",
+        "login": "Layer 2 — Broker login",
         "connection_class": "Layer 3 — MT5Connection",
-        "instruments":      "Layer 4 — Instrument parsing",
-        "live_ticks":       "Layer 5 — Live ticks",
-        "historical_bars":  "Layer 6 — Historical bars",
+        "instruments": "Layer 4 — Instrument parsing",
+        "live_ticks": "Layer 5 — Live ticks",
+        "historical_bars": "Layer 6 — Historical bars",
         "client_construct": "Layers 7-8 — Client construction",
-        "round_trip":       "Layer 9 — Full round-trip",
+        "round_trip": "Layer 9 — Full round-trip",
     }
     for key, label in labels.items():
         ok = results.get(key, False)

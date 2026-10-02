@@ -1,4 +1,5 @@
 """Backend selection and the remote ws_url derivation helper."""
+
 from __future__ import annotations
 
 import importlib
@@ -37,7 +38,7 @@ _CONSUMER_MODULES = (
 )
 
 
-def set_backend(config: "MT5Config"):
+def set_backend(config: MT5Config):
     """Bind the active MT5 backend module into the consumer modules.
 
     ``local`` uses the real MetaTrader5 library (Windows); ``remote`` uses

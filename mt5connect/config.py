@@ -6,14 +6,15 @@ This is the only file users need to touch to connect their broker.
 """
 
 from dataclasses import dataclass
+
 from mt5connect.backend import derive_ws_url
 from mt5connect.constants import (
-    DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_EXEC_POLL_INTERVAL_MS,
-    RECONNECT_INITIAL_DELAY_S,
-    RECONNECT_MAX_DELAY_S,
-    RECONNECT_MAX_ATTEMPTS,
+    DEFAULT_POLL_INTERVAL_MS,
     MT5_MAGIC_NUMBER,
+    RECONNECT_INITIAL_DELAY_S,
+    RECONNECT_MAX_ATTEMPTS,
+    RECONNECT_MAX_DELAY_S,
 )
 from mt5connect.errors import MT5ConfigError
 
@@ -103,17 +104,17 @@ class MT5Config:
     symbols: list[str]
 
     # ── Optional / defaults ───────────────────────────────────────────────────
-    poll_interval_ms: int         = DEFAULT_POLL_INTERVAL_MS
-    exec_poll_interval_ms: int    = DEFAULT_EXEC_POLL_INTERVAL_MS
-    magic_number: int             = MT5_MAGIC_NUMBER
+    poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS
+    exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
+    magic_number: int = MT5_MAGIC_NUMBER
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
-    reconnect_max_delay_s: float  = RECONNECT_MAX_DELAY_S
-    reconnect_max_attempts: int   = RECONNECT_MAX_ATTEMPTS
-    timeout_s: float              = 10.0
+    reconnect_max_delay_s: float = RECONNECT_MAX_DELAY_S
+    reconnect_max_attempts: int = RECONNECT_MAX_ATTEMPTS
+    timeout_s: float = 10.0
 
-    backend: str                  = "local"
-    server_url: str | None        = None
-    ws_url: str | None            = None
+    backend: str = "local"
+    server_url: str | None = None
+    ws_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.account or self.account <= 0:
@@ -136,8 +137,7 @@ class MT5Config:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")
 
         if self.backend not in ("local", "remote"):
-            raise MT5ConfigError(
-                f"backend must be 'local' or 'remote', got {self.backend!r}")
+            raise MT5ConfigError(f"backend must be 'local' or 'remote', got {self.backend!r}")
         if self.backend == "remote" and not self.server_url:
             raise MT5ConfigError("backend='remote' requires server_url (e.g. http://host:5000)")
         if self.ws_url is None and self.server_url:

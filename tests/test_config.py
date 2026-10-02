@@ -6,8 +6,7 @@ from mt5connect.errors import MT5ConfigError
 
 
 def _base(backend="local", **kw):
-    return MT5Config(account=1, password="p", server="s", symbols=["EURUSD"],
-                     backend=backend, **kw)
+    return MT5Config(account=1, password="p", server="s", symbols=["EURUSD"], backend=backend, **kw)
 
 
 def test_default_backend_is_local():
@@ -35,8 +34,9 @@ def test_ws_url_derived_when_omitted():
 
 
 def test_ws_url_explicit_wins():
-    c = _base(backend="remote", server_url="http://192.168.1.10:5000",
-              ws_url="ws://192.168.1.10:9001")
+    c = _base(
+        backend="remote", server_url="http://192.168.1.10:5000", ws_url="ws://192.168.1.10:9001"
+    )
     assert c.ws_url == "ws://192.168.1.10:9001"
 
 

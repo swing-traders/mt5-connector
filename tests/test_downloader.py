@@ -31,30 +31,29 @@ Test groups:
   23. write order           — ts_event ordering within chunk
 """
 
-import pytest
+from datetime import UTC, datetime
+from unittest.mock import MagicMock, patch
+
 import numpy as np
-from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch, call
-from nautilus_trader.model.data import QuoteTick, Bar
+import pytest
+from nautilus_trader.model.data import Bar, QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.instruments import CurrencyPair
+from nautilus_trader.model.objects import Price, Quantity
 
-from mt5connect.downloader import (
-    MT5DataDownloader,
-    DownloadResult,
-    _ensure_utc,
-    _date_chunks,
-)
 from mt5connect.connection import ConnectionState
+from mt5connect.downloader import (
+    DownloadResult,
+    MT5DataDownloader,
+    _date_chunks,
+    _ensure_utc,
+)
 from mt5connect.errors import MT5ConnectionError, MT5SymbolNotFoundError
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-UTC = timezone.utc
 
 def dt(year, month, day, hour=0, minute=0):
     return datetime(year, month, day, hour, minute, tzinfo=UTC)
@@ -62,16 +61,18 @@ def dt(year, month, day, hour=0, minute=0):
 
 def make_raw_tick(bid=1.085, ask=1.0852, time_s=1_700_000_000):
     """Build a numpy structured array row matching mt5.copy_ticks_range() output."""
-    dtype = np.dtype([
-        ("time",   np.int64),
-        ("bid",    np.float64),
-        ("ask",    np.float64),
-        ("last",   np.float64),
-        ("volume", np.uint64),
-        ("time_msc", np.int64),
-        ("flags",  np.uint32),
-        ("volume_real", np.float64),
-    ])
+    dtype = np.dtype(
+        [
+            ("time", np.int64),
+            ("bid", np.float64),
+            ("ask", np.float64),
+            ("last", np.float64),
+            ("volume", np.uint64),
+            ("time_msc", np.int64),
+            ("flags", np.uint32),
+            ("volume_real", np.float64),
+        ]
+    )
     arr = np.array(
         [(time_s, bid, ask, bid, 1, time_s * 1000, 134, 0.0)],
         dtype=dtype,
@@ -79,19 +80,22 @@ def make_raw_tick(bid=1.085, ask=1.0852, time_s=1_700_000_000):
     return arr[0]
 
 
-def make_raw_rate(time_s=1_700_000_000, open_=1.085, high=1.090,
-                  low=1.080, close=1.088, tick_volume=1000):
+def make_raw_rate(
+    time_s=1_700_000_000, open_=1.085, high=1.090, low=1.080, close=1.088, tick_volume=1000
+):
     """Build a numpy structured array row matching mt5.copy_rates_range() output."""
-    dtype = np.dtype([
-        ("time",        np.int64),
-        ("open",        np.float64),
-        ("high",        np.float64),
-        ("low",         np.float64),
-        ("close",       np.float64),
-        ("tick_volume", np.int64),
-        ("spread",      np.int32),
-        ("real_volume", np.int64),
-    ])
+    dtype = np.dtype(
+        [
+            ("time", np.int64),
+            ("open", np.float64),
+            ("high", np.float64),
+            ("low", np.float64),
+            ("close", np.float64),
+            ("tick_volume", np.int64),
+            ("spread", np.int32),
+            ("real_volume", np.int64),
+        ]
+    )
     arr = np.array(
         [(time_s, open_, high, low, close, tick_volume, 2, 0)],
         dtype=dtype,
@@ -101,9 +105,10 @@ def make_raw_rate(time_s=1_700_000_000, open_=1.085, high=1.090,
 
 def make_eurusd_instrument():
     """Build a real CurrencyPair instrument for EURUSD."""
-    from nautilus_trader.model.currencies import Currency
-    from nautilus_trader.model.identifiers import Symbol, Venue
     from decimal import Decimal
+
+    from nautilus_trader.model.currencies import Currency
+
     return CurrencyPair(
         instrument_id=InstrumentId.from_str("EURUSD.MT5"),
         raw_symbol=from_str_sym("EURUSD"),
@@ -131,6 +136,7 @@ def make_eurusd_instrument():
 
 def from_str_sym(s):
     from nautilus_trader.model.identifiers import Symbol
+
     return Symbol(s)
 
 
@@ -141,9 +147,7 @@ def make_conn(connected=True):
     if connected:
         conn.ensure_connected = MagicMock()  # no-op
     else:
-        conn.ensure_connected = MagicMock(
-            side_effect=MT5ConnectionError("Not connected")
-        )
+        conn.ensure_connected = MagicMock(side_effect=MT5ConnectionError("Not connected"))
     return conn
 
 
@@ -151,7 +155,7 @@ def make_provider(instrument=None):
     provider = MagicMock()
     eurusd = instrument or make_eurusd_instrument()
     provider.get_instrument.return_value = eurusd
-    provider.load_symbol.return_value    = eurusd
+    provider.load_symbol.return_value = eurusd
     return provider
 
 
@@ -162,11 +166,20 @@ def make_catalog():
 
 
 @pytest.fixture
-def conn():       return make_conn()
+def conn():
+    return make_conn()
+
+
 @pytest.fixture
-def provider():   return make_provider()
+def provider():
+    return make_provider()
+
+
 @pytest.fixture
-def catalog():    return make_catalog()
+def catalog():
+    return make_catalog()
+
+
 @pytest.fixture
 def downloader(conn, provider, catalog):
     return MT5DataDownloader(
@@ -181,6 +194,7 @@ def downloader(conn, provider, catalog):
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. _ensure_utc()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestEnsureUtc:
 
@@ -212,63 +226,64 @@ class TestEnsureUtc:
 # 2. _date_chunks()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDateChunks:
 
     def test_single_chunk_when_range_less_than_chunk(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 1, 3)
+        start = dt(2024, 1, 1)
+        end = dt(2024, 1, 3)
         chunks = _date_chunks(start, end, days=7)
         assert len(chunks) == 1
         assert chunks[0] == (start, end)
 
     def test_exact_chunk_size(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 1, 8)  # exactly 7 days
+        start = dt(2024, 1, 1)
+        end = dt(2024, 1, 8)  # exactly 7 days
         chunks = _date_chunks(start, end, days=7)
         assert len(chunks) == 1
 
     def test_two_chunks(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 1, 15)  # 14 days → 2 chunks of 7
+        start = dt(2024, 1, 1)
+        end = dt(2024, 1, 15)  # 14 days → 2 chunks of 7
         chunks = _date_chunks(start, end, days=7)
         assert len(chunks) == 2
 
     def test_last_chunk_does_not_exceed_end(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 1, 10)  # 9 days → chunk1=7 days, chunk2=2 days
+        start = dt(2024, 1, 1)
+        end = dt(2024, 1, 10)  # 9 days → chunk1=7 days, chunk2=2 days
         chunks = _date_chunks(start, end, days=7)
         assert len(chunks) == 2
         assert chunks[-1][1] == end
 
     def test_chunks_are_contiguous(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 2, 1)
+        start = dt(2024, 1, 1)
+        end = dt(2024, 2, 1)
         chunks = _date_chunks(start, end, days=7)
         for i in range(len(chunks) - 1):
             assert chunks[i][1] == chunks[i + 1][0]
 
     def test_first_chunk_starts_at_start(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 2, 1)
+        start = dt(2024, 1, 1)
+        end = dt(2024, 2, 1)
         chunks = _date_chunks(start, end, days=7)
         assert chunks[0][0] == start
 
     def test_last_chunk_ends_at_end(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2024, 2, 1)
+        start = dt(2024, 1, 1)
+        end = dt(2024, 2, 1)
         chunks = _date_chunks(start, end, days=7)
         assert chunks[-1][1] == end
 
     def test_one_year_weekly_has_correct_count(self):
-        start  = dt(2024, 1, 1)
-        end    = dt(2025, 1, 1)
+        start = dt(2024, 1, 1)
+        end = dt(2025, 1, 1)
         chunks = _date_chunks(start, end, days=7)
         # 365 days / 7 = ~52-53 chunks
         assert 52 <= len(chunks) <= 53
 
     def test_empty_range_returns_no_chunks(self):
         start = dt(2024, 1, 1)
-        end   = dt(2024, 1, 1)  # zero-length range
+        end = dt(2024, 1, 1)  # zero-length range
         chunks = _date_chunks(start, end, days=7)
         assert chunks == []
 
@@ -282,6 +297,7 @@ class TestDateChunks:
 # 3. DownloadResult
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadResult:
 
     def test_success_when_no_errors(self):
@@ -289,8 +305,7 @@ class TestDownloadResult:
         assert r.success is True
 
     def test_not_success_when_errors(self):
-        r = DownloadResult(symbol="EURUSD", data_type="ticks",
-                           errors=["chunk failed"])
+        r = DownloadResult(symbol="EURUSD", data_type="ticks", errors=["chunk failed"])
         assert r.success is False
 
     def test_default_total_written_zero(self):
@@ -310,8 +325,7 @@ class TestDownloadResult:
         assert "OK" in str(r)
 
     def test_str_shows_error_count(self):
-        r = DownloadResult(symbol="EURUSD", data_type="ticks",
-                           errors=["e1", "e2"])
+        r = DownloadResult(symbol="EURUSD", data_type="ticks", errors=["e1", "e2"])
         assert "2" in str(r)
 
     def test_errors_list_mutable(self):
@@ -324,15 +338,16 @@ class TestDownloadResult:
 # 4. download_ticks() — happy path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadTicksHappy:
 
     def test_returns_download_result(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.TIMEFRAME_H1   = 16385
+            mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
 
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert isinstance(result, DownloadResult)
 
@@ -340,7 +355,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.success is True
 
@@ -349,7 +364,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = raw_ticks
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.total_written == 100
 
@@ -358,7 +373,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            result = downloader.download_ticks(" EURUSDm ", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks(" EURUSDm ", dt(2024, 1, 1), dt(2024, 1, 8))
 
         # Whitespace stripped, broker casing preserved
         assert result.symbol == "EURUSDm"
@@ -368,7 +383,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            result = downloader.download_ticks("EURUSDm", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSDm", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.symbol == "EURUSDm"  # lowercase m preserved
 
@@ -376,7 +391,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         catalog.write_data.assert_called()
 
@@ -384,7 +399,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         written_data = catalog.write_data.call_args[0][0]
         assert all(isinstance(t, QuoteTick) for t in written_data)
@@ -394,7 +409,7 @@ class TestDownloadTicksHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,15))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 15))
 
         assert result.chunks_processed == 2
 
@@ -403,13 +418,14 @@ class TestDownloadTicksHappy:
 # 5. download_ticks() — empty chunks (weekends)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadTicksEmptyChunks:
 
     def test_empty_chunk_not_counted_in_total(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = []  # weekend → empty
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.total_written == 0
 
@@ -417,7 +433,7 @@ class TestDownloadTicksEmptyChunks:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = []
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.chunks_empty == 1
 
@@ -425,7 +441,7 @@ class TestDownloadTicksEmptyChunks:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = None
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.chunks_empty == 1
         assert result.total_written == 0
@@ -434,7 +450,7 @@ class TestDownloadTicksEmptyChunks:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = []
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         catalog.write_data.assert_not_called()
 
@@ -442,7 +458,7 @@ class TestDownloadTicksEmptyChunks:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = []
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.success is True
 
@@ -451,13 +467,14 @@ class TestDownloadTicksEmptyChunks:
 # 6. download_ticks() — chunk errors (partial failure)
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadTicksErrors:
 
     def test_chunk_error_recorded_in_result(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = RuntimeError("MT5 IPC error")
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert len(result.errors) == 1
         assert "MT5 IPC error" in result.errors[0]
@@ -466,13 +483,14 @@ class TestDownloadTicksErrors:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = RuntimeError("error")
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.success is False
 
     def test_partial_failure_continues_other_chunks(self, downloader):
         """First chunk fails, second succeeds — total_written should be > 0."""
         call_count = {"n": 0}
+
         def side_effect(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
@@ -483,7 +501,7 @@ class TestDownloadTicksErrors:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = side_effect
             # Use 14 day range to get 2 chunks
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,15))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 15))
 
         assert result.total_written == 1
         assert len(result.errors) == 1
@@ -492,7 +510,7 @@ class TestDownloadTicksErrors:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = RuntimeError("boom")
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert "2024-01-01" in result.errors[0]
 
@@ -500,6 +518,7 @@ class TestDownloadTicksErrors:
 # ═════════════════════════════════════════════════════════════════════════════
 # 7. download_ticks() — symbol not found
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestDownloadTicksSymbolNotFound:
 
@@ -510,7 +529,7 @@ class TestDownloadTicksSymbolNotFound:
 
         downloader = MT5DataDownloader(conn, provider, catalog)
         with patch("mt5connect.downloader.mt5"):
-            result = downloader.download_ticks("FAKESYM", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("FAKESYM", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.success is False
         assert "FAKESYM" in result.errors[0]
@@ -522,7 +541,7 @@ class TestDownloadTicksSymbolNotFound:
 
         downloader = MT5DataDownloader(conn, provider, catalog)
         with patch("mt5connect.downloader.mt5"):
-            result = downloader.download_ticks("FAKESYM", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("FAKESYM", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.total_written == 0
 
@@ -531,6 +550,7 @@ class TestDownloadTicksSymbolNotFound:
 # 8. download_ticks() — not connected
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadTicksNotConnected:
 
     def test_raises_when_not_connected(self, catalog, provider):
@@ -538,26 +558,27 @@ class TestDownloadTicksNotConnected:
         downloader = MT5DataDownloader(disconnected_conn, provider, catalog)
 
         with pytest.raises(MT5ConnectionError):
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 9. download_ticks() — auto-loads instrument
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadTicksAutoLoad:
 
     def test_auto_loads_instrument_if_not_pre_loaded(self, conn, catalog):
         eurusd = make_eurusd_instrument()
         provider = MagicMock()
-        provider.get_instrument.return_value = None      # not pre-loaded
-        provider.load_symbol.return_value    = eurusd    # auto-load succeeds
+        provider.get_instrument.return_value = None  # not pre-loaded
+        provider.load_symbol.return_value = eurusd  # auto-load succeeds
 
         downloader = MT5DataDownloader(conn, provider, catalog)
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         provider.load_symbol.assert_called_once_with("EURUSD")
         assert result.total_written == 1
@@ -567,13 +588,14 @@ class TestDownloadTicksAutoLoad:
 # 10. download_bars() — happy path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadBarsHappy:
 
     def test_returns_download_result(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert isinstance(result, DownloadResult)
 
@@ -581,7 +603,7 @@ class TestDownloadBarsHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert result.success is True
 
@@ -589,11 +611,11 @@ class TestDownloadBarsHappy:
         # downloader fixture has chunk_days_bars=365
         # Range: 2024-01-01 to 2025-01-01 = 366 days → 2 chunks (365 + 1 day)
         # Each returns 50 bars → total = 100
-        raw_bars = [make_raw_rate(time_s=1_700_000_000 + i*3600) for i in range(50)]
+        raw_bars = [make_raw_rate(time_s=1_700_000_000 + i * 3600) for i in range(50)]
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = raw_bars
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2025,1,1))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2025, 1, 1))
 
         # 366 days / 365 chunk_days = 2 chunks × 50 bars each = 100
         assert result.total_written == 100
@@ -602,7 +624,7 @@ class TestDownloadBarsHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
-            downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         written_data = catalog.write_data.call_args[0][0]
         assert all(isinstance(b, Bar) for b in written_data)
@@ -611,7 +633,7 @@ class TestDownloadBarsHappy:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert result.data_type == "bars"
 
@@ -620,13 +642,14 @@ class TestDownloadBarsHappy:
 # 11. download_bars() — default timeframe
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadBarsDefaultTimeframe:
 
     def test_default_timeframe_is_h1(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
-            downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         # Second arg to copy_rates_range should be H1 = 16385
         call_args = mock_mt5.copy_rates_range.call_args[0]
@@ -637,8 +660,7 @@ class TestDownloadBarsDefaultTimeframe:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.TIMEFRAME_D1 = 16408
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
-            downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31),
-                                     timeframe=16408)
+            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=16408)
 
         call_args = mock_mt5.copy_rates_range.call_args[0]
         assert call_args[1] == 16408  # D1
@@ -648,21 +670,23 @@ class TestDownloadBarsDefaultTimeframe:
 # 12. download_bars() — empty chunks
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadBarsEmpty:
 
     def test_empty_bar_chunk_not_counted(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.return_value = []
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert result.total_written == 0
-        assert result.chunks_empty  == 1
+        assert result.chunks_empty == 1
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 13. download_bars() — chunk errors
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestDownloadBarsErrors:
 
@@ -670,7 +694,7 @@ class TestDownloadBarsErrors:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.side_effect = RuntimeError("IPC error")
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert len(result.errors) == 1
 
@@ -678,7 +702,7 @@ class TestDownloadBarsErrors:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_rates_range.side_effect = RuntimeError("IPC error")
-            result = downloader.download_bars("EURUSD", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert result.success is False
 
@@ -686,6 +710,7 @@ class TestDownloadBarsErrors:
 # ═════════════════════════════════════════════════════════════════════════════
 # 14. download_bars() — symbol not found
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestDownloadBarsSymbolNotFound:
 
@@ -697,7 +722,7 @@ class TestDownloadBarsSymbolNotFound:
         downloader = MT5DataDownloader(conn, provider, catalog)
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.TIMEFRAME_H1 = 16385
-            result = downloader.download_bars("FAKESYM", dt(2024,1,1), dt(2024,12,31))
+            result = downloader.download_bars("FAKESYM", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert not result.success
         assert result.total_written == 0
@@ -707,19 +732,21 @@ class TestDownloadBarsSymbolNotFound:
 # 15. download_all() — happy path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadAll:
 
     def test_returns_dict_keyed_by_symbol(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.TIMEFRAME_H1   = 16385
-            mock_mt5.TIMEFRAME_D1   = 16408
+            mock_mt5.TIMEFRAME_H1 = 16385
+            mock_mt5.TIMEFRAME_D1 = 16408
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
 
             results = downloader.download_all(
                 ["EURUSD", "XAUUSD"],
-                dt(2024,1,1), dt(2024,1,8),
+                dt(2024, 1, 1),
+                dt(2024, 1, 8),
                 timeframes=[16385],
             )
 
@@ -729,13 +756,14 @@ class TestDownloadAll:
     def test_each_symbol_has_result_list(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.TIMEFRAME_H1   = 16385
+            mock_mt5.TIMEFRAME_H1 = 16385
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
 
             results = downloader.download_all(
                 ["EURUSD"],
-                dt(2024,1,1), dt(2024,1,8),
+                dt(2024, 1, 1),
+                dt(2024, 1, 8),
                 timeframes=[16385],
             )
 
@@ -746,6 +774,7 @@ class TestDownloadAll:
 # 16. download_all() — include_ticks=False
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadAllNoTicks:
 
     def test_skip_ticks_when_include_ticks_false(self, downloader):
@@ -754,8 +783,11 @@ class TestDownloadAllNoTicks:
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
 
             downloader.download_all(
-                ["EURUSD"], dt(2024,1,1), dt(2024,1,8),
-                include_ticks=False, timeframes=[16385],
+                ["EURUSD"],
+                dt(2024, 1, 1),
+                dt(2024, 1, 8),
+                include_ticks=False,
+                timeframes=[16385],
             )
 
         mock_mt5.copy_ticks_range.assert_not_called()
@@ -765,6 +797,7 @@ class TestDownloadAllNoTicks:
 # 17. download_all() — include_bars=False
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadAllNoBars:
 
     def test_skip_bars_when_include_bars_false(self, downloader):
@@ -773,7 +806,9 @@ class TestDownloadAllNoBars:
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
 
             downloader.download_all(
-                ["EURUSD"], dt(2024,1,1), dt(2024,1,8),
+                ["EURUSD"],
+                dt(2024, 1, 1),
+                dt(2024, 1, 8),
                 include_bars=False,
             )
 
@@ -784,18 +819,21 @@ class TestDownloadAllNoBars:
 # 18. download_all() — multiple timeframes
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDownloadAllMultipleTimeframes:
 
     def test_multiple_timeframes_each_downloaded(self, downloader):
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.TIMEFRAME_H1   = 16385
-            mock_mt5.TIMEFRAME_D1   = 16408
+            mock_mt5.TIMEFRAME_H1 = 16385
+            mock_mt5.TIMEFRAME_D1 = 16408
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
             mock_mt5.copy_rates_range.return_value = [make_raw_rate()]
 
             results = downloader.download_all(
-                ["EURUSD"], dt(2024,1,1), dt(2024,1,8),
+                ["EURUSD"],
+                dt(2024, 1, 1),
+                dt(2024, 1, 8),
                 timeframes=[16385, 16408],
             )
 
@@ -807,10 +845,12 @@ class TestDownloadAllMultipleTimeframes:
 # 19 & 20. Chunking integration
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestChunkingIntegration:
 
     def test_weekly_range_produces_one_chunk(self, downloader):
         call_count = {"n": 0}
+
         def count_calls(*args, **kwargs):
             call_count["n"] += 1
             return [make_raw_tick()]
@@ -818,12 +858,13 @@ class TestChunkingIntegration:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = count_calls
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert call_count["n"] == 1
 
     def test_four_week_range_produces_four_chunks(self, downloader):
         call_count = {"n": 0}
+
         def count_calls(*args, **kwargs):
             call_count["n"] += 1
             return [make_raw_tick()]
@@ -831,13 +872,14 @@ class TestChunkingIntegration:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = count_calls
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,29))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 29))
 
         assert call_count["n"] == 4
 
     def test_partial_last_chunk_uses_correct_end_date(self, downloader):
         """Last chunk must end at `end`, not at start + chunk_days."""
         chunk_ends = []
+
         def capture_calls(symbol, chunk_start, chunk_end, flags):
             chunk_ends.append(chunk_end)
             return [make_raw_tick()]
@@ -846,8 +888,8 @@ class TestChunkingIntegration:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.side_effect = capture_calls
             # 10 days with 7-day chunks → chunk1=7 days, chunk2=3 days
-            end = dt(2024,1,11)
-            downloader.download_ticks("EURUSD", dt(2024,1,1), end)
+            end = dt(2024, 1, 11)
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), end)
 
         assert chunk_ends[-1] == end
 
@@ -856,17 +898,17 @@ class TestChunkingIntegration:
 # 21 & 22. Catalog write behaviour
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestCatalogWriteBehaviour:
 
     def test_write_data_called_once_per_non_empty_chunk(self, conn, provider, catalog):
         """Two non-empty chunks → write_data called twice."""
-        downloader = MT5DataDownloader(conn, provider, catalog,
-                                       chunk_days_ticks=7)
+        downloader = MT5DataDownloader(conn, provider, catalog, chunk_days_ticks=7)
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = [make_raw_tick()]
             # 14-day range → 2 chunks
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,15))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 15))
 
         assert catalog.write_data.call_count == 2
 
@@ -875,18 +917,17 @@ class TestCatalogWriteBehaviour:
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = None
-            downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,8))
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         catalog.write_data.assert_not_called()
 
     def test_accumulated_total_across_chunks(self, conn, provider, catalog):
         """100 ticks per chunk × 2 chunks = 200 total written."""
         raw = [make_raw_tick(time_s=1_700_000_000 + i) for i in range(100)]
-        downloader = MT5DataDownloader(conn, provider, catalog,
-                                       chunk_days_ticks=7)
+        downloader = MT5DataDownloader(conn, provider, catalog, chunk_days_ticks=7)
         with patch("mt5connect.downloader.mt5") as mock_mt5:
             mock_mt5.COPY_TICKS_ALL = -1
             mock_mt5.copy_ticks_range.return_value = raw
-            result = downloader.download_ticks("EURUSD", dt(2024,1,1), dt(2024,1,15))
+            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 15))
 
         assert result.total_written == 200

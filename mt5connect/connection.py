@@ -24,21 +24,24 @@ logger = logging.getLogger(__name__)
 # CONNECTION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class ConnectionState(Enum):
     """Tracks exactly where in the lifecycle the connection is."""
-    DISCONNECTED  = auto()   # nothing attempted yet
-    INITIALIZING  = auto()   # mt5.initialize() in progress
-    INITIALIZED   = auto()   # terminal IPC established, not logged in
-    LOGGING_IN    = auto()   # mt5.login() in progress
-    CONNECTED     = auto()   # fully ready to use
-    RECONNECTING  = auto()   # lost connection, retrying
-    SHUTTING_DOWN = auto()   # mt5.shutdown() called
-    FAILED        = auto()   # gave up after max attempts
+
+    DISCONNECTED = auto()  # nothing attempted yet
+    INITIALIZING = auto()  # mt5.initialize() in progress
+    INITIALIZED = auto()  # terminal IPC established, not logged in
+    LOGGING_IN = auto()  # mt5.login() in progress
+    CONNECTED = auto()  # fully ready to use
+    RECONNECTING = auto()  # lost connection, retrying
+    SHUTTING_DOWN = auto()  # mt5.shutdown() called
+    FAILED = auto()  # gave up after max attempts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ACCOUNT SNAPSHOT
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class AccountSnapshot:
@@ -47,6 +50,7 @@ class AccountSnapshot:
     Returned by MT5Connection.get_account_info().
     Avoids leaking the raw MT5 AccountInfo namedtuple outside this module.
     """
+
     login: int
     server: str
     balance: float
@@ -61,7 +65,7 @@ class AccountSnapshot:
     company: str
 
     @classmethod
-    def from_mt5(cls, info) -> "AccountSnapshot":
+    def from_mt5(cls, info) -> AccountSnapshot:
         """Build from the raw mt5.account_info() namedtuple."""
         return cls(
             login=info.login,
@@ -92,6 +96,7 @@ class AccountSnapshot:
 # MT5 CONNECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class MT5Connection:
     """
     Owns the entire MT5 terminal connection lifecycle.
@@ -114,7 +119,7 @@ class MT5Connection:
     use inside asyncio polling loops.
     """
 
-    def __init__(self, config: "MT5Config") -> None:
+    def __init__(self, config: MT5Config) -> None:
         self._config = config
         self._state = ConnectionState.DISCONNECTED
         self._attempt = 0
@@ -200,7 +205,7 @@ class MT5Connection:
             delay = min(delay * 2.0, self._config.reconnect_max_delay_s)
 
             try:
-                mt5.shutdown()          # clean slate before retry
+                mt5.shutdown()  # clean slate before retry
                 self._initialize()
                 self._login()
                 logger.info(f"MT5 reconnected on attempt {self._attempt}")
@@ -262,9 +267,7 @@ class MT5Connection:
         info = mt5.account_info()
         if info is None:
             code, msg = mt5.last_error()
-            raise MT5ConnectionError(
-                f"mt5.account_info() returned None — error {code}: {msg}"
-            )
+            raise MT5ConnectionError(f"mt5.account_info() returned None — error {code}: {msg}")
         return AccountSnapshot.from_mt5(info)
 
     def get_terminal_info(self) -> dict:
@@ -277,11 +280,11 @@ class MT5Connection:
         if info is None:
             return {}
         return {
-            "name":           info.name,
-            "path":           info.path,
-            "data_path":      info.data_path,
-            "connected":      info.connected,
-            "ping_last":      info.ping_last,
+            "name": info.name,
+            "path": info.path,
+            "data_path": info.data_path,
+            "connected": info.connected,
+            "ping_last": info.ping_last,
             "retransmission": info.retransmission,
         }
 
@@ -354,7 +357,7 @@ class MT5Connection:
 
     # ── Context manager ───────────────────────────────────────────────────────
 
-    def __enter__(self) -> "MT5Connection":
+    def __enter__(self) -> MT5Connection:
         self.connect()
         return self
 

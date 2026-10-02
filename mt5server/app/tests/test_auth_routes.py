@@ -1,7 +1,8 @@
 import sys
 
-from conftest import Fake
 from routes.auth import auth_bp
+
+from conftest import Fake
 
 
 def test_login_ok(client_factory, monkeypatch):

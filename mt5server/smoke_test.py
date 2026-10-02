@@ -6,6 +6,7 @@ Run from the host venv after the container is up (``make run``):
 Reads ../.env for MT5_ACCOUNT, MT5_PASSWORD, MT5_SERVER, MT5_SYMBOLS,
 MT5_SERVER_URL (default http://localhost:5000). Non-zero exit on any FAIL.
 """
+
 import asyncio
 import json
 import os
@@ -13,10 +14,10 @@ import sys
 import time
 import urllib.request
 
+from dotenv import load_dotenv
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
-
-from dotenv import load_dotenv
 
 load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
@@ -147,7 +148,11 @@ def main() -> None:
             _report(
                 f"ws tick {symbol}",
                 symbol in received,
-                "no tick yet - market may be closed; re-run after more ticks" if symbol not in received else "",
+                (
+                    "no tick yet - market may be closed; re-run after more ticks"
+                    if symbol not in received
+                    else ""
+                ),
             )
         _report("ws parse", not parse_errors, "; ".join(parse_errors))
         conn.disconnect()

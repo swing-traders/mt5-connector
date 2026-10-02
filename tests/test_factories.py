@@ -7,21 +7,21 @@ build_mt5_node_config.
 """
 
 import asyncio
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, patch, call
 
 from mt5connect.config import MT5Config
+from mt5connect.data import MT5DataClient
+from mt5connect.execution import MT5LiveExecutionClient
 from mt5connect.factories import (
     MT5LiveDataClientFactory,
     MT5LiveExecClientFactory,
-    _get_or_create_connection,
     _connection_registry,
-    clear_connection_registry,
+    _get_or_create_connection,
     build_mt5_node_config,
+    clear_connection_registry,
 )
-from mt5connect.data import MT5DataClient
-from mt5connect.execution import MT5LiveExecutionClient
-from mt5connect.constants import MT5_VENUE
 
 
 def make_config(account=12345678, server="Exness-MT5Trial1", symbols=None):
@@ -34,8 +34,9 @@ def make_config(account=12345678, server="Exness-MT5Trial1", symbols=None):
 
 
 def make_nt_components():
-    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
     from nautilus_trader.common.component import LiveClock
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
     return TestComponentStubs.msgbus(), TestComponentStubs.cache(), LiveClock()
 
 
@@ -54,6 +55,7 @@ def make_live_exec_config(mt5_config):
 @pytest.fixture(autouse=True)
 def clean_registry():
     from mt5connect.factories import _mt5_config_registry
+
     clear_connection_registry()
     _mt5_config_registry.clear()
     yield
@@ -65,7 +67,7 @@ def clean_registry():
 def mock_mt5_conn():
     with patch("mt5connect.factories.MT5Connection") as MockConn:
         instance = MagicMock()
-        instance.connect    = MagicMock()
+        instance.connect = MagicMock()
         instance.disconnect = MagicMock()
         instance.is_connected = True
         instance.ensure_connected = MagicMock()
@@ -75,8 +77,9 @@ def mock_mt5_conn():
 
 @pytest.fixture
 def mock_provider():
-    from mt5connect.providers import MT5InstrumentProvider as RealProvider
     from nautilus_trader.common.providers import InstrumentProvider
+
+    from mt5connect.providers import MT5InstrumentProvider as RealProvider
 
     real_instance = RealProvider.__new__(RealProvider)
     InstrumentProvider.__init__(real_instance)
@@ -93,20 +96,20 @@ class TestGetOrCreateConnection:
     def test_creates_connection_on_first_call(self, mock_mt5_conn, mock_provider):
         MockConn, _ = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         MockConn.assert_called_once_with(config)
 
     def test_calls_connect_on_first_call(self, mock_mt5_conn, mock_provider):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         conn_inst.connect.assert_called_once()
 
     def test_reuses_connection_on_second_call(self, mock_mt5_conn, mock_provider):
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         conn1, prov1 = _get_or_create_connection(config, loop)
         conn2, prov2 = _get_or_create_connection(config, loop)
         assert conn1 is conn2
@@ -115,7 +118,7 @@ class TestGetOrCreateConnection:
     def test_connect_called_only_once_for_same_config(self, mock_mt5_conn, mock_provider):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         _get_or_create_connection(config, loop)
         conn_inst.connect.assert_called_once()
@@ -124,9 +127,9 @@ class TestGetOrCreateConnection:
         _, conn_inst = mock_mt5_conn
         _, prov_inst = mock_provider
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         conn, provider = _get_or_create_connection(config, loop)
-        assert conn     is conn_inst
+        assert conn is conn_inst
         assert provider is prov_inst
 
 
@@ -163,7 +166,7 @@ class TestConnectionRegistryIsolation:
 class TestClearConnectionRegistry:
     def test_clears_all_entries(self, mock_mt5_conn, mock_provider):
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         assert len(_connection_registry) == 1
         clear_connection_registry()
@@ -172,7 +175,7 @@ class TestClearConnectionRegistry:
     def test_calls_disconnect_on_each_connection(self, mock_mt5_conn, mock_provider):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         clear_connection_registry()
         conn_inst.disconnect.assert_called_once()
@@ -185,7 +188,7 @@ class TestClearConnectionRegistry:
         _, conn_inst = mock_mt5_conn
         conn_inst.disconnect.side_effect = RuntimeError("oops")
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         clear_connection_registry()
         assert len(_connection_registry) == 0
@@ -193,7 +196,7 @@ class TestClearConnectionRegistry:
     def test_new_connection_created_after_clear(self, mock_mt5_conn, mock_provider):
         MockConn, _ = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         _get_or_create_connection(config, loop)
         clear_connection_registry()
         _get_or_create_connection(config, loop)
@@ -203,64 +206,82 @@ class TestClearConnectionRegistry:
 class TestDataClientFactory:
     def test_create_returns_mt5_data_client(self, mock_mt5_conn, mock_provider):
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus, cache, clock)
+        client = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
         assert isinstance(client, MT5DataClient)
 
     def test_create_reads_mt5_config_from_custom(self, mock_mt5_conn, mock_provider):
         config = make_config(account=99998888)
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus, cache, clock)
+        client = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
         assert client._config.account == 99998888
 
     def test_create_uses_registry_connection(self, mock_mt5_conn, mock_provider):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus, cache, clock)
+        client = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
         assert client._conn is conn_inst
 
     def test_create_twice_uses_same_connection(self, mock_mt5_conn, mock_provider):
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        c1 = MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus, cache, clock)
+        c1 = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
         msgbus2, cache2, clock2 = make_nt_components()
-        c2 = MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus2, cache2, clock2)
+        c2 = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus2, cache2, clock2
+        )
         assert c1._conn is c2._conn
 
 
 class TestExecClientFactory:
     def test_create_returns_mt5_exec_client(self, mock_mt5_conn, mock_provider):
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveExecClientFactory.create(loop, "MT5", make_live_exec_config(config), msgbus, cache, clock)
+        client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus, cache, clock
+        )
         assert isinstance(client, MT5LiveExecutionClient)
 
     def test_create_reads_mt5_config_from_custom(self, mock_mt5_conn, mock_provider):
         config = make_config(account=77776666)
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveExecClientFactory.create(loop, "MT5", make_live_exec_config(config), msgbus, cache, clock)
+        client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus, cache, clock
+        )
         assert client._config.account == 77776666
 
     def test_create_uses_registry_connection(self, mock_mt5_conn, mock_provider):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveExecClientFactory.create(loop, "MT5", make_live_exec_config(config), msgbus, cache, clock)
+        client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus, cache, clock
+        )
         assert client._conn is conn_inst
 
     def test_account_id_derived_from_config(self, mock_mt5_conn, mock_provider):
         config = make_config(account=55554444)
-        loop   = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         msgbus, cache, clock = make_nt_components()
-        client = MT5LiveExecClientFactory.create(loop, "MT5", make_live_exec_config(config), msgbus, cache, clock)
+        client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus, cache, clock
+        )
         # NT 1.224: account_id lives on the parent C-level property, not _account_id
         assert client.account_id.value == "MT5-55554444"
 
@@ -269,21 +290,29 @@ class TestFactoriesShareConnection:
     def test_data_and_exec_factories_share_connection(self, mock_mt5_conn, mock_provider):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
-        msgbus, cache, clock   = make_nt_components()
+        loop = asyncio.new_event_loop()
+        msgbus, cache, clock = make_nt_components()
         msgbus2, cache2, clock2 = make_nt_components()
-        data_client = MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus, cache, clock)
-        exec_client = MT5LiveExecClientFactory.create(loop, "MT5", make_live_exec_config(config), msgbus2, cache2, clock2)
+        data_client = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
+        exec_client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus2, cache2, clock2
+        )
         assert data_client._conn is exec_client._conn
 
     def test_connection_created_only_once_for_both_factories(self, mock_mt5_conn, mock_provider):
         MockConn, _ = mock_mt5_conn
         config = make_config()
-        loop   = asyncio.new_event_loop()
-        msgbus, cache, clock   = make_nt_components()
+        loop = asyncio.new_event_loop()
+        msgbus, cache, clock = make_nt_components()
         msgbus2, cache2, clock2 = make_nt_components()
-        MT5LiveDataClientFactory.create(loop, "MT5", make_live_data_config(config), msgbus, cache, clock)
-        MT5LiveExecClientFactory.create(loop, "MT5", make_live_exec_config(config), msgbus2, cache2, clock2)
+        MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
+        MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus2, cache2, clock2
+        )
         assert MockConn.call_count == 1
 
 
@@ -291,53 +320,63 @@ class TestBuildMt5NodeConfig:
 
     def test_returns_trading_node_config(self):
         from nautilus_trader.config import TradingNodeConfig
+
         result = build_mt5_node_config(make_config(symbols=["EURUSD", "XAUUSD"]))
         assert isinstance(result, TradingNodeConfig)
 
     def test_registry_keyed_by_venue_string(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config())
         assert "MT5" in _mt5_config_registry
 
     def test_data_factory_stored_in_registry(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config())
         assert _mt5_config_registry["MT5"]["data_factory"] is MT5LiveDataClientFactory
 
     def test_exec_factory_stored_in_registry(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config())
         assert _mt5_config_registry["MT5"]["exec_factory"] is MT5LiveExecClientFactory
 
     def test_mt5_config_stored_in_registry(self):
         from mt5connect.factories import _mt5_config_registry
+
         config = make_config()
         build_mt5_node_config(config)
         assert _mt5_config_registry["MT5"]["mt5_config"] is config
 
     def test_account_id_stored_in_registry(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config(account=12345678))
         assert _mt5_config_registry["MT5"]["account_id"] == "MT5-12345678"
 
     def test_load_ids_stored_in_registry(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config(symbols=["EURUSD", "XAUUSD"]))
         assert "EURUSD.MT5" in _mt5_config_registry["MT5"]["load_ids"]
         assert "XAUUSD.MT5" in _mt5_config_registry["MT5"]["load_ids"]
 
     def test_load_ids_count_matches_symbols(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config(symbols=["EURUSD", "XAUUSD", "BTCUSD"]))
         assert len(_mt5_config_registry["MT5"]["load_ids"]) == 3
 
     def test_single_symbol_load_ids(self):
         from mt5connect.factories import _mt5_config_registry
+
         build_mt5_node_config(make_config(symbols=["EURUSD"]))
         assert _mt5_config_registry["MT5"]["load_ids"] == ["EURUSD.MT5"]
 
     def test_optional_risk_engine_config_is_wired(self):
         from nautilus_trader.config import LiveRiskEngineConfig
+
         risk_config = LiveRiskEngineConfig()
         result = build_mt5_node_config(make_config(), risk_engine_config=risk_config)
         assert result.risk_engine is risk_config
@@ -372,6 +411,7 @@ class TestBuildMt5NodeConfig:
 
     def test_registry_updated_on_repeated_call(self):
         from mt5connect.factories import _mt5_config_registry
+
         config1 = make_config(account=11111111)
         config2 = make_config(account=22222222)
         build_mt5_node_config(config1)

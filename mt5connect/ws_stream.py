@@ -1,10 +1,11 @@
 """WebSocket tick-stream client for the remote MT5 backend."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Callable
+from collections.abc import Callable
 
 import websockets
 
@@ -18,8 +19,13 @@ class WSStreamClient:
     incoming tick messages to ``message_handler``. Auto-reconnects with
     exponential backoff and flushes pending messages on (re)connect."""
 
-    def __init__(self, url: str, message_handler: MessageHandler,
-                 initial_delay_s: float = 1.0, max_delay_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        message_handler: MessageHandler,
+        initial_delay_s: float = 1.0,
+        max_delay_s: float = 60.0,
+    ) -> None:
         self._url = url
         self._handler = message_handler
         self._initial_delay_s = initial_delay_s
@@ -30,8 +36,7 @@ class WSStreamClient:
         self._stop = False
 
     async def start(self) -> None:
-        self._task = asyncio.get_event_loop().create_task(
-            self._run(), name="WSStreamClient._run")
+        self._task = asyncio.get_event_loop().create_task(self._run(), name="WSStreamClient._run")
 
     async def stop(self) -> None:
         self._stop = True
@@ -48,8 +53,7 @@ class WSStreamClient:
         """Queue a state message; sent immediately if connected, else
         flushed on the next (re)connect. Replaces a pending message of the
         same ``type``."""
-        self._pending = [p for p in self._pending
-                         if p.get("type") != payload.get("type")]
+        self._pending = [p for p in self._pending if p.get("type") != payload.get("type")]
         self._pending.append(payload)
         if self._ws is not None:
             await self._flush(self._ws)

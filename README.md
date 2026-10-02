@@ -1,13 +1,14 @@
 # mt5-connector
 
+This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5-connector). It is maintained independently and does not track upstream.
+
 **Unofficial community MetaTrader 5 adapter for NautilusTrader** — live trading and backtesting on any MT5 broker (Exness, IC Markets, Pepperstone, and more).
 
 > ⚠️ **Disclaimer:** This is an independent community project. It is **not** affiliated with, endorsed by, or supported by [Nautech Systems Pty Ltd](https://nautilustrader.io) or the official [NautilusTrader](https://nautilustrader.io) project.
 
-[![PyPI version](https://badge.fury.io/py/mt5-connector.svg)](https://badge.fury.io/py/mt5-connector)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](https://www.microsoft.com/windows)
+[![Platform: Linux | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#requirements)
 [![Unofficial](https://img.shields.io/badge/NautilusTrader-unofficial%20community%20adapter-orange.svg)](https://nautilustrader.io)
 
 ---
@@ -32,7 +33,7 @@ MT5 Terminal (Windows) ←→ mt5-connector ←→ NautilusTrader
 - Automatic reconnection with exponential backoff
 - Works with any MT5 broker — Exness, IC Markets, Pepperstone, OANDA, and more
 
-> **Platform note:** The MetaTrader5 Python library is Windows-only. This adapter runs on Windows. Backtesting with downloaded data works on any platform once the data has been collected.
+> **Platform note:** The MetaTrader5 Python library is Windows-only, so the local backend runs on Windows. The remote backend runs on Linux against the dockerized server. Backtesting with downloaded data works on any platform once the data has been collected.
 
 ---
 
@@ -54,7 +55,7 @@ MT5 Terminal (Windows) ←→ mt5-connector ←→ NautilusTrader
     - [Bar types for live trading](#bar-types-for-live-trading)
   - [Dockerized server backend](#dockerized-server-backend)
     - [What it is](#what-it-is)
-    - [Improtant Security Notice](#improtant-security-notice)
+    - [Important Security Notice](#important-security-notice)
     - [Requirements](#requirements-1)
       - [Quick start](#quick-start-1)
     - [Persistence](#persistence)
@@ -63,16 +64,15 @@ MT5 Terminal (Windows) ←→ mt5-connector ←→ NautilusTrader
   - [Broker compatibility](#broker-compatibility)
   - [Troubleshooting](#troubleshooting)
   - [Safety notes](#safety-notes)
-  - [Changelog](#changelog)
-    - [0.1.0 (2026-06-12)](#010-2026-06-12)
   - [License](#license)
 
 ---
 
 ## Requirements
 
-- Windows 10 or 11 (required by MetaTrader 5)
-- Python 3.10, 3.11, or 3.12
+- Python 3.11+
+- The local backend: Windows 10 or 11 (required by the `MetaTrader5` package)
+- The remote backend: Linux with Docker, running the server under `mt5server/` (see [Dockerized server backend](#dockerized-server-backend))
 - MetaTrader 5 terminal installed and open, logged in to your broker account
 - An MT5 broker account (demo accounts work perfectly for development)
 
@@ -80,16 +80,21 @@ MT5 Terminal (Windows) ←→ mt5-connector ←→ NautilusTrader
 
 ## Installation
 
+Releases are published as wheels on the fork's package index:
+
 ```bash
-pip install mt5-connector
+pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector==0.4.0+st.1"
 ```
 
-Or install from source for development:
+For development, create the environment with mamba and layer the dev tooling on top:
 
 ```bash
-git clone https://github.com/aulekator/mt5-connect
+git clone https://github.com/swing-traders/mt5-connector
 cd mt5-connector
-pip install -e ".[dev]"
+mamba env create -f environment.yml
+mamba env update -f environment.dev.yml
+just lint
+just test
 ```
 
 ---
@@ -559,7 +564,7 @@ machine — including Linux — by selecting `backend="remote"`.
   `mt5connect/ws_stream.py`) into the adapter, replacing the local
   `MetaTrader5` package — no Windows-only dependency needed.
 
-### Improtant Security Notice
+### Important Security Notice
 
 There is no authentication in the dockerized backend. It is intended to be used on the
 same machine only for now. Never expose ports to an insecure network. 
@@ -668,7 +673,7 @@ line, or change the `docker-compose.yaml` file accordingly.
 ## Running the full test suite
 
 ```bash
-pytest tests/ -v
+just test
 ```
 
 All tests mock the MT5 terminal — no live connection required to run tests.
@@ -749,7 +754,7 @@ You are using an old version of `factories.py` where `MT5LiveExecClientFactory` 
 
 Check that the bar type string in your strategy config exactly matches the bar type you subscribed to in `on_start`. A mismatch means `on_bar` is never called. Also verify AutoTrading is enabled in the MT5 terminal.
 
-Note: `mt5-connector` only installs successfully on Windows. It cannot be installed on macOS or Linux.
+Note: the local backend needs the `MetaTrader5` package, which installs only on Windows. On Linux, use the remote backend.
 
 ---
 
@@ -760,25 +765,6 @@ Note: `mt5-connector` only installs successfully on Windows. It cannot be instal
 - Change `magic_number` if you run multiple bots simultaneously to avoid one bot managing the other's positions.
 - The adapter uses netting mode (one position per symbol) matching how MT5 accounts work by default. Hedging accounts are not currently supported.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
-
----
-
-## Changelog
-
-### 0.1.0 (2026-06-12)
-
-**Bug fix:** `MT5LiveExecutionClient` no longer replays historical deals from the current day's MT5 history as fills when the node starts up. Previously, restarting the node mid-session caused NautilusTrader to emit `WARN/ERROR` log entries like:
-
-```
-Order with ClientOrderId('MT5-xxxx') not found in the cache to apply OrderFilled(...)
-Cannot apply event to any order: ... not found in cache
-```
-
-because fills from prior sessions were re-emitted into an execution engine that had no record of those orders.
-
-**Root cause:** `_processed_deal_keys` was empty on startup, so the first execution poll replayed every deal since UTC midnight.
-
-**Fix:** `_connect()` now calls `_seed_processed_deals()` before starting the poll loop. This pre-populates `_processed_deal_keys` with all existing deals in the silence window (UTC midnight → now) without emitting them as fills. A secondary guard in `_emit_fill()` also silently skips any deal whose order is not registered with NT in the current session, rather than synthesising a fake `ClientOrderId` and pushing it through `generate_order_filled`.
 
 ---
 

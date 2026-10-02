@@ -8,8 +8,14 @@ from mt5connect.errors import MT5ConfigError
 
 
 def _remote_config():
-    return MT5Config(account=1, password="p", server="s", symbols=["EURUSD"],
-                     backend="remote", server_url="http://127.0.0.1:5000")
+    return MT5Config(
+        account=1,
+        password="p",
+        server="s",
+        symbols=["EURUSD"],
+        backend="remote",
+        server_url="http://127.0.0.1:5000",
+    )
 
 
 def _local_config():
@@ -31,16 +37,19 @@ def test_set_backend_remote_binds_remote_mt5():
         chosen = backend.set_backend(_remote_config())
         assert chosen is remote
         remote.configure.assert_called_once_with(
-            server_url="http://127.0.0.1:5000", ws_url="ws://127.0.0.1:9000")
+            server_url="http://127.0.0.1:5000", ws_url="ws://127.0.0.1:9000"
+        )
         from mt5connect import connection, data
+
         assert connection.mt5 is remote
         assert data.mt5 is remote
 
 
 def test_set_backend_remote_without_server_url_raises():
     with pytest.raises(MT5ConfigError):
-        backend.set_backend(MT5Config(account=1, password="p", server="s",
-                                      symbols=["EURUSD"], backend="remote"))
+        backend.set_backend(
+            MT5Config(account=1, password="p", server="s", symbols=["EURUSD"], backend="remote")
+        )
 
 
 def test_set_backend_local_without_mt5_raises():
@@ -51,7 +60,9 @@ def test_set_backend_local_without_mt5_raises():
 
 def test_set_backend_local_binds_real_module():
     import MetaTrader5 as real  # conftest pre-mocks this on non-Windows
+
     chosen = backend.set_backend(_local_config())
     assert chosen is real
     from mt5connect import connection
+
     assert connection.mt5 is real

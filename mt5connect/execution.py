@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 try:
@@ -54,6 +54,7 @@ except ImportError:  # pragma: no cover - Windows-only dependency
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     CancelAllOrders,
     CancelOrder,
@@ -66,6 +67,7 @@ from nautilus_trader.execution.reports import (
     PositionStatusReport,
 )
 from nautilus_trader.live.execution_client import LiveExecutionClient
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     AccountType,
     LiquiditySide,
@@ -74,8 +76,6 @@ from nautilus_trader.model.enums import (
     OrderStatus,
     OrderType,
     TimeInForce,
-    TrailingOffsetType,
-    TriggerType,
 )
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -87,11 +87,9 @@ from nautilus_trader.model.identifiers import (
     TradeId,
     VenueOrderId,
 )
-from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.objects import Money, Price, Quantity
-from nautilus_trader.model.currencies import USD
 
-from mt5connect.constants import MT5_MAGIC_NUMBER, MT5_VENUE
+from mt5connect.constants import MT5_VENUE
 from mt5connect.errors import MT5ConnectionError, MT5OrderError
 
 if TYPE_CHECKING:
@@ -122,6 +120,7 @@ logger = logging.getLogger(__name__)
 #   support FOK. RETURN is the last resort for brokers that only allow it.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _get_filling_mode(symbol: str) -> int:
     """Auto-detect the correct MT5 order filling mode for a symbol."""
     info = mt5.symbol_info(symbol)
@@ -130,7 +129,7 @@ def _get_filling_mode(symbol: str) -> int:
 
     bitmask = info.filling_mode
 
-    if bitmask & 2:    # IOC supported
+    if bitmask & 2:  # IOC supported
         return mt5.ORDER_FILLING_IOC
     elif bitmask & 1:  # FOK supported
         return mt5.ORDER_FILLING_FOK
@@ -144,6 +143,7 @@ def _get_filling_mode(symbol: str) -> int:
 # ORDER TYPE MAPPING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _nautilus_side_to_mt5_market(side: OrderSide) -> int:
     """Map NautilusTrader OrderSide to MT5 market order type."""
     if side == OrderSide.BUY:
@@ -154,11 +154,11 @@ def _nautilus_side_to_mt5_market(side: OrderSide) -> int:
 def _nautilus_order_to_mt5_pending(order_type: OrderType, side: OrderSide) -> int:
     """Map NautilusTrader OrderType + OrderSide to MT5 pending order type."""
     mapping = {
-        (OrderType.LIMIT, OrderSide.BUY):  mt5.ORDER_TYPE_BUY_LIMIT,
+        (OrderType.LIMIT, OrderSide.BUY): mt5.ORDER_TYPE_BUY_LIMIT,
         (OrderType.LIMIT, OrderSide.SELL): mt5.ORDER_TYPE_SELL_LIMIT,
-        (OrderType.STOP_MARKET, OrderSide.BUY):  mt5.ORDER_TYPE_BUY_STOP,
+        (OrderType.STOP_MARKET, OrderSide.BUY): mt5.ORDER_TYPE_BUY_STOP,
         (OrderType.STOP_MARKET, OrderSide.SELL): mt5.ORDER_TYPE_SELL_STOP,
-        (OrderType.STOP_LIMIT, OrderSide.BUY):  mt5.ORDER_TYPE_BUY_STOP_LIMIT,
+        (OrderType.STOP_LIMIT, OrderSide.BUY): mt5.ORDER_TYPE_BUY_STOP_LIMIT,
         (OrderType.STOP_LIMIT, OrderSide.SELL): mt5.ORDER_TYPE_SELL_STOP_LIMIT,
     }
     key = (order_type, side)
@@ -231,6 +231,7 @@ def _mt5_retcode_to_str(retcode: int) -> str:
 # EXECUTION CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class MT5LiveExecutionClient(LiveExecutionClient):
     """
     Live execution client for MT5. Submits orders and polls for fills.
@@ -261,12 +262,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        connection: "MT5Connection",
+        connection: MT5Connection,
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
-        instrument_provider: "MT5InstrumentProvider",
-        config: "MT5Config",
+        instrument_provider: MT5InstrumentProvider,
+        config: MT5Config,
         account_id: AccountId | None = None,
     ) -> None:
         if account_id is None:
@@ -278,7 +279,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             venue=MT5_VENUE,
             oms_type=OmsType.NETTING,
             account_type=AccountType.MARGIN,
-            base_currency=None,   # MT5 accounts are multi-currency
+            base_currency=None,  # MT5 accounts are multi-currency
             msgbus=msgbus,
             cache=cache,
             clock=clock,
@@ -286,8 +287,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         )
         # Register with parent via _set_account_id so the C-level property is set.
         self._set_account_id(account_id)
-        self._conn     = connection
-        self._config   = config
+        self._conn = connection
+        self._config = config
         self._provider = instrument_provider
 
         # asyncio polling task — created in _connect, cancelled in _disconnect
@@ -375,16 +376,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         On success: emits OrderAccepted (pending/stop) or OrderFilled (market).
         On failure: emits OrderRejected.
         """
-        order  = command.order
+        order = command.order
         symbol = order.instrument_id.symbol.value
 
         self._conn.ensure_connected()
 
         instrument = self._provider.get_instrument(symbol)
         if instrument is None:
-            self._generate_order_rejected(
-                order, f"Instrument not found for symbol '{symbol}'"
-            )
+            self._generate_order_rejected(order, f"Instrument not found for symbol '{symbol}'")
             return
 
         # ── Build the MT5 trade request ───────────────────────────────────
@@ -396,7 +395,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             return
 
         price = float(order.price) if hasattr(order, "price") and order.price else 0.0
-        sl    = float(order.trigger_price) if hasattr(order, "trigger_price") and order.trigger_price else 0.0
 
         # For stop-limit: price = limit price, stoplimit_price = stop trigger
         stoplimit_price = 0.0
@@ -407,10 +405,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # Market order: use current ask/bid
         if order.order_type == OrderType.MARKET:
             price = tick.ask if order.side == OrderSide.BUY else tick.bid
-            action    = mt5.TRADE_ACTION_DEAL
+            action = mt5.TRADE_ACTION_DEAL
             mt5_order_type = _nautilus_side_to_mt5_market(order.side)
         else:
-            action    = mt5.TRADE_ACTION_PENDING
+            action = mt5.TRADE_ACTION_PENDING
             mt5_order_type = _nautilus_order_to_mt5_pending(order.order_type, order.side)
 
         # Auto-detect the correct filling mode for this symbol/account type
@@ -418,18 +416,18 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         # Build request dict
         request = {
-            "action":       action,
-            "symbol":       symbol,
-            "volume":       float(order.quantity),
-            "type":         mt5_order_type,
-            "price":        price,
-            "sl":           0.0,      # set below if order has sl
-            "tp":           0.0,      # set below if order has tp
-            "deviation":    20,       # max price deviation (points) for market orders
-            "magic":        self._config.magic_number,
-            "comment":      str(order.client_order_id),
+            "action": action,
+            "symbol": symbol,
+            "volume": float(order.quantity),
+            "type": mt5_order_type,
+            "price": price,
+            "sl": 0.0,  # set below if order has sl
+            "tp": 0.0,  # set below if order has tp
+            "deviation": 20,  # max price deviation (points) for market orders
+            "magic": self._config.magic_number,
+            "comment": str(order.client_order_id),
             "type_filling": filling_mode,
-            "type_time":    _time_in_force_to_mt5(order.time_in_force),
+            "type_time": _time_in_force_to_mt5(order.time_in_force),
         }
 
         if stoplimit_price:
@@ -452,12 +450,15 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             )
             return
 
-        if result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED,
-                                   mt5.TRADE_RETCODE_DONE_PARTIAL, 10008):
+        if result.retcode not in (
+            mt5.TRADE_RETCODE_DONE,
+            mt5.TRADE_RETCODE_PLACED,
+            mt5.TRADE_RETCODE_DONE_PARTIAL,
+            10008,
+        ):
             reason = _mt5_retcode_to_str(result.retcode)
             self._generate_order_rejected(
-                order,
-                f"MT5 rejected order: {reason} (retcode={result.retcode})"
+                order, f"MT5 rejected order: {reason} (retcode={result.retcode})"
             )
             return
 
@@ -513,7 +514,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             # It's a pending order — remove it
             request = {
                 "action": mt5.TRADE_ACTION_REMOVE,
-                "order":  ticket,
+                "order": ticket,
                 "comment": f"cancel:{client_order_id_str}",
             }
             result = mt5.order_send(request)
@@ -533,32 +534,30 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             pos = positions[0]
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
-                self._log.error(
-                    f"MT5LiveExecutionClient: cannot close position {ticket} — no tick"
-                )
+                self._log.error(f"MT5LiveExecutionClient: cannot close position {ticket} — no tick")
                 return
 
             # Opposite side to close
             if pos.type == mt5.ORDER_TYPE_BUY:
-                close_type  = mt5.ORDER_TYPE_SELL
+                close_type = mt5.ORDER_TYPE_SELL
                 close_price = tick.bid
             else:
-                close_type  = mt5.ORDER_TYPE_BUY
+                close_type = mt5.ORDER_TYPE_BUY
                 close_price = tick.ask
 
             # Auto-detect the correct filling mode for this symbol/account type
             filling_mode = _get_filling_mode(symbol)
 
             request = {
-                "action":       mt5.TRADE_ACTION_DEAL,
-                "symbol":       symbol,
-                "volume":       pos.volume,
-                "type":         close_type,
-                "position":     ticket,
-                "price":        close_price,
-                "deviation":    20,
-                "magic":        self._config.magic_number,
-                "comment":      f"close:{client_order_id_str}",
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": pos.volume,
+                "type": close_type,
+                "position": ticket,
+                "price": close_price,
+                "deviation": 20,
+                "magic": self._config.magic_number,
+                "comment": f"close:{client_order_id_str}",
                 "type_filling": filling_mode,
             }
             result = mt5.order_send(request)
@@ -569,14 +568,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     f"retcode={code}: {_mt5_retcode_to_str(code)}"
                 )
             else:
-                self._log.info(
-                    f"MT5LiveExecutionClient: position {ticket} closed"
-                )
+                self._log.info(f"MT5LiveExecutionClient: position {ticket} closed")
             return
 
-        self._log.warning(
-            f"MT5LiveExecutionClient: ticket {ticket} not found as order or position"
-        )
+        self._log.warning(f"MT5LiveExecutionClient: ticket {ticket} not found as order or position")
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         """
@@ -595,14 +590,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 continue  # not ours
             request = {
                 "action": mt5.TRADE_ACTION_REMOVE,
-                "order":  order.ticket,
+                "order": order.ticket,
                 "comment": "cancel_all",
             }
             result = mt5.order_send(request)
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                self._log.info(
-                    f"MT5LiveExecutionClient: cancelled order ticket={order.ticket}"
-                )
+                self._log.info(f"MT5LiveExecutionClient: cancelled order ticket={order.ticket}")
             else:
                 code = result.retcode if result else -1
                 self._log.warning(
@@ -633,8 +626,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             return
 
         new_price = float(command.price) if command.price else 0.0
-        new_sl    = float(command.trigger_price) if command.trigger_price else 0.0
-        new_tp    = 0.0  # NautilusTrader doesn't pass tp in ModifyOrder currently
+        new_sl = float(command.trigger_price) if command.trigger_price else 0.0
+        new_tp = 0.0  # NautilusTrader doesn't pass tp in ModifyOrder currently
 
         # Check pending order vs open position
         orders = mt5.orders_get(ticket=ticket)
@@ -642,27 +635,25 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             order = orders[0]
             request = {
                 "action": mt5.TRADE_ACTION_MODIFY,
-                "order":  ticket,
-                "price":  new_price or order.price_open,
-                "sl":     new_sl,
-                "tp":     new_tp or order.tp,
+                "order": ticket,
+                "price": new_price or order.price_open,
+                "sl": new_sl,
+                "tp": new_tp or order.tp,
                 "type_time": order.type_time,
                 "expiration": order.time_expiration,
             }
         else:
             positions = mt5.positions_get(ticket=ticket)
             if not positions:
-                self._log.warning(
-                    f"MT5LiveExecutionClient: modify target {ticket} not found"
-                )
+                self._log.warning(f"MT5LiveExecutionClient: modify target {ticket} not found")
                 return
             pos = positions[0]
             request = {
-                "action":   mt5.TRADE_ACTION_SLTP,
-                "symbol":   pos.symbol,
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": pos.symbol,
                 "position": ticket,
-                "sl":       new_sl or pos.sl,
-                "tp":       new_tp or pos.tp,
+                "sl": new_sl or pos.sl,
+                "tp": new_tp or pos.tp,
             }
 
         result = mt5.order_send(request)
@@ -764,16 +755,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 self._log.warning(f"MT5LiveExecutionClient: connection lost — {exc}")
                 ok = await self._conn.reconnect_async()
                 if not ok:
-                    self._log.error(
-                        "MT5LiveExecutionClient: reconnect failed — stopping exec loop"
-                    )
+                    self._log.error("MT5LiveExecutionClient: reconnect failed — stopping exec loop")
                     break
                 self._log.info("MT5LiveExecutionClient: reconnected")
 
             except Exception as exc:
-                self._log.error(
-                    f"MT5LiveExecutionClient: unexpected exec poll error — {exc}"
-                )
+                self._log.error(f"MT5LiveExecutionClient: unexpected exec poll error — {exc}")
                 await asyncio.sleep(1.0)
 
         self._log.info("MT5LiveExecutionClient: exec poll loop stopped")
@@ -791,10 +778,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # ── 1. Pending orders ─────────────────────────────────────────────
 
         current_orders = mt5.orders_get() or ()
-        current_tickets = {
-            o.ticket for o in current_orders
-            if o.magic == self._config.magic_number
-        }
+        current_tickets = {o.ticket for o in current_orders if o.magic == self._config.magic_number}
 
         # Detect orders that disappeared (filled or cancelled)
         disappeared = self._known_order_tickets - current_tickets
@@ -810,8 +794,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # Look back from today (UTC midnight) to catch all deals this session.
         # We track _processed_deal_keys (set of (time, ticket) tuples) so each
         # deal is emitted into NT exactly once regardless of poll frequency.
-        now     = datetime.now(timezone.utc)
-        from_dt = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        now = datetime.now(UTC)
+        from_dt = datetime(now.year, now.month, now.day, tzinfo=UTC)
 
         deals = mt5.history_deals_get(from_dt, now)
         if deals:
@@ -838,23 +822,18 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         current_positions = mt5.positions_get() or ()
         current_pos_tickets = {
-            p.ticket for p in current_positions
-            if p.magic == self._config.magic_number
+            p.ticket for p in current_positions if p.magic == self._config.magic_number
         }
 
         # New positions since last poll
         new_positions = current_pos_tickets - self._known_position_tickets
         for ticket in new_positions:
-            self._log.debug(
-                f"MT5LiveExecutionClient: new position ticket={ticket}"
-            )
+            self._log.debug(f"MT5LiveExecutionClient: new position ticket={ticket}")
 
         # Closed positions since last poll
         closed_positions = self._known_position_tickets - current_pos_tickets
         for ticket in closed_positions:
-            self._log.debug(
-                f"MT5LiveExecutionClient: position {ticket} closed"
-            )
+            self._log.debug(f"MT5LiveExecutionClient: position {ticket} closed")
 
         self._known_position_tickets = current_pos_tickets
 
@@ -886,7 +865,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if deal.volume <= 0:
             return
 
-        symbol     = deal.symbol
+        symbol = deal.symbol
         instrument = self._provider.get_instrument(symbol)
         if instrument is None:
             self._log.warning(
@@ -918,26 +897,22 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 return
 
         venue_order_id = VenueOrderId(str(deal.order))
-        trade_id       = TradeId(str(deal.ticket))
+        trade_id = TradeId(str(deal.ticket))
 
-        order_side = (
-            OrderSide.BUY
-            if deal.type == mt5.DEAL_TYPE_BUY
-            else OrderSide.SELL
-        )
+        order_side = OrderSide.BUY if deal.type == mt5.DEAL_TYPE_BUY else OrderSide.SELL
 
         # ================================================================
         # FIXED: Get account currency safely for commission
         # ================================================================
         try:
             # Try to get currency from deal first
-            deal_currency = getattr(deal, 'currency', None)
+            deal_currency = getattr(deal, "currency", None)
             if deal_currency:
                 currency = _parse_account_currency(deal_currency)
             else:
                 # Fallback: get account info
                 account_info = mt5.account_info()
-                if account_info and hasattr(account_info, 'currency'):
+                if account_info and hasattr(account_info, "currency"):
                     currency = _parse_account_currency(account_info.currency)
                 else:
                     currency = USD
@@ -946,7 +921,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         commission = Money(abs(deal.commission or 0.0), currency)
 
-        ts_event = int(deal.time) * 1_000_000_000   # seconds → nanoseconds
+        ts_event = int(deal.time) * 1_000_000_000  # seconds → nanoseconds
 
         # Recover strategy_id from cache if order is known, else use EXTERNAL
         strategy_id = StrategyId("EXTERNAL-001")
@@ -960,7 +935,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 InstrumentId(Symbol(symbol), MT5_VENUE),
                 client_order_id,
                 venue_order_id,
-                None,                        # venue_position_id
+                None,  # venue_position_id
                 trade_id,
                 order_side,
                 OrderType.MARKET,
@@ -998,9 +973,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         except Exception:
             currency = USD
 
-        balances = [
-            _make_account_balance(snapshot.balance, snapshot.equity, currency)
-        ]
+        balances = [_make_account_balance(snapshot.balance, snapshot.equity, currency)]
 
         self.generate_account_state(
             balances=balances,
@@ -1040,7 +1013,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if orders:
             order = orders[0]
             return _build_order_status_report(
-                order, instrument_id, client_order_id, venue_order_id,
+                order,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
                 self._clock.timestamp_ns(),
             )
 
@@ -1067,10 +1043,13 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 continue
             client_order_id_str = self._ticket_to_client_order_id.get(order.ticket)
             client_order_id = ClientOrderId(client_order_id_str) if client_order_id_str else None
-            venue_order_id  = VenueOrderId(str(order.ticket))
+            venue_order_id = VenueOrderId(str(order.ticket))
             iid = instrument_id or InstrumentId(Symbol(order.symbol), MT5_VENUE)
             report = _build_order_status_report(
-                order, iid, client_order_id, venue_order_id,
+                order,
+                iid,
+                client_order_id,
+                venue_order_id,
                 self._clock.timestamp_ns(),
             )
             reports.append(report)
@@ -1085,16 +1064,17 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._conn.ensure_connected()
 
         # Extract fields from the command object
-        instrument_id  = getattr(command, "instrument_id", None)
-        venue_order_id = getattr(command, "venue_order_id", None)
-        start          = getattr(command, "start", None)
-        end            = getattr(command, "end", None)
+        instrument_id = getattr(command, "instrument_id", None)
+        start = getattr(command, "start", None)
+        end = getattr(command, "end", None)
 
         from_dt = start or datetime(
-            datetime.now().year, datetime.now().month, datetime.now().day,
-            tzinfo=timezone.utc,
+            datetime.now().year,
+            datetime.now().month,
+            datetime.now().day,
+            tzinfo=UTC,
         )
-        to_dt = end or datetime.now(timezone.utc)
+        to_dt = end or datetime.now(UTC)
 
         deals = mt5.history_deals_get(from_dt, to_dt) or ()
         reports = []
@@ -1106,7 +1086,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # ================================================================
         try:
             account_info = mt5.account_info()
-            if account_info and hasattr(account_info, 'currency'):
+            if account_info and hasattr(account_info, "currency"):
                 account_currency = _parse_account_currency(account_info.currency)
             else:
                 account_currency = USD
@@ -1177,8 +1157,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             if instrument is None:
                 continue
 
-            pp = instrument.price_precision
-
             side = OrderSide.BUY if pos.type == mt5.ORDER_TYPE_BUY else OrderSide.SELL
             report = PositionStatusReport(
                 account_id=self.account_id,
@@ -1247,6 +1225,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 # MODULE-LEVEL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _time_in_force_to_mt5(tif: TimeInForce) -> int:
     """
     Convert NautilusTrader TimeInForce to MT5 order time-in-force constant.
@@ -1277,6 +1256,7 @@ def _parse_account_currency(code: str):
     known crypto currencies.
     """
     from nautilus_trader.model.currencies import Currency
+
     _KNOWN_CRYPTOS = frozenset({"BTC", "ETH", "XRP", "LTC", "BCH", "SOL", "ADA", "DOT"})
     code = code.strip().upper()
     try:
@@ -1299,6 +1279,7 @@ def _make_account_balance(balance: float, equity: float, currency):
     the invariant. Unrealised P&L (equity - balance) is visible via positions.
     """
     from nautilus_trader.model.objects import AccountBalance
+
     return AccountBalance(
         total=Money(balance, currency),
         locked=Money(0.0, currency),
@@ -1309,6 +1290,7 @@ def _make_account_balance(balance: float, equity: float, currency):
 def _order_side_to_position_side(side: OrderSide):
     """Convert OrderSide to PositionSide."""
     from nautilus_trader.model.enums import PositionSide
+
     return PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
 
 
@@ -1326,8 +1308,12 @@ def _build_order_status_report(
 
     # MT5 pending order types map to LIMIT or STOP
     pending_limit_types = {mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT}
-    pending_stop_types  = {mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_SELL_STOP,
-                           mt5.ORDER_TYPE_BUY_STOP_LIMIT, mt5.ORDER_TYPE_SELL_STOP_LIMIT}
+    pending_stop_types = {
+        mt5.ORDER_TYPE_BUY_STOP,
+        mt5.ORDER_TYPE_SELL_STOP,
+        mt5.ORDER_TYPE_BUY_STOP_LIMIT,
+        mt5.ORDER_TYPE_SELL_STOP_LIMIT,
+    }
 
     if mt5_order.type in pending_limit_types:
         order_type = OrderType.LIMIT
@@ -1357,4 +1343,5 @@ def _build_order_status_report(
         cancel_reason=None,
     )
 
-#fix2
+
+# fix2
