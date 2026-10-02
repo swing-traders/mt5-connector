@@ -1,18 +1,21 @@
-"""The MT5 server: the MetaTrader5 package mirrored over HTTP, its liveness, and the commission
-schedules the terminal's EA relays."""
+"""The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, its
+liveness, and the commission schedules the terminal's EA relays."""
 
 import dataclasses
 import logging
 import os
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 
 import waitress
 from flask import Flask, request
 
 from mt5connect import mirror
+from mt5connect.broker_clock import BrokerClock
+from mt5server.app.clock_check import ClockCheck
 from mt5server.app.commissions import CommissionStore
-from mt5server.app.encoding import encode
+from mt5server.app.encoding import encode, non_epochs, package_arguments
 from mt5server.app.settings import Settings, read_settings
 from mt5server.app.terminal import Failed, Terminal
 
@@ -41,20 +44,25 @@ def connect_terminal(terminal: Terminal, settings: Settings) -> None:
         raise TerminalStartError(f"initialize failed: {outcome.last_error}")
 
 
-def create_app(terminal: Terminal, commissions: CommissionStore) -> Flask:
+def create_app(
+    terminal: Terminal, commissions: CommissionStore, clock: BrokerClock, ready: threading.Event
+) -> Flask:
     """The server's routes: POST /mt5/<function> for every package function, GET /health and GET
-    /commissions/<symbol>."""
+    /commissions/<symbol>. /health answers 503 until `ready` is set."""
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
     for function in mirror.FUNCTIONS.values():
         app.add_url_rule(
             f"/mt5/{function.name}",
             endpoint=function.name.value,
-            view_func=_mirror_view(terminal, function),
+            view_func=_mirror_view(terminal, function, clock),
             methods=["POST"],
         )
     app.add_url_rule(
-        "/health", endpoint="health", view_func=_health_view(terminal), methods=["GET"]
+        "/health",
+        endpoint="health",
+        view_func=_health_view(terminal, clock, ready),
+        methods=["GET"],
     )
     app.add_url_rule(
         "/commissions/<symbol>",
@@ -65,7 +73,7 @@ def create_app(terminal: Terminal, commissions: CommissionStore) -> Flask:
     return app
 
 
-def _mirror_view(terminal: Terminal, function: mirror.Function) -> Callable:
+def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClock) -> Callable:
     def view():
         arguments = _body_arguments()
         refusal = _refusal(function, arguments)
@@ -77,7 +85,7 @@ def _mirror_view(terminal: Terminal, function: mirror.Function) -> Callable:
             logger.info("%s from %s keeps the server's session", function.name, request.remote_addr)
             return _answer(None, mirror.SUCCESS), 200
         else:
-            outcome = terminal.call(function, arguments)
+            outcome = terminal.call(function, package_arguments(function, arguments, clock))
             if isinstance(outcome, Failed):
                 # terminal_info() failing is the terminal's IPC being down.
                 if function.name is mirror.FunctionName.TERMINAL_INFO:
@@ -86,20 +94,24 @@ def _mirror_view(terminal: Terminal, function: mirror.Function) -> Callable:
                     status = 200
                 return _failure(*outcome.last_error), status
             else:
-                return _answer(encode(function, outcome.value), outcome.last_error), 200
+                return _answer(encode(function, outcome.value, clock), outcome.last_error), 200
 
     return view
 
 
-def _health_view(terminal: Terminal) -> Callable:
+def _health_view(terminal: Terminal, clock: BrokerClock, ready: threading.Event) -> Callable:
     watch = _ConnectionWatch()
 
     def view():
+        if not ready.is_set():
+            # No package call answers it, so this envelope carries no last_error.
+            message = "the broker clock is not verified"
+            return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}, 503
         outcome = terminal.call(_TERMINAL_INFO, {})
         if isinstance(outcome, Failed):
             return _failure(*outcome.last_error), 503
         else:
-            info = encode(_TERMINAL_INFO, outcome.value)
+            info = encode(_TERMINAL_INFO, outcome.value, clock)
             watch.observe(info["connected"])
             return _answer(info, outcome.last_error), 200
 
@@ -153,12 +165,15 @@ def _refusal(function: mirror.Function, arguments: object) -> str | None:
     in_a_form = not function.forms or any(
         all(name in arguments for name in form) for form in function.forms
     )
+    not_epochs = non_epochs(function, arguments)
     if unknown:
         return f"unknown parameter: {', '.join(unknown)}"
     elif missing:
         return f"missing parameter: {', '.join(missing)}"
     elif not in_a_form:
         return f"missing parameter: {', or '.join(' and '.join(form) for form in function.forms)}"
+    elif not_epochs:
+        return f"not an integer epoch: {', '.join(not_epochs)}"
     else:
         return None
 
@@ -179,12 +194,27 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     settings = read_settings(os.environ)
+    clock = BrokerClock(settings.broker_tz, timedelta(hours=settings.broker_offset_hours))
+    logger.info(
+        "broker clock: %s %+d h, verified on %s every %d s",
+        settings.broker_tz.key,
+        settings.broker_offset_hours,
+        settings.clock_symbol,
+        settings.clock_check_seconds,
+    )
     import MetaTrader5
 
     terminal = Terminal(MetaTrader5)
     connect_terminal(terminal, settings)
+    clock_check = ClockCheck(terminal, clock, settings.clock_symbol)
+    threading.Thread(
+        target=clock_check.run,
+        args=(settings.clock_check_seconds,),
+        name="broker-clock-check",
+        daemon=True,
+    ).start()
     waitress.serve(
-        create_app(terminal, CommissionStore()),
+        create_app(terminal, CommissionStore(), clock, clock_check.ready),
         host=settings.api_host,
         port=settings.api_port,
         threads=settings.api_threads,

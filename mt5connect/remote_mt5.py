@@ -1,6 +1,5 @@
-"""The MetaTrader5 package's call surface served by the MT5 server: every package function with the
-package's signature, its structs as namedtuples, its arrays as numpy structured arrays, its
-constants, and Buy/Sell/Close.
+"""The MetaTrader5 package's call surface served by the MT5 server, every epoch in true UTC: its
+functions, structs as namedtuples, arrays as numpy structured arrays, constants and Buy/Sell/Close.
 
 State: the server this module is configured against with its HTTP session, and the last_error() pair
 the last answered call carried."""

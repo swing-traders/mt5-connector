@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import waitress
+from mirror_samples import CLOCK
 
 import mt5connect.remote_mt5 as shim
 from mt5server.app.app import create_app
@@ -24,8 +25,16 @@ def commissions():
 
 
 @pytest.fixture
-def app(stub, commissions):
-    return create_app(Terminal(stub), commissions)
+def terminal(stub):
+    return Terminal(stub)
+
+
+@pytest.fixture
+def app(terminal, commissions):
+    """The app with the broker clock verified."""
+    ready = threading.Event()
+    ready.set()
+    return create_app(terminal, commissions, CLOCK, ready)
 
 
 @pytest.fixture

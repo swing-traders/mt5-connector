@@ -9,6 +9,7 @@ from mirror_samples import (
     array_sample,
     expected_call,
     expected_json,
+    in_true_utc,
     result_sample,
 )
 
@@ -92,7 +93,7 @@ def test_route_forwards_every_parameter_and_answers_the_result(client, stub, fun
         getattr(stub, function.name).assert_called_once_with(*args, **kwargs)
         assert response.json == {
             "ok": True,
-            "result": expected_json(result),
+            "result": expected_json(in_true_utc(result)),
             "last_error": list(stub.last_error.return_value),
         }
 

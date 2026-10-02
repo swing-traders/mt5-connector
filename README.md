@@ -563,11 +563,15 @@ The adapter can run against a **Dockerized MT5 server** instead of a local MetaT
 
 The server mirrors the `MetaTrader5` package (5.0.6231), so code written against `import MetaTrader5 as mt5` runs unchanged against `mt5connect.remote_mt5`. Both are generated from one inventory of the package, `mt5connect/mirror.py`.
 
-- `POST /mt5/<function>` for each of the package's 32 functions, its arguments a JSON object keyed by parameter name; datetimes travel as epoch seconds.
+- `POST /mt5/<function>` for each of the package's 32 functions, its arguments a JSON object keyed by parameter name; datetimes travel as true-UTC epoch seconds.
 - A package call answers `{"ok": true, "result": ..., "last_error": [code, message]}` or `{"ok": false, "error": {"code": ..., "message": ...}, "last_error": [code, message]}`. `last_error` is the package's `last_error()` read right after the call; a failure's error is that same pair. Structs answer as objects in the package's field order, arrays as lists of objects keyed by the dtype's fields.
-- Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
+- Every epoch is true UTC in both directions. The terminal keeps time on the broker's clock — a zone's wall time plus a fixed offset, New York plus seven hours by default — and the server converts by the era of each instant:
+  - every epoch field of an answer, `0` (no time) left as `0`, with bars still stamped at their open;
+  - every time window a client sends, and a trade request's `expiration`.
+- An epoch in the zone's repeated autumn hour reads as its first occurrence, and the server logs a warning naming the field. One in its skipped spring hour is a server error (HTTP 500).
+- Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, a time that is not an integer epoch, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
 - `POST /mt5/shutdown` is the one deliberate departure from the package: it answers `None` without calling the package's `shutdown()`. Every client shares the server's terminal session, and the adapter calls `shutdown()` whenever it disconnects, so passing it on would end the session for every client. `initialize` and `login` pass through unchanged.
-- `GET /health` answers `terminal_info()`, or HTTP 503 with the error when the terminal does not answer.
+- `GET /health` answers `terminal_info()`, or HTTP 503 with the error when the terminal does not answer. It answers HTTP 503 until the broker's clock is verified.
 - `GET /commissions/<symbol>` answers the commission schedule the terminal's EA relayed for the symbol, or code -4 (`RES_E_NOT_FOUND`) while none has been relayed. No package call answers it, so its envelope carries no `last_error`.
 - Package calls run one at a time; waitress serves the API.
 
@@ -585,6 +589,16 @@ The server reads its settings from the environment once at start, initializes th
 | `MT5_API_HOST` | bind address | `0.0.0.0` |
 | `MT5_API_PORT` | HTTP port | `5000` |
 | `MT5_API_THREADS` | waitress threads | `4` |
+| `MT5_CLOCK_SYMBOL` | a symbol selected in the terminal, whose tick verifies the broker's clock | required |
+| `MT5_CLOCK_CHECK_SECONDS` | interval between clock verifications | `300` |
+| `MT5_BROKER_TZ` | the zone the broker's clock follows, as an IANA name | `America/New_York` |
+| `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
+
+Once the terminal is initialized, the server verifies the broker's clock against the live tick of `MT5_CLOCK_SYMBOL`, at once and every `MT5_CLOCK_CHECK_SECONDS`:
+
+- It reads the tick twice, a few seconds apart. A tick that moved, once converted, must sit within 120 s of the server's clock, or the server exits with both times and the offset in its log.
+- A tick that did not move means the market is closed: the check is deferred to the next one. A first check that finds the market closed still makes the server ready.
+- A missing tick at start exits the server; on a later check it logs a warning.
 
 ### Important Security Notice
 
@@ -603,7 +617,7 @@ With docker compose:
 
 ```bash
 # 0. create an environment file 
-cp .env.example .env   # set MT5_ACCOUNT / MT5_PASSWORD / MT5_SERVER
+cp .env.example .env   # set MT5_ACCOUNT / MT5_PASSWORD / MT5_SERVER / MT5_CLOCK_SYMBOL
 
 # 1. Build + start the server (the build context is the repo root; MT5_ACCOUNT becomes MT5_LOGIN)
 source .env
@@ -612,6 +626,7 @@ export MT5_ACCOUNT
 export MT5_PASSWORD
 export MT5_SERVER
 export MT5_SYMBOLS
+export MT5_CLOCK_SYMBOL
 cd mt5server && docker compose up --build -d
 ``` 
 
@@ -626,6 +641,7 @@ source ../.env
 docker run -d --name mt5-server \
   -p 127.0.0.1:5000:5000 -p 127.0.0.1:9000:9000 -p 127.0.0.1:3001:3001 \
   -e MT5_SYMBOLS="${MT5_SYMBOLS}" \
+  -e MT5_CLOCK_SYMBOL="${MT5_CLOCK_SYMBOL}" \
   -e MT5_SERVER="${MT5_SERVER}" \
   -e MT5_PASSWORD="${MT5_PASSWORD}" \
   -e MT5_LOGIN="${MT5_ACCOUNT}" \

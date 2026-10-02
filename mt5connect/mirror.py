@@ -1,6 +1,5 @@
-"""The MetaTrader5 package's call surface, pinned to one release: its functions with their
-parameters, result shapes and failure values, the structs and arrays they return, and its
-constants."""
+"""The MetaTrader5 package's call surface at one release: its functions, the structs and arrays they
+return with their epoch fields, and its constants."""
 
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -90,6 +89,11 @@ class ResultKind(StrEnum):
     NONE = "none"
 
 
+class EpochUnit(StrEnum):
+    SECONDS = "seconds"
+    MILLISECONDS = "milliseconds"
+
+
 class Failure(StrEnum):
     """What the package answers when a function fails."""
 
@@ -128,11 +132,14 @@ class Function:
 
 @dataclass(frozen=True)
 class Struct:
-    """A package struct; `nested` names the fields that hold another struct."""
+    """A package struct."""
 
     name: StructName
     fields: tuple[str, ...]
+    # The fields that hold another struct.
     nested: dict[str, StructName] = field(default_factory=dict)
+    # The fields that hold an epoch on the broker's clock.
+    epochs: dict[str, EpochUnit] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,8 @@ class Array:
 
     name: ArrayName
     dtype: tuple[tuple[str, str], ...]
+    # The fields that hold an epoch on the broker's clock.
+    epochs: dict[str, EpochUnit] = field(default_factory=dict)
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -469,6 +478,12 @@ STRUCTS: dict[StructName, Struct] = {
                 "comment",
                 "external_id",
             ),
+            epochs={
+                "time": EpochUnit.SECONDS,
+                "time_msc": EpochUnit.MILLISECONDS,
+                "time_update": EpochUnit.SECONDS,
+                "time_update_msc": EpochUnit.MILLISECONDS,
+            },
         ),
         Struct(
             StructName.TRADE_ORDER,
@@ -498,6 +513,13 @@ STRUCTS: dict[StructName, Struct] = {
                 "comment",
                 "external_id",
             ),
+            epochs={
+                "time_setup": EpochUnit.SECONDS,
+                "time_setup_msc": EpochUnit.MILLISECONDS,
+                "time_done": EpochUnit.SECONDS,
+                "time_done_msc": EpochUnit.MILLISECONDS,
+                "time_expiration": EpochUnit.SECONDS,
+            },
         ),
         Struct(
             StructName.TRADE_DEAL,
@@ -521,6 +543,7 @@ STRUCTS: dict[StructName, Struct] = {
                 "comment",
                 "external_id",
             ),
+            epochs={"time": EpochUnit.SECONDS, "time_msc": EpochUnit.MILLISECONDS},
         ),
         Struct(
             StructName.TRADE_REQUEST,
@@ -543,6 +566,7 @@ STRUCTS: dict[StructName, Struct] = {
                 "position",
                 "position_by",
             ),
+            epochs={"expiration": EpochUnit.SECONDS},
         ),
         Struct(
             StructName.ORDER_SEND_RESULT,
@@ -588,6 +612,7 @@ STRUCTS: dict[StructName, Struct] = {
                 "flags",
                 "volume_real",
             ),
+            epochs={"time": EpochUnit.SECONDS, "time_msc": EpochUnit.MILLISECONDS},
         ),
         Struct(
             StructName.TERMINAL_INFO,
@@ -716,6 +741,11 @@ STRUCTS: dict[StructName, Struct] = {
                 "page",
                 "path",
             ),
+            epochs={
+                "time": EpochUnit.SECONDS,
+                "start_time": EpochUnit.SECONDS,
+                "expiration_time": EpochUnit.SECONDS,
+            },
         ),
         Struct(
             StructName.ACCOUNT_INFO,
@@ -774,6 +804,7 @@ RATES = Array(
         ("spread", "<i4"),
         ("real_volume", "<u8"),
     ),
+    epochs={"time": EpochUnit.SECONDS},
 )
 TICKS = Array(
     ArrayName.TICKS,
@@ -787,6 +818,7 @@ TICKS = Array(
         ("flags", "<u4"),
         ("volume_real", "<f8"),
     ),
+    epochs={"time": EpochUnit.SECONDS, "time_msc": EpochUnit.MILLISECONDS},
 )
 ARRAYS: dict[ArrayName, Array] = {array.name: array for array in (RATES, TICKS)}
 
