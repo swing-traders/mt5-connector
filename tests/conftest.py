@@ -1,14 +1,16 @@
 """
 tests/conftest.py
 
-Shared fixtures: a valid MT5Config, and the shim mocked inside mt5connect.connection.
+Shared fixtures: a valid MT5Config, the shim mocked inside mt5connect.connection, and the shim the
+execution client calls.
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
-from venue_doubles import account_info
+from venue_doubles import account_info, send_result, tick
 
+from mt5connect import mirror
 from mt5connect.config import MT5Config
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,3 +83,18 @@ def mock_mt5():
         mock.terminal_info.return_value = terminal
 
         yield mock
+
+
+@pytest.fixture
+def exec_shim():
+    """The shim the execution client calls, holding the package's signatures: no order, deal or
+    position, a quote, and every trade request completed."""
+    with patch("mt5connect.execution.mt5", autospec=True) as shim:
+        shim.orders_get.return_value = ()
+        shim.positions_get.return_value = ()
+        shim.history_deals_get.return_value = ()
+        shim.history_orders_get.return_value = ()
+        shim.symbol_info_tick.return_value = tick(bid=1.085, ask=1.0852)
+        shim.order_send.return_value = send_result()
+        shim.last_error.return_value = mirror.SUCCESS
+        yield shim

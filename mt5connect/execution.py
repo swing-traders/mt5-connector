@@ -1,63 +1,43 @@
-"""
-nautilus_mt5/execution.py
+"""The NT execution client for an MT5 hedging account: one trader's orders at the venue, the order
+events the venue confirms, and the reports NT's reconciliation reads.
 
-MT5LiveExecutionClient — submits, modifies, and cancels orders on MT5,
-then polls for fills and position changes and emits execution reports
-back into NautilusTrader.
+State, none of which survives a restart on its own — connect rebuilds it from NT's cache and the
+venue:
 
-MT5 has no push/event API for order state. Everything is polled.
-
-Architecture
-------------
-  _connect()
-    └─ holds the account to a hedging, tradable session
-    └─ loads the instruments and registers the currencies they and the account book in
-    └─ starts _exec_poll_loop() as asyncio Task
-
-  _exec_poll_loop()  (runs every exec_poll_interval_ms, default 250ms)
-    └─ mt5.orders_get()      → detect new/removed pending orders
-    └─ mt5.positions_get()   → detect new fills / position changes
-    └─ mt5.history_deals_get() → detect closed deals (fills)
-    └─ generate_order_status_report() / generate_fill_report()
-
-  submit_order()
-    └─ mt5.order_send(ORDER_TYPE_BUY / ORDER_TYPE_SELL)
-    └─ emits OrderAccepted / OrderRejected
-
-  cancel_order()
-    └─ mt5.order_send(ACTION_REMOVE) for pending orders
-    └─ mt5.order_send(ACTION_DEAL, opposite side) for market positions
-
-  modify_order()
-    └─ mt5.order_send(ACTION_SLTP) for SL/TP updates
-
-Order type support
-------------------
-  Market orders  → ACTION_DEAL   (immediate fill at current price)
-  Limit orders   → ACTION_PENDING (ORDER_TYPE_BUY_LIMIT / SELL_LIMIT)
-  Stop orders    → ACTION_PENDING (ORDER_TYPE_BUY_STOP  / SELL_STOP)
-  Stop-limit     → ACTION_PENDING (ORDER_TYPE_BUY_STOP_LIMIT / SELL_STOP_LIMIT)
-
-  All order types support SL/TP at submission time.
-"""
+- the ticket index, venue order ticket ↔ client order id: rebuilt at connect from NT's orders the
+  venue accepted, extended by each accepted submit and each comment the digest lane matches;
+- the deals already seen, and the time of the last one, where the next deal read starts;
+- the tickets of this trader's orders resting at the venue at the last poll, and those that left it
+  with no final state in the venue's history yet;
+- the tickets no NT order explains, logged once each;
+- the poll steps awaiting recovery;
+- whether an account report is owed, and when the next one is due."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
-from datetime import UTC, datetime
-from decimal import Decimal
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import IntFlag, StrEnum
 from hashlib import sha256
+from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
+    BatchCancelOrders,
     CancelAllOrders,
     CancelOrder,
+    GenerateFillReports,
+    GenerateOrderStatusReport,
+    GenerateOrderStatusReports,
+    GeneratePositionStatusReports,
     ModifyOrder,
     SubmitOrder,
+    SubmitOrderList,
 )
 from nautilus_trader.execution.reports import (
     FillReport,
@@ -67,38 +47,51 @@ from nautilus_trader.execution.reports import (
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.enums import (
     AccountType,
+    ContingencyType,
     LiquiditySide,
     OmsType,
     OrderSide,
     OrderStatus,
     OrderType,
+    PositionSide,
     TimeInForce,
+    TriggerType,
+    order_type_to_str,
+    time_in_force_to_str,
 )
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
     ClientOrderId,
     InstrumentId,
-    StrategyId,
+    PositionId,
     Symbol,
     TradeId,
     TraderId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import Currency, Money, Price, Quantity
+from nautilus_trader.model.objects import AccountBalance, Currency, Money, Price
 
+from mt5connect import mirror
 from mt5connect import remote_mt5 as mt5
 from mt5connect.connection import MarginMode
 from mt5connect.constants import MT5_VENUE
 from mt5connect.currencies import register_venue_currency, venue_currency
-from mt5connect.errors import MT5ConfigError, MT5ConnectionError, MT5OrderError
+from mt5connect.errors import (
+    MT5ConfigError,
+    MT5ConnectionError,
+    MT5InstrumentError,
+    MT5OrderError,
+    ResponseLost,
+)
+from mt5connect.parsing import InstrumentAny, finite_decimal
 
 if TYPE_CHECKING:
+    from nautilus_trader.model.orders import Order
+
     from mt5connect.config import MT5Config
     from mt5connect.connection import MT5Connection
     from mt5connect.providers import MT5InstrumentProvider
-
-logger = logging.getLogger(__name__)
 
 
 def magic_for(trader_id: TraderId) -> int:
@@ -108,141 +101,134 @@ def magic_for(trader_id: TraderId) -> int:
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FILLING MODE AUTO-DETECT
-#
-# Different brokers and account types support different MT5 order filling
-# modes. Sending the wrong one causes retcode=10030 "Invalid type of order
-# filling". This function reads the symbol's actual supported filling modes
-# at runtime and picks the correct one — works across Raw Spread, Pro,
-# Standard, and Zero account types without any manual configuration.
-#
-#   symbol_info().filling_mode bitmask:
-#     bit 0 (1) = ORDER_FILLING_FOK    supported
-#     bit 1 (2) = ORDER_FILLING_IOC    supported
-#     bit 2 (4) = ORDER_FILLING_RETURN supported
-#
-#   Priority: IOC > FOK > RETURN
-#   IOC works on Raw Spread, Pro, and Standard Exness accounts (the most
-#   common case). FOK is used as fallback for Zero accounts that only
-#   support FOK. RETURN is the last resort for brokers that only allow it.
-# ─────────────────────────────────────────────────────────────────────────────
+# The venue refuses a comment of 30 characters or more.
+_COMMENT_LENGTH = 29
 
 
-def _get_filling_mode(symbol: str) -> int:
-    """Auto-detect the correct MT5 order filling mode for a symbol."""
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        return mt5.ORDER_FILLING_FOK  # safe fallback if symbol info unavailable
-
-    bitmask = info.filling_mode
-
-    if bitmask & 2:  # IOC supported
-        return mt5.ORDER_FILLING_IOC
-    elif bitmask & 1:  # FOK supported
-        return mt5.ORDER_FILLING_FOK
-    elif bitmask & 4:  # RETURN supported
-        return mt5.ORDER_FILLING_RETURN
-    else:
-        return mt5.ORDER_FILLING_FOK  # absolute fallback
+def order_comment(client_order_id: ClientOrderId) -> str:
+    """The comment an order carries to the venue: its client order id's SHA-256 in hex, cut to the
+    length the venue accepts."""
+    return sha256(client_order_id.value.encode("utf-8")).hexdigest()[:_COMMENT_LENGTH]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ORDER TYPE MAPPING HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+class SymbolFilling(IntFlag):
+    """The fillings a symbol allows besides RETURN, which every symbol allows and no flag marks:
+    `symbol_info().filling_mode`."""
+
+    FOK = 1
+    IOC = 2
+    BOC = 4
 
 
-def _nautilus_side_to_mt5_market(side: OrderSide) -> int:
-    """Map NautilusTrader OrderSide to MT5 market order type."""
-    if side == OrderSide.BUY:
-        return mt5.ORDER_TYPE_BUY
-    return mt5.ORDER_TYPE_SELL
+class OrderState(StrEnum):
+    """An order's state at the venue: `TradeOrder.state`."""
+
+    STARTED = "STARTED"
+    PLACED = "PLACED"
+    CANCELED = "CANCELED"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    REQUEST_ADD = "REQUEST_ADD"
+    REQUEST_MODIFY = "REQUEST_MODIFY"
+    REQUEST_CANCEL = "REQUEST_CANCEL"
 
 
-def _nautilus_order_to_mt5_pending(order_type: OrderType, side: OrderSide) -> int:
-    """Map NautilusTrader OrderType + OrderSide to MT5 pending order type."""
-    mapping = {
-        (OrderType.LIMIT, OrderSide.BUY): mt5.ORDER_TYPE_BUY_LIMIT,
-        (OrderType.LIMIT, OrderSide.SELL): mt5.ORDER_TYPE_SELL_LIMIT,
-        (OrderType.STOP_MARKET, OrderSide.BUY): mt5.ORDER_TYPE_BUY_STOP,
-        (OrderType.STOP_MARKET, OrderSide.SELL): mt5.ORDER_TYPE_SELL_STOP,
-        (OrderType.STOP_LIMIT, OrderSide.BUY): mt5.ORDER_TYPE_BUY_STOP_LIMIT,
-        (OrderType.STOP_LIMIT, OrderSide.SELL): mt5.ORDER_TYPE_SELL_STOP_LIMIT,
-    }
-    key = (order_type, side)
-    if key not in mapping:
-        raise MT5OrderError(
-            f"Unsupported order type/side combination: {order_type.name} {side.name}. "
-            "MT5 supports: MARKET, LIMIT, STOP_MARKET, STOP_LIMIT."
-        )
-    return mapping[key]
+class PollStep(StrEnum):
+    """The independently retried steps of an execution poll."""
+
+    VENUE_READ = "venue read"
+    ACCOUNT_REPORT = "account report"
 
 
-def _mt5_order_type_to_nautilus_side(mt5_order_type: int) -> OrderSide:
-    """Map MT5 order type integer back to NautilusTrader OrderSide."""
-    buy_types = {
-        mt5.ORDER_TYPE_BUY,
-        mt5.ORDER_TYPE_BUY_LIMIT,
-        mt5.ORDER_TYPE_BUY_STOP,
-        mt5.ORDER_TYPE_BUY_STOP_LIMIT,
-    }
-    return OrderSide.BUY if mt5_order_type in buy_types else OrderSide.SELL
+class SendOutcome(StrEnum):
+    """What the venue's answer to a trade request proves."""
+
+    DONE = "DONE"
+    REFUSED = "REFUSED"
+    # No answer proves either way; the venue may have acted on the request.
+    LOST = "LOST"
+    NOT_SENT = "NOT_SENT"
 
 
-def _mt5_retcode_to_str(retcode: int) -> str:
-    """Human-readable string for common MT5 return codes."""
-    _RETCODES = {
-        10004: "Requote",
-        10006: "Request rejected",
-        10007: "Request cancelled by trader",
-        10008: "Order placed",
-        10009: "Request completed",
-        10010: "Only part of the request was completed",
-        10011: "Request processing error",
-        10012: "Request cancelled by timeout",
-        10013: "Invalid request",
-        10014: "Invalid volume",
-        10015: "Invalid price",
-        10016: "Invalid stops",
-        10017: "Trade is disabled",
-        10018: "Market is closed",
-        10019: "Insufficient funds",
-        10020: "Prices changed",
-        10021: "No quotes to process request",
-        10022: "Invalid order expiration date",
-        10023: "Order state changed",
-        10024: "Too frequent requests",
-        10025: "No changes in request",
-        10026: "Auto trading disabled by server",
-        10027: "Auto trading disabled by client terminal",
-        10028: "Request locked for processing",
-        10029: "Order or position frozen",
-        10030: "Invalid type of order filling",
-        10031: "No connection to the trade server",
-        10032: "Operation is allowed only for live accounts",
-        10033: "Pending orders limit reached",
-        10034: "Volume of orders and positions limit reached",
-        10035: "Incorrect or prohibited order type",
-        10036: "Position with the specified ID already closed",
-        10038: "Close volume exceeds open volume",
-        10039: "A close order already exists",
-        10040: "Positions limit not reached",
-        10041: "Pending order activation pending",
-        10042: "Pending orders are not allowed for this symbol",
-        10043: "Request declined — settlement in progress",
-        10044: "SL/TP levels invalid",
-    }
-    return _RETCODES.get(retcode, f"Unknown retcode {retcode}")
+@dataclass(frozen=True)
+class _Sent:
+    """A trade request's outcome, its reason, and the venue's result when one came back."""
+
+    outcome: SendOutcome
+    reason: str
+    result: tuple | None = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXECUTION CLIENT
-# ─────────────────────────────────────────────────────────────────────────────
+_ORDER_STATES = {
+    mirror.ORDER_STATE_STARTED: OrderState.STARTED,
+    mirror.ORDER_STATE_PLACED: OrderState.PLACED,
+    mirror.ORDER_STATE_CANCELED: OrderState.CANCELED,
+    mirror.ORDER_STATE_PARTIAL: OrderState.PARTIAL,
+    mirror.ORDER_STATE_FILLED: OrderState.FILLED,
+    mirror.ORDER_STATE_REJECTED: OrderState.REJECTED,
+    mirror.ORDER_STATE_EXPIRED: OrderState.EXPIRED,
+    mirror.ORDER_STATE_REQUEST_ADD: OrderState.REQUEST_ADD,
+    mirror.ORDER_STATE_REQUEST_MODIFY: OrderState.REQUEST_MODIFY,
+    mirror.ORDER_STATE_REQUEST_CANCEL: OrderState.REQUEST_CANCEL,
+}
+_STATUSES = {
+    OrderState.STARTED: OrderStatus.ACCEPTED,
+    OrderState.PLACED: OrderStatus.ACCEPTED,
+    OrderState.CANCELED: OrderStatus.CANCELED,
+    OrderState.PARTIAL: OrderStatus.PARTIALLY_FILLED,
+    OrderState.FILLED: OrderStatus.FILLED,
+    OrderState.REJECTED: OrderStatus.REJECTED,
+    OrderState.EXPIRED: OrderStatus.EXPIRED,
+    OrderState.REQUEST_ADD: OrderStatus.ACCEPTED,
+    OrderState.REQUEST_MODIFY: OrderStatus.ACCEPTED,
+    OrderState.REQUEST_CANCEL: OrderStatus.ACCEPTED,
+}
+# How a pending order ends other than filled; a fill's end is its deal's.
+_ENDS = frozenset({OrderState.CANCELED, OrderState.EXPIRED, OrderState.REJECTED})
+
+_VENUE_ORDER_TYPES = {
+    mirror.ORDER_TYPE_BUY: (OrderSide.BUY, OrderType.MARKET),
+    mirror.ORDER_TYPE_SELL: (OrderSide.SELL, OrderType.MARKET),
+    mirror.ORDER_TYPE_BUY_LIMIT: (OrderSide.BUY, OrderType.LIMIT),
+    mirror.ORDER_TYPE_SELL_LIMIT: (OrderSide.SELL, OrderType.LIMIT),
+    mirror.ORDER_TYPE_BUY_STOP: (OrderSide.BUY, OrderType.STOP_MARKET),
+    mirror.ORDER_TYPE_SELL_STOP: (OrderSide.SELL, OrderType.STOP_MARKET),
+    mirror.ORDER_TYPE_BUY_STOP_LIMIT: (OrderSide.BUY, OrderType.STOP_LIMIT),
+    mirror.ORDER_TYPE_SELL_STOP_LIMIT: (OrderSide.SELL, OrderType.STOP_LIMIT),
+}
+_PENDING_TYPES = {
+    (OrderType.LIMIT, OrderSide.BUY): mirror.ORDER_TYPE_BUY_LIMIT,
+    (OrderType.LIMIT, OrderSide.SELL): mirror.ORDER_TYPE_SELL_LIMIT,
+    (OrderType.STOP_MARKET, OrderSide.BUY): mirror.ORDER_TYPE_BUY_STOP,
+    (OrderType.STOP_MARKET, OrderSide.SELL): mirror.ORDER_TYPE_SELL_STOP,
+    (OrderType.STOP_LIMIT, OrderSide.BUY): mirror.ORDER_TYPE_BUY_STOP_LIMIT,
+    (OrderType.STOP_LIMIT, OrderSide.SELL): mirror.ORDER_TYPE_SELL_STOP_LIMIT,
+}
+_TIMES_IN_FORCE = {
+    mirror.ORDER_TIME_GTC: TimeInForce.GTC,
+    mirror.ORDER_TIME_DAY: TimeInForce.DAY,
+    mirror.ORDER_TIME_SPECIFIED: TimeInForce.GTD,
+    mirror.ORDER_TIME_SPECIFIED_DAY: TimeInForce.GTD,
+}
+_PENDING_ORDER_TYPES = frozenset({OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.STOP_LIMIT})
+_ORDER_TYPES = _PENDING_ORDER_TYPES | {OrderType.MARKET}
+_TIMES_IN_FORCE_SENT = frozenset({TimeInForce.GTC, TimeInForce.GTD})
+
+_DONE_RETCODES = frozenset(
+    {mirror.TRADE_RETCODE_DONE, mirror.TRADE_RETCODE_PLACED, mirror.TRADE_RETCODE_DONE_PARTIAL}
+)
+_RETCODE_NAMES = {
+    value: name for name, value in mirror.CONSTANTS.items() if name.startswith("TRADE_RETCODE_")
+}
+_FILL_ENTRIES = frozenset(
+    {mirror.DEAL_ENTRY_IN, mirror.DEAL_ENTRY_OUT, mirror.DEAL_ENTRY_INOUT, mirror.DEAL_ENTRY_OUT_BY}
+)
 
 
 class MT5LiveExecutionClient(LiveExecutionClient):
-    """Live execution client for an MT5 hedging account, trading for the one trader it is built
-    for."""
+    """Live execution client for an MT5 hedging account, trading for the trader it is built for."""
 
     def __init__(
         self,
@@ -271,38 +257,29 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._provider = instrument_provider
         self._magic = magic_for(self.trader_id)
         self._account_currency: Currency | None = None
-
-        # asyncio polling task — created in _connect, cancelled in _disconnect
         self._exec_poll_task: asyncio.Task | None = None
+        self._client_order_ids: dict[int, ClientOrderId] = {}
+        self._tickets: dict[ClientOrderId, int] = {}
+        self._seen_deals: set[int] = set()
+        self._deals_since_ms = 0
+        self._resting: set[int] = set()
+        self._vanished: set[int] = set()
+        self._unresolved: set[int] = set()
+        self._account_owed = False
+        self._account_due_ns = 0
+        self._outages: set[PollStep] = set()
 
-        # Track known pending order tickets (MT5 ticket int) to detect changes
-        self._known_order_tickets: set[int] = set()
-
-        # Track known open position tickets to detect new fills / closures
-        self._known_position_tickets: set[int] = set()
-
-        # Track last deal time to only process new deals on each poll
-        self._last_deal_time: int = 0
-
-        # Set of (deal.time, deal.ticket) tuples already emitted into NT.
-        # Prevents double-counting when the same deal appears in multiple polls.
-        self._processed_deal_keys: set[tuple[int, int]] = set()
-
-        # Map from ClientOrderId string → MT5 ticket int for fast lookup
-        self._client_order_id_to_ticket: dict[str, int] = {}
-
-        # Reverse map: MT5 ticket → ClientOrderId string
-        self._ticket_to_client_order_id: dict[int, str] = {}
-
-    # ── Required: connect / disconnect ───────────────────────────────────────
+    # ── Connect / disconnect ──────────────────────────────────────────────────
 
     async def _connect(self) -> None:
+        """Holds the account to a hedging, tradable session before anything is reported or sent,
+        books under the account's login, loads the config's symbols and registers the currencies the
+        account and the loaded instruments book in; then indexes NT's orders, takes in what the
+        venue already holds, reports the account and starts polling. Raises MT5ConfigError for an
+        account that books another way or a read-only session, RuntimeError on a connected client.
         """
-        Holds the account to a hedging, tradable session before anything is reported or sent, books
-        under the account's login, loads the config's symbols and registers the currencies the
-        account and the loaded instruments book in, then reports the account, reconciles and starts
-        polling. Raises MT5ConfigError for an account that books another way or a read-only session.
-        """
+        if self._exec_poll_task is not None:
+            raise RuntimeError("execution client: already connected")
         self._conn.ensure_connected()
         account = self._conn.get_account_info()
         terminal = self._conn.get_terminal_info()
@@ -324,959 +301,1047 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         for instrument in self._provider.list_all():
             register_venue_currency(instrument.quote_currency)
 
-        await self._generate_account_state()
-
-        # Reconcile existing open orders and positions at startup
-        await self._reconcile_open_orders()
-        await self._reconcile_open_positions()
-
-        # Start execution polling loop
-        self._exec_poll_task = asyncio.get_event_loop().create_task(
+        self._index_nt_orders()
+        self._take_in_venue()
+        self._refresh_account()
+        self._outages.clear()
+        self._exec_poll_task = self._loop.create_task(
             self._exec_poll_loop(),
             name="MT5LiveExecutionClient._exec_poll_loop",
         )
-        self._log.info(
-            f"MT5LiveExecutionClient: connected — polling every "
-            f"{self._config.exec_poll_interval_ms}ms"
-        )
+        self._log.info(f"connected, polling every {self._config.exec_poll_interval_ms}ms")
 
     async def _disconnect(self) -> None:
-        """Cancel the execution polling loop cleanly."""
-        if self._exec_poll_task and not self._exec_poll_task.done():
-            self._exec_poll_task.cancel()
-            try:
-                await self._exec_poll_task
-            except asyncio.CancelledError:
-                pass
-            self._exec_poll_task = None
+        """Stops polling and drops the client's view of the venue; raises RuntimeError on a client
+        never connected."""
+        if self._exec_poll_task is None:
+            raise RuntimeError("execution client: not connected")
+        self._exec_poll_task.cancel()
+        try:
+            await self._exec_poll_task
+        except asyncio.CancelledError:
+            pass
+        self._exec_poll_task = None
+        self._client_order_ids.clear()
+        self._tickets.clear()
+        self._seen_deals.clear()
+        self._resting.clear()
+        self._vanished.clear()
+        self._unresolved.clear()
+        self._log.info("disconnected")
 
-        self._known_order_tickets.clear()
-        self._known_position_tickets.clear()
-        self._client_order_id_to_ticket.clear()
-        self._ticket_to_client_order_id.clear()
-        self._processed_deal_keys.clear()
-        self._log.info("MT5LiveExecutionClient: disconnected")
+    def _index_nt_orders(self) -> None:
+        """Rebuilds the ticket index from NT's orders at this venue that carry the venue's ticket;
+        an order the venue never accepted has none and is reconciliation's to resolve."""
+        self._client_order_ids.clear()
+        self._tickets.clear()
+        for order in self._cache.orders(venue=self.venue):
+            if order.venue_order_id is not None:
+                if order.venue_order_id.value.isdigit():
+                    self._index(int(order.venue_order_id.value), order.client_order_id)
+                else:
+                    self._log.debug(f"{order.venue_order_id!r} is not a venue ticket")
 
-    # ── Order submission ──────────────────────────────────────────────────────
-
-    async def _submit_order(self, command: SubmitOrder) -> None:
-        """
-        Submit an order to MT5.
-
-        Supports:
-          - MarketOrder    → ACTION_DEAL
-          - LimitOrder     → ACTION_PENDING + ORDER_TYPE_BUY/SELL_LIMIT
-          - StopMarketOrder → ACTION_PENDING + ORDER_TYPE_BUY/SELL_STOP
-          - StopLimitOrder  → ACTION_PENDING + ORDER_TYPE_BUY/SELL_STOP_LIMIT
-
-        On success: emits OrderAccepted (pending/stop) or OrderFilled (market).
-        On failure: emits OrderRejected.
-        """
-        order = command.order
-        symbol = order.instrument_id.symbol.value
-
-        self._conn.ensure_connected()
-
-        instrument = self._provider.get_instrument(symbol)
-        if instrument is None:
-            self._generate_order_rejected(order, f"Instrument not found for symbol '{symbol}'")
-            return
-
-        # ── Build the MT5 trade request ───────────────────────────────────
-
-        # Get current price for market orders
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            self._generate_order_rejected(order, f"Cannot get price for '{symbol}'")
-            return
-
-        price = float(order.price) if hasattr(order, "price") and order.price else 0.0
-
-        # For stop-limit: price = limit price, stoplimit_price = stop trigger
-        stoplimit_price = 0.0
-        if order.order_type == OrderType.STOP_LIMIT:
-            stoplimit_price = price
-            price = float(order.trigger_price) if order.trigger_price else 0.0
-
-        # Market order: use current ask/bid
-        if order.order_type == OrderType.MARKET:
-            price = tick.ask if order.side == OrderSide.BUY else tick.bid
-            action = mt5.TRADE_ACTION_DEAL
-            mt5_order_type = _nautilus_side_to_mt5_market(order.side)
-        else:
-            action = mt5.TRADE_ACTION_PENDING
-            mt5_order_type = _nautilus_order_to_mt5_pending(order.order_type, order.side)
-
-        # Auto-detect the correct filling mode for this symbol/account type
-        filling_mode = _get_filling_mode(symbol)
-
-        # Build request dict
-        request = {
-            "action": action,
-            "symbol": symbol,
-            "volume": float(order.quantity),
-            "type": mt5_order_type,
-            "price": price,
-            "sl": 0.0,  # set below if order has sl
-            "tp": 0.0,  # set below if order has tp
-            "deviation": 20,  # max price deviation (points) for market orders
-            "magic": self._magic,
-            "comment": str(order.client_order_id),
-            "type_filling": filling_mode,
-            "type_time": _time_in_force_to_mt5(order.time_in_force),
-        }
-
-        if stoplimit_price:
-            request["stoplimit"] = stoplimit_price
-
-        # Attach SL/TP if the order carries them
-        if hasattr(order, "sl_trigger_price") and order.sl_trigger_price:
-            request["sl"] = float(order.sl_trigger_price)
-        if hasattr(order, "tp_price") and order.tp_price:
-            request["tp"] = float(order.tp_price)
-
-        # ── Send to MT5 ───────────────────────────────────────────────────
-
-        result = mt5.order_send(request)
-
-        if result is None:
-            code, msg = mt5.last_error()
-            self._generate_order_rejected(
-                order, f"mt5.order_send() returned None — error {code}: {msg}"
-            )
-            return
-
-        if result.retcode not in (
-            mt5.TRADE_RETCODE_DONE,
-            mt5.TRADE_RETCODE_PLACED,
-            mt5.TRADE_RETCODE_DONE_PARTIAL,
-            10008,
-        ):
-            reason = _mt5_retcode_to_str(result.retcode)
-            self._generate_order_rejected(
-                order, f"MT5 rejected order: {reason} (retcode={result.retcode})"
-            )
-            return
-
-        # ── Success — record the ticket ───────────────────────────────────
-
-        ticket = result.order
-        client_order_id_str = str(order.client_order_id)
-        self._client_order_id_to_ticket[client_order_id_str] = ticket
-        self._ticket_to_client_order_id[ticket] = client_order_id_str
-
-        self._log.info(
-            f"MT5LiveExecutionClient: order sent "
-            f"ticket={ticket} client_order_id={client_order_id_str} "
-            f"retcode={result.retcode}"
+    def _take_in_venue(self) -> None:
+        """Marks every deal in the history over the lookback as seen — a deal present at connect is
+        never emitted — and takes this trader's resting orders as the ones the poll watches."""
+        now = self._clock.utc_now()
+        since = now - timedelta(minutes=self._config.history_lookback_mins)
+        deals = _answer("history_deals_get", mt5.history_deals_get(since, now))
+        self._seen_deals = {deal.ticket for deal in deals}
+        self._deals_since_ms = max(
+            (deal.time_msc for deal in deals), default=since.value // 1_000_000
         )
+        self._resting = {order.ticket for order in self._resting_orders()}
+        self._vanished = set()
+        self._unresolved = set()
 
-        # NautilusTrader will receive fill reports from the polling loop.
-        # For now just emit OrderAccepted.
-        self._generate_order_accepted(order, VenueOrderId(str(ticket)))
-
-    async def _cancel_order(self, command: CancelOrder) -> None:
-        """
-        Cancel a pending order or close a market position.
-
-        For pending orders → ACTION_REMOVE.
-        For open positions → ACTION_DEAL with opposite side at market price.
-        """
-        self._conn.ensure_connected()
-
-        client_order_id_str = str(command.client_order_id)
-        ticket = self._client_order_id_to_ticket.get(client_order_id_str)
-
-        if ticket is None:
-            # Try to find by venue order id
-            if command.venue_order_id:
-                try:
-                    ticket = int(command.venue_order_id.value)
-                except (ValueError, AttributeError):
-                    pass
-
-        if ticket is None:
-            self._log.warning(
-                f"MT5LiveExecutionClient: cannot cancel — ticket not found for "
-                f"{client_order_id_str}"
-            )
-            return
-
-        symbol = command.instrument_id.symbol.value
-
-        # Check if it's a pending order
-        orders = mt5.orders_get(ticket=ticket)
-        if orders:
-            # It's a pending order — remove it
-            request = {
-                "action": mt5.TRADE_ACTION_REMOVE,
-                "order": ticket,
-                "comment": f"cancel:{client_order_id_str}",
-            }
-            result = mt5.order_send(request)
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-                code = result.retcode if result else -1
-                self._log.error(
-                    f"MT5LiveExecutionClient: cancel failed for ticket={ticket} "
-                    f"retcode={code}: {_mt5_retcode_to_str(code)}"
-                )
-                return
-            self._log.info(f"MT5LiveExecutionClient: pending order {ticket} cancelled")
-            return
-
-        # Check if it's an open position
-        positions = mt5.positions_get(ticket=ticket)
-        if positions:
-            pos = positions[0]
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                self._log.error(f"MT5LiveExecutionClient: cannot close position {ticket} — no tick")
-                return
-
-            # Opposite side to close
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                close_type = mt5.ORDER_TYPE_SELL
-                close_price = tick.bid
-            else:
-                close_type = mt5.ORDER_TYPE_BUY
-                close_price = tick.ask
-
-            # Auto-detect the correct filling mode for this symbol/account type
-            filling_mode = _get_filling_mode(symbol)
-
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": pos.volume,
-                "type": close_type,
-                "position": ticket,
-                "price": close_price,
-                "deviation": 20,
-                "magic": self._magic,
-                "comment": f"close:{client_order_id_str}",
-                "type_filling": filling_mode,
-            }
-            result = mt5.order_send(request)
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-                code = result.retcode if result else -1
-                self._log.error(
-                    f"MT5LiveExecutionClient: close failed for position {ticket} "
-                    f"retcode={code}: {_mt5_retcode_to_str(code)}"
-                )
-            else:
-                self._log.info(f"MT5LiveExecutionClient: position {ticket} closed")
-            return
-
-        self._log.warning(f"MT5LiveExecutionClient: ticket {ticket} not found as order or position")
-
-    async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        """
-        Cancel all pending orders for a given instrument.
-        Open positions are NOT closed by this command.
-        """
-        self._conn.ensure_connected()
-
-        symbol = command.instrument_id.symbol.value
-        orders = mt5.orders_get(symbol=symbol)
-        if not orders:
-            return
-
-        for order in orders:
-            if order.magic != self._magic:
-                continue  # not ours
-            request = {
-                "action": mt5.TRADE_ACTION_REMOVE,
-                "order": order.ticket,
-                "comment": "cancel_all",
-            }
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                self._log.info(f"MT5LiveExecutionClient: cancelled order ticket={order.ticket}")
-            else:
-                code = result.retcode if result else -1
-                self._log.warning(
-                    f"MT5LiveExecutionClient: failed to cancel ticket={order.ticket} "
-                    f"retcode={code}"
-                )
-
-    async def _modify_order(self, command: ModifyOrder) -> None:
-        """
-        Modify price, SL, or TP on an existing pending order.
-        Uses ACTION_MODIFY for pending orders, ACTION_SLTP for open positions.
-        """
-        self._conn.ensure_connected()
-
-        client_order_id_str = str(command.client_order_id)
-        ticket = self._client_order_id_to_ticket.get(client_order_id_str)
-        if ticket is None and command.venue_order_id:
-            try:
-                ticket = int(command.venue_order_id.value)
-            except (ValueError, AttributeError):
-                pass
-
-        if ticket is None:
-            self._log.warning(
-                f"MT5LiveExecutionClient: cannot modify — ticket not found for "
-                f"{client_order_id_str}"
-            )
-            return
-
-        new_price = float(command.price) if command.price else 0.0
-        new_sl = float(command.trigger_price) if command.trigger_price else 0.0
-        new_tp = 0.0  # NautilusTrader doesn't pass tp in ModifyOrder currently
-
-        # Check pending order vs open position
-        orders = mt5.orders_get(ticket=ticket)
-        if orders:
-            order = orders[0]
-            request = {
-                "action": mt5.TRADE_ACTION_MODIFY,
-                "order": ticket,
-                "price": new_price or order.price_open,
-                "sl": new_sl,
-                "tp": new_tp or order.tp,
-                "type_time": order.type_time,
-                "expiration": order.time_expiration,
-            }
-        else:
-            positions = mt5.positions_get(ticket=ticket)
-            if not positions:
-                self._log.warning(f"MT5LiveExecutionClient: modify target {ticket} not found")
-                return
-            pos = positions[0]
-            request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "symbol": pos.symbol,
-                "position": ticket,
-                "sl": new_sl or pos.sl,
-                "tp": new_tp or pos.tp,
-            }
-
-        result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            code = result.retcode if result else -1
-            self._log.error(
-                f"MT5LiveExecutionClient: modify failed ticket={ticket} "
-                f"retcode={code}: {_mt5_retcode_to_str(code)}"
-            )
-        else:
-            self._log.info(f"MT5LiveExecutionClient: order {ticket} modified")
-
-    # ── Reconciliation (called at startup) ───────────────────────────────────
-
-    async def _reconcile_open_orders(self) -> None:
-        """
-        Load all currently open pending orders at startup and register them
-        so the polling loop can detect state changes.
-
-        Only processes orders with our magic.
-        """
-        orders = mt5.orders_get()
-        if not orders:
-            return
-
-        for order in orders:
-            if order.magic != self._magic:
-                continue
-            self._known_order_tickets.add(order.ticket)
-            self._log.debug(
-                f"MT5LiveExecutionClient: reconciled pending order ticket={order.ticket} "
-                f"symbol={order.symbol}"
-            )
-
-        self._log.info(
-            f"MT5LiveExecutionClient: reconciled {len(self._known_order_tickets)} "
-            f"open pending orders"
-        )
-
-    async def _reconcile_open_positions(self) -> None:
-        """
-        Load all open positions at startup. Register them so the polling
-        loop can detect closures.
-
-        Only processes positions with our magic.
-        """
-        positions = mt5.positions_get()
-        if not positions:
-            return
-
-        for pos in positions:
-            if pos.magic != self._magic:
-                continue
-            self._known_position_tickets.add(pos.ticket)
-            self._log.debug(
-                f"MT5LiveExecutionClient: reconciled position ticket={pos.ticket} "
-                f"symbol={pos.symbol} volume={pos.volume}"
-            )
-
-        self._log.info(
-            f"MT5LiveExecutionClient: reconciled {len(self._known_position_tickets)} "
-            f"open positions"
-        )
-
-    # ── Execution polling loop ────────────────────────────────────────────────
+    # ── The poll ──────────────────────────────────────────────────────────────
 
     async def _exec_poll_loop(self) -> None:
-        """
-        Poll MT5 for order and position state changes.
-
-        On each iteration:
-          1. Check for filled / cancelled pending orders
-          2. Check for new deals (fills) in history
-          3. Refresh account state periodically
-
-        On connection error → attempt reconnect.
-        On reconnect failure → stop loop (node must be restarted).
-        """
-        self._log.info("MT5LiveExecutionClient: exec poll loop started")
-        _account_refresh_counter = 0
-
+        """Polls the venue every poll interval, reconnecting a terminal session the connection
+        reports lost; ends when a reconnect gives up."""
         while True:
             try:
-                await self._poll_exec_once()
-
-                # Refresh account state every ~10 seconds (40 polls × 250ms)
-                _account_refresh_counter += 1
-                if _account_refresh_counter >= 40:
-                    await self._generate_account_state()
-                    _account_refresh_counter = 0
-
-                await asyncio.sleep(self._config.exec_poll_interval_s)
-
-            except asyncio.CancelledError:
-                self._log.info("MT5LiveExecutionClient: exec poll loop cancelled")
-                break
-
+                self._conn.ensure_connected()
             except MT5ConnectionError as exc:
-                self._log.warning(f"MT5LiveExecutionClient: connection lost — {exc}")
-                ok = await self._conn.reconnect_async()
-                if not ok:
-                    self._log.error("MT5LiveExecutionClient: reconnect failed — stopping exec loop")
-                    break
-                self._log.info("MT5LiveExecutionClient: reconnected")
+                if not await self._reconnect(exc):
+                    return
+            else:
+                self._poll_turn()
+            await asyncio.sleep(self._config.exec_poll_interval_s)
 
-            except Exception as exc:
-                self._log.error(f"MT5LiveExecutionClient: unexpected exec poll error — {exc}")
-                await asyncio.sleep(1.0)
-
-        self._log.info("MT5LiveExecutionClient: exec poll loop stopped")
-
-    async def _poll_exec_once(self) -> None:
-        """
-        Single execution poll iteration.
-
-        1. Fetch pending orders — detect new, removed, or state-changed orders.
-        2. Fetch recent deals from history — emit FillReports for new fills.
-        3. Fetch open positions — detect newly opened or closed positions.
-        """
-        self._conn.ensure_connected()
-
-        # ── 1. Pending orders ─────────────────────────────────────────────
-
-        current_orders = mt5.orders_get() or ()
-        current_tickets = {o.ticket for o in current_orders if o.magic == self._magic}
-
-        # Detect orders that disappeared (filled or cancelled)
-        disappeared = self._known_order_tickets - current_tickets
-        for ticket in disappeared:
-            self._log.debug(
-                f"MT5LiveExecutionClient: pending order {ticket} disappeared "
-                "(filled or cancelled)"
-            )
-        self._known_order_tickets = current_tickets
-
-        # ── 2. Deal history (fills) ───────────────────────────────────────
-
-        # Look back from today (UTC midnight) to catch all deals this session.
-        # We track _processed_deal_keys (set of (time, ticket) tuples) so each
-        # deal is emitted into NT exactly once regardless of poll frequency.
-        now = datetime.now(UTC)
-        from_dt = datetime(now.year, now.month, now.day, tzinfo=UTC)
-
-        deals = mt5.history_deals_get(from_dt, now)
-        if deals:
-            for deal in deals:
-                if deal.magic != self._magic:
-                    continue
-                deal_key = (deal.time, deal.ticket)
-                if deal_key in self._processed_deal_keys:
-                    continue
-
-                self._processed_deal_keys.add(deal_key)
-                self._last_deal_time = max(self._last_deal_time, deal.time)
-
-                self._log.info(
-                    f"MT5LiveExecutionClient: new deal ticket={deal.ticket} "
-                    f"symbol={deal.symbol} volume={deal.volume} "
-                    f"price={deal.price} profit={deal.profit}"
-                )
-
-                # Emit fill into NautilusTrader execution engine
-                await self._emit_fill(deal)
-
-        # ── 3. Open positions ─────────────────────────────────────────────
-
-        current_positions = mt5.positions_get() or ()
-        current_pos_tickets = {p.ticket for p in current_positions if p.magic == self._magic}
-
-        # New positions since last poll
-        new_positions = current_pos_tickets - self._known_position_tickets
-        for ticket in new_positions:
-            self._log.debug(f"MT5LiveExecutionClient: new position ticket={ticket}")
-
-        # Closed positions since last poll
-        closed_positions = self._known_position_tickets - current_pos_tickets
-        for ticket in closed_positions:
-            self._log.debug(f"MT5LiveExecutionClient: position {ticket} closed")
-
-        self._known_position_tickets = current_pos_tickets
-
-    # ── Fill emission ─────────────────────────────────────────────────────────
-
-    async def _emit_fill(self, deal) -> None:
-        """
-        Convert a single MT5 deal into a NautilusTrader OrderFilled event
-        and push it into the execution engine.
-
-        MT5 deal types:
-            DEAL_TYPE_BUY  (0) — opening a long or closing a short
-            DEAL_TYPE_SELL (1) — opening a short or closing a long
-            DEAL_TYPE_BALANCE, DEAL_TYPE_CREDIT, etc. — skip these
-
-        We skip non-trade deals (balance adjustments, commissions paid
-        as separate entries, etc.) by checking deal.type is BUY or SELL.
-
-        The ClientOrderId is recovered from our ticket→client_order_id map
-        if we placed the order this session. For orders placed in a previous
-        session (e.g. a pending order left overnight) we synthesise a
-        ClientOrderId from the MT5 order ticket so NT can still track it.
-        """
-        # Skip non-trade deal types (balance, credit, correction, etc.)
-        if deal.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
-            return
-
-        # Skip zero-volume deals (e.g. commission-only entries)
-        if deal.volume <= 0:
-            return
-
-        symbol = deal.symbol
-        instrument = self._provider.get_instrument(symbol)
-        if instrument is None:
-            self._log.warning(
-                f"MT5LiveExecutionClient: no instrument for deal symbol {symbol!r} — "
-                "skipping fill emission"
-            )
-            return
-
-        pp = instrument.price_precision
-        sp = instrument.size_precision
-
-        # Recover or synthesise ClientOrderId
-        client_order_id_str = self._ticket_to_client_order_id.get(deal.order)
-        if client_order_id_str:
-            client_order_id = ClientOrderId(client_order_id_str)
+    async def _reconnect(self, cause: MT5ConnectionError) -> bool:
+        self._log.warning(f"terminal session lost: {cause}")
+        reconnected = await self._conn.reconnect_async()
+        if reconnected:
+            self._log.info("terminal session reconnected")
         else:
-            # Order placed in a previous session or externally; synthesise one
-            client_order_id = ClientOrderId(f"MT5-{deal.order}")
+            self._log.error("reconnect gave up: execution polling stops")
+        return reconnected
 
-        # Skip deals from previous sessions that have no order in the cache.
-        # NT reconciliation already handles the open position — emitting a fill
-        # for an unknown order just produces ERROR noise with no benefit.
-        if not self._ticket_to_client_order_id.get(deal.order):
-            if self._cache.order(client_order_id) is None:
-                self._log.debug(
-                    f"MT5LiveExecutionClient: skipping pre-session deal "
-                    f"ticket={deal.ticket} order={deal.order} — no cached order"
-                )
-                return
+    def _poll_turn(self) -> None:
+        """Reads the venue once and emits what it confirms, then reports the account when a report
+        is owed or the refresh period is up, whether or not the read completed."""
+        with self._poll_step(PollStep.VENUE_READ):
+            self._poll_venue()
+        if self._account_owed or self._clock.timestamp_ns() >= self._account_due_ns:
+            with self._poll_step(PollStep.ACCOUNT_REPORT):
+                self._refresh_account()
 
-        venue_order_id = VenueOrderId(str(deal.order))
-        trade_id = TradeId(str(deal.ticket))
-
-        order_side = OrderSide.BUY if deal.type == mt5.DEAL_TYPE_BUY else OrderSide.SELL
-
-        commission = Money(abs(deal.commission or 0.0), self._account_currency)
-
-        ts_event = int(deal.time) * 1_000_000_000  # seconds → nanoseconds
-
-        # Recover strategy_id from cache if order is known, else use EXTERNAL
-        strategy_id = StrategyId("EXTERNAL-001")
-        cached_order = self._cache.order(client_order_id)
-        if cached_order is not None:
-            strategy_id = cached_order.strategy_id
-
+    @contextmanager
+    def _poll_step(self, step: PollStep):
+        """Runs one step of a poll turn, which the next turn retries when it fails: a step the
+        server does not answer is logged once per outage, any other failure with its stack."""
         try:
-            self.generate_order_filled(
-                strategy_id,
-                InstrumentId(Symbol(symbol), MT5_VENUE),
-                client_order_id,
+            yield
+        except MT5ConnectionError as exc:
+            if step not in self._outages:
+                self._log.warning(f"execution poll {step}: {exc}")
+            self._outages.add(step)
+        except Exception as exc:
+            self._log.exception(f"execution poll {step} failed", exc)
+        else:
+            if step in self._outages:
+                self._outages.remove(step)
+                self._log.info(f"execution poll {step}: the server answers again")
+
+    def _poll_venue(self) -> None:
+        """Emits the fills of the deals since the last one seen, accepts the resting orders the
+        index learns, and ends the pending orders the venue ended. The deal read opens a second
+        before the last deal, so one stamped in the same second as it is never missed."""
+        since = datetime.fromtimestamp((self._deals_since_ms - 1_000) / 1_000, tz=UTC)
+        deals = _answer("history_deals_get", mt5.history_deals_get(since, self._clock.utc_now()))
+        for deal in sorted(deals, key=attrgetter("time_msc", "ticket")):
+            self._on_deal(deal)
+        resting = self._resting_orders()
+        for venue_order in resting:
+            self._on_resting(venue_order)
+        tickets = {venue_order.ticket for venue_order in resting}
+        self._vanished |= self._resting - tickets
+        self._resting = tickets
+        for ticket in sorted(self._vanished):
+            self._on_vanished(ticket)
+
+    def _on_deal(self, deal) -> None:
+        """Emits the fill a deal of this trader carries, once per deal ticket. A deal whose order no
+        order of NT's explains is logged and left to NT's reconciliation; one whose fill cannot be
+        built raises before it counts as seen, so a later turn emits it."""
+        if deal.ticket in self._seen_deals:
+            return
+        fill = self._is_fill(deal)
+        fields = None
+        if fill:
+            self._learn_ticket(deal.order)
+            order = self._indexed_order(deal.order)
+            if order is not None:
+                fields = self._fill_fields(order, deal)
+        self._seen_deals.add(deal.ticket)
+        self._deals_since_ms = max(self._deals_since_ms, deal.time_msc)
+        if fields is not None:
+            self.generate_order_filled(**fields)
+            self._account_owed = True
+        elif fill:
+            self._log.info(
+                f"deal {deal.ticket} of order {deal.order}: no order of this trader matches it, "
+                "left to reconciliation"
+            )
+
+    def _on_resting(self, venue_order) -> None:
+        """Indexes a resting order of this trader the index lacks when its comment is the digest of
+        an in-flight NT order, and accepts that order under its ticket while NT holds it submitted.
+        One matching nothing is logged once."""
+        if venue_order.ticket in self._client_order_ids:
+            return
+        self._index_by_comment(venue_order.ticket, venue_order.comment)
+        order = self._indexed_order(venue_order.ticket)
+        if order is None:
+            self._log_unresolved(venue_order.ticket)
+        elif order.status == OrderStatus.SUBMITTED:
+            self._accept(order, venue_order)
+
+    def _log_unresolved(self, ticket: int) -> None:
+        if ticket not in self._unresolved:
+            self._unresolved.add(ticket)
+            self._log.info(f"order {ticket}: no order of this trader matches it")
+
+    def _on_vanished(self, ticket: int) -> None:
+        """Emits the end of a pending order that left the venue's resting orders once the venue's
+        history states it — cancelled, expired or rejected; a fill's end is its deal's. Until the
+        history holds the order, the next turn asks again."""
+        historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+        if historical:
+            self._vanished.discard(ticket)
+            self._emit_end(historical[0])
+
+    def _emit_end(self, venue_order) -> None:
+        """Ends the NT order behind a venue order its history ended other than filled, through the
+        index or the digest its comment carries, unless NT has closed it already. One matching no NT
+        order is logged once."""
+        state = _order_state(venue_order)
+        if state in _ENDS:
+            self._index_by_comment(venue_order.ticket, venue_order.comment)
+            order = self._indexed_order(venue_order.ticket)
+            if order is None:
+                self._log_unresolved(venue_order.ticket)
+            elif not order.is_closed:
+                self._end(order, venue_order, state)
+
+    def _accept(self, order: Order, venue_order) -> None:
+        self.generate_order_accepted(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            VenueOrderId(str(venue_order.ticket)),
+            venue_order.time_setup_msc * 1_000_000,
+        )
+        self._account_owed = True
+
+    def _end(self, order: Order, venue_order, state: OrderState) -> None:
+        # The venue placed the order before ending it, and NT expires only an accepted order.
+        if order.status == OrderStatus.SUBMITTED and state != OrderState.REJECTED:
+            self._accept(order, venue_order)
+        venue_order_id = VenueOrderId(str(venue_order.ticket))
+        ts_event = venue_order.time_done_msc * 1_000_000
+        if state == OrderState.CANCELED:
+            self.generate_order_canceled(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
                 venue_order_id,
-                None,  # venue_position_id
-                trade_id,
-                order_side,
-                OrderType.MARKET,
-                Quantity(deal.volume, sp),
-                Price(deal.price, pp),
-                instrument.quote_currency,
-                commission,
-                LiquiditySide.TAKER,
                 ts_event,
             )
-            self._log.info(
-                f"MT5LiveExecutionClient: fill emitted — "
-                f"order={deal.order} deal={deal.ticket} "
-                f"{order_side.name} {deal.volume} {symbol} @ {deal.price}"
+        elif state == OrderState.EXPIRED:
+            self.generate_order_expired(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                venue_order_id,
+                ts_event,
             )
-        except Exception as exc:
-            self._log.error(
-                f"MT5LiveExecutionClient: failed to emit fill for deal {deal.ticket}: {exc}"
+        else:
+            self.generate_order_rejected(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                f"the venue rejected order {venue_order.ticket}",
+                ts_event,
             )
+        self._account_owed = True
 
-    # ── Account state ────────────────────────────────────────────────────────
+    def _fill_fields(self, order: Order, deal) -> dict:
+        """The OrderFilled a deal of an NT order carries, as generate_order_filled takes it; raises
+        for a deal no fill can be built from."""
+        instrument = self._instrument(deal.symbol)
+        return {
+            "strategy_id": order.strategy_id,
+            "instrument_id": order.instrument_id,
+            "client_order_id": order.client_order_id,
+            "venue_order_id": VenueOrderId(str(deal.order)),
+            "venue_position_id": PositionId(str(deal.position_id)),
+            "trade_id": TradeId(str(deal.ticket)),
+            "order_side": _deal_side(deal),
+            "order_type": order.order_type,
+            "last_qty": instrument.make_qty(deal.volume),
+            "last_px": instrument.make_price(deal.price),
+            "quote_currency": instrument.quote_currency,
+            "commission": self._commission(deal),
+            "liquidity_side": _liquidity_side(order.order_type),
+            "ts_event": deal.time_msc * 1_000_000,
+        }
 
-    async def _generate_account_state(self) -> None:
-        """
-        Push account balance/equity/margin to NautilusTrader's account engine.
-        """
-        try:
-            snapshot = self._conn.get_account_info()
-        except MT5ConnectionError as exc:
-            self._log.warning(f"MT5LiveExecutionClient: cannot refresh account state: {exc}")
-            return
-
-        balances = [_make_account_balance(snapshot.balance, self._account_currency)]
-
+    def _refresh_account(self) -> None:
+        """Reports the account: its balance and credit in total, its margin locked and the rest
+        free; NT's portfolio adds the open positions' unrealised P&L. A report that fails stays owed
+        to the next poll turn."""
+        self._account_owed = True
+        account = self._conn.get_account_info()
+        total = Money(account.balance + account.credit, self._account_currency)
+        locked = Money(account.margin, self._account_currency)
+        free = Money(total.as_decimal() - locked.as_decimal(), self._account_currency)
         self.generate_account_state(
-            balances=balances,
+            balances=[AccountBalance(total, locked, free)],
             margins=[],
             reported=True,
             ts_event=self._clock.timestamp_ns(),
         )
+        self._account_owed = False
+        self._account_due_ns = (
+            self._clock.timestamp_ns() + self._config.account_refresh_seconds * 1_000_000_000
+        )
 
-    # ── Required report generators ───────────────────────────────────────────
+    # ── Submit ────────────────────────────────────────────────────────────────
+
+    async def _submit_order(self, command: SubmitOrder) -> None:
+        """Sends an order as the venue's market deal or pending order, refusing before sending one
+        the venue cannot hold as stated."""
+        self.generate_order_submitted(
+            command.order.strategy_id,
+            command.order.instrument_id,
+            command.order.client_order_id,
+            self._clock.timestamp_ns(),
+        )
+        refusal = _refusal(command.order)
+        if refusal is not None:
+            self._reject(command.order, refusal)
+        else:
+            self._place(command.order)
+
+    async def _submit_order_list(self, command: SubmitOrderList) -> None:
+        """Refuses every order of a list: the venue links no order to another."""
+        for order in command.order_list.orders:
+            self.generate_order_submitted(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                self._clock.timestamp_ns(),
+            )
+            self._reject(order, "unsupported: order lists")
+
+    def _place(self, order: Order) -> None:
+        try:
+            self._conn.ensure_connected()
+            request = self._new_order_request(order)
+        except (MT5ConnectionError, MT5InstrumentError, MT5OrderError) as exc:
+            self._reject(order, f"not sent: {exc}")
+        else:
+            self._on_new_order_sent(order, _send(request))
+
+    def _on_new_order_sent(self, order: Order, sent: _Sent) -> None:
+        if sent.outcome == SendOutcome.DONE:
+            self._index(sent.result.order, order.client_order_id)
+            if order.order_type != OrderType.MARKET:
+                self._resting.add(sent.result.order)
+            self.generate_order_accepted(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                VenueOrderId(str(sent.result.order)),
+                self._clock.timestamp_ns(),
+            )
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.REFUSED:
+            self._reject(order, sent.reason)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.NOT_SENT:
+            self._reject(order, sent.reason)
+        else:
+            self._log.warning(f"{order.client_order_id!r} submit: {sent.reason}; {_LOST}")
+
+    def _new_order_request(self, order: Order) -> dict:
+        """The trade request placing an order; raises when the venue cannot be asked for it."""
+        instrument = self._instrument(order.instrument_id.symbol.value)
+        request = {
+            "symbol": instrument.raw_symbol.value,
+            "volume": order.quantity.as_double(),
+            "magic": self._magic,
+            "comment": order_comment(order.client_order_id),
+            "sl": 0.0,
+            "tp": 0.0,
+        }
+        if order.order_type == OrderType.MARKET:
+            if order.side == OrderSide.BUY:
+                request["type"] = mirror.ORDER_TYPE_BUY
+            else:
+                request["type"] = mirror.ORDER_TYPE_SELL
+            request["action"] = mirror.TRADE_ACTION_DEAL
+            request["price"] = self._market_price(order)
+            request["deviation"] = self._config.deviation_points
+            request["type_filling"] = _market_filling(instrument)
+        else:
+            request["type"] = _PENDING_TYPES[(order.order_type, order.side)]
+            request["action"] = mirror.TRADE_ACTION_PENDING
+            request["type_filling"] = mirror.ORDER_FILLING_RETURN
+            request |= _pending_prices(order, _limit_price(order), _trigger_price(order))
+            request |= _expiry(order)
+        return request
+
+    def _market_price(self, order: Order) -> float:
+        """The side's price of NT's cached quote, else of the terminal's last one: instant and
+        request execution need a price, market execution ignores it. Raises MT5OrderError while the
+        symbol has no quote."""
+        quote = self._cache.quote_tick(order.instrument_id)
+        if quote is not None:
+            if order.side == OrderSide.BUY:
+                return quote.ask_price.as_double()
+            else:
+                return quote.bid_price.as_double()
+        last = _answer("symbol_info_tick", mt5.symbol_info_tick(order.instrument_id.symbol.value))
+        if last.time == 0:
+            raise MT5OrderError(f"{order.instrument_id.symbol} has no quote")
+        elif order.side == OrderSide.BUY:
+            return last.ask
+        else:
+            return last.bid
+
+    def _reject(self, order: Order, reason: str) -> None:
+        self.generate_order_rejected(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            reason,
+            self._clock.timestamp_ns(),
+        )
+
+    # ── Modify ────────────────────────────────────────────────────────────────
+
+    async def _modify_order(self, command: ModifyOrder) -> None:
+        """Moves a pending order's prices at the venue, which cannot change an order's quantity."""
+        order = self._cache.order(command.client_order_id)
+        ticket = self._ticket(order)
+        if command.quantity is not None and command.quantity != order.quantity:
+            self._modify_rejected(order, ticket, "unsupported: quantity changes")
+        elif order.order_type not in _PENDING_ORDER_TYPES:
+            self._modify_rejected(
+                order, ticket, f"unsupported: modifying a {order_type_to_str(order.order_type)}"
+            )
+        elif ticket is None:
+            self._modify_rejected(order, ticket, "no venue order is known for it")
+        else:
+            self._modify_resting(order, ticket, command)
+
+    def _modify_resting(self, order: Order, ticket: int, command: ModifyOrder) -> None:
+        try:
+            self._conn.ensure_connected()
+            refusal = self._not_resting(ticket)
+        except MT5ConnectionError as exc:
+            self._modify_rejected(order, ticket, f"not sent: {exc}")
+        else:
+            if refusal is None:
+                price = _stated(command.price, _limit_price(order))
+                trigger = _stated(command.trigger_price, _trigger_price(order))
+                request = {
+                    "action": mirror.TRADE_ACTION_MODIFY,
+                    "order": ticket,
+                    "sl": 0.0,
+                    "tp": 0.0,
+                }
+                request |= _pending_prices(order, price, trigger) | _expiry(order)
+                self._on_modify_sent(order, ticket, price, trigger, _send(request))
+            else:
+                self._modify_rejected(order, ticket, refusal)
+                self._refresh_account()
+
+    def _on_modify_sent(
+        self, order: Order, ticket: int, price: Price | None, trigger: Price | None, sent: _Sent
+    ) -> None:
+        if sent.outcome == SendOutcome.DONE:
+            self.generate_order_updated(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                VenueOrderId(str(ticket)),
+                order.quantity,
+                price,
+                trigger,
+                self._clock.timestamp_ns(),
+            )
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.REFUSED:
+            self._modify_rejected(order, ticket, sent.reason)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.NOT_SENT:
+            self._modify_rejected(order, ticket, sent.reason)
+        else:
+            self._log.warning(f"{order.client_order_id!r} modify: {sent.reason}; {_LOST}")
+
+    def _modify_rejected(self, order: Order, ticket: int | None, reason: str) -> None:
+        self.generate_order_modify_rejected(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            _venue_order_id(ticket),
+            reason,
+            self._clock.timestamp_ns(),
+        )
+
+    # ── Cancel ────────────────────────────────────────────────────────────────
+
+    async def _cancel_order(self, command: CancelOrder) -> None:
+        """Removes a pending order from the venue; a cancel never closes a position."""
+        self._cancel(self._cache.order(command.client_order_id))
+
+    async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
+        """Removes the commanding strategy's pending orders on the instrument, of the command's side
+        when it names one; the other strategies' orders under the trader stay."""
+        self._conn.ensure_connected()
+        venue_orders = _answer(
+            "orders_get", mt5.orders_get(symbol=command.instrument_id.symbol.value)
+        )
+        ours = [venue_order for venue_order in venue_orders if venue_order.magic == self._magic]
+        for venue_order in ours:
+            order = self._order_behind(venue_order)
+            if order is not None and _commanded(order, command):
+                self._remove(order, venue_order.ticket)
+
+    async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
+        """Removes each pending order the batch names, as a cancel of each would."""
+        for cancel in command.cancels:
+            self._cancel(self._cache.order(cancel.client_order_id))
+
+    def _cancel(self, order: Order) -> None:
+        ticket = self._ticket(order)
+        if ticket is None:
+            self._cancel_rejected(order, ticket, "no venue order is known for it")
+        else:
+            self._remove(order, ticket)
+
+    def _remove(self, order: Order, ticket: int) -> None:
+        try:
+            self._conn.ensure_connected()
+            refusal = self._not_resting(ticket)
+        except MT5ConnectionError as exc:
+            self._cancel_rejected(order, ticket, f"not sent: {exc}")
+        else:
+            if refusal is None:
+                request = {"action": mirror.TRADE_ACTION_REMOVE, "order": ticket}
+                self._on_remove_sent(order, ticket, _send(request))
+            else:
+                self._cancel_rejected(order, ticket, refusal)
+                self._refresh_account()
+
+    def _on_remove_sent(self, order: Order, ticket: int, sent: _Sent) -> None:
+        if sent.outcome == SendOutcome.DONE:
+            # The poll would otherwise cancel it a second time once it leaves the resting orders.
+            self._resting.discard(ticket)
+            self._vanished.discard(ticket)
+            self.generate_order_canceled(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                VenueOrderId(str(ticket)),
+                self._clock.timestamp_ns(),
+            )
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.REFUSED:
+            self._cancel_rejected(order, ticket, sent.reason)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.NOT_SENT:
+            self._cancel_rejected(order, ticket, sent.reason)
+        else:
+            self._log.warning(f"{order.client_order_id!r} cancel: {sent.reason}; {_LOST}")
+
+    def _cancel_rejected(self, order: Order, ticket: int | None, reason: str) -> None:
+        self.generate_order_cancel_rejected(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            _venue_order_id(ticket),
+            reason,
+            self._clock.timestamp_ns(),
+        )
+
+    def _not_resting(self, ticket: int) -> str | None:
+        """None while the venue rests an order under the ticket; else why it cannot act on one — the
+        state its history ended it in, or that it holds no such order."""
+        if _answer("orders_get", mt5.orders_get(ticket=ticket)):
+            return None
+        historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+        if historical:
+            return f"the order is {_order_state(historical[0])}"
+        else:
+            return f"the venue holds no order {ticket}"
+
+    # ── Reports ───────────────────────────────────────────────────────────────
 
     async def generate_order_status_report(
         self,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId | None = None,
-        venue_order_id: VenueOrderId | None = None,
+        command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        """
-        Generate an OrderStatusReport for a specific order.
-        Used by NautilusTrader for reconciliation.
-        """
+        """The venue's order an NT order names — by its ticket, else by its comment's digest among
+        the resting orders and the lookback's history — or None when the venue holds none."""
+        if command.client_order_id is None and command.venue_order_id is None:
+            raise ValueError("an order status report needs a client or a venue order id")
         self._conn.ensure_connected()
-
-        ticket: int | None = None
-        if client_order_id:
-            ticket = self._client_order_id_to_ticket.get(str(client_order_id))
-        if ticket is None and venue_order_id:
-            try:
-                ticket = int(venue_order_id.value)
-            except (ValueError, AttributeError):
-                pass
-
-        if ticket is None:
+        ticket = self._report_ticket(command)
+        if ticket is not None:
+            venue_order = self._venue_order(ticket)
+        else:
+            venue_order = self._venue_order_by_comment(order_comment(command.client_order_id))
+        if venue_order is None:
             return None
-
-        # Check pending orders
-        orders = mt5.orders_get(ticket=ticket)
-        if orders:
-            order = orders[0]
-            return _build_order_status_report(
-                order,
-                instrument_id,
-                client_order_id,
-                venue_order_id,
-                self._clock.timestamp_ns(),
-            )
-
-        return None
+        elif venue_order.magic != self._magic:
+            raise MT5OrderError(f"order {venue_order.ticket} carries another trader's magic")
+        else:
+            return self._order_report(venue_order)
 
     async def generate_order_status_reports(
         self,
-        command,  # GenerateOrderStatusReports command object (NT 1.224+)
+        command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
-        """Generate OrderStatusReports for all known open orders."""
+        """This trader's resting orders, with its orders in the venue's history over the command's
+        window unless it asks for open orders only; one report per ticket."""
         self._conn.ensure_connected()
-        reports = []
-
-        # Extract fields from the command object
-        instrument_id = getattr(command, "instrument_id", None)
-
-        kwargs = {}
-        if instrument_id:
-            kwargs["symbol"] = instrument_id.symbol.value
-
-        orders = mt5.orders_get(**kwargs) or ()
-        for order in orders:
-            if order.magic != self._magic:
-                continue
-            client_order_id_str = self._ticket_to_client_order_id.get(order.ticket)
-            client_order_id = ClientOrderId(client_order_id_str) if client_order_id_str else None
-            venue_order_id = VenueOrderId(str(order.ticket))
-            iid = instrument_id or InstrumentId(Symbol(order.symbol), MT5_VENUE)
-            report = _build_order_status_report(
-                order,
-                iid,
-                client_order_id,
-                venue_order_id,
-                self._clock.timestamp_ns(),
+        if command.instrument_id is None:
+            resting = _answer("orders_get", mt5.orders_get())
+        else:
+            resting = _answer(
+                "orders_get", mt5.orders_get(symbol=command.instrument_id.symbol.value)
             )
-            reports.append(report)
+        venue_orders = {order.ticket: order for order in resting if order.magic == self._magic}
+        if not command.open_only:
+            date_from, date_to = self._window(command)
+            historical = _answer("history_orders_get", mt5.history_orders_get(date_from, date_to))
+            for order in historical:
+                if order.magic == self._magic and _in_scope(order.symbol, command.instrument_id):
+                    venue_orders.setdefault(order.ticket, order)
+        return [self._order_report(venue_order) for venue_order in venue_orders.values()]
 
-        return reports
-
-    async def generate_fill_reports(
-        self,
-        command,  # GenerateFillReports command object (NT 1.224+)
-    ) -> list[FillReport]:
-        """Generate FillReports from MT5 deal history."""
+    async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
+        """The fills of this trader's deals in the venue's history over the command's window."""
         self._conn.ensure_connected()
-
-        # Extract fields from the command object
-        instrument_id = getattr(command, "instrument_id", None)
-        start = getattr(command, "start", None)
-        end = getattr(command, "end", None)
-
-        from_dt = start or datetime(
-            datetime.now().year,
-            datetime.now().month,
-            datetime.now().day,
-            tzinfo=UTC,
-        )
-        to_dt = end or datetime.now(UTC)
-
-        deals = mt5.history_deals_get(from_dt, to_dt) or ()
+        date_from, date_to = self._window(command)
         reports = []
-
-        symbol_filter = instrument_id.symbol.value if instrument_id else None
-
-        for deal in deals:
-            if deal.magic != self._magic:
-                continue
-            if symbol_filter and deal.symbol != symbol_filter:
-                continue
-
-            client_order_id_str = self._ticket_to_client_order_id.get(deal.order)
-            client_order_id = ClientOrderId(client_order_id_str) if client_order_id_str else None
-            iid = InstrumentId(Symbol(deal.symbol), MT5_VENUE)
-            instrument = self._provider.get_instrument(deal.symbol)
-            if instrument is None:
-                continue
-
-            pp = instrument.price_precision
-
-            commission_amount = abs(deal.commission or 0.0)
-            commission = Money(commission_amount, self._account_currency)
-
-            report = FillReport(
-                account_id=self.account_id,
-                instrument_id=iid,
-                venue_order_id=VenueOrderId(str(deal.order)),
-                trade_id=TradeId(str(deal.ticket)),
-                order_side=OrderSide.BUY if deal.type == mt5.DEAL_TYPE_BUY else OrderSide.SELL,
-                last_qty=Quantity(deal.volume, instrument.size_precision),
-                last_px=Price(deal.price, pp),
-                commission=commission,
-                liquidity_side=LiquiditySide.TAKER,
-                report_id=UUID4(),
-                ts_event=int(deal.time) * 1_000_000_000,
-                ts_init=self._clock.timestamp_ns(),
-                client_order_id=client_order_id,
-            )
-            reports.append(report)
-
+        for deal in _answer("history_deals_get", mt5.history_deals_get(date_from, date_to)):
+            if (
+                self._is_fill(deal)
+                and _in_scope(deal.symbol, command.instrument_id)
+                and _of_order(deal, command.venue_order_id)
+            ):
+                reports.append(self._fill_report(deal))
         return reports
 
     async def generate_position_status_reports(
         self,
-        command,  # GeneratePositionStatusReports command object (NT 1.224+)
+        command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
-        """Generate PositionStatusReports for open positions."""
+        """One report per venue position of this trader: the venue hedges each under its own
+        identifier."""
         self._conn.ensure_connected()
-
-        # Extract fields from the command object
-        instrument_id = getattr(command, "instrument_id", None)
-
-        kwargs = {}
-        if instrument_id:
-            kwargs["symbol"] = instrument_id.symbol.value
-
-        positions = mt5.positions_get(**kwargs) or ()
-        reports = []
-
-        for pos in positions:
-            if pos.magic != self._magic:
-                continue
-
-            iid = instrument_id or InstrumentId(Symbol(pos.symbol), MT5_VENUE)
-            instrument = self._provider.get_instrument(pos.symbol)
-            if instrument is None:
-                continue
-
-            side = OrderSide.BUY if pos.type == mt5.ORDER_TYPE_BUY else OrderSide.SELL
-            report = PositionStatusReport(
-                account_id=self.account_id,
-                instrument_id=iid,
-                position_side=_order_side_to_position_side(side),
-                quantity=Quantity(pos.volume, instrument.size_precision),
-                report_id=UUID4(),
-                ts_last=int(pos.time) * 1_000_000_000,
-                ts_init=self._clock.timestamp_ns(),
+        if command.instrument_id is None:
+            positions = _answer("positions_get", mt5.positions_get())
+        else:
+            positions = _answer(
+                "positions_get", mt5.positions_get(symbol=command.instrument_id.symbol.value)
             )
-            reports.append(report)
-
+        reports = []
+        for position in positions:
+            if position.magic == self._magic:
+                reports.append(self._position_report(position))
         return reports
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    def _report_ticket(self, command: GenerateOrderStatusReport) -> int | None:
+        if command.venue_order_id is not None and command.venue_order_id.value.isdigit():
+            return int(command.venue_order_id.value)
+        else:
+            return self._tickets.get(command.client_order_id)
 
-    def _generate_order_accepted(self, order, venue_order_id: VenueOrderId) -> None:
-        """Emit OrderAccepted into the execution engine."""
-        self.generate_order_accepted(
-            strategy_id=order.strategy_id,
-            instrument_id=order.instrument_id,
-            client_order_id=order.client_order_id,
-            venue_order_id=venue_order_id,
-            ts_event=self._clock.timestamp_ns(),
+    def _window(self, command) -> tuple[datetime, datetime]:
+        """The history window a report reads: the command's bounds, else the config's lookback up to
+        now."""
+        now = self._clock.utc_now()
+        if command.start is not None:
+            date_from = command.start
+        else:
+            date_from = now - timedelta(minutes=self._config.history_lookback_mins)
+        if command.end is not None:
+            date_to = command.end
+        else:
+            date_to = now
+        return date_from, date_to
+
+    def _venue_order_by_comment(self, comment: str):
+        """This trader's venue order carrying the comment, resting or in the history over the
+        lookback; None when neither holds one."""
+        for venue_order in _answer("orders_get", mt5.orders_get()):
+            if venue_order.magic == self._magic and venue_order.comment == comment:
+                return venue_order
+        now = self._clock.utc_now()
+        since = now - timedelta(minutes=self._config.history_lookback_mins)
+        for venue_order in _answer("history_orders_get", mt5.history_orders_get(since, now)):
+            if venue_order.magic == self._magic and venue_order.comment == comment:
+                return venue_order
+        return None
+
+    def _order_report(self, venue_order) -> OrderStatusReport:
+        instrument = self._instrument(venue_order.symbol)
+        side, order_type = _venue_order_type(venue_order)
+        time_in_force = _time_in_force(venue_order)
+        price, trigger = _report_prices(venue_order, order_type, instrument)
+        if trigger is None:
+            trigger_type = TriggerType.NO_TRIGGER
+        else:
+            trigger_type = TriggerType.DEFAULT
+        if time_in_force == TimeInForce.GTD and venue_order.time_expiration != 0:
+            expire_time = datetime.fromtimestamp(venue_order.time_expiration, tz=UTC)
+        else:
+            expire_time = None
+        volume_initial = finite_decimal(venue_order.volume_initial, "volume_initial")
+        volume_current = finite_decimal(venue_order.volume_current, "volume_current")
+        return OrderStatusReport(
+            account_id=self.account_id,
+            instrument_id=instrument.id,
+            venue_order_id=VenueOrderId(str(venue_order.ticket)),
+            order_side=side,
+            order_type=order_type,
+            time_in_force=time_in_force,
+            order_status=_STATUSES[_order_state(venue_order)],
+            quantity=instrument.make_qty(volume_initial),
+            filled_qty=instrument.make_qty(volume_initial - volume_current),
+            report_id=UUID4(),
+            ts_accepted=venue_order.time_setup_msc * 1_000_000,
+            ts_last=_last_update_ms(venue_order) * 1_000_000,
+            ts_init=self._clock.timestamp_ns(),
+            client_order_id=self._client_order_id_of(venue_order),
+            expire_time=expire_time,
+            price=price,
+            trigger_price=trigger,
+            trigger_type=trigger_type,
+            post_only=False,
+            reduce_only=False,
         )
 
-    def _generate_order_rejected(self, order, reason: str) -> None:
-        """Emit OrderRejected into the execution engine."""
-        self._log.warning(
-            f"MT5LiveExecutionClient: order rejected "
-            f"client_order_id={order.client_order_id} reason={reason}"
+    def _fill_report(self, deal) -> FillReport:
+        instrument = self._instrument(deal.symbol)
+        client_order_id, order_type = self._deal_order(deal)
+        return FillReport(
+            account_id=self.account_id,
+            instrument_id=instrument.id,
+            venue_order_id=VenueOrderId(str(deal.order)),
+            trade_id=TradeId(str(deal.ticket)),
+            order_side=_deal_side(deal),
+            last_qty=instrument.make_qty(deal.volume),
+            last_px=instrument.make_price(deal.price),
+            commission=self._commission(deal),
+            liquidity_side=_liquidity_side(order_type),
+            report_id=UUID4(),
+            ts_event=deal.time_msc * 1_000_000,
+            ts_init=self._clock.timestamp_ns(),
+            client_order_id=client_order_id,
+            venue_position_id=PositionId(str(deal.position_id)),
         )
-        self.generate_order_rejected(
-            strategy_id=order.strategy_id,
-            instrument_id=order.instrument_id,
-            client_order_id=order.client_order_id,
-            reason=reason,
-            ts_event=self._clock.timestamp_ns(),
+
+    def _position_report(self, position) -> PositionStatusReport:
+        instrument = self._instrument(position.symbol)
+        if position.type == mirror.POSITION_TYPE_BUY:
+            side = PositionSide.LONG
+        elif position.type == mirror.POSITION_TYPE_SELL:
+            side = PositionSide.SHORT
+        else:
+            raise MT5OrderError(f"position {position.identifier}: type {position.type} is unknown")
+        return PositionStatusReport(
+            account_id=self.account_id,
+            instrument_id=instrument.id,
+            position_side=side,
+            quantity=instrument.make_qty(position.volume),
+            report_id=UUID4(),
+            ts_last=position.time_update_msc * 1_000_000,
+            ts_init=self._clock.timestamp_ns(),
+            venue_position_id=PositionId(str(position.identifier)),
         )
 
-    # ── Properties ────────────────────────────────────────────────────────────
+    def _deal_order(self, deal) -> tuple[ClientOrderId | None, OrderType | None]:
+        """The client order id and order type behind a deal: NT's indexed order's, else the venue
+        order's type with the in-flight NT order its comment digests, if any."""
+        order = self._indexed_order(deal.order)
+        if order is not None:
+            return order.client_order_id, order.order_type
+        venue_order = self._venue_order(deal.order)
+        if venue_order is None:
+            return None, None
+        else:
+            _, order_type = _venue_order_type(venue_order)
+            return self._in_flight_by_comment().get(venue_order.comment), order_type
 
-    @property
-    def is_polling(self) -> bool:
-        """True if the execution polling task is running."""
-        return self._exec_poll_task is not None and not self._exec_poll_task.done()
+    # ── Identity ──────────────────────────────────────────────────────────────
 
-    @property
-    def known_order_count(self) -> int:
-        return len(self._known_order_tickets)
+    def _index(self, ticket: int, client_order_id: ClientOrderId) -> None:
+        self._client_order_ids[ticket] = client_order_id
+        self._tickets[client_order_id] = ticket
 
-    @property
-    def known_position_count(self) -> int:
-        return len(self._known_position_tickets)
+    def _learn_ticket(self, ticket: int) -> None:
+        """Indexes a ticket the index lacks when its venue order's comment is the digest of an
+        in-flight NT order."""
+        if ticket not in self._client_order_ids:
+            venue_order = self._venue_order(ticket)
+            if venue_order is not None:
+                self._index_by_comment(ticket, venue_order.comment)
 
-    def __repr__(self) -> str:
+    def _index_by_comment(self, ticket: int, comment: str) -> None:
+        """Indexes a ticket the index lacks when the comment its venue order carries is the digest
+        of an in-flight NT order."""
+        if ticket not in self._client_order_ids:
+            client_order_id = self._in_flight_by_comment().get(comment)
+            if client_order_id is not None:
+                self._index(ticket, client_order_id)
+
+    def _indexed_order(self, ticket: int) -> Order | None:
+        client_order_id = self._client_order_ids.get(ticket)
+        if client_order_id is not None:
+            return self._cache.order(client_order_id)
+        else:
+            return None
+
+    def _order_behind(self, venue_order) -> Order | None:
+        """NT's order behind a venue order, through the index or the digest its comment carries."""
+        client_order_id = self._client_order_id_of(venue_order)
+        if client_order_id is not None:
+            return self._cache.order(client_order_id)
+        else:
+            return None
+
+    def _client_order_id_of(self, venue_order) -> ClientOrderId | None:
+        """The client order id of a venue order: the index's, else that of the in-flight NT order
+        its comment digests."""
+        client_order_id = self._client_order_ids.get(venue_order.ticket)
+        if client_order_id is not None:
+            return client_order_id
+        else:
+            return self._in_flight_by_comment().get(venue_order.comment)
+
+    def _in_flight_by_comment(self) -> dict[str, ClientOrderId]:
+        """NT's open and in-flight orders at this venue, by the comment each carries to it."""
+        orders = self._cache.orders_open(venue=self.venue) + self._cache.orders_inflight(
+            venue=self.venue
+        )
+        return {order_comment(order.client_order_id): order.client_order_id for order in orders}
+
+    def _ticket(self, order: Order) -> int | None:
+        """The venue ticket of an NT order: its venue order id, else the index's."""
+        if order.venue_order_id is not None and order.venue_order_id.value.isdigit():
+            return int(order.venue_order_id.value)
+        else:
+            return self._tickets.get(order.client_order_id)
+
+    # ── Venue reads ───────────────────────────────────────────────────────────
+
+    def _resting_orders(self) -> list:
+        """This trader's orders resting at the venue."""
+        resting = _answer("orders_get", mt5.orders_get())
+        return [order for order in resting if order.magic == self._magic]
+
+    def _venue_order(self, ticket: int):
+        """The venue's order under a ticket — resting, else in its history — or None when it holds
+        none."""
+        resting = _answer("orders_get", mt5.orders_get(ticket=ticket))
+        if resting:
+            return resting[0]
+        historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+        if historical:
+            return historical[0]
+        else:
+            return None
+
+    def _is_fill(self, deal) -> bool:
+        """Whether a deal is a fill of this trader's: a buy or a sell of some volume that enters or
+        leaves a position."""
         return (
-            f"MT5LiveExecutionClient("
-            f"orders={self.known_order_count}, "
-            f"positions={self.known_position_count})"
+            deal.magic == self._magic
+            and deal.type in (mirror.DEAL_TYPE_BUY, mirror.DEAL_TYPE_SELL)
+            and deal.entry in _FILL_ENTRIES
+            and deal.volume > 0
         )
 
+    def _instrument(self, symbol: str) -> InstrumentAny:
+        """The loaded instrument of a venue symbol; raises MT5InstrumentError for one the provider
+        has not loaded."""
+        instrument = self._provider.get_instrument(symbol)
+        if instrument is None:
+            raise MT5InstrumentError(f"{symbol} is not loaded")
+        return instrument
+
+    def _commission(self, deal) -> Money:
+        """What a deal charged, in the account currency: the venue states a charge negative, so a
+        positive commission is a rebate."""
+        charge = finite_decimal(deal.commission, "commission") + finite_decimal(deal.fee, "fee")
+        return Money(-charge, self._account_currency)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL HELPERS
+# MODULE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def _time_in_force_to_mt5(tif: TimeInForce) -> int:
-    """
-    Convert NautilusTrader TimeInForce to MT5 order time-in-force constant.
-
-    GTC → ORDER_TIME_GTC  (good till cancelled)
-    DAY → ORDER_TIME_DAY  (good till end of day)
-    IOC → ORDER_TIME_GTC  (closest MT5 equiv — IOC is handled by filling mode)
-    FOK → ORDER_TIME_GTC  (same — handled by filling mode IOC/FOK)
-    GTD → ORDER_TIME_SPECIFIED (needs expiration set separately)
-    """
-    mapping = {
-        TimeInForce.GTC: mt5.ORDER_TIME_GTC,
-        TimeInForce.DAY: mt5.ORDER_TIME_DAY,
-        TimeInForce.IOC: mt5.ORDER_TIME_GTC,
-        TimeInForce.FOK: mt5.ORDER_TIME_GTC,
-        TimeInForce.GTD: mt5.ORDER_TIME_SPECIFIED,
-    }
-    return mapping.get(tif, mt5.ORDER_TIME_GTC)
+_LOST = "the venue may have acted on it, left to reconciliation"
 
 
-def _make_account_balance(balance: Decimal, currency: Currency):
-    """
-    Build a NautilusTrader AccountBalance from MT5 account info snapshot.
-
-    NautilusTrader enforces: total - locked == free (strict equality).
-    MT5 exposes balance and equity separately but does not directly expose
-    a "locked" margin figure in the AccountSnapshot we carry. We therefore
-    use balance as both total and free with locked=0, which always satisfies
-    the invariant. Unrealised P&L (equity - balance) is visible via positions.
-    """
-    from nautilus_trader.model.objects import AccountBalance
-
-    return AccountBalance(
-        total=Money(balance, currency),
-        locked=Money(0, currency),
-        free=Money(balance, currency),
-    )
+def _answer(function: str, value):
+    """A read's answer; raises MT5ConnectionError for the package's failure, None."""
+    if value is None:
+        code, message = mt5.last_error()
+        raise MT5ConnectionError(f"{function} failed — error {code}: {message}")
+    return value
 
 
-def _order_side_to_position_side(side: OrderSide):
-    """Convert OrderSide to PositionSide."""
-    from nautilus_trader.model.enums import PositionSide
-
-    return PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
-
-
-def _build_order_status_report(
-    mt5_order,
-    instrument_id: InstrumentId,
-    client_order_id: ClientOrderId | None,
-    venue_order_id: VenueOrderId | None,
-    ts_init: int,
-) -> OrderStatusReport:
-    """Build an OrderStatusReport from a raw MT5 order namedtuple."""
-    from nautilus_trader.execution.reports import OrderStatusReport
-
-    side = _mt5_order_type_to_nautilus_side(mt5_order.type)
-
-    # MT5 pending order types map to LIMIT or STOP
-    pending_limit_types = {mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT}
-    pending_stop_types = {
-        mt5.ORDER_TYPE_BUY_STOP,
-        mt5.ORDER_TYPE_SELL_STOP,
-        mt5.ORDER_TYPE_BUY_STOP_LIMIT,
-        mt5.ORDER_TYPE_SELL_STOP_LIMIT,
-    }
-
-    if mt5_order.type in pending_limit_types:
-        order_type = OrderType.LIMIT
-    elif mt5_order.type in pending_stop_types:
-        order_type = OrderType.STOP_MARKET
+def _send(request: dict) -> _Sent:
+    """Sends a trade request and classifies what the venue's answer to it proves."""
+    try:
+        result = mt5.order_send(request)
+    except ResponseLost as exc:
+        return _Sent(SendOutcome.LOST, str(exc))
+    except MT5ConnectionError as exc:
+        return _Sent(SendOutcome.NOT_SENT, f"not sent: {exc}")
+    if result is None:
+        code, message = mt5.last_error()
+        return _Sent(SendOutcome.LOST, f"order_send failed — error {code}: {message}")
+    elif result.retcode in _DONE_RETCODES:
+        return _Sent(SendOutcome.DONE, _retcode_reason(result), result)
+    elif result.retcode == mirror.TRADE_RETCODE_CONNECTION:
+        return _Sent(SendOutcome.LOST, _retcode_reason(result), result)
     else:
-        order_type = OrderType.MARKET
+        return _Sent(SendOutcome.REFUSED, _retcode_reason(result), result)
 
-    return OrderStatusReport(
-        account_id=AccountId(f"MT5-{mt5_order.magic}"),
-        instrument_id=instrument_id,
-        venue_order_id=venue_order_id or VenueOrderId(str(mt5_order.ticket)),
-        order_side=side,
-        order_type=order_type,
-        time_in_force=TimeInForce.GTC,
-        order_status=OrderStatus.ACCEPTED,
-        quantity=Quantity(mt5_order.volume_initial, 2),
-        filled_qty=Quantity(mt5_order.volume_initial - mt5_order.volume_current, 2),
-        report_id=UUID4(),
-        ts_accepted=int(mt5_order.time_setup) * 1_000_000_000,
-        ts_last=int(mt5_order.time_setup) * 1_000_000_000,
-        ts_init=ts_init,
-        client_order_id=client_order_id,
-        price=Price(mt5_order.price_open, 5) if mt5_order.price_open else None,
-        post_only=False,
-        reduce_only=False,
-        cancel_reason=None,
+
+def _retcode_reason(result) -> str:
+    if result.retcode in _RETCODE_NAMES:
+        return f"{_RETCODE_NAMES[result.retcode]}: {result.comment}"
+    else:
+        return f"retcode {result.retcode}: {result.comment}"
+
+
+def _refusal(order: Order) -> str | None:
+    """Why the venue cannot hold an order as it is stated, or None when it can."""
+    if order.is_reduce_only:
+        return "unsupported: reduce-only orders (position exits are not translated)"
+    elif order.order_type not in _ORDER_TYPES:
+        return f"unsupported: order type {order_type_to_str(order.order_type)}"
+    elif order.time_in_force not in _TIMES_IN_FORCE_SENT:
+        return f"unsupported: time in force {time_in_force_to_str(order.time_in_force)}"
+    elif order.is_post_only:
+        return "unsupported: post-only"
+    elif order.contingency_type != ContingencyType.NO_CONTINGENCY:
+        return "unsupported: contingent orders"
+    else:
+        return None
+
+
+def _market_filling(instrument: InstrumentAny) -> int:
+    """The filling a market deal takes: IOC where the symbol allows it, else FOK, else RETURN."""
+    allowed = SymbolFilling(instrument.info["filling_mode"])
+    if SymbolFilling.IOC in allowed:
+        return mirror.ORDER_FILLING_IOC
+    elif SymbolFilling.FOK in allowed:
+        return mirror.ORDER_FILLING_FOK
+    else:
+        return mirror.ORDER_FILLING_RETURN
+
+
+def _pending_prices(order: Order, price: Price | None, trigger: Price | None) -> dict:
+    """A pending request's prices: a limit rests at its price, a stop at its trigger, and a
+    stop-limit at its trigger with its limit as the stoplimit."""
+    if order.order_type == OrderType.LIMIT:
+        return {"price": price.as_double()}
+    elif order.order_type == OrderType.STOP_MARKET:
+        return {"price": trigger.as_double()}
+    else:
+        return {"price": trigger.as_double(), "stoplimit": price.as_double()}
+
+
+def _expiry(order: Order) -> dict:
+    """A pending request's time in force: a GTD order expires at its UTC second, which the server
+    converts to the broker's clock."""
+    if order.time_in_force == TimeInForce.GTD:
+        return {
+            "type_time": mirror.ORDER_TIME_SPECIFIED,
+            "expiration": order.expire_time_ns // 1_000_000_000,
+        }
+    else:
+        return {"type_time": mirror.ORDER_TIME_GTC}
+
+
+def _stated(value: Price | None, current: Price | None) -> Price | None:
+    """The price a modify states, else the order's current one."""
+    if value is not None:
+        return value
+    else:
+        return current
+
+
+def _limit_price(order: Order) -> Price | None:
+    if order.has_price:
+        return order.price
+    else:
+        return None
+
+
+def _trigger_price(order: Order) -> Price | None:
+    if order.has_trigger_price:
+        return order.trigger_price
+    else:
+        return None
+
+
+def _venue_order_id(ticket: int | None) -> VenueOrderId | None:
+    if ticket is not None:
+        return VenueOrderId(str(ticket))
+    else:
+        return None
+
+
+def _in_scope(symbol: str, instrument_id: InstrumentId | None) -> bool:
+    return instrument_id is None or instrument_id.symbol.value == symbol
+
+
+def _of_order(deal, venue_order_id: VenueOrderId | None) -> bool:
+    return venue_order_id is None or venue_order_id.value == str(deal.order)
+
+
+def _commanded(order: Order, command: CancelAllOrders) -> bool:
+    """Whether a cancel-all covers an order: the commanding strategy's, of the command's side when
+    it names one."""
+    return order.strategy_id == command.strategy_id and command.order_side in (
+        OrderSide.NO_ORDER_SIDE,
+        order.side,
     )
 
 
-# fix2
+def _deal_side(deal) -> OrderSide:
+    if deal.type == mirror.DEAL_TYPE_BUY:
+        return OrderSide.BUY
+    else:
+        return OrderSide.SELL
+
+
+def _liquidity_side(order_type: OrderType | None) -> LiquiditySide:
+    """A resting limit's fill makes liquidity; a market or stop order's takes it."""
+    if order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
+        return LiquiditySide.MAKER
+    elif order_type in (OrderType.MARKET, OrderType.STOP_MARKET):
+        return LiquiditySide.TAKER
+    else:
+        return LiquiditySide.NO_LIQUIDITY_SIDE
+
+
+def _order_state(venue_order) -> OrderState:
+    if venue_order.state not in _ORDER_STATES:
+        raise MT5OrderError(f"order {venue_order.ticket}: state {venue_order.state} is unknown")
+    return _ORDER_STATES[venue_order.state]
+
+
+def _venue_order_type(venue_order) -> tuple[OrderSide, OrderType]:
+    if venue_order.type not in _VENUE_ORDER_TYPES:
+        raise MT5OrderError(f"order {venue_order.ticket}: type {venue_order.type} is not reported")
+    return _VENUE_ORDER_TYPES[venue_order.type]
+
+
+def _time_in_force(venue_order) -> TimeInForce:
+    if venue_order.type_time not in _TIMES_IN_FORCE:
+        raise MT5OrderError(
+            f"order {venue_order.ticket}: time in force {venue_order.type_time} is unknown"
+        )
+    return _TIMES_IN_FORCE[venue_order.type_time]
+
+
+def _report_prices(
+    venue_order, order_type: OrderType, instrument: InstrumentAny
+) -> tuple[Price | None, Price | None]:
+    """A venue order's limit price and trigger: its open price is a limit's price and a stop's
+    trigger, and a stop-limit carries its limit in its stoplimit price."""
+    if order_type == OrderType.LIMIT:
+        return instrument.make_price(venue_order.price_open), None
+    elif order_type == OrderType.STOP_MARKET:
+        return None, instrument.make_price(venue_order.price_open)
+    elif order_type == OrderType.STOP_LIMIT:
+        return (
+            instrument.make_price(venue_order.price_stoplimit),
+            instrument.make_price(venue_order.price_open),
+        )
+    else:
+        return None, None
+
+
+def _last_update_ms(venue_order) -> int:
+    """When the venue last changed an order: when it ended, else when it was set up."""
+    if venue_order.time_done_msc != 0:
+        return venue_order.time_done_msc
+    else:
+        return venue_order.time_setup_msc

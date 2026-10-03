@@ -39,6 +39,7 @@ dependencies = [
     "nautilus_trader>=1.231.0",
     "python-dotenv>=1.0",
     "requests>=2.32",
+    "urllib3>=2",
     "websockets>=17.0.1",
 ]
 

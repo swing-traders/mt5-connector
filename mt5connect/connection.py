@@ -152,6 +152,7 @@ class MT5Connection:
         self._attempt = 0
         self._last_error: tuple[int, str] | None = None
         self._connected_at: float | None = None
+        self._reconnect_lock = asyncio.Lock()
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -247,16 +248,18 @@ class MT5Connection:
         return False
 
     async def reconnect_async(self) -> bool:
-        """
-        Async reconnect with exponential backoff.
-        Use this inside asyncio polling loops in data.py and execution.py.
+        """Reconnects with exponential backoff; True once connected. The clients sharing the
+        connection reconnect it one at a time, so a caller that finds it already reconnected, or
+        given up on, takes that outcome rather than running the sequence again."""
+        async with self._reconnect_lock:
+            if self._state == ConnectionState.CONNECTED:
+                return True
+            elif self._state == ConnectionState.FAILED:
+                return False
+            else:
+                return await self._reconnect_with_backoff()
 
-        Example:
-            except MT5ConnectionError:
-                ok = await self._conn.reconnect_async()
-                if not ok:
-                    raise
-        """
+    async def _reconnect_with_backoff(self) -> bool:
         self._state = ConnectionState.RECONNECTING
         delay = self._config.reconnect_initial_delay_s
 

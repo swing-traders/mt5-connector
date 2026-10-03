@@ -11,12 +11,14 @@ from nautilus_trader.cache.transformers import transform_instrument_to_pyo3
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.model.enums import CurrencyType, OmsType
-from nautilus_trader.model.identifiers import AccountId, InstrumentId, Symbol, TraderId
+from nautilus_trader.model.identifiers import AccountId, InstrumentId, PositionId, Symbol, TraderId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from venue_doubles import account_info, symbol_info
+from venue_doubles import account_info, symbol_info, trade_position
 
 from mt5connect import connection, execution, mirror
 from mt5connect.config import MT5Config
@@ -212,7 +214,7 @@ async def test_a_hedging_account_connects(venue):
     client = _client(account_info(margin_mode=mirror.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING))
     await client._connect()
     client.generate_account_state.assert_called_once()
-    assert client.is_polling
+    assert not client._exec_poll_task.done()
     await _stop_polling(client)
 
 
@@ -233,7 +235,7 @@ async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue)
 async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(venue):
     client = _client(account_info(trade_allowed=True), terminal_trade_allowed=True)
     await client._connect()
-    assert client.is_polling
+    assert not client._exec_poll_task.done()
     await _stop_polling(client)
 
 
@@ -354,14 +356,22 @@ def test_two_trader_ids_give_two_magics():
     assert execution.magic_for(TraderId("ALPHA-001")) != execution.magic_for(TraderId("BETA-001"))
 
 
-async def test_the_client_owns_exactly_the_orders_its_trader_ids_magic_marks(venue):
-    trader_id = "TRADER-001"
-    ours = MagicMock(ticket=1, magic=3181061856910866440, symbol="EURUSD")
-    theirs = MagicMock(ticket=2, magic=2268196824564769654, symbol="EURUSD")
-    venue.orders_get.return_value = (ours, theirs)
-    client = _client(account_info(), trader_id=trader_id)
-    await client._reconcile_open_orders()
-    assert client._known_order_tickets == {1}
+async def test_the_client_owns_exactly_the_positions_its_trader_ids_magic_marks(venue):
+    instrument = _pair("EURUSD", Currency.from_str("EUR"), Currency.from_str("USD"))
+    client = _client(account_info(), instruments=[instrument], trader_id="TRADER-001")
+    client._provider.get_instrument.side_effect = {"EURUSD": instrument}.get
+    await client._connect()
+    await _stop_polling(client)
+    venue.positions_get.return_value = (
+        trade_position(identifier=1, magic=3181061856910866440),
+        trade_position(identifier=2, magic=2268196824564769654),
+    )
+    reports = await client.generate_position_status_reports(
+        GeneratePositionStatusReports(
+            instrument_id=None, start=None, end=None, command_id=UUID4(), ts_init=0
+        )
+    )
+    assert [report.venue_position_id for report in reports] == [PositionId("1")]
 
 
 async def test_the_currencies_register_before_the_first_account_state(venue):
@@ -416,3 +426,22 @@ async def test_each_client_loads_its_own_configs_symbols_from_a_shared_provider(
         await client._connect()
     assert provider.get_instrument("GBPUSD") is not None
     await _stop_polling(client)
+
+
+# ── The lifecycle ────────────────────────────────────────────────────────────
+
+
+async def test_a_connect_on_a_connected_client_is_refused(venue):
+    client = _client(account_info())
+    await client._connect()
+    try:
+        with pytest.raises(RuntimeError, match="already connected"):
+            await client._connect()
+    finally:
+        await _stop_polling(client)
+
+
+async def test_a_disconnect_on_a_client_never_connected_is_refused(venue):
+    client = _client(account_info())
+    with pytest.raises(RuntimeError, match="not connected"):
+        await client._disconnect()

@@ -87,3 +87,85 @@ def tick(bid: float, ask: float, time: int = 1_760_000_000):
         flags=6,
         volume_real=0.0,
     )
+
+
+def _struct(name: mirror.StructName, strings: frozenset[str], fields: dict):
+    struct = STRUCT_TYPES[name]
+    values = {field: "" if field in strings else 0 for field in struct._fields}
+    return struct(**(values | fields))
+
+
+def trade_order(**fields):
+    """A pending EURUSD buy limit of 0.01 at 1.08 that the venue placed and still holds, under
+    `fields`."""
+    return _struct(
+        mirror.StructName.TRADE_ORDER,
+        frozenset({"symbol", "comment", "external_id"}),
+        {
+            "ticket": 9001,
+            "time_setup": 1_760_000_000,
+            "time_setup_msc": 1_760_000_000_000,
+            "type": mirror.ORDER_TYPE_BUY_LIMIT,
+            "type_time": mirror.ORDER_TIME_GTC,
+            "type_filling": mirror.ORDER_FILLING_RETURN,
+            "state": mirror.ORDER_STATE_PLACED,
+            "volume_initial": 0.01,
+            "volume_current": 0.01,
+            "price_open": 1.08,
+            "symbol": "EURUSD",
+        }
+        | fields,
+    )
+
+
+def trade_deal(**fields):
+    """An EURUSD buy of 0.01 at 1.08 opening a position, under `fields`."""
+    return _struct(
+        mirror.StructName.TRADE_DEAL,
+        frozenset({"symbol", "comment", "external_id"}),
+        {
+            "ticket": 7001,
+            "order": 9001,
+            "time": 1_760_000_000,
+            "time_msc": 1_760_000_000_000,
+            "type": mirror.DEAL_TYPE_BUY,
+            "entry": mirror.DEAL_ENTRY_IN,
+            "position_id": 9001,
+            "volume": 0.01,
+            "price": 1.08,
+            "symbol": "EURUSD",
+        }
+        | fields,
+    )
+
+
+def trade_position(**fields):
+    """An open EURUSD long of 0.01 at 1.08, under `fields`."""
+    return _struct(
+        mirror.StructName.TRADE_POSITION,
+        frozenset({"symbol", "comment", "external_id"}),
+        {
+            "ticket": 9001,
+            "time": 1_760_000_000,
+            "time_msc": 1_760_000_000_000,
+            "time_update": 1_760_000_000,
+            "time_update_msc": 1_760_000_000_000,
+            "type": mirror.POSITION_TYPE_BUY,
+            "identifier": 9001,
+            "volume": 0.01,
+            "price_open": 1.08,
+            "price_current": 1.08,
+            "symbol": "EURUSD",
+        }
+        | fields,
+    )
+
+
+def send_result(**fields):
+    """The venue's answer to a trade request that completed, under `fields`."""
+    request = _struct(mirror.StructName.TRADE_REQUEST, frozenset({"symbol", "comment"}), {})
+    return _struct(
+        mirror.StructName.ORDER_SEND_RESULT,
+        frozenset({"comment"}),
+        {"retcode": mirror.TRADE_RETCODE_DONE, "order": 9001, "request": request} | fields,
+    )

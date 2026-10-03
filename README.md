@@ -27,7 +27,7 @@ MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
 **What you get:**
 
 - Live tick data streamed from the MT5 server over WebSocket, aggregated into any bar type NautilusTrader supports
-- Full order lifecycle: market, limit, stop, stop-limit orders with SL/TP
+- Order lifecycle for entries: market, limit, stop and stop-limit orders, their fills booked to the venue's hedging positions
 - Account state and position reconciliation on startup and continuously
 - Historical bar data download into a NautilusTrader Parquet catalog for backtesting
 - Automatic reconnection with exponential backoff
@@ -166,6 +166,11 @@ config = MT5Config(
 
     # Order/position polling interval
     exec_poll_interval_ms = 250,   # default: 250ms
+
+    # Execution
+    deviation_points        = 20,  # the price deviation a market order accepts, in points
+    account_refresh_seconds = 10,  # the longest the account goes unreported between events
+    history_lookback_mins   = 60,  # the venue history read when NT names no window, and at connect
 
     # Reconnection
     reconnect_initial_delay_s = 1.0,
@@ -785,7 +790,9 @@ All tests mock the MT5 terminal — no live connection required to run tests.
 tests/test_connection.py   — MT5Connection lifecycle, reconnect logic
 tests/test_data.py         — MT5DataClient subscriptions and history requests
 tests/test_data_ws.py      — MT5DataClient's WebSocket tick stream
-tests/test_execution.py    — order submission, fills, reconciliation
+tests/test_execution.py    — order identity and the submit, modify and cancel boundary
+tests/test_execution_events.py  — the ticket index, the deal stream, ended orders, the account and the poll loop
+tests/test_execution_reports.py — the order, fill and position reports for reconciliation
 tests/test_factories.py    — factory wiring and node config
 tests/test_parsing.py      — symbol info → NautilusTrader instrument conversion
 tests/test_providers.py    — MT5InstrumentProvider loading
@@ -811,7 +818,7 @@ mt5-connector/
 │   ├── data.py          # MT5DataClient — WebSocket tick stream and history requests
 │   ├── downloader.py    # MT5DataDownloader — historical bar download
 │   ├── errors.py        # custom exceptions
-│   ├── execution.py     # MT5LiveExecutionClient — order submission and fills
+│   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
 │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
 │   ├── history.py       # the server's history routes, as a client
 │   ├── history_wire.py  # the history routes' paths, series and answer states
@@ -855,7 +862,7 @@ The server's MT5 terminal is not running, or is not logged in. Check the contain
 
 Wrong account number, password, or server name. Double-check all three against your broker's welcome email or the MT5 terminal itself (the account number is shown in the top-left of the terminal).
 
-**`order_send failed — retcode=10027 comment=AutoTrading disabled by client`**
+**An order rejected with `TRADE_RETCODE_CLIENT_DISABLES_AT: AutoTrading disabled by client`**
 
 AutoTrading is disabled in the server's MT5 terminal. Click the **AutoTrading** button in the toolbar — it should turn green. This must be enabled for any automated order to be sent.
 
@@ -875,6 +882,10 @@ Check that the bar type string in your strategy config exactly matches the bar t
 - Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, so manual trading on the same account, or a node with another trader id, is left alone.
 - The adapter runs on hedging accounts only: it declares NT's `HEDGING` position model and refuses to connect to an account whose margin mode is netting or exchange, or to a read-only (investor) session.
 - The execution account id is `MT5-<login>`, the login read from the account at connect.
+- An order's comment at the venue is the first 29 hex digits of its client order id's SHA-256. Venue tickets map to NT orders through NT's own order records, and through that digest for an order whose submit got no answer; a deal or order neither explains is logged and left to NT's reconciliation.
+- Reduce-only orders, order lists, post-only and trailing orders, and times in force other than GTC and GTD are rejected before anything is sent: the client translates entries, not position exits.
+- A submit, modify or cancel the venue may have acted on without the client learning it — `order_send` answering 10031, a read timeout, a connection closed after the request arrived — emits no event and logs a warning; the poll or NT's reconciliation settles the order. A request that never left the client is rejected at once as `not sent`.
+- Fills come from the venue's deals alone, once per deal; deals already in the history when the client connects are never emitted.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
 
 ---
