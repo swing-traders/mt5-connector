@@ -117,7 +117,7 @@ def clock_check(timeline: Timeline) -> ClockCheck:
 def routes(terminal, commissions, check: ClockCheck):
     history = History(terminal, CLOCK, FloorStore(), retry_s=0.01, floor_ttl_s=900)
     return create_app(
-        terminal, commissions, CLOCK, ServerTimeSink(), check.status, history
+        terminal, commissions, CLOCK, ServerTimeSink(), check.status, history, workers=3, retry_s=5
     ).test_client()
 
 
@@ -153,6 +153,10 @@ def test_a_fresh_sample_near_the_server_clock_verifies_the_clock(
             "gmt": 1_752_570_029,
             "skew_s": -30,
             "offset_s": 10_800,
+            "in_flight": 0,
+            "peak_in_flight": 0,
+            "refusals": 0,
+            "workers": 3,
         },
     }
     stub.terminal_info.assert_not_called()

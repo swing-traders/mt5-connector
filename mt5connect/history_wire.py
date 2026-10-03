@@ -1,5 +1,6 @@
 """The history routes' vocabulary, shared by the server and its client: their paths, the series they
-serve with each bar series' period, the tick selections, and the codes the routes answer with."""
+serve with each bar series' period, the tick selections, and the codes the server answers with
+beside the package's own."""
 
 from enum import IntEnum, StrEnum
 
@@ -47,11 +48,13 @@ class TickFlags(StrEnum):
     TRADE = "TRADE"
 
 
-class HistoryCode(IntEnum):
-    """The error codes a history route answers beside the package's own, outside their range."""
+class ServerCode(IntEnum):
+    """The error codes the server answers beside the package's own, outside their range."""
 
     # HTTP 503 with Retry-After: the terminal's answers do not prove the window yet.
     SYNCING = -20_001
+    # HTTP 503 with Retry-After: every slot for a call that can reach the terminal is taken.
+    BUSY = -20_002
 
 
 # Each bar series' period and the package's timeframe for it. MN1 has no fixed period, so no series

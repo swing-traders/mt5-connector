@@ -15,8 +15,8 @@ from mt5connect.history_wire import (
     BARS_PATH,
     RANGES_PATH,
     TICKS_PATH,
-    HistoryCode,
     Series,
+    ServerCode,
     TickFlags,
 )
 
@@ -47,7 +47,7 @@ def bars(
     symbol: str, series: Series, start: int, end: int, cancel: threading.Event | None = None
 ) -> np.ndarray | None:
     """The bars opened in [start, end], true-UTC epoch seconds, each stamped at its open; None for a
-    failure, or when `cancel` is set while the terminal syncs, either leaving last_error set."""
+    failure, or when `cancel` is set while the server defers it, either leaving last_error set."""
     body = {"symbol": symbol, "timeframe": series.value, "start": start, "end": end}
     rows = _rows(_BARS, BARS_PATH, body, cancel)
     if rows is None:
@@ -64,8 +64,8 @@ def ticks(
     cancel: threading.Event | None = None,
 ) -> np.ndarray | None:
     """The ticks from the start of second `start` through the end of second `end`, true-UTC epoch
-    seconds; None for a failure, or when `cancel` is set while the terminal syncs, either leaving
-    last_error set."""
+    seconds; None for a failure, or when `cancel` is set while the server defers them, either
+    leaving last_error set."""
     body = {"symbol": symbol, "start": start, "end": end, "flags": flags.value}
     rows = _rows(_TICKS, TICKS_PATH, body, cancel)
     if rows is None:
@@ -74,10 +74,10 @@ def ticks(
         return remote_mt5.decode_array(_TICKS, mirror.TICKS, rows)
 
 
-def ranges(symbol: str) -> HistoryRanges | None:
+def ranges(symbol: str, cancel: threading.Event | None = None) -> HistoryRanges | None:
     """The terminal's MaxBars and the floors the server has measured for the symbol; None for a
-    failure, which sets last_error."""
-    reply = remote_mt5.call_route(_RANGES, HTTPMethod.GET, RANGES_PATH, params={"symbol": symbol})
+    failure, or when `cancel` is set while the server defers them, either leaving last_error set."""
+    reply = _reply(_RANGES, HTTPMethod.GET, RANGES_PATH, cancel, params={"symbol": symbol})
     if reply.envelope["ok"]:
         return _ranges(reply.envelope["result"])
     else:
@@ -87,11 +87,8 @@ def ranges(symbol: str) -> HistoryRanges | None:
 def _rows(
     name: str, path: str, body: dict[str, object], cancel: threading.Event | None
 ) -> list | None:
-    """The rows a window route answers, asked again each time it answers that the terminal is
-    syncing, after the delay that answer gives, until it answers otherwise or `cancel` is set."""
-    reply = remote_mt5.call_route(name, HTTPMethod.POST, path, json=body)
-    while _is_syncing(reply) and _waits_out(_retry_after_s(name, reply), cancel):
-        reply = remote_mt5.call_route(name, HTTPMethod.POST, path, json=body)
+    """The rows a window route answers."""
+    reply = _reply(name, HTTPMethod.POST, path, cancel, json=body)
     if not reply.envelope["ok"]:
         return None
     elif isinstance(reply.envelope["result"], list):
@@ -100,15 +97,33 @@ def _rows(
         raise ServerUnreachable(f"{name}: the result is not a list of rows")
 
 
-def _is_syncing(reply: remote_mt5.Reply) -> bool:
-    return (
-        reply.status is HTTPStatus.SERVICE_UNAVAILABLE
-        and reply.envelope["error"]["code"] == HistoryCode.SYNCING
+def _reply(
+    name: str,
+    method: HTTPMethod,
+    path: str,
+    cancel: threading.Event | None,
+    *,
+    json: dict[str, object] | None = None,
+    params: dict[str, str] | None = None,
+) -> remote_mt5.Reply:
+    """A route's answer, asked again each time the server defers it — the terminal syncing, or every
+    slot taken — after the delay that answer gives, until it answers otherwise or `cancel` is
+    set."""
+    reply = remote_mt5.call_route(name, method, path, json=json, params=params)
+    while _is_deferred(reply) and _waits_out(_retry_after_s(name, reply), cancel):
+        reply = remote_mt5.call_route(name, method, path, json=json, params=params)
+    return reply
+
+
+def _is_deferred(reply: remote_mt5.Reply) -> bool:
+    return reply.status is HTTPStatus.SERVICE_UNAVAILABLE and reply.envelope["error"]["code"] in (
+        ServerCode.SYNCING,
+        ServerCode.BUSY,
     )
 
 
 def _retry_after_s(name: str, reply: remote_mt5.Reply) -> float:
-    """The delay a syncing answer's Retry-After gives; raises ServerUnreachable for none."""
+    """The delay a deferring answer's Retry-After gives; raises ServerUnreachable for none."""
     try:
         seconds = float(reply.retry_after)
     except (TypeError, ValueError):
@@ -116,7 +131,9 @@ def _retry_after_s(name: str, reply: remote_mt5.Reply) -> float:
     if math.isfinite(seconds) and seconds >= 0:
         return seconds
     else:
-        raise ServerUnreachable(f"{name}: a syncing answer's Retry-After is {reply.retry_after!r}")
+        raise ServerUnreachable(
+            f"{name}: a deferring answer's Retry-After is {reply.retry_after!r}"
+        )
 
 
 def _waits_out(seconds: float, cancel: threading.Event | None) -> bool:

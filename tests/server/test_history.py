@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from mirror_samples import CLOCK, struct_sample
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from saturation import Held, counters, until
 
 import mt5connect.history as history_client
 import mt5connect.history_wire as wire
@@ -93,7 +94,7 @@ def ok(rows: list) -> dict[str, object]:
 
 
 def syncing(message: str) -> dict[str, object]:
-    code = int(wire.HistoryCode.SYNCING)
+    code = int(wire.ServerCode.SYNCING)
     return {"ok": False, "error": {"code": code, "message": message}, "last_error": [code, message]}
 
 
@@ -231,6 +232,16 @@ def server_times():
 @pytest.fixture
 def no_sleep(monkeypatch):
     monkeypatch.setattr(time, "sleep", forbidden_sleep)
+
+
+@pytest.fixture
+def cold_reads(served, stub):
+    """Window reads held in the terminal until released, as a cold read holds it, the first in the
+    package and the rest waiting on the terminal behind it."""
+    held = Held(served)
+    stub.syncing = lambda: not held.released.wait(5)
+    yield held
+    held.release()
 
 
 def post_bars(client, series: str, start: int, end: int):
@@ -1203,16 +1214,135 @@ def test_a_cancellation_between_retries_stops_the_client(remote, stub, floors):
     assert not request.is_alive()
     assert answered == [None]
     assert len(stub.windows("symbol_select")) == 1
-    assert remote.last_error()[0] == wire.HistoryCode.SYNCING
+    assert remote.last_error()[0] == wire.ServerCode.SYNCING
 
 
-def test_a_syncing_reply_carries_its_status_as_a_member_and_its_retry_after(remote, stub):
+def asked_routes(remote, monkeypatch) -> list[str]:
+    """The routes the client asks from here on, in order."""
+    asked = []
+    call_route = remote.call_route
+
+    def asking(name, method, path, **kwargs):
+        asked.append(path)
+        return call_route(name, method, path, **kwargs)
+
+    monkeypatch.setattr(remote, "call_route", asking)
+    return asked
+
+
+def releasing_sleep(cold_reads: Held, monkeypatch) -> list[float]:
+    """The client's sleeps from here on, the first releasing the cold reads."""
+    slept = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        cold_reads.release()
+
+    monkeypatch.setattr(history_client, "time", types.SimpleNamespace(sleep=sleep))
+    return slept
+
+
+def test_the_client_asks_a_window_again_after_a_busy_answers_retry_after(
+    remote, stub, served, floors, cold_reads, monkeypatch
+):
+    floor = broker(2025, 7, 15, 12)
+    stub.rates[H1] = rates(floor, floor + HOUR)
+    kept(floors, Series.H1, floor)
+    window = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "start": floor - EDT,
+        "end": floor + HOUR - EDT,
+    }
+    cold_reads.take(2, "/history/bars", window)
+    asked = asked_routes(remote, monkeypatch)
+    slept = releasing_sleep(cold_reads, monkeypatch)
+
+    answered = history_client.bars("EURUSD", Series.H1, floor - EDT, floor + HOUR - EDT)
+
+    assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
+    assert asked == ["/history/bars", "/history/bars"]
+    assert slept == [5.0]
+    assert counters(served)["refusals"] == 1
+
+
+def test_the_client_asks_the_ranges_again_after_a_busy_answers_retry_after(
+    remote, stub, served, floors, cold_reads, monkeypatch
+):
+    floor = broker(2025, 7, 15, 12)
+    stub.rates[H1] = rates(floor, floor + HOUR)
+    kept(floors, Series.H1, floor)
+    window = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "start": floor - EDT,
+        "end": floor + HOUR - EDT,
+    }
+    cold_reads.take(2, "/history/bars", window)
+    asked = asked_routes(remote, monkeypatch)
+    slept = releasing_sleep(cold_reads, monkeypatch)
+
+    answered = history_client.ranges("EURUSD")
+
+    assert answered.maxbars == 100_000
+    assert set(answered.series) == {Series.H1}
+    assert asked == ["/history/ranges", "/history/ranges"]
+    assert slept == [5.0]
+    assert counters(served)["refusals"] == 1
+
+
+@pytest.mark.parametrize(
+    ("route", "read"),
+    [
+        (
+            "/history/bars",
+            lambda cancel: history_client.bars(
+                "EURUSD", Series.H1, 1_752_570_000, 1_752_573_600, cancel=cancel
+            ),
+        ),
+        ("/history/ranges", lambda cancel: history_client.ranges("EURUSD", cancel=cancel)),
+    ],
+    ids=["bars", "ranges"],
+)
+def test_a_cancellation_while_the_server_is_busy_stops_the_client(
+    remote, stub, served, floors, cold_reads, monkeypatch, route, read
+):
+    floor = broker(2025, 7, 15, 12)
+    stub.rates[H1] = rates(floor, floor + HOUR)
+    kept(floors, Series.H1, floor)
+    window = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "start": floor - EDT,
+        "end": floor + HOUR - EDT,
+    }
+    cold_reads.take(2, "/history/bars", window)
+    asked = asked_routes(remote, monkeypatch)
+    cancel = threading.Event()
+    answered = []
+    request = threading.Thread(target=lambda: answered.append(read(cancel)))
+
+    request.start()
+    until(lambda: counters(served)["refusals"] == 1)
+    cancel.set()
+    request.join(5)
+
+    assert not request.is_alive()
+    assert answered == [None]
+    assert asked == [route]
+    assert remote.last_error() == (wire.ServerCode.BUSY, f"{route}: the server is busy")
+    assert remote.last_error()[0] is wire.ServerCode.BUSY
+
+
+def test_a_syncing_reply_carries_its_status_and_code_as_members_and_its_retry_after(remote, stub):
     body = {"symbol": "EURUSD", "timeframe": "H1", "start": 1_752_570_000, "end": 1_752_573_600}
 
     reply = remote.call_route("history/bars", HTTPMethod.POST, "/history/bars", json=body)
 
     assert (reply.status, reply.retry_after) == (HTTPStatus.SERVICE_UNAVAILABLE, "5")
     assert type(reply.status) is HTTPStatus
+    assert reply.envelope["error"]["code"] is wire.ServerCode.SYNCING
+    assert remote.last_error()[0] is wire.ServerCode.SYNCING
 
 
 def test_the_client_raises_server_unreachable_while_the_server_is_not_ready(

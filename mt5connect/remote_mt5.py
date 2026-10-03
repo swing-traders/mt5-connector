@@ -17,7 +17,8 @@ import numpy as np
 import requests
 
 from mt5connect import mirror
-from mt5connect.errors import MT5ConfigError, ServerUnreachable
+from mt5connect.errors import MT5ConfigError, ServerBusy, ServerUnreachable
+from mt5connect.history_wire import ServerCode
 
 __version__ = mirror.PACKAGE_VERSION
 
@@ -28,6 +29,7 @@ READ_TIMEOUT_S = 60.0
 _ENVELOPE_STATUSES = frozenset(
     {HTTPStatus.OK, HTTPStatus.BAD_REQUEST, HTTPStatus.SERVICE_UNAVAILABLE}
 )
+_SERVER_CODES = frozenset(ServerCode)
 
 _server_url: str | None = None
 _ws_url: str | None = None
@@ -116,6 +118,11 @@ def _call(function: mirror.Function, body: dict[str, object]) -> object:
     )
     if reply.envelope["ok"]:
         return _decode(function, reply.envelope["result"])
+    elif (
+        reply.status is HTTPStatus.SERVICE_UNAVAILABLE
+        and reply.envelope["error"]["code"] is ServerCode.BUSY
+    ):
+        raise ServerBusy(f"{function.name}: server busy")
     else:
         return mirror.failure_value(function)
 
@@ -183,11 +190,25 @@ def _envelope(name: str, response: requests.Response) -> dict:
     if response.status_code == HTTPStatus.OK and _is_answer(envelope):
         return envelope
     elif _is_error(envelope):
-        return envelope
+        return _with_server_code(envelope)
     elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_not_ready(envelope):
         raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
     else:
         raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not an envelope")
+
+
+def _with_server_code(envelope: dict) -> dict:
+    """A failure envelope whose code, when it is one of the server's own, is its ServerCode member;
+    a package code stays the package's integer."""
+    code, message = envelope["last_error"]
+    if code in _SERVER_CODES:
+        member = ServerCode(code)
+        return envelope | {
+            "error": envelope["error"] | {"code": member},
+            "last_error": [member, message],
+        }
+    else:
+        return envelope
 
 
 def _is_answer(envelope: object) -> bool:
