@@ -54,12 +54,17 @@ def package_arguments(
     converted = {}
     for name, value in arguments.items():
         if params[name].kind is mirror.ParamKind.DATETIME:
-            converted[name] = datetime.fromtimestamp(clock.to_broker(value), tz=UTC)
+            converted[name] = broker_datetime(clock.to_broker(value))
         elif params[name].kind is mirror.ParamKind.REQUEST and isinstance(value, dict):
             converted[name] = _broker_request(value, clock)
         else:
             converted[name] = value
     return converted
+
+
+def broker_datetime(broker_epoch: int) -> datetime:
+    """The datetime the package reads as a broker epoch, through its timestamp()."""
+    return datetime.fromtimestamp(broker_epoch, tz=UTC)
 
 
 def non_epochs(function: mirror.Function, arguments: dict[str, object]) -> list[str]:

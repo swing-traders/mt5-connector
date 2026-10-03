@@ -313,11 +313,17 @@ Backtesting requires two steps: download historical bar data from MT5, then run 
 python examples/download_historical_data.py
 ```
 
-This connects to MT5, downloads H1 bars for the configured symbol, and writes them into a NautilusTrader Parquet catalog at `./catalog`.
+This downloads H1 bars for the configured symbol through the MT5 server's [history routes](#history), so it runs on the remote backend against `MT5_SERVER_URL` (`http://127.0.0.1:5000` by default), and writes them into a NautilusTrader Parquet catalog at `./catalog`.
+
+The downloader walks back from `end`, one request per window, until `start` or the floor `/history/ranges` advertises for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
+
+- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at its close — the range names the closes;
+- ticks one UTC day at a time.
 
 You can customise the download by editing the script, or call the downloader directly:
 
 ```python
+from mt5connect.backend import set_backend
 from mt5connect.config import MT5Config
 from mt5connect.connection import MT5Connection
 from mt5connect.providers import MT5InstrumentProvider
@@ -328,7 +334,9 @@ from datetime import datetime, timezone
 config = MT5Config(
     account=12345678, password="your_password",
     server="Exness-MT5Trial9", symbols=["EURUSDm"],
+    backend="remote", server_url="http://127.0.0.1:5000",
 )
+set_backend(config)
 
 conn     = MT5Connection(config)
 conn.connect()
@@ -574,10 +582,11 @@ The server mirrors the `MetaTrader5` package (5.0.6231), so code written against
 - `GET /health` answers the broker clock's latest verification — the relayed sample's chart `symbol`, its `trade_server` and `current` (last quote) times in true UTC, the terminal's own `gmt`, and the `skew_s` from the server's clock and the `offset_s` in effect — or HTTP 503 while the clock is not verified. It never calls the terminal: the server initialized it at start, and the EA's samples say whether it is connected to the trade server.
 - `POST /relay/server_time` takes the `server_time` frame the WS hub relays from the EA and answers `{"ok": true, "result": null}`. It accepts a frame from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the frame's exact shape with HTTP 400 and code -2.
 - `GET /commissions/<symbol>` answers the commission schedule the terminal's EA relayed for the symbol, or code -4 (`RES_E_NOT_FOUND`) while none has been relayed. No package call answers it, so its envelope carries no `last_error`.
+- `POST /history/bars` and `POST /history/ticks` answer a history window the server vouches for (see [History](#history)), and `GET /history/ranges?symbol=<symbol>` the floors it has measured.
 - While the broker clock is not verified, every route but `/health` and `/relay/server_time` answers HTTP 503 with `{"ok": false, "error": {"code": -1, "message": "the broker clock is not verified"}}` and calls nothing.
 - Package calls run one at a time; waitress serves the API.
 
-The remote backend raises `ServerUnreachable` when the server cannot be reached or answers outside this contract. Every call sets the remote backend's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
+The remote backend raises `ServerUnreachable` when the server cannot be reached or answers outside this contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. Every call sets the remote backend's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
 
 The server reads its settings from the environment once at start, initializes the terminal with them, and exits when that fails:
 
@@ -596,6 +605,8 @@ The server reads its settings from the environment once at start, initializes th
 | `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long the server waits at start for the first fresh sample | `120` |
 | `MT5_BROKER_TZ` | the zone the broker's clock follows, as an IANA name | `America/New_York` |
 | `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
+| `MT5_HISTORY_RETRY_SECONDS` | the `Retry-After` of a history answer the terminal has not proven yet: how long the client waits before asking again | `5` |
+| `MT5_FLOOR_TTL_SECONDS` | how long a measured history floor is used before it is measured again | `900` |
 
 Once the terminal is initialized, the server verifies the broker's clock against the trade server's time the EA relays through the WS hub, at any hour, market open or closed:
 
@@ -603,6 +614,43 @@ Once the terminal is initialized, the server verifies the broker's clock against
 - A fresh sample's trade-server time, converted to true UTC, must sit within 120 s of the server's clock, or the server exits with both times and the offset in its log. The terminal extrapolates the trade server's time from the clock it shares with the server, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the container's clock reads.
 - At start the server waits up to `MT5_CLOCK_BOOTSTRAP_SECONDS` for the first fresh sample, and exits when none arrives. It then re-verifies the latest sample every `MT5_CLOCK_CHECK_SECONDS`.
 - The moment no sample is fresh the clock is unverified, and stays so until a fresh sample verifies it again. Each change is logged once.
+
+### History
+
+The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. The history routes answer a window only once the terminal's answers prove it, so a client never receives emptiness it cannot trust.
+
+- `POST /history/bars` takes `{"symbol", "timeframe", "start", "end"}`, the timeframe by its MT5 name from `M1` to `W1` (a month has no fixed period, so `MN1` is refused), and `start` and `end` the bars' opens in true-UTC epoch seconds, inclusive at both ends.
+- `POST /history/ticks` takes `{"symbol", "start", "end", "flags"}`: the ticks from the start of second `start` through the end of second `end`, true UTC, and `flags` the selection by its `COPY_TICKS_*` name — `ALL`, `INFO` or `TRADE`, `INFO` when absent.
+
+| HTTP | Answer | When |
+|---|---|---|
+| 200 | the mirror's envelope, its `result` the window's rows as the mirror answers them, bars stamped at their open | the terminal's answers prove the rows; an empty list is an answer like any other |
+| 503 | the failure envelope with code -20001, naming the symbol, the series and the window, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | the terminal's answers do not prove the window yet: ask again after the delay |
+| 400 | the failure envelope with code -2 | a body out of shape, or a window that starts after the terminal's current time: the trade-server time the EA last relayed, plus the time since it arrived |
+
+A 200 carries the failure envelope instead when the terminal cannot select the symbol, or when the rows it answers break the checks below.
+
+How the server proves a window, within the request and without waiting:
+
+- It selects the symbol and reads the terminal's `maxbars`. The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in the fewest equal spans within that.
+- A read the terminal answers with rows and a success `last_error` is proven: the rows are the answer. A read it fails, with no answer or with an error, is a 503.
+- A read that answers no rows is proven empty by any one of these facts, each read from the terminal, and is a 503 without one:
+  - **Before the floor**: the window lies wholly before the series' floor. A window that begins before the floor answers its rows from the floor on.
+  - **The live edge**: the window lies after the second of the symbol's last quote, read with `symbol_info_tick`. A last quote at time zero dates nothing, and a window holding the last quote's second is a 503: that quote is itself a record.
+  - **Bracketed**: the terminal has a row before the window and a record after it. Before it: for bars, the last bar the terminal answers as opened at or before the window's start (`copy_rates_from` for one bar); for ticks, the window's UTC day, then its UTC week. After it: the first bar in the span of one read from the window's end, or the first tick from its last second. An empty span of a long bar window between spans that answered rows is bracketed by them.
+- Every read asks the terminal to sync what it lacks, and a client's retry after a 503 reads the window again.
+- Every bar must lie on its timeframe's grid, or the answer fails with code -1 naming the row. In an answer that begins at the series' floor, a leading run of an intraday series spaced a whole number of days apart, ahead of its first two rows one period apart, is not that timeframe's data: it is dropped and the floor moves past it. An answer that begins anywhere else drops no such run. Ticks must not go back in time.
+- A cold read holds the terminal for as long as the package's own call takes. `/health` never waits on the terminal, so liveness does not see it.
+
+A series' floor is set by the stub — the one bar the terminal answers for a window before any plausible history; for ticks, the first tick from then — or by a coarse prefix at the series' start, at the first row past it. It is used for `MT5_FLOOR_TTL_SECONDS`, then measured again, and sooner when a window read from a kept floor answers no rows, since the terminal's own floor may have moved past it. A stub measured again never moves a floor the coarse prefix set back: it replaces it only with a later row.
+
+`GET /history/ranges?symbol=<symbol>` answers `{"maxbars", "ranges": {"<series>": {"floor", "measured_at", "generation"}}}`: every floor measured for the symbol since the server started, keyed by timeframe name and `ticks`, in true UTC with the time it was measured. A floor's `generation` steps each time its value changes.
+
+`mt5connect.history` calls these routes through the remote backend's session, with no read timeout:
+
+- `bars()` and `ticks()` answer the rows as the package's arrays. On a 503 they wait its `Retry-After` and ask again, with no deadline of their own, until the server answers otherwise or the `cancel` event they were handed is set.
+- They answer `None` for a failure, a 400 among them, and for a cancellation, with `last_error()` set to the pair the server last answered.
+- `ranges()` answers the advertised floors and `maxbars`, or `None` for a failure.
 
 ### WebSocket hub
 
@@ -736,7 +784,7 @@ tests/test_factories.py    — factory wiring and node config
 tests/test_parsing.py      — symbol info → NautilusTrader instrument conversion
 tests/test_providers.py    — MT5InstrumentProvider loading
 tests/test_remote_mt5.py   — the remote backend's transport and failure classes
-tests/server/              — the server's routes, lifecycle and WS hub, and the remote backend through them
+tests/server/              — the server's routes, lifecycle, WS hub and history protocol, and the remote backend through them
 tests/conformance/         — the inventory against the pinned MetaTrader5 wheel
 ```
 
@@ -757,6 +805,8 @@ mt5-connector/
 │   ├── errors.py        # custom exceptions
 │   ├── execution.py     # MT5LiveExecutionClient — order submission and fills
 │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
+│   ├── history.py       # the server's history routes, as a client
+│   ├── history_wire.py  # the history routes' paths, series and answer states
 │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
 │   └── providers.py     # MT5InstrumentProvider
 ├── tests/               # full test suite (no live MT5 required)

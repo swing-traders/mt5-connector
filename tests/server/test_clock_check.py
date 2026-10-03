@@ -14,6 +14,7 @@ from mirror_samples import CLOCK
 
 from mt5server.app.app import create_app
 from mt5server.app.clock_check import ClockCheck
+from mt5server.app.history import FloorStore, History
 from mt5server.app.server_time import Received, ServerTimeSample, ServerTimeSink
 
 BROKER_EPOCH = 1_752_580_800
@@ -114,7 +115,10 @@ def clock_check(timeline: Timeline) -> ClockCheck:
 
 
 def routes(terminal, commissions, check: ClockCheck):
-    return create_app(terminal, commissions, CLOCK, ServerTimeSink(), check.status).test_client()
+    history = History(terminal, CLOCK, FloorStore(), retry_s=0.01, floor_ttl_s=900)
+    return create_app(
+        terminal, commissions, CLOCK, ServerTimeSink(), check.status, history
+    ).test_client()
 
 
 def run_to_its_end(check: ClockCheck) -> None:

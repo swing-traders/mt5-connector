@@ -9,6 +9,7 @@ import mt5connect.remote_mt5 as shim
 from mt5server.app.app import create_app
 from mt5server.app.clock_check import ClockStatus, ClockVerification
 from mt5server.app.commissions import CommissionStore
+from mt5server.app.history import FloorStore, History
 from mt5server.app.server_time import ServerTimeSink
 from mt5server.app.terminal import Terminal
 
@@ -55,9 +56,20 @@ def clock_status():
 
 
 @pytest.fixture
-def app(terminal, commissions, server_times, clock_status):
+def floors():
+    return FloorStore()
+
+
+@pytest.fixture
+def history(terminal, floors):
+    """The history protocol under the settings' defaults."""
+    return History(terminal, CLOCK, floors, retry_s=5, floor_ttl_s=900)
+
+
+@pytest.fixture
+def app(terminal, commissions, server_times, clock_status, history):
     """The app with the broker clock verified."""
-    return create_app(terminal, commissions, CLOCK, server_times, clock_status)
+    return create_app(terminal, commissions, CLOCK, server_times, clock_status, history)
 
 
 @pytest.fixture

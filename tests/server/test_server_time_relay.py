@@ -160,13 +160,17 @@ class _SinkEndingTheCheck(ServerTimeSink):
         return super().wait_newer(than, timeout)
 
 
-def test_a_frame_relayed_through_the_route_verifies_the_clock(terminal, commissions, monkeypatch):
+def test_a_frame_relayed_through_the_route_verifies_the_clock(
+    terminal, commissions, history, monkeypatch
+):
     exits = []
     monkeypatch.setattr(os, "_exit", exits.append)
     monkeypatch.setattr(time, "time", lambda: 1_752_570_030.0)
     server_times = _SinkEndingTheCheck()
     check = ClockCheck(server_times, CLOCK, max_age_s=30, check_s=300, bootstrap_s=5)
-    client = create_app(terminal, commissions, CLOCK, server_times, check.status).test_client()
+    client = create_app(
+        terminal, commissions, CLOCK, server_times, check.status, history
+    ).test_client()
 
     def run_until_ended():
         with pytest.raises(SystemExit):

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -32,10 +34,14 @@ from nautilus_trader.data.messages import (
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
 
+from mt5connect import history
 from mt5connect.constants import MT5_VENUE
+from mt5connect.history_wire import BAR_PERIOD_S, bar_series
 from mt5connect.parsing import parse_bar, parse_quote_tick
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from mt5connect.config import MT5Config
     from mt5connect.connection import MT5Connection
     from mt5connect.providers import MT5InstrumentProvider
@@ -305,83 +311,66 @@ class MT5DataClient(LiveMarketDataClient):
 
     async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:
         symbol = request.instrument_id.symbol.value
-        start = _nanos_to_datetime(request.start)
-        end = _nanos_to_datetime(request.end) if request.end else datetime.now(UTC)
-
         instrument = self._provider.get_instrument(symbol)
         if instrument is None:
             self._log.error(f"MT5DataClient: instrument not found for {symbol}")
             return
 
         self._conn.ensure_connected()
-
-        raw = mt5.copy_ticks_range(
-            symbol,
-            start,
-            end,
-            mt5.COPY_TICKS_ALL,
-        )
-
-        if raw is None or len(raw) == 0:
-            self._log.warning(f"MT5DataClient: no ticks for {symbol} {start}→{end}")
-            # _handle_quote_ticks(instrument_id, ticks, correlation_id, start, end, params)
-            self._handle_quote_ticks(
-                instrument.id, [], request.id, request.start, request.end, request.params
+        start = _epoch_s(request.start)
+        end = self._end_s(request.end)
+        rows = await _read_in_thread(history.ticks, symbol, start, end)
+        if rows is None:
+            self._log.error(
+                f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: "
+                f"{mt5.last_error()}"
             )
-            return
+        else:
+            ticks = [parse_quote_tick(row, instrument) for row in rows]
+            self._handle_quote_ticks(
+                instrument.id, ticks, request.id, request.start, request.end, request.params
+            )
+            self._log.debug(f"MT5DataClient: delivered {len(ticks):,} ticks for {symbol}")
 
-        ticks = [parse_quote_tick(row, instrument) for row in raw]
-        # _handle_quote_ticks signature: (instrument_id, ticks, correlation_id, start, end, params)
-        self._handle_quote_ticks(
-            instrument.id, ticks, request.id, request.start, request.end, request.params
-        )
-        self._log.debug(f"MT5DataClient: delivered {len(ticks):,} ticks for {symbol}")
-
-    # ================================================================
-    # FIXED: _request_bars with correct _handle_bars signature (6 args)
-    # ================================================================
     async def _request_bars(self, request: RequestBars) -> None:
         bar_type = request.bar_type
         symbol = bar_type.instrument_id.symbol.value
         timeframe = _bar_spec_to_mt5_timeframe(bar_type)
-
-        # Handle start time
-        if request.start is not None:
-            if hasattr(request.start, "timestamp"):
-                start = datetime.fromtimestamp(request.start.timestamp(), tz=UTC)
-            else:
-                start = _nanos_to_datetime(request.start)
-        else:
-            start = None
-
-        # Handle end time
-        if request.end is not None:
-            if hasattr(request.end, "timestamp"):
-                end = datetime.fromtimestamp(request.end.timestamp(), tz=UTC)
-            else:
-                end = _nanos_to_datetime(request.end)
-        else:
-            end = datetime.now(UTC)
-
+        series = bar_series(timeframe)
         instrument = self._provider.get_instrument(symbol)
         if instrument is None:
             self._log.error(f"MT5DataClient: instrument not found for {symbol}")
             return
 
         self._conn.ensure_connected()
+        # The request names closes; the server serves bars by their open.
+        first_close = _epoch_s(request.start)
+        last_close = self._end_s(request.end)
+        rows = await _read_in_thread(
+            history.bars,
+            symbol,
+            series,
+            first_close - BAR_PERIOD_S[series],
+            last_close - BAR_PERIOD_S[series],
+        )
+        if rows is None:
+            self._log.error(
+                f"MT5DataClient: {bar_type} bars closing {_iso(first_close)}..{_iso(last_close)} "
+                f"failed: {mt5.last_error()}"
+            )
+        else:
+            bars = [parse_bar(row, instrument, timeframe) for row in rows]
+            self._handle_bars(
+                bar_type, bars, request.id, request.start, request.end, request.params
+            )
+            self._log.debug(f"MT5DataClient: delivered {len(bars):,} bars for {symbol}")
 
-        raw = mt5.copy_rates_range(symbol, timeframe, start, end)
-
-        if raw is None or len(raw) == 0:
-            self._log.warning(f"MT5DataClient: no bars for {symbol} TF={timeframe}")
-            # _handle_bars signature: (bar_type, bars, correlation_id, start, end, params)
-            self._handle_bars(bar_type, [], request.id, request.start, request.end, request.params)
-            return
-
-        bars = [parse_bar(row, instrument, timeframe) for row in raw]
-        # _handle_bars signature: (bar_type, bars, correlation_id, start, end, params)
-        self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
-        self._log.debug(f"MT5DataClient: delivered {len(bars):,} bars for {symbol}")
+    def _end_s(self, end) -> int:
+        """A request's end in epoch seconds; a request without one ends now."""
+        if end is None:
+            return self._clock.timestamp_ns() // 1_000_000_000
+        else:
+            return _epoch_s(end)
 
     async def _request_order_book_snapshot(self, request) -> None:
         self._log.warning("MT5 does not support order book snapshots")
@@ -448,10 +437,27 @@ class MT5DataClient(LiveMarketDataClient):
         return self._poll_task is not None and not self._poll_task.done()
 
 
-def _nanos_to_datetime(nanos: int | None) -> datetime | None:
-    if nanos is None:
-        return None
-    return datetime.fromtimestamp(nanos / 1_000_000_000, tz=UTC)
+async def _read_in_thread(read: Callable[..., np.ndarray | None], *args) -> np.ndarray | None:
+    """A history read run off the event loop, its retries stopped when the awaiting task is
+    cancelled, since the thread outlives the task."""
+    cancel = threading.Event()
+    try:
+        return await asyncio.to_thread(read, *args, cancel=cancel)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
+
+
+def _epoch_s(value) -> int:
+    """A request bound — a datetime, or epoch nanoseconds — in epoch seconds."""
+    if hasattr(value, "timestamp"):
+        return int(value.timestamp())
+    else:
+        return value // 1_000_000_000
+
+
+def _iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
 
 
 def _bar_spec_to_mt5_timeframe(bar_type) -> int:

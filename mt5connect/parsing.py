@@ -550,31 +550,15 @@ _MT5_TIMEFRAME_MAP: dict[int, tuple[int, BarAggregation]] = {
 
 
 def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:
-    """
-    Convert one row from mt5.copy_rates_range() into a NautilusTrader Bar.
-
-    Parameters
-    ----------
-    mt5_rate : numpy structured array row
-        Fields: time, open, high, low, close, tick_volume, spread, real_volume
-    instrument : InstrumentAny
-        For instrument_id and price_precision.
-    timeframe : int
-        MT5 timeframe constant (e.g. mt5.TIMEFRAME_H1 = 16385).
-
-    Returns
-    -------
-    Bar
-    """
+    """One mt5.copy_rates_range() row of an MT5 timeframe as a Bar stamped at its close, the row's
+    open plus the timeframe's interval; a month has no fixed interval, so MN1 raises ValueError."""
     step, aggregation = _MT5_TIMEFRAME_MAP.get(timeframe, (1, BarAggregation.DAY))  # safe fallback
+    if aggregation == BarAggregation.MONTH:
+        raise ValueError(f"timeframe {timeframe}: a month has no fixed interval")
     pp = instrument.price_precision
-
-    bar_type = BarType(
-        instrument_id=instrument.id,
-        bar_spec=BarSpecification(step, aggregation, PriceType.LAST),
-    )
-
-    ts_event = int(mt5_rate["time"]) * 1_000_000_000  # seconds → nanoseconds
+    bar_spec = BarSpecification(step, aggregation, PriceType.LAST)
+    bar_type = BarType(instrument_id=instrument.id, bar_spec=bar_spec)
+    ts_event = int(mt5_rate["time"]) * 1_000_000_000 + bar_spec.get_interval_ns()
 
     return Bar(
         bar_type=bar_type,
@@ -584,5 +568,5 @@ def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:
         close=Price(mt5_rate["close"], pp),
         volume=Quantity(float(mt5_rate["tick_volume"]), 0),
         ts_event=ts_event,
-        ts_init=time.time_ns(),
+        ts_init=ts_event,
     )

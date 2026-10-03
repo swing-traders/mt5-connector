@@ -9,7 +9,9 @@ from __future__ import annotations
 import inspect
 from collections import namedtuple
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
+from http import HTTPMethod, HTTPStatus
 
 import numpy as np
 import requests
@@ -22,6 +24,10 @@ __version__ = mirror.PACKAGE_VERSION
 CONNECT_TIMEOUT_S = 10.0
 # The server serializes every package call, so a request's wait includes the calls queued ahead.
 READ_TIMEOUT_S = 60.0
+
+_ENVELOPE_STATUSES = frozenset(
+    {HTTPStatus.OK, HTTPStatus.BAD_REQUEST, HTTPStatus.SERVICE_UNAVAILABLE}
+)
 
 _server_url: str | None = None
 _ws_url: str | None = None
@@ -91,25 +97,70 @@ def _wire_value(param: mirror.Param, value: object) -> object:
         return value
 
 
+@dataclass(frozen=True)
+class Reply:
+    """A server's answer to one request, as the shim received it."""
+
+    status: HTTPStatus
+    envelope: dict
+    retry_after: str | None
+
+
 def _call(function: mirror.Function, body: dict[str, object]) -> object:
+    reply = _exchange(
+        function.name,
+        HTTPMethod.POST,
+        f"/mt5/{function.name}",
+        _read_timeout_s(function, body),
+        json=body,
+    )
+    if reply.envelope["ok"]:
+        return _decode(function, reply.envelope["result"])
+    else:
+        return mirror.failure_value(function)
+
+
+def call_route(
+    name: str,
+    method: HTTPMethod,
+    path: str,
+    *,
+    json: dict[str, object] | None = None,
+    params: dict[str, str] | None = None,
+) -> Reply:
+    """Calls one of the server's own routes and sets last_error to the pair its envelope carries.
+    No read timeout bounds it: a cold history read holds the terminal as long as the package's own
+    call takes."""
+    return _exchange(name, method, path, None, json=json, params=params)
+
+
+def _exchange(
+    name: str,
+    method: HTTPMethod,
+    path: str,
+    read_timeout_s: float | None,
+    *,
+    json: dict[str, object] | None = None,
+    params: dict[str, str] | None = None,
+) -> Reply:
+    """The server's reply to a request, its last_error recorded as the shim's."""
     global _last_error
     if _session is None:
         raise MT5ConfigError("remote backend: no server is configured")
     try:
-        response = _session.post(
-            f"{_server_url}/mt5/{function.name}",
-            json=body,
-            timeout=(CONNECT_TIMEOUT_S, _read_timeout_s(function, body)),
+        response = _session.request(
+            method,
+            f"{_server_url}{path}",
+            json=json,
+            params=params,
+            timeout=(CONNECT_TIMEOUT_S, read_timeout_s),
         )
     except requests.RequestException as exc:
-        raise ServerUnreachable(f"{function.name}: {exc}") from exc
-    envelope = _envelope(function.name, response)
+        raise ServerUnreachable(f"{name}: {exc}") from exc
+    envelope = _envelope(name, response)
     code, message = envelope["last_error"]
     _last_error = (code, message)
-    if envelope["ok"]:
-        return _decode(function, envelope["result"])
-    else:
-        return mirror.failure_value(function)
+    return Reply(HTTPStatus(response.status_code), envelope, response.headers.get("Retry-After"))
 
 
 def _read_timeout_s(function: mirror.Function, body: dict[str, object]) -> float:
@@ -123,16 +174,18 @@ def _read_timeout_s(function: mirror.Function, body: dict[str, object]) -> float
 
 def _envelope(name: str, response: requests.Response) -> dict:
     """The response's envelope; raises ServerUnreachable for anything outside the contract."""
-    if response.status_code not in (200, 400, 503):
+    if response.status_code not in _ENVELOPE_STATUSES:
         raise ServerUnreachable(f"{name}: HTTP {response.status_code}")
     try:
         envelope = response.json()
     except requests.JSONDecodeError as exc:
         raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not JSON") from exc
-    if response.status_code == 200 and _is_answer(envelope):
+    if response.status_code == HTTPStatus.OK and _is_answer(envelope):
         return envelope
     elif _is_error(envelope):
         return envelope
+    elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_not_ready(envelope):
+        raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
     else:
         raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not an envelope")
 
@@ -158,6 +211,19 @@ def _is_error(envelope: object) -> bool:
     )
 
 
+def _is_not_ready(envelope: object) -> bool:
+    """Whether a body is the server's refusal of a route it is not ready to serve: an error no
+    package call left, so it carries no last_error."""
+    if not isinstance(envelope, dict) or envelope.get("ok") is not False:
+        return False
+    error = envelope.get("error")
+    return (
+        isinstance(error, dict)
+        and _is_code_and_message(error.get("code"), error.get("message"))
+        and "last_error" not in envelope
+    )
+
+
 def _is_last_error(value: object) -> bool:
     return isinstance(value, list) and len(value) == 2 and _is_code_and_message(*value)
 
@@ -176,7 +242,7 @@ def _decode(function: mirror.Function, result: object) -> object:
         struct = mirror.STRUCTS[function.struct]
         return tuple(_struct(function.name, struct, item) for item in result)
     elif function.result is mirror.ResultKind.ARRAY:
-        return _array(function.name, mirror.ARRAYS[function.array], result)
+        return decode_array(function.name, mirror.ARRAYS[function.array], result)
     elif function.result is mirror.ResultKind.TUPLE:
         return tuple(result)
     else:
@@ -208,7 +274,9 @@ def _struct(name: str, struct: mirror.Struct, data: object) -> tuple:
     return STRUCT_TYPES[struct.name](**values)
 
 
-def _array(name: str, array: mirror.Array, rows: list) -> np.ndarray:
+def decode_array(name: str, array: mirror.Array, rows: list) -> np.ndarray:
+    """The rows as the package's structured array; raises ServerUnreachable for a row that does not
+    fit its dtype."""
     records = []
     for row in rows:
         if (

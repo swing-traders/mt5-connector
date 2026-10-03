@@ -31,16 +31,20 @@ FAILURE_ANSWERS = {mirror.Failure.NONE: None, mirror.Failure.FALSE: False}
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
 
 
-def test_the_server_routes_the_mirror_health_commissions_and_the_server_time_relay(app):
+def test_the_server_routes_the_mirror_health_commissions_the_relay_and_the_history(app):
     routes = {
         (rule.rule, method)
         for rule in app.url_map.iter_rules()
         for method in rule.methods - {"HEAD", "OPTIONS"}
     }
+    assert len(routes) == 32 + 3 + 3
     assert routes == {(f"/mt5/{function.name}", "POST") for function in FUNCTIONS} | {
         ("/health", "GET"),
         ("/commissions/<symbol>", "GET"),
         ("/relay/server_time", "POST"),
+        ("/history/bars", "POST"),
+        ("/history/ticks", "POST"),
+        ("/history/ranges", "GET"),
     }
 
 

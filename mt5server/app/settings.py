@@ -24,6 +24,8 @@ class Settings:
     clock_check_seconds: int
     clock_sample_max_age_seconds: int
     clock_bootstrap_seconds: int
+    history_retry_seconds: int
+    floor_ttl_seconds: int
 
     def __post_init__(self) -> None:
         if self.login_timeout_ms <= 0:
@@ -42,6 +44,12 @@ class Settings:
             raise SettingsError(
                 f"clock_bootstrap_seconds {self.clock_bootstrap_seconds} is not positive"
             )
+        elif self.history_retry_seconds < 1:
+            raise SettingsError(
+                f"history_retry_seconds {self.history_retry_seconds} is not positive"
+            )
+        elif self.floor_ttl_seconds < 1:
+            raise SettingsError(f"floor_ttl_seconds {self.floor_ttl_seconds} is not positive")
 
 
 def read_settings(environ: Mapping[str, str]) -> Settings:
@@ -70,6 +78,12 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         ),
         clock_bootstrap_seconds=_integer(
             "MT5_CLOCK_BOOTSTRAP_SECONDS", environ.get("MT5_CLOCK_BOOTSTRAP_SECONDS", "120")
+        ),
+        history_retry_seconds=_integer(
+            "MT5_HISTORY_RETRY_SECONDS", environ.get("MT5_HISTORY_RETRY_SECONDS", "5")
+        ),
+        floor_ttl_seconds=_integer(
+            "MT5_FLOOR_TTL_SECONDS", environ.get("MT5_FLOOR_TTL_SECONDS", "900")
         ),
     )
 
