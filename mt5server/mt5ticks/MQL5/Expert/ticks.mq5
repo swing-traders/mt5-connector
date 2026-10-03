@@ -52,6 +52,21 @@ void SendServerTime()
 }
 
 //+------------------------------------------------------------------+
+//| Read what the hub sent, discarding every message                 |
+//+------------------------------------------------------------------+
+void ReadHub()
+{
+    // The library answers a ping and acknowledges a close only while it reads, and it reads nothing
+    // while a message it holds is unread.
+    IWebSocketMessage *msg = wss.readMessage(false);
+    while (msg != NULL)
+    {
+        delete msg;
+        msg = wss.readMessage(false);
+    }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -106,6 +121,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+    ReadHub();
     // TimeLocal, not TimeCurrent: the time of the last quote stands still while the market is
     // closed.
     if (!wss.isConnected() && TimeLocal() - g_lastReconnect >= ReconnectIntervalSec)
@@ -134,6 +150,7 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    ReadHub();
     MqlTick tick;
     if (wss.isConnected() && SymbolInfoTick(symbol, tick))
     {
