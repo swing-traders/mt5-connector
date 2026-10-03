@@ -29,7 +29,6 @@ from dotenv import load_dotenv
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 import mt5connect.remote_mt5 as mt5
-from mt5connect.backend import set_backend
 from mt5connect.config import MT5Config
 from mt5connect.connection import MT5Connection
 from mt5connect.downloader import MT5DataDownloader
@@ -94,10 +93,8 @@ def main():
         password=PASSWORD,
         server=SERVER,
         symbols=[SYMBOL],
-        backend="remote",
         server_url=SERVER_URL,
     )
-    set_backend(config)
 
     conn = MT5Connection(config)
     print("Connecting to MT5...")

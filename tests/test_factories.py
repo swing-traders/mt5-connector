@@ -30,6 +30,7 @@ def make_config(account=12345678, server="Exness-MT5Trial1", symbols=None):
         password="test_password",
         server=server,
         symbols=symbols or ["EURUSD"],
+        server_url="http://127.0.0.1:5000",
     )
 
 

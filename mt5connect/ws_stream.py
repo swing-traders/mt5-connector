@@ -1,4 +1,4 @@
-"""WebSocket tick-stream client for the remote MT5 backend."""
+"""WebSocket tick-stream client for the MT5 server's tick hub."""
 
 from __future__ import annotations
 

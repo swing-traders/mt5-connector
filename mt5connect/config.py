@@ -6,11 +6,10 @@ This is the only file users need to touch to connect their broker.
 """
 
 from dataclasses import dataclass
+from urllib.parse import urlparse, urlunparse
 
-from mt5connect.backend import derive_ws_url
 from mt5connect.constants import (
     DEFAULT_EXEC_POLL_INTERVAL_MS,
-    DEFAULT_POLL_INTERVAL_MS,
     MT5_MAGIC_NUMBER,
     RECONNECT_INITIAL_DELAY_S,
     RECONNECT_MAX_ATTEMPTS,
@@ -51,9 +50,10 @@ class MT5Config:
         The adapter automatically handles suffix normalisation internally —
         you just provide the exact broker symbol name and it works.
 
-    poll_interval_ms : int
-        How often (milliseconds) to poll MT5 for live tick data.
-        Default: 100ms. Lower = fresher data, more CPU.
+    server_url : str
+        The MT5 server's HTTP API, e.g. "http://127.0.0.1:5000".
+    ws_url : str | None
+        The MT5 server's WebSocket tick hub. Default: derived from server_url, on port 9000.
     exec_poll_interval_ms : int
         How often (milliseconds) to poll MT5 for position/fill updates.
         Default: 250ms.
@@ -78,6 +78,7 @@ class MT5Config:
             password="demo_password",
             server="Exness-MT5Trial9",
             symbols=["EURUSDm", "XAUUSDm", "BTCUSDm"],
+            server_url="http://127.0.0.1:5000",
         )
 
     Exness zero/raw account (no suffix):
@@ -86,6 +87,7 @@ class MT5Config:
             password="live_password",
             server="Exness-MT5Real8",
             symbols=["EURUSD", "XAUUSD", "BTCUSD"],
+            server_url="http://127.0.0.1:5000",
         )
 
     IC Markets:
@@ -94,6 +96,7 @@ class MT5Config:
             password="ic_password",
             server="ICMarketsSC-Demo",
             symbols=["EURUSD", "XAUUSD"],
+            server_url="http://127.0.0.1:5000",
         )
     """
 
@@ -104,7 +107,6 @@ class MT5Config:
     symbols: list[str]
 
     # ── Optional / defaults ───────────────────────────────────────────────────
-    poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS
     exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
     magic_number: int = MT5_MAGIC_NUMBER
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
@@ -112,7 +114,7 @@ class MT5Config:
     reconnect_max_attempts: int = RECONNECT_MAX_ATTEMPTS
     timeout_s: float = 10.0
 
-    backend: str = "local"
+    # Required: defaulted only so that a config without it is refused as an MT5ConfigError.
     server_url: str | None = None
     ws_url: str | None = None
 
@@ -131,22 +133,23 @@ class MT5Config:
         # We only strip surrounding whitespace.
         self.symbols = [s.strip() for s in self.symbols]
 
-        if self.poll_interval_ms < 10:
-            raise ValueError("poll_interval_ms must be at least 10ms.")
         if self.exec_poll_interval_ms < 50:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")
 
-        if self.backend not in ("local", "remote"):
-            raise MT5ConfigError(f"backend must be 'local' or 'remote', got {self.backend!r}")
-        if self.backend == "remote" and not self.server_url:
-            raise MT5ConfigError("backend='remote' requires server_url (e.g. http://host:5000)")
-        if self.ws_url is None and self.server_url:
+        if not self.server_url:
+            raise MT5ConfigError("MT5Config.server_url cannot be empty.")
+        if self.ws_url is None:
             self.ws_url = derive_ws_url(self.server_url)
-
-    @property
-    def poll_interval_s(self) -> float:
-        return self.poll_interval_ms / 1000.0
 
     @property
     def exec_poll_interval_s(self) -> float:
         return self.exec_poll_interval_ms / 1000.0
+
+
+def derive_ws_url(server_url: str) -> str:
+    """Derive the WebSocket hub URL from the REST server URL (port 9000)."""
+    p = urlparse(server_url)
+    if p.scheme == "ws" and p.port == 9000:
+        return server_url
+    host = p.hostname or "localhost"
+    return urlunparse(("ws", f"{host}:9000", p.path, "", "", ""))

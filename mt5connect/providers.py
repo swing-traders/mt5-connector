@@ -22,14 +22,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-try:
-    import MetaTrader5 as mt5
-except ImportError:  # pragma: no cover - Windows-only dependency
-    mt5 = None  # bound to the real backend by mt5connect.backend.set_backend()
-
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
+from mt5connect import remote_mt5 as mt5
 from mt5connect.errors import MT5ConnectionError, MT5InstrumentError, MT5SymbolNotFoundError
 from mt5connect.parsing import InstrumentAny, parse_symbol_info
 

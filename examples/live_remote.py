@@ -1,15 +1,15 @@
 """
 examples/live_remote.py
 
-Connect to a remote MT5 server backend (the Dockerized MT5 terminal) and
-stream live ticks for the configured symbols.
+Connect to the MT5 server (the Dockerized MT5 terminal) and stream live
+ticks for the configured symbols.
 
     python examples/live_remote.py
 
 Requirements
 ------------
 - The MT5 server container from ``mt5server/`` is running (see README →
-  "Remote server backend"), and the container's MT5 terminal has been
+  "Dockerized MT5 server"), and the container's MT5 terminal has been
   logged into a broker once (via the desktop on port 3000).
 - A local ``.env`` with:
       MT5_ACCOUNT=12345678
@@ -33,7 +33,6 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from mt5connect.backend import set_backend
 from mt5connect.config import MT5Config
 from mt5connect.factories import (
     MT5LiveDataClientFactory,
@@ -60,7 +59,7 @@ INSTRUMENT_ID = "EURUSDp.MT5"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG — remote backend
+# CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 config = MT5Config(
@@ -68,13 +67,9 @@ config = MT5Config(
     password=MT5_PASSWORD,
     server=MT5_SERVER,
     symbols=MT5_SYMBOLS,
-    backend="remote",
     server_url=MT5_SERVER_URL,
 )
-
-# Bind the remote backend module into mt5connect (no local MetaTrader5 needed).
-set_backend(config)
-print(f"Backend: {config.backend}, server: {config.server_url}, ws: {config.ws_url}")
+print(f"Server: {config.server_url}, ws: {config.ws_url}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

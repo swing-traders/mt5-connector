@@ -2,8 +2,8 @@
 examples/test_place_order.py
 
 Places a single 0.01 lot BUY market order on XAUUSD, waits 5 seconds,
-then closes it. Use this to confirm the execution path works end-to-end
-before running the full strategy.
+then closes it, through the MT5 server at MT5_SERVER_URL. Use this to confirm
+the execution path works end-to-end before running the full strategy.
 
     python examples/test_place_order.py
 
@@ -20,8 +20,9 @@ import sys
 import time
 from pathlib import Path
 
-import MetaTrader5 as mt5
 from dotenv import load_dotenv
+
+from mt5connect import remote_mt5 as mt5
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -36,13 +37,15 @@ def _require(key: str) -> str:
 ACCOUNT = int(_require("MT5_ACCOUNT"))
 PASSWORD = _require("MT5_PASSWORD")
 SERVER = _require("MT5_SERVER")
+SERVER_URL = os.getenv("MT5_SERVER_URL", "http://127.0.0.1:5000")
 SYMBOL = os.getenv("MT5_SYMBOLS", "XAUUSD").split(",")[0].strip()
 VOLUME = 0.01
 MAGIC = 510
 
 
 def connect():
-    print(f"Connecting to MT5 — account {ACCOUNT} on {SERVER}...")
+    print(f"Connecting to MT5 — account {ACCOUNT} on {SERVER} via {SERVER_URL}...")
+    mt5.configure(SERVER_URL)
     if not mt5.initialize():
         sys.exit(f"mt5.initialize() failed: {mt5.last_error()}")
     if not mt5.login(ACCOUNT, PASSWORD, SERVER):

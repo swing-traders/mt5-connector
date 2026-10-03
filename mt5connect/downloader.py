@@ -9,14 +9,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-try:
-    import MetaTrader5 as mt5
-except ImportError:  # pragma: no cover - Windows-only dependency
-    mt5 = None  # bound to the real backend by mt5connect.backend.set_backend()
-
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connect import history
+from mt5connect import remote_mt5 as mt5
 from mt5connect.errors import MT5SymbolNotFoundError
 from mt5connect.history import HistoryRanges
 from mt5connect.history_wire import BAR_PERIOD_S, SPAN_MARGIN, Series, bar_series

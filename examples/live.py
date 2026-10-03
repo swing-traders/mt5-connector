@@ -46,6 +46,7 @@ MT5_ACCOUNT = int(_require("MT5_ACCOUNT"))
 MT5_PASSWORD = _require("MT5_PASSWORD")
 MT5_SERVER = _require("MT5_SERVER")
 MT5_SYMBOLS = [s.strip() for s in _require("MT5_SYMBOLS").split(",")]
+MT5_SERVER_URL = os.getenv("MT5_SERVER_URL", "http://127.0.0.1:5000")
 
 # Strategy parameters
 FVG_MIN_PIPS = float(os.getenv("FVG_MIN_PIPS", "0.50"))
@@ -338,7 +339,7 @@ def main():
         password=MT5_PASSWORD,
         server=MT5_SERVER,
         symbols=MT5_SYMBOLS,
-        poll_interval_ms=100,
+        server_url=MT5_SERVER_URL,
         exec_poll_interval_ms=250,
     )
 

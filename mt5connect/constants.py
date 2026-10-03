@@ -22,10 +22,6 @@ MT5_MAGIC_NUMBER: int = 510
 # POLLING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Default interval (milliseconds) for the live tick polling loop.
-# 100ms = 10 ticks/second per symbol — balanced between freshness and CPU usage.
-DEFAULT_POLL_INTERVAL_MS: int = 100
-
 # Interval (milliseconds) for polling open positions to detect fills.
 DEFAULT_EXEC_POLL_INTERVAL_MS: int = 250
 

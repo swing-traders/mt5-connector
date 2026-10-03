@@ -146,7 +146,7 @@ def _exchange(
     """The server's reply to a request, its last_error recorded as the shim's."""
     global _last_error
     if _session is None:
-        raise MT5ConfigError("remote backend: no server is configured")
+        raise MT5ConfigError("remote_mt5: no server is configured")
     try:
         response = _session.request(
             method,

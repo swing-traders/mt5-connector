@@ -42,7 +42,6 @@ import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import MetaTrader5 as mt5
 import pytest
 from nautilus_trader.model.currencies import Currency
 from nautilus_trader.model.enums import (
@@ -59,6 +58,7 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
+from mt5connect import remote_mt5 as mt5
 from mt5connect.errors import MT5ConnectionError
 from mt5connect.execution import (
     MT5LiveExecutionClient,
@@ -86,6 +86,7 @@ def config():
         password="test_password",
         server="Exness-MT5Trial1",
         symbols=["EURUSD", "XAUUSD"],
+        server_url="http://127.0.0.1:5000",
         exec_poll_interval_ms=50,
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
@@ -95,7 +96,7 @@ def config():
 
 @pytest.fixture
 def mock_mt5_exec():
-    """Patches MetaTrader5 for execution tests."""
+    """Patches the shim inside mt5connect.execution for execution tests."""
     with patch("mt5connect.execution.mt5") as mock:
         # Connection
         mock.initialize.return_value = True

@@ -95,6 +95,14 @@ class TestInitialState:
 
 class TestSuccessfulConnect:
 
+    def test_connect_binds_the_shim_to_the_configured_server_before_initializing(
+        self, config, mock_mt5
+    ):
+        conn = MT5Connection(config)
+        conn.connect()
+        mock_mt5.configure.assert_called_once_with("http://127.0.0.1:5000", "ws://127.0.0.1:9000")
+        assert [name for name, _, _ in mock_mt5.mock_calls][:2] == ["configure", "initialize"]
+
     def test_connect_calls_initialize_and_login(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn.connect()
