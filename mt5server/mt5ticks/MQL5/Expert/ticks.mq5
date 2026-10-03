@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                       ticks.mq5  |
-//|            OnTick EA streaming ticks to the WS hub (mt5ticks)   |
+//|  Streams ticks and the trade server's time to the WS hub         |
 //+------------------------------------------------------------------+
 #property script_show_inputs
 
@@ -9,6 +9,7 @@
 //+------------------------------------------------------------------+
 input string Server = "ws://127.0.0.1:9000/";
 input int ReconnectIntervalSec = 0;
+input int RelaySeconds = 5;
 
 #include <MQL5Book/AutoPtr.mqh>
 #include <MQL5Book/ws/wsclient.mqh>
@@ -35,23 +36,53 @@ void SendHello()
 }
 
 //+------------------------------------------------------------------+
+//| Relay the trade server's time to the server through the hub      |
+//+------------------------------------------------------------------+
+void SendServerTime()
+{
+    CJAVal frame(jtOBJ, "");
+    frame["v"] = 1;
+    frame["type"] = "server_time";
+    frame["symbol"] = symbol;
+    frame["trade_server"] = (long)TimeTradeServer();
+    frame["current"] = (long)TimeCurrent();
+    frame["gmt"] = (long)TimeGMT();
+    frame["connected"] = (int)TerminalInfoInteger(TERMINAL_CONNECTED);
+    wss.send(frame.Serialize());
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
-void OnInit()
-{   
-    Print("ticks EA initialzing");
+int OnInit()
+{
+    Print("ticks EA initializing");
     symbol = Symbol();
+    if (RelaySeconds < 1)
+    {
+        Print("RelaySeconds ", RelaySeconds, " is not positive");
+        return INIT_PARAMETERS_INCORRECT;
+    }
+    // The timer fires whether or not the market ticks, so it reconnects and relays the server time
+    // while the market is closed too.
+    if (!EventSetTimer(RelaySeconds))
+    {
+        Print("EventSetTimer failed: ", GetLastError());
+        return INIT_FAILED;
+    }
 
     wss = new WebSocketClient<Hybi>(Server);
     wss.setTimeOut(10000);
-    if (!wss.open())
+    if (wss.open())
+    {
+        SendHello();
+        Print("ticks EA initialization successful");
+    }
+    else
     {
         Print("Failed to connect to server");
-        return;
     }
-    SendHello();
-    Print("ticks EA initialization successful");
-    
+    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
@@ -59,20 +90,27 @@ void OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    wss.close();
-    delete wss;
-    Print("WebSocket client closed");
+    EventKillTimer();
+    if (wss != NULL)
+    {
+        wss.close();
+        delete wss;
+        wss = NULL;
+        Print("WebSocket client closed");
+    }
     Print("Deinitialization");
 }
 
 //+------------------------------------------------------------------+
-//| onTick method is called every tick                               |
+//| Timer event handler                                              |
 //+------------------------------------------------------------------+
-void OnTick()
+void OnTimer()
 {
-    if (!wss.isConnected() && TimeCurrent() - g_lastReconnect >= ReconnectIntervalSec)
+    // TimeLocal, not TimeCurrent: the time of the last quote stands still while the market is
+    // closed.
+    if (!wss.isConnected() && TimeLocal() - g_lastReconnect >= ReconnectIntervalSec)
     {
-        g_lastReconnect = TimeCurrent();
+        g_lastReconnect = TimeLocal();
         Print("Reconnecting");
         g_helloSent = false;
         if (!wss.open())
@@ -85,8 +123,19 @@ void OnTick()
         }
     }
 
+    if (wss.isConnected())
+    {
+        SendServerTime();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| onTick method is called every tick                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
     MqlTick tick;
-    if (SymbolInfoTick(symbol, tick))
+    if (wss.isConnected() && SymbolInfoTick(symbol, tick))
     {
         CJAVal tickObj(jtOBJ, "");
         tickObj["symbol"] = symbol;

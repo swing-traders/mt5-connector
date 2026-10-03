@@ -1,13 +1,10 @@
 """The server's settings, start, liveness and relayed commission schedules."""
 
-import logging
-import threading
 from zoneinfo import ZoneInfo
 
 import pytest
-from mirror_samples import CLOCK, expected_json, struct_sample
+from mirror_samples import CLOCK
 
-from mt5connect import mirror
 from mt5server.app.app import TerminalStartError, connect_terminal, create_app
 from mt5server.app.commissions import CommissionRule, CommissionSchedule, CommissionTier
 from mt5server.app.settings import Settings, SettingsError, read_settings
@@ -18,7 +15,6 @@ ENVIRONMENT = {
     "MT5_LOGIN": "12345678",
     "MT5_PASSWORD": "secret-password",
     "MT5_SERVER": "example-server",
-    "MT5_CLOCK_SYMBOL": "EURUSD",
 }
 
 
@@ -34,8 +30,9 @@ def test_settings_read_the_environment_with_defaults():
     assert settings.api_threads == 4
     assert settings.broker_tz == ZoneInfo("America/New_York")
     assert settings.broker_offset_hours == 7
-    assert settings.clock_symbol == "EURUSD"
     assert settings.clock_check_seconds == 300
+    assert settings.clock_sample_max_age_seconds == 30
+    assert settings.clock_bootstrap_seconds == 120
 
 
 def test_settings_take_overrides():
@@ -49,6 +46,8 @@ def test_settings_take_overrides():
             "MT5_BROKER_TZ": "Europe/Helsinki",
             "MT5_BROKER_OFFSET_HOURS": "0",
             "MT5_CLOCK_CHECK_SECONDS": "60",
+            "MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS": "15",
+            "MT5_CLOCK_BOOTSTRAP_SECONDS": "600",
         }
     )
     assert (settings.login_timeout_ms, settings.api_host, settings.api_port) == (
@@ -60,11 +59,11 @@ def test_settings_take_overrides():
     assert settings.broker_tz == ZoneInfo("Europe/Helsinki")
     assert settings.broker_offset_hours == 0
     assert settings.clock_check_seconds == 60
+    assert settings.clock_sample_max_age_seconds == 15
+    assert settings.clock_bootstrap_seconds == 600
 
 
-@pytest.mark.parametrize(
-    "name", ["MT5_TERMINAL_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_CLOCK_SYMBOL"]
-)
+@pytest.mark.parametrize("name", ["MT5_TERMINAL_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"])
 def test_settings_refuse_a_missing_variable(name):
     environment = dict(ENVIRONMENT)
     del environment[name]
@@ -81,6 +80,10 @@ def test_settings_refuse_a_missing_variable(name):
         ("MT5_LOGIN_TIMEOUT_MS", "0", "login_timeout_ms"),
         ("MT5_LOGIN_TIMEOUT_MS", "-1", "login_timeout_ms"),
         ("MT5_CLOCK_CHECK_SECONDS", "0", "clock_check_seconds"),
+        ("MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS", "0", "clock_sample_max_age_seconds"),
+        ("MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS", "-1", "clock_sample_max_age_seconds"),
+        ("MT5_CLOCK_BOOTSTRAP_SECONDS", "0", "clock_bootstrap_seconds"),
+        ("MT5_CLOCK_BOOTSTRAP_SECONDS", "-1", "clock_bootstrap_seconds"),
     ],
 )
 def test_settings_refuse_an_out_of_range_value(variable, value, field):
@@ -101,8 +104,9 @@ def test_settings_built_directly_refuse_an_out_of_range_value():
             api_threads=0,
             broker_tz=ZoneInfo("America/New_York"),
             broker_offset_hours=7,
-            clock_symbol="EURUSD",
             clock_check_seconds=300,
+            clock_sample_max_age_seconds=30,
+            clock_bootstrap_seconds=120,
         )
 
 
@@ -112,7 +116,15 @@ def test_settings_refuse_an_unknown_broker_zone(value):
         read_settings(ENVIRONMENT | {"MT5_BROKER_TZ": value})
 
 
-@pytest.mark.parametrize("variable", ["MT5_BROKER_OFFSET_HOURS", "MT5_CLOCK_CHECK_SECONDS"])
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "MT5_BROKER_OFFSET_HOURS",
+        "MT5_CLOCK_CHECK_SECONDS",
+        "MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS",
+        "MT5_CLOCK_BOOTSTRAP_SECONDS",
+    ],
+)
 @pytest.mark.parametrize("value", ["7.5", "seven"])
 def test_settings_refuse_a_clock_setting_that_is_not_an_integer(variable, value):
     with pytest.raises(SettingsError, match=f"{variable} is not an integer"):
@@ -132,17 +144,18 @@ def test_settings_repr_carries_no_login_values():
     assert "example-server" not in text
 
 
-def test_start_initializes_the_configured_terminal_once(stub, commissions):
+def test_start_initializes_the_configured_terminal_once(
+    stub, commissions, server_times, clock_status
+):
     stub.initialize.return_value = True
-    stub.terminal_info.return_value = struct_sample(mirror.StructName.TERMINAL_INFO)
+    stub.positions_total.return_value = 0
     terminal = Terminal(stub)
 
     connect_terminal(terminal, read_settings(ENVIRONMENT))
-    ready = threading.Event()
-    ready.set()
-    client = create_app(terminal, commissions, CLOCK, ready).test_client()
+    client = create_app(terminal, commissions, CLOCK, server_times, clock_status).test_client()
     for _ in range(3):
         assert client.get("/health").status_code == 200
+        assert client.post("/mt5/positions_total").status_code == 200
 
     stub.initialize.assert_called_once_with(
         "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
@@ -162,47 +175,35 @@ def test_start_fails_with_the_packages_last_error(stub):
     assert "12345678" not in str(failure.value)
 
 
-def test_health_answers_the_terminal_info(client, stub):
-    info = struct_sample(mirror.StructName.TERMINAL_INFO)._replace(connected=True)
-    stub.terminal_info.return_value = info
-
+def test_health_answers_the_verification_without_calling_the_terminal(client, stub):
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json == {
         "ok": True,
-        "result": expected_json(info),
-        "last_error": [1, "Success"],
+        "result": {
+            "symbol": "EURUSD",
+            "trade_server": 1_752_570_000,
+            "current": 1_752_569_998,
+            "gmt": 1_752_570_000,
+            "skew_s": -30,
+            "offset_s": 10_800,
+        },
     }
-    stub.initialize.assert_not_called()
+    assert stub.mock_calls == []
 
 
-def test_health_is_unavailable_when_the_terminal_does_not_answer(client, stub):
-    stub.terminal_info.return_value = None
-    stub.last_error.return_value = (-10004, "No IPC connection")
+def test_health_is_unavailable_while_the_clock_is_not_verified(client, stub, clock_status):
+    clock_status.clear()
 
     response = client.get("/health")
 
     assert response.status_code == 503
     assert response.json == {
         "ok": False,
-        "error": {"code": -10004, "message": "No IPC connection"},
-        "last_error": [-10004, "No IPC connection"],
+        "error": {"code": -1, "message": "the broker clock is not verified"},
     }
-    stub.initialize.assert_not_called()
-
-
-def test_health_logs_the_broker_connection_when_it_changes(client, stub, caplog):
-    info = struct_sample(mirror.StructName.TERMINAL_INFO)
-    caplog.set_level(logging.INFO, logger="mt5server.app.app")
-    for connected in (True, True, False, False, True):
-        stub.terminal_info.return_value = info._replace(connected=connected)
-        client.get("/health")
-    assert [record.getMessage() for record in caplog.records] == [
-        "terminal broker connection: connected=True",
-        "terminal broker connection: connected=False",
-        "terminal broker connection: connected=True",
-    ]
+    assert stub.mock_calls == []
 
 
 def test_commissions_without_a_relayed_schedule_answer_not_found(client):

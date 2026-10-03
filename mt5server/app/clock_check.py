@@ -1,48 +1,84 @@
-"""The broker clock's verification against the live tick of the clock symbol.
+"""The broker clock's verification against the trade-server time the terminal's EA relays.
 
-State: `ready`, set once the first verification has passed or found the market closed, and never
-cleared; the server exits on any failed verification."""
+State: `status`, the latest verification, held while the latest relayed sample is fresh and cleared
+while it is not; the server exits on a sample the broker clock contradicts, and when no fresh sample
+arrives at connect."""
 
 import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from mt5connect import mirror
 from mt5connect.broker_clock import BrokerClock
-from mt5server.app.terminal import Failed, Terminal
+from mt5server.app.server_time import Received, ServerTimeSample, ServerTimeSink
 
 logger = logging.getLogger(__name__)
 
-_SYMBOL_INFO_TICK = mirror.FUNCTIONS[mirror.FunctionName.SYMBOL_INFO_TICK]
-# The time between a verification's two reads: a tick whose time_msc moved across it is fresh.
-_READ_GAP_S = 5
 _TOLERANCE_S = 120
 
 
 class ClockCheckFailed(Exception):
-    """Raised when the clock symbol's tick contradicts the broker clock's schedule or is missing at
-    connect."""
+    """Raised when a sample contradicts the broker clock's schedule, or none is fresh at connect."""
+
+
+@dataclass(frozen=True)
+class ClockVerification:
+    """A sample the broker clock agreed with, in true UTC, and what its verification measured."""
+
+    symbol: str
+    trade_server: int
+    current: int
+    gmt: int
+    skew_s: int
+    offset_s: int
+
+
+class ClockStatus:
+    """The broker clock's latest verification, or None while the clock is not verified."""
+
+    def __init__(self) -> None:
+        self._verification: ClockVerification | None = None
+        self._lock = threading.Lock()
+
+    def read(self) -> ClockVerification | None:
+        with self._lock:
+            return self._verification
+
+    def set(self, verification: ClockVerification) -> None:
+        with self._lock:
+            self._verification = verification
+
+    def clear(self) -> None:
+        with self._lock:
+            self._verification = None
 
 
 class ClockCheck:
-    """Verifies the broker clock's schedule against the clock symbol's live tick."""
+    """Verifies the broker clock against the relayed trade-server time, keeping `status` current."""
 
-    def __init__(self, terminal: Terminal, clock: BrokerClock, symbol: str) -> None:
-        self._terminal = terminal
+    def __init__(
+        self,
+        server_times: ServerTimeSink,
+        clock: BrokerClock,
+        *,
+        max_age_s: int,
+        check_s: int,
+        bootstrap_s: int,
+    ) -> None:
+        self._server_times = server_times
         self._clock = clock
-        self._symbol = symbol
-        self.ready = threading.Event()
+        self._max_age_s = max_age_s
+        self._check_s = check_s
+        self._bootstrap_s = bootstrap_s
+        self.status = ClockStatus()
 
-    def run(self, interval_s: int) -> None:
-        """Verifies at once, then every interval; a failed verification exits the process."""
+    def run(self) -> None:
+        """Verifies the first fresh sample, then follows the samples until the process ends."""
         try:
-            self.verify(at_connect=True)
-            self.ready.set()
-            while True:
-                time.sleep(interval_s)
-                self.verify(at_connect=False)
+            received = self._bootstrap()
+            self._watch(received)
         except ClockCheckFailed as failure:
             logger.critical("broker clock: %s", failure)
             os._exit(1)
@@ -50,49 +86,86 @@ class ClockCheck:
             logger.critical("broker clock: the verification failed", exc_info=True)
             os._exit(1)
 
-    def verify(self, at_connect: bool) -> None:
-        """Reads the clock symbol's tick twice, each read under the terminal's lock, and measures a
-        fresh one against the server's clock; a stale one defers to the next verification."""
-        first = self._terminal.call(_SYMBOL_INFO_TICK, {"symbol": self._symbol})
-        time.sleep(_READ_GAP_S)
-        second = self._terminal.call(_SYMBOL_INFO_TICK, {"symbol": self._symbol})
+    def _bootstrap(self) -> Received:
+        """Verifies the first fresh sample to arrive within the bootstrap window."""
+        deadline = time.monotonic() + self._bootstrap_s
+        received = None
+        while not self._is_fresh(received, time.monotonic()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ClockCheckFailed(f"no fresh server-time sample in {self._bootstrap_s} s")
+            received = self._server_times.wait_newer(received, remaining)
+        self.status.set(self._verify(received.sample))
+        logger.info("broker clock verified")
+        return received
+
+    def _watch(self, received: Received) -> None:
+        """Wakes when a sample arrives, when the latest goes stale, and when a re-verification of it
+        is due."""
+        due = time.monotonic() + self._check_s
+        while True:
+            if self.status.read() is None:
+                timeout = None
+            else:
+                timeout = min(due, received.arrived + self._max_age_s) - time.monotonic()
+            received = self._server_times.wait_newer(received, timeout)
+            now = time.monotonic()
+            if not self._is_fresh(received, now):
+                if self.status.read() is not None:
+                    self.status.clear()
+                    logger.info(
+                        "broker clock unverified: the latest server-time sample arrived %d s ago, "
+                        "connected=%s",
+                        now - received.arrived,
+                        received.sample.connected,
+                    )
+            elif self.status.read() is None:
+                self.status.set(self._verify(received.sample))
+                logger.info("broker clock verified")
+                due = now + self._check_s
+            elif now >= due:
+                self.status.set(self._verify(received.sample))
+                due = now + self._check_s
+
+    def _is_fresh(self, received: Received | None, now: float) -> bool:
+        """Whether a sample says the terminal is connected and arrived less than the maximum age
+        ago."""
+        return (
+            received is not None
+            and received.sample.connected
+            and now - received.arrived < self._max_age_s
+        )
+
+    def _verify(self, sample: ServerTimeSample) -> ClockVerification:
+        """Measures the sample's trade-server time against the server's clock; raises
+        ClockCheckFailed past the tolerance."""
         now = int(time.time())
         offset_s = int(self._clock.offset_at(now).total_seconds())
-        failures = [
-            outcome.last_error for outcome in (first, second) if isinstance(outcome, Failed)
-        ]
-        if failures:
-            if at_connect:
-                raise ClockCheckFailed(f"no {self._symbol} tick: {failures[0]}")
-            else:
-                logger.warning(
-                    "broker clock verification deferred: no %s tick: %s", self._symbol, failures[0]
-                )
-        elif second.value.time_msc == first.value.time_msc:
-            logger.info(
-                "broker clock verification deferred: %s did not tick in %s s, the market is "
-                "closed; offset %+d s",
-                self._symbol,
-                _READ_GAP_S,
-                offset_s,
+        trade_server = self._clock.to_utc(sample.trade_server)
+        skew_s = trade_server - now
+        logger.info(
+            "broker clock measured on %s: trade server at %s, %+d s from the server clock; "
+            "offset %+d s",
+            sample.symbol,
+            _iso(trade_server),
+            skew_s,
+            offset_s,
+        )
+        if abs(skew_s) > _TOLERANCE_S:
+            raise ClockCheckFailed(
+                f"{sample.symbol} trade server at broker epoch {sample.trade_server} reads "
+                f"{_iso(trade_server)}, {skew_s:+d} s from the server clock's {_iso(now)}, "
+                f"under offset {offset_s:+d} s"
             )
         else:
-            tick_utc = self._clock.to_utc(second.value.time)
-            skew_s = tick_utc - now
-            logger.info(
-                "broker clock measured on %s: tick at %s, %+d s from the server clock; "
-                "offset %+d s",
-                self._symbol,
-                _iso(tick_utc),
-                skew_s,
-                offset_s,
+            return ClockVerification(
+                symbol=sample.symbol,
+                trade_server=trade_server,
+                current=self._clock.to_utc(sample.current),
+                gmt=sample.gmt,
+                skew_s=skew_s,
+                offset_s=offset_s,
             )
-            if abs(skew_s) > _TOLERANCE_S:
-                raise ClockCheckFailed(
-                    f"{self._symbol} tick at broker epoch {second.value.time} reads "
-                    f"{_iso(tick_utc)}, {skew_s:+d} s from the server clock's {_iso(now)}, "
-                    f"under offset {offset_s:+d} s"
-                )
 
 
 def _iso(epoch: int) -> str:
