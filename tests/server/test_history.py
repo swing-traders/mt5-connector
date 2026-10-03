@@ -224,7 +224,7 @@ def stub():
 @pytest.fixture
 def server_times():
     """The relay's latest sample, carrying the trade server at NOW."""
-    sink = ServerTimeSink()
+    sink = ServerTimeSink(max_age_s=30)
     sink.write(ServerTimeSample("EURUSD", NOW, NOW, NOW - EST, True))
     return sink
 

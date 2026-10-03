@@ -147,15 +147,14 @@ def test_a_wait_wakes_on_a_write_from_another_thread(server_times):
 
 
 class _SinkEndingTheCheck(ServerTimeSink):
-    """A sink whose second wait ends the clock check's run: the first is the one at connect."""
+    """A sink whose first wait past a sample from a connected run of the maximum age ends the clock
+    check's run: the check has verified that sample by then."""
 
     def __init__(self) -> None:
-        super().__init__()
-        self._waits = 0
+        super().__init__(max_age_s=30)
 
     def wait_newer(self, than, timeout):
-        self._waits += 1
-        if self._waits == 2:
+        if than is not None and than.arrived - than.connected_since >= 30:
             raise SystemExit
         return super().wait_newer(than, timeout)
 
@@ -166,8 +165,10 @@ def test_a_frame_relayed_through_the_route_verifies_the_clock(
     exits = []
     monkeypatch.setattr(os, "_exit", exits.append)
     monkeypatch.setattr(time, "time", lambda: 1_752_570_030.0)
+    monotonic = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic[0])
     server_times = _SinkEndingTheCheck()
-    check = ClockCheck(server_times, CLOCK, max_age_s=30, check_s=300, bootstrap_s=5)
+    check = ClockCheck(server_times, CLOCK, max_age_s=30, check_s=300, bootstrap_s=60)
     client = create_app(
         terminal, commissions, CLOCK, server_times, check.status, history, workers=3, retry_s=5
     ).test_client()
@@ -181,9 +182,13 @@ def test_a_frame_relayed_through_the_route_verifies_the_clock(
 
     unverified = client.get("/health").status_code
     client.post("/relay/server_time", json=FRAME)
+    connected_for_0_s = client.get("/health").status_code
+    for at in (15.0, 30.0):
+        monotonic[0] = at
+        client.post("/relay/server_time", json=FRAME)
     thread.join(timeout=5)
 
     assert not thread.is_alive()
     assert exits == []
-    assert unverified == 503
+    assert (unverified, connected_for_0_s) == (503, 503)
     assert client.get("/health").status_code == 200

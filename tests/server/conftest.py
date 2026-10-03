@@ -34,7 +34,7 @@ def terminal(stub):
 
 @pytest.fixture
 def server_times():
-    return ServerTimeSink()
+    return ServerTimeSink(max_age_s=30)
 
 
 @pytest.fixture
