@@ -42,6 +42,10 @@ class ServerTimeSink:
             self._latest = Received(sample, time.monotonic())
             self._arrival.notify_all()
 
+    def latest(self) -> Received | None:
+        with self._arrival:
+            return self._latest
+
     def wait_newer(self, than: Received | None, timeout: float | None) -> Received | None:
         """The latest sample once it is not `than`, or whichever it is when the timeout ends the
         wait; a None timeout waits without end."""

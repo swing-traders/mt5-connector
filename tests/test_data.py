@@ -4,7 +4,7 @@ tests/test_data.py
 Exhaustive tests for MT5DataClient.
 
 Tests are split into:
-  1.  Helpers (_nanos_to_datetime, _bar_spec_to_mt5_timeframe)
+  1.  Helpers (_epoch_s, _bar_spec_to_mt5_timeframe)
   2.  Initial state
   3.  _connect() — instrument loading, poll task creation
   4.  _disconnect() — task cancellation, state cleanup
@@ -12,16 +12,17 @@ Tests are split into:
   6.  _subscribe_bars() / _unsubscribe_bars()
   7.  _poll_once() — tick emission, duplicate suppression
   8.  _poll_loop() — reconnect on connection error, stop on failure
-  9.  _request_quote_ticks() — historical tick delivery
-  10. _request_bars() — historical bar delivery
+  9.  _request_quote_ticks() — historical ticks through the server's history routes
+  10. _request_bars() — historical bars through the server's history routes
   11. No-op methods — don't raise
   12. Properties — subscribed_quote_ticks, is_polling
 """
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -30,9 +31,11 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
+from mt5connect import mirror
 from mt5connect.connection import ConnectionState
-from mt5connect.data import MT5DataClient, _bar_spec_to_mt5_timeframe, _nanos_to_datetime
+from mt5connect.data import MT5DataClient, _bar_spec_to_mt5_timeframe, _epoch_s
 from mt5connect.errors import MT5ConnectionError
+from mt5connect.history_wire import Series
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -164,7 +167,19 @@ def make_provider(instrument=None):
     return provider
 
 
-def make_client(symbols=None, connected=True, instrument=None):
+class RecordedDataClient(MT5DataClient):
+    """The data client with its log calls recorded."""
+
+    def __init__(self, *args, **kwargs):
+        self.recorded_log = MagicMock()
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _log(self):
+        return self.recorded_log
+
+
+def make_client(symbols=None, connected=True, instrument=None, client_class=MT5DataClient):
     """Build a fully wired MT5DataClient with real NautilusTrader components."""
     from nautilus_trader.common.component import LiveClock
     from nautilus_trader.test_kit.stubs.component import TestComponentStubs
@@ -184,7 +199,7 @@ def make_client(symbols=None, connected=True, instrument=None):
     cache = TestComponentStubs.cache()
     clock = LiveClock()
 
-    client = MT5DataClient(
+    client = client_class(
         loop=loop,
         connection=conn,
         msgbus=msgbus,
@@ -222,25 +237,13 @@ def client_with_loop():
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-class TestNanosToDatetime:
+class TestEpochS:
 
-    def test_converts_nanos_to_utc_datetime(self):
-        nanos = 1_700_000_000_000_000_000
-        result = _nanos_to_datetime(nanos)
-        assert isinstance(result, datetime)
-        assert result.tzinfo == UTC
+    def test_nanoseconds_become_seconds(self):
+        assert _epoch_s(1_700_000_000_500_000_000) == 1_700_000_000
 
-    def test_none_returns_none(self):
-        assert _nanos_to_datetime(None) is None
-
-    def test_epoch_zero(self):
-        result = _nanos_to_datetime(0)
-        assert result.year == 1970
-
-    def test_value_correct(self):
-        nanos = 1_700_000_000 * 1_000_000_000
-        result = _nanos_to_datetime(nanos)
-        assert result.timestamp() == pytest.approx(1_700_000_000.0)
+    def test_a_datetime_becomes_its_epoch_seconds(self):
+        assert _epoch_s(datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)) == 1_700_000_000
 
 
 class TestBarSpecToMt5Timeframe:
@@ -700,76 +703,87 @@ class TestPollLoop:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+RATES = np.dtype(list(mirror.RATES.dtype))
+TICKS = np.dtype(list(mirror.TICKS.dtype))
+
+
+def rate_rows(*opens):
+    return np.array([(t, 1.085, 1.09, 1.08, 1.088, 1000, 2, 0) for t in opens], dtype=RATES)
+
+
+def tick_rows(*times_msc):
+    return np.array([(t // 1000, 1.085, 1.0852, 0.0, 0, t, 6, 0.0) for t in times_msc], dtype=TICKS)
+
+
+def minute_bars_request(first_close, last_close):
+    from nautilus_trader.model.data import BarType
+
+    request = MagicMock()
+    request.bar_type = BarType.from_str("EURUSDm.MT5-1-MINUTE-LAST-EXTERNAL")
+    request.start = first_close * 1_000_000_000
+    request.end = last_close * 1_000_000_000
+    request.id = "req-bars"
+    return request
+
+
+def ticks_request(start, end):
+    request = MagicMock()
+    request.instrument_id.symbol.value = "EURUSDm"
+    request.start = start * 1_000_000_000
+    request.end = end * 1_000_000_000
+    request.id = "req-ticks"
+    return request
+
+
+@pytest.fixture
+def recorded():
+    c, conn, prov, loop = make_client(client_class=RecordedDataClient)
+    yield c
+    loop.close()
+
+
 class TestRequestQuoteTicks:
 
     @pytest.mark.asyncio
-    async def test_fetches_and_delivers_ticks(self, client):
-        request = MagicMock()
-        request.instrument_id.symbol.value = "EURUSDm"
-        request.start = 1_700_000_000_000_000_000
-        request.end = 1_700_100_000_000_000_000
-        request.id = "req-001"
+    async def test_asks_the_server_for_the_window_and_delivers_its_ticks(self, recorded):
+        rows = tick_rows(*((1_752_570_000 + i) * 1000 + 250 for i in range(10)))
+        with patch("mt5connect.history.ticks", return_value=rows) as ticks:
+            await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        raw_ticks = [
-            make_raw_tick(time_s=1_700_000_000 + i, time_msc=(1_700_000_000 + i) * 1000)
-            for i in range(10)
+        ticks.assert_called_once_with("EURUSDm", 1_752_570_000, 1_752_573_600, cancel=ANY)
+        delivered = recorded._handle_quote_ticks.call_args[0][1]
+        assert [tick.ts_event for tick in delivered] == [
+            ((1_752_570_000 + i) * 1000 + 250) * 1_000_000 for i in range(10)
         ]
-
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.copy_ticks_range.return_value = raw_ticks
-            await client._request_quote_ticks(request)
-
-        client._handle_quote_ticks.assert_called_once()
-        args = client._handle_quote_ticks.call_args[0]
-        assert len(args[1]) == 10
+        assert recorded._log.warning.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_delivers_empty_list_when_no_data(self, client):
-        request = MagicMock()
-        request.instrument_id.symbol.value = "EURUSDm"
-        request.start = 1_700_000_000_000_000_000
-        request.end = 1_700_100_000_000_000_000
-        request.id = "req-002"
+    async def test_an_empty_answer_completes_the_request_with_nothing_and_no_warning(
+        self, recorded
+    ):
+        with patch("mt5connect.history.ticks", return_value=tick_rows()):
+            await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.copy_ticks_range.return_value = []
-            await client._request_quote_ticks(request)
-
-        client._handle_quote_ticks.assert_called_once()
-        args = client._handle_quote_ticks.call_args[0]
-        assert args[1] == []
+        assert recorded._handle_quote_ticks.call_args[0][1] == []
+        assert recorded._log.warning.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_handles_none_response_gracefully(self, client):
-        request = MagicMock()
-        request.instrument_id.symbol.value = "EURUSDm"
-        request.start = 1_700_000_000_000_000_000
-        request.end = None
-        request.id = "req-003"
+    async def test_a_failed_window_is_an_error_and_delivers_nothing(self, recorded):
+        with patch("mt5connect.history.ticks", return_value=None):
+            await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.COPY_TICKS_ALL = -1
-            mock_mt5.copy_ticks_range.return_value = None
-            await client._request_quote_ticks(request)
-
-        # Should still call handle (with empty list) and not raise
-        client._handle_quote_ticks.assert_called_once()
+        recorded._handle_quote_ticks.assert_not_called()
+        assert recorded._log.error.call_count == 1
+        assert "2025-07-15T09:00:00+00:00" in recorded._log.error.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_skips_when_instrument_not_found(self, client):
         client._provider.get_instrument.return_value = None
-        request = MagicMock()
-        request.instrument_id.symbol.value = "FAKESYM"
-        request.start = 1_700_000_000_000_000_000
-        request.end = 1_700_100_000_000_000_000
-        request.id = "req-004"
 
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            await client._request_quote_ticks(request)
+        with patch("mt5connect.history.ticks") as ticks:
+            await client._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        mock_mt5.copy_ticks_range.assert_not_called()
+        ticks.assert_not_called()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -780,59 +794,70 @@ class TestRequestQuoteTicks:
 class TestRequestBars:
 
     @pytest.mark.asyncio
-    async def test_fetches_and_delivers_bars(self, client):
-        request = MagicMock()
-        request.bar_type.instrument_id.symbol.value = "EURUSDm"
-        request.start = 1_700_000_000_000_000_000
-        request.end = 1_700_100_000_000_000_000
-        request.id = "req-bars-001"
+    async def test_asks_the_server_for_the_opens_of_the_closes_requested(self, recorded):
+        c0, c1 = 1_752_570_060, 1_752_570_300
+        rows = rate_rows(*range(c0 - 60, c1, 60))
+        with patch("mt5connect.history.bars", return_value=rows) as bars:
+            await recorded._request_bars(minute_bars_request(c0, c1))
 
-        raw_bars = [make_raw_rate(time_s=1_700_000_000 + i * 3600) for i in range(5)]
-
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            mock_mt5.TIMEFRAME_H4 = 16388
-            mock_mt5.TIMEFRAME_D1 = 16408
-            mock_mt5.copy_rates_range.return_value = raw_bars
-            # Mock _bar_spec_to_mt5_timeframe return
-            with patch("mt5connect.data._bar_spec_to_mt5_timeframe", return_value=16385):
-                await client._request_bars(request)
-
-        client._handle_bars.assert_called_once()
-        args = client._handle_bars.call_args[0]
-        assert len(args[1]) == 5
+        bars.assert_called_once_with("EURUSDm", Series.M1, c0 - 60, c1 - 60, cancel=ANY)
+        delivered = recorded._handle_bars.call_args[0][1]
+        assert [bar.ts_event for bar in delivered] == [
+            close * 1_000_000_000 for close in range(c0, c1 + 1, 60)
+        ]
+        assert recorded._log.warning.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_delivers_empty_list_when_no_bars(self, client):
-        request = MagicMock()
-        request.bar_type.instrument_id.symbol.value = "EURUSDm"
-        request.start = 1_700_000_000_000_000_000
-        request.end = 1_700_100_000_000_000_000
-        request.id = "req-bars-002"
+    async def test_an_empty_answer_completes_the_request_with_nothing_and_no_warning(
+        self, recorded
+    ):
+        with patch("mt5connect.history.bars", return_value=rate_rows()):
+            await recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
 
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.copy_rates_range.return_value = []
-            with patch("mt5connect.data._bar_spec_to_mt5_timeframe", return_value=16385):
-                await client._request_bars(request)
+        assert recorded._handle_bars.call_args[0][1] == []
+        assert recorded._log.warning.call_count == 0
 
-        client._handle_bars.assert_called_once()
-        args = client._handle_bars.call_args[0]
-        assert args[1] == []
+    @pytest.mark.asyncio
+    async def test_a_failed_window_is_an_error_and_delivers_nothing(self, recorded):
+        with patch("mt5connect.history.bars", return_value=None):
+            await recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
+
+        recorded._handle_bars.assert_not_called()
+        assert recorded._log.error.call_count == 1
+        error = recorded._log.error.call_args[0][0]
+        assert "2025-07-15T09:01:00+00:00" in error and "2025-07-15T09:05:00+00:00" in error
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_request_stops_the_history_calls_retries(self, recorded):
+        handed = []
+        reading = threading.Event()
+
+        def syncing(*args, cancel):
+            handed.append(cancel)
+            reading.set()
+            cancel.wait(5)
+            return None
+
+        with patch("mt5connect.history.bars", side_effect=syncing):
+            request = asyncio.ensure_future(
+                recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
+            )
+            await asyncio.to_thread(reading.wait, 5)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+        assert handed[0].is_set()
+        recorded._handle_bars.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skips_when_instrument_not_found(self, client):
         client._provider.get_instrument.return_value = None
-        request = MagicMock()
-        request.bar_type.instrument_id.symbol.value = "FAKESYM"
-        request.start = 1_700_000_000_000_000_000
-        request.end = None
-        request.id = "req-bars-003"
 
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            with patch("mt5connect.data._bar_spec_to_mt5_timeframe", return_value=16385):
-                await client._request_bars(request)
+        with patch("mt5connect.history.bars") as bars:
+            await client._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
 
-        mock_mt5.copy_rates_range.assert_not_called()
+        bars.assert_not_called()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

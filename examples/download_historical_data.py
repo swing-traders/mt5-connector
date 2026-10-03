@@ -1,7 +1,7 @@
 """
 examples/download_historical_data.py
 
-Downloads H1 bar data from MT5 and writes it into a NautilusTrader
+Downloads H1 bar data through the MT5 server's history routes and writes it into a NautilusTrader
 Parquet catalog. Run this before running backtest_eurusd.py.
 
     python examples/download_historical_data.py
@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
+from mt5connect.backend import set_backend
 from mt5connect.config import MT5Config
 from mt5connect.connection import MT5Connection
 from mt5connect.downloader import MT5DataDownloader
@@ -34,6 +35,7 @@ def _require(key: str) -> str:
 ACCOUNT = int(_require("MT5_ACCOUNT"))
 PASSWORD = _require("MT5_PASSWORD")
 SERVER = _require("MT5_SERVER")
+SERVER_URL = os.getenv("MT5_SERVER_URL", "http://127.0.0.1:5000")
 SYMBOL = os.getenv("DOWNLOAD_SYMBOL", _require("MT5_SYMBOLS").split(",")[0].strip())
 START = datetime(2024, 1, 1, tzinfo=UTC)
 END = datetime(2024, 12, 31, tzinfo=UTC)
@@ -45,7 +47,10 @@ config = MT5Config(
     password=PASSWORD,
     server=SERVER,
     symbols=[SYMBOL],
+    backend="remote",
+    server_url=SERVER_URL,
 )
+set_backend(config)
 
 conn = MT5Connection(config)
 conn.connect()

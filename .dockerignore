@@ -3,6 +3,7 @@
 *
 !mt5connect/__init__.py
 !mt5connect/mirror.py
+!mt5connect/history_wire.py
 !mt5server/
 mt5server/**/__pycache__
 mt5server/compile_commands.json

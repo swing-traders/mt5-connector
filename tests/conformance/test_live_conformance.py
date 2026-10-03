@@ -2,9 +2,7 @@
 
 Runs only with MT5_LIVE_CONFORMANCE=1, on a Windows host whose terminal initialize() can reach."""
 
-import importlib
 import os
-import sys
 import time
 
 import numpy as np
@@ -15,31 +13,6 @@ from mt5connect import mirror
 pytestmark = pytest.mark.skipif(
     os.environ.get("MT5_LIVE_CONFORMANCE") != "1", reason="MT5_LIVE_CONFORMANCE is not 1"
 )
-
-
-@pytest.fixture(scope="module")
-def package():
-    # tests/conftest.py stands a MagicMock in for MetaTrader5; the real package replaces it here.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.delitem(sys.modules, "MetaTrader5", raising=False)
-        yield importlib.import_module("MetaTrader5")
-
-
-@pytest.fixture(scope="module")
-def terminal(package):
-    if not package.initialize():
-        pytest.fail(f"initialize failed: {package.last_error()}")
-    yield package
-    package.shutdown()
-
-
-@pytest.fixture(scope="module")
-def symbol(terminal) -> str:
-    symbols = terminal.symbols_get()
-    if not symbols:
-        pytest.fail(f"symbols_get answered {symbols!r}: {terminal.last_error()}")
-    terminal.symbol_select(symbols[0].name, True)
-    return symbols[0].name
 
 
 def test_version_is_the_pinned_release(package):

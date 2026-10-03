@@ -1,7 +1,7 @@
 """
 examples/download_xauusd.py
 
-Downloads H1 (and M15) bar data for XAUUSD from MT5 and writes it
+Downloads H1 (and M15) bar data for XAUUSD through the MT5 server's history routes and writes it
 into a NautilusTrader Parquet catalog.
 
 Run this BEFORE running backtest_xauusd_fvg.py:
@@ -25,10 +25,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-import MetaTrader5 as mt5
 from dotenv import load_dotenv
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
+import mt5connect.remote_mt5 as mt5
+from mt5connect.backend import set_backend
 from mt5connect.config import MT5Config
 from mt5connect.connection import MT5Connection
 from mt5connect.downloader import MT5DataDownloader
@@ -51,6 +52,7 @@ def _require(key: str) -> str:
 ACCOUNT = int(_require("MT5_ACCOUNT"))
 PASSWORD = _require("MT5_PASSWORD")
 SERVER = _require("MT5_SERVER")
+SERVER_URL = os.getenv("MT5_SERVER_URL", "http://127.0.0.1:5000")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -92,7 +94,10 @@ def main():
         password=PASSWORD,
         server=SERVER,
         symbols=[SYMBOL],
+        backend="remote",
+        server_url=SERVER_URL,
     )
+    set_backend(config)
 
     conn = MT5Connection(config)
     print("Connecting to MT5...")

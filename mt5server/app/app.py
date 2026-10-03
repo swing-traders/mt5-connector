@@ -1,10 +1,12 @@
-"""The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, its
-liveness, and what the terminal's EA relays — its trade-server time and its commission schedules."""
+"""The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, the
+history windows it vouches for, its liveness, and what the terminal's EA relays — its trade-server
+time and its commission schedules."""
 
 import dataclasses
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from datetime import timedelta
 from enum import StrEnum
@@ -14,12 +16,14 @@ from flask import Flask, request
 
 from mt5connect import mirror
 from mt5connect.broker_clock import BrokerClock
+from mt5connect.history_wire import BARS_PATH, RANGES_PATH, TICKS_PATH, Series, TickFlags
 from mt5server.app.clock_check import ClockCheck, ClockStatus
 from mt5server.app.commissions import CommissionStore
 from mt5server.app.encoding import encode, non_epochs, package_arguments
+from mt5server.app.history import FloorStore, History, Syncing, bars_refusal, ticks_refusal
 from mt5server.app.server_time import ServerTimeSink, server_time_refusal, server_time_sample
 from mt5server.app.settings import Settings, read_settings
-from mt5server.app.terminal import Failed, Terminal
+from mt5server.app.terminal import Answered, Failed, Terminal
 from mt5server.app.ws_server import SERVER_TIME_RELAY_PATH
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,9 @@ class _Endpoint(StrEnum):
     HEALTH = "health"
     COMMISSIONS = "commissions"
     SERVER_TIME_RELAY = "server_time_relay"
+    HISTORY_BARS = "history_bars"
+    HISTORY_TICKS = "history_ticks"
+    HISTORY_RANGES = "history_ranges"
 
 
 # The routes that answer while the broker clock is not verified: the liveness, and the relay that
@@ -64,10 +71,12 @@ def create_app(
     clock: BrokerClock,
     server_times: ServerTimeSink,
     clock_status: ClockStatus,
+    history: History,
 ) -> Flask:
     """The server's routes: POST /mt5/<function> for every package function, GET /health, GET
-    /commissions/<symbol> and POST /relay/server_time. Every route but /health and the relay answers
-    503 while `clock_status` holds no verification."""
+    /commissions/<symbol>, POST /relay/server_time, POST /history/bars and /history/ticks, and GET
+    /history/ranges. Every route but /health and the relay answers 503 while `clock_status` holds no
+    verification."""
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
     app.before_request(_clock_gate(clock_status))
@@ -95,6 +104,24 @@ def create_app(
         endpoint=_Endpoint.SERVER_TIME_RELAY.value,
         view_func=_server_time_relay_view(server_times),
         methods=["POST"],
+    )
+    app.add_url_rule(
+        BARS_PATH,
+        endpoint=_Endpoint.HISTORY_BARS.value,
+        view_func=_history_bars_view(history, server_times, clock),
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        TICKS_PATH,
+        endpoint=_Endpoint.HISTORY_TICKS.value,
+        view_func=_history_ticks_view(history, server_times, clock),
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        RANGES_PATH,
+        endpoint=_Endpoint.HISTORY_RANGES.value,
+        view_func=_history_ranges_view(history),
+        methods=["GET"],
     )
     return app
 
@@ -177,6 +204,55 @@ def _server_time_relay_view(server_times: ServerTimeSink) -> Callable:
     return view
 
 
+def _history_bars_view(
+    history: History, server_times: ServerTimeSink, clock: BrokerClock
+) -> Callable:
+    def view():
+        body = _body_arguments()
+        refusal = bars_refusal(body, _terminal_time(server_times, clock))
+        if refusal is not None:
+            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), 400
+        else:
+            return _outcome(
+                history.bars(body["symbol"], Series(body["timeframe"]), body["start"], body["end"])
+            )
+
+    return view
+
+
+def _history_ticks_view(
+    history: History, server_times: ServerTimeSink, clock: BrokerClock
+) -> Callable:
+    def view():
+        body = _body_arguments()
+        refusal = ticks_refusal(body, _terminal_time(server_times, clock))
+        if refusal is not None:
+            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), 400
+        else:
+            flags = TickFlags(body.get("flags", TickFlags.INFO))
+            return _outcome(history.ticks(body["symbol"], body["start"], body["end"], flags))
+
+    return view
+
+
+def _history_ranges_view(history: History) -> Callable:
+    def view():
+        symbol = request.args.get("symbol", "")
+        if not symbol:
+            return _failure(mirror.RES_E_INVALID_PARAMS, "missing parameter: symbol"), 400
+        else:
+            return _outcome(history.ranges(symbol))
+
+    return view
+
+
+def _terminal_time(server_times: ServerTimeSink, clock: BrokerClock) -> int:
+    """The terminal's current time in true UTC: the trade-server time of the relay's latest sample,
+    which a verified clock always has, aged by the time since it arrived."""
+    received = server_times.latest()
+    return clock.to_utc(received.sample.trade_server) + int(time.monotonic() - received.arrived)
+
+
 def _clock_unverified() -> dict[str, object]:
     """The envelope of a route refused while the broker clock is not verified."""
     message = "the broker clock is not verified"
@@ -220,6 +296,17 @@ def _answer(result: object, last_error: tuple[int, str]) -> dict[str, object]:
     return {"ok": True, "result": result, "last_error": list(last_error)}
 
 
+def _outcome(outcome: Answered | Failed | Syncing) -> tuple:
+    """The response to an answer the server composed from package calls: one it cannot give yet is
+    HTTP 503, its Retry-After the delay before the client asks again."""
+    if isinstance(outcome, Syncing):
+        return _failure(*outcome.last_error), 503, {"Retry-After": str(outcome.retry_after_s)}
+    elif isinstance(outcome, Failed):
+        return _failure(*outcome.last_error), 200
+    else:
+        return _answer(outcome.value, outcome.last_error), 200
+
+
 def _failure(code: int, message: str) -> dict[str, object]:
     """A package call's failure envelope, or a refusal's standing in for one; its error is also the
     last_error() it leaves."""
@@ -251,8 +338,15 @@ def main() -> None:
         bootstrap_s=settings.clock_bootstrap_seconds,
     )
     threading.Thread(target=clock_check.run, name="broker-clock-check", daemon=True).start()
+    history = History(
+        terminal,
+        clock,
+        FloorStore(),
+        retry_s=settings.history_retry_seconds,
+        floor_ttl_s=settings.floor_ttl_seconds,
+    )
     waitress.serve(
-        create_app(terminal, CommissionStore(), clock, server_times, clock_check.status),
+        create_app(terminal, CommissionStore(), clock, server_times, clock_check.status, history),
         host=settings.api_host,
         port=settings.api_port,
         threads=settings.api_threads,

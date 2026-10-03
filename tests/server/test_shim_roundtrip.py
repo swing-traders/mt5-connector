@@ -17,6 +17,7 @@ from mirror_samples import (
 )
 
 from mt5connect import mirror
+from mt5connect.errors import ServerUnreachable
 
 FUNCTIONS = [
     function
@@ -113,6 +114,17 @@ def test_positions_get_failure_and_emptiness_are_distinct(remote, stub, client):
         "last_error": [1, "Success"],
     }
     assert remote.positions_get() == ()
+
+
+def test_a_call_the_server_is_not_ready_for_raises_server_unreachable(remote, stub, clock_status):
+    clock_status.clear()
+
+    with pytest.raises(
+        ServerUnreachable,
+        match="^positions_total: server not ready — the broker clock is not verified$",
+    ):
+        remote.positions_total()
+    stub.positions_total.assert_not_called()
 
 
 def test_last_error_follows_every_call_as_the_package_reports_it(remote, stub):

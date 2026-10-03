@@ -28,8 +28,9 @@ RUN pacman -Sy --noconfirm \
 # Stage 2: Final image
 FROM base
 
-# Built from the repository root: the server imports the client package's inventory and broker clock.
-COPY mt5connect/__init__.py mt5connect/mirror.py mt5connect/broker_clock.py /app/mt5connect/
+# Built from the repository root: the server imports the client package's inventory, broker clock
+# and history vocabulary.
+COPY mt5connect/__init__.py mt5connect/mirror.py mt5connect/broker_clock.py mt5connect/history_wire.py /app/mt5connect/
 COPY mt5server/__init__.py /app/mt5server/
 COPY mt5server/app /app/mt5server/app
 COPY mt5server/scripts /scripts

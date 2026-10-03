@@ -7,6 +7,7 @@ from mirror_samples import CLOCK
 
 from mt5server.app.app import TerminalStartError, connect_terminal, create_app
 from mt5server.app.commissions import CommissionRule, CommissionSchedule, CommissionTier
+from mt5server.app.history import FloorStore, History
 from mt5server.app.settings import Settings, SettingsError, read_settings
 from mt5server.app.terminal import Terminal
 
@@ -33,6 +34,8 @@ def test_settings_read_the_environment_with_defaults():
     assert settings.clock_check_seconds == 300
     assert settings.clock_sample_max_age_seconds == 30
     assert settings.clock_bootstrap_seconds == 120
+    assert settings.history_retry_seconds == 5
+    assert settings.floor_ttl_seconds == 900
 
 
 def test_settings_take_overrides():
@@ -48,6 +51,8 @@ def test_settings_take_overrides():
             "MT5_CLOCK_CHECK_SECONDS": "60",
             "MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS": "15",
             "MT5_CLOCK_BOOTSTRAP_SECONDS": "600",
+            "MT5_HISTORY_RETRY_SECONDS": "2",
+            "MT5_FLOOR_TTL_SECONDS": "60",
         }
     )
     assert (settings.login_timeout_ms, settings.api_host, settings.api_port) == (
@@ -61,6 +66,8 @@ def test_settings_take_overrides():
     assert settings.clock_check_seconds == 60
     assert settings.clock_sample_max_age_seconds == 15
     assert settings.clock_bootstrap_seconds == 600
+    assert settings.history_retry_seconds == 2
+    assert settings.floor_ttl_seconds == 60
 
 
 @pytest.mark.parametrize("name", ["MT5_TERMINAL_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"])
@@ -84,6 +91,10 @@ def test_settings_refuse_a_missing_variable(name):
         ("MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS", "-1", "clock_sample_max_age_seconds"),
         ("MT5_CLOCK_BOOTSTRAP_SECONDS", "0", "clock_bootstrap_seconds"),
         ("MT5_CLOCK_BOOTSTRAP_SECONDS", "-1", "clock_bootstrap_seconds"),
+        ("MT5_HISTORY_RETRY_SECONDS", "0", "history_retry_seconds"),
+        ("MT5_HISTORY_RETRY_SECONDS", "-1", "history_retry_seconds"),
+        ("MT5_FLOOR_TTL_SECONDS", "0", "floor_ttl_seconds"),
+        ("MT5_FLOOR_TTL_SECONDS", "-1", "floor_ttl_seconds"),
     ],
 )
 def test_settings_refuse_an_out_of_range_value(variable, value, field):
@@ -107,6 +118,8 @@ def test_settings_built_directly_refuse_an_out_of_range_value():
             clock_check_seconds=300,
             clock_sample_max_age_seconds=30,
             clock_bootstrap_seconds=120,
+            history_retry_seconds=5,
+            floor_ttl_seconds=900,
         )
 
 
@@ -131,6 +144,13 @@ def test_settings_refuse_a_clock_setting_that_is_not_an_integer(variable, value)
         read_settings(ENVIRONMENT | {variable: value})
 
 
+@pytest.mark.parametrize("variable", ["MT5_HISTORY_RETRY_SECONDS", "MT5_FLOOR_TTL_SECONDS"])
+@pytest.mark.parametrize("value", ["2.5", "five", ""])
+def test_settings_refuse_a_history_setting_that_is_not_an_integer(variable, value):
+    with pytest.raises(SettingsError, match=f"{variable} is not an integer"):
+        read_settings(ENVIRONMENT | {variable: value})
+
+
 def test_settings_refuse_a_login_that_is_not_an_integer_without_echoing_it():
     with pytest.raises(SettingsError, match="MT5_LOGIN is not an integer") as refusal:
         read_settings(ENVIRONMENT | {"MT5_LOGIN": "acct-98765"})
@@ -151,8 +171,12 @@ def test_start_initializes_the_configured_terminal_once(
     stub.positions_total.return_value = 0
     terminal = Terminal(stub)
 
+    history = History(terminal, CLOCK, FloorStore(), retry_s=0.01, floor_ttl_s=900)
+
     connect_terminal(terminal, read_settings(ENVIRONMENT))
-    client = create_app(terminal, commissions, CLOCK, server_times, clock_status).test_client()
+    client = create_app(
+        terminal, commissions, CLOCK, server_times, clock_status, history
+    ).test_client()
     for _ in range(3):
         assert client.get("/health").status_code == 200
         assert client.post("/mt5/positions_total").status_code == 200

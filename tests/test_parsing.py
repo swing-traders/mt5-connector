@@ -1017,10 +1017,20 @@ class TestParseBar:
         result = parse_bar(rate, eurusd, timeframe=16385)
         assert float(result.volume) == pytest.approx(1500)
 
-    def test_ts_event_nanoseconds(self, eurusd):
+    def test_ts_event_is_the_close_in_nanoseconds(self, eurusd):
         rate = make_rate(time_s=1700000000)
         result = parse_bar(rate, eurusd, timeframe=16385)
-        assert result.ts_event == 1700000000 * 1_000_000_000
+        assert result.ts_event == (1700000000 + 3600) * 1_000_000_000
+
+    def test_a_minute_bar_is_stamped_at_its_close_in_event_and_init(self, eurusd):
+        rate = make_rate(time_s=1_752_570_000)
+        result = parse_bar(rate, eurusd, timeframe=1)
+        assert result.ts_event == 1_752_570_060 * 1_000_000_000
+        assert result.ts_init == result.ts_event
+
+    def test_a_month_bar_has_no_close_to_stamp(self, eurusd):
+        with pytest.raises(ValueError, match="49153"):
+            parse_bar(make_rate(), eurusd, timeframe=49153)
 
     def test_bar_type_instrument_id(self, eurusd):
         rate = make_rate()
