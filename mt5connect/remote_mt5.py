@@ -1,5 +1,6 @@
 """The MetaTrader5 package's call surface served by the MT5 server, every epoch in true UTC: its
-functions, structs as namedtuples, arrays as numpy structured arrays, constants and Buy/Sell/Close.
+functions, structs as namedtuples, arrays as numpy structured arrays, constants and Buy/Sell/Close;
+and the commission schedules the server relays from the terminal.
 
 State: the server this module is configured against with its HTTP session, and the last_error() pair
 the last answered call carried."""
@@ -12,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPMethod, HTTPStatus
+from urllib.parse import quote
 
 import numpy as np
 import requests
@@ -170,6 +172,37 @@ def _exchange(
     return Reply(HTTPStatus(response.status_code), envelope, response.headers.get("Retry-After"))
 
 
+def commission_schedule(symbol: str) -> dict | None:
+    """The commission schedule the terminal's EA relayed for a symbol, as the server keeps it; None
+    while none has been relayed. Leaves last_error as it was: no package call answers it."""
+    name = "commissions"
+    if _session is None:
+        raise MT5ConfigError("remote_mt5: no server is configured")
+    try:
+        response = _session.get(
+            f"{_server_url}/commissions/{quote(symbol, safe='')}",
+            timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
+        )
+    except requests.RequestException as exc:
+        raise ServerUnreachable(f"{name}: {exc}") from exc
+    try:
+        envelope = response.json()
+    except requests.JSONDecodeError as exc:
+        raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not JSON") from exc
+    if response.status_code == HTTPStatus.OK and _is_relayed(envelope):
+        return envelope["result"]
+    elif (
+        response.status_code == HTTPStatus.OK
+        and _is_server_failure(envelope)
+        and envelope["error"]["code"] == mirror.RES_E_NOT_FOUND
+    ):
+        return None
+    elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(envelope):
+        raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
+    else:
+        raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not an envelope")
+
+
 def _read_timeout_s(function: mirror.Function, body: dict[str, object]) -> float:
     """The HTTP read timeout: a call carrying the terminal's own timeout waits that long on top."""
     for param in function.params:
@@ -191,7 +224,7 @@ def _envelope(name: str, response: requests.Response) -> dict:
         return envelope
     elif _is_error(envelope):
         return _with_server_code(envelope)
-    elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_not_ready(envelope):
+    elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(envelope):
         raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
     else:
         raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not an envelope")
@@ -232,9 +265,20 @@ def _is_error(envelope: object) -> bool:
     )
 
 
-def _is_not_ready(envelope: object) -> bool:
-    """Whether a body is the server's refusal of a route it is not ready to serve: an error no
-    package call left, so it carries no last_error."""
+def _is_relayed(envelope: object) -> bool:
+    """Whether a body is the server's answer from what the terminal relayed: a result no package
+    call answered, so it carries no last_error."""
+    return (
+        isinstance(envelope, dict)
+        and envelope.get("ok") is True
+        and "result" in envelope
+        and "last_error" not in envelope
+    )
+
+
+def _is_server_failure(envelope: object) -> bool:
+    """Whether a body is a failure of the server's own — a route it is not ready to serve, or a
+    relayed value it does not hold: an error no package call left, so it carries no last_error."""
     if not isinstance(envelope, dict) or envelope.get("ok") is not False:
         return False
     error = envelope.get("error")

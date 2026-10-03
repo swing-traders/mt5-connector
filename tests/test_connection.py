@@ -84,7 +84,6 @@ class TestInitialState:
         conn = MT5Connection(config)
         r = repr(conn)
         assert "DISCONNECTED" in r
-        assert "12345678" in r
         assert "Exness-MT5Trial1" in r
 
 
@@ -203,7 +202,7 @@ class TestLoginFailure:
         with pytest.raises(MT5LoginError) as exc_info:
             conn.connect()
         assert "mt5.login() failed" in str(exc_info.value)
-        assert "12345678" in str(exc_info.value)
+        assert "12345678" not in str(exc_info.value)
 
     def test_state_stays_initialized_after_login_failure(self, config, mock_mt5):
         """Terminal IPC is up, only login failed — state must be INITIALIZED not DISCONNECTED."""
@@ -501,11 +500,13 @@ class TestGetTerminalInfo:
         assert "connected" in info
         assert "ping_last" in info
 
-    def test_returns_empty_dict_when_terminal_info_none(self, config, mock_mt5):
+    def test_raises_when_terminal_info_returns_none(self, config, mock_mt5):
         mock_mt5.terminal_info.return_value = None
+        mock_mt5.last_error.return_value = (6, "No connection")
         conn = MT5Connection(config)
         conn.connect()
-        assert conn.get_terminal_info() == {}
+        with pytest.raises(MT5ConnectionError, match="None"):
+            conn.get_terminal_info()
 
     def test_raises_when_not_connected(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -597,9 +598,9 @@ class TestContextManager:
 
 class TestRepr:
 
-    def test_repr_contains_account(self, config, mock_mt5):
+    def test_repr_omits_the_login(self, config, mock_mt5):
         conn = MT5Connection(config)
-        assert "12345678" in repr(conn)
+        assert "12345678" not in repr(conn)
 
     def test_repr_contains_server(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -714,12 +715,12 @@ class TestAccountSnapshot:
         assert snap.leverage == 2000
         assert snap.company == "Exness Technologies Ltd"
 
-    def test_str_contains_all_key_fields(self, config, mock_mt5):
+    def test_str_carries_the_account_but_not_its_login(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn.connect()
         snap = conn.get_account_info()
         s = str(snap)
-        assert "12345678" in s
+        assert "12345678" not in s
         assert "10000.00" in s
         assert "USD" in s
         assert "2000" in s

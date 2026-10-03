@@ -10,7 +10,6 @@ from urllib.parse import urlparse, urlunparse
 
 from mt5connect.constants import (
     DEFAULT_EXEC_POLL_INTERVAL_MS,
-    MT5_MAGIC_NUMBER,
     RECONNECT_INITIAL_DELAY_S,
     RECONNECT_MAX_ATTEMPTS,
     RECONNECT_MAX_DELAY_S,
@@ -20,85 +19,8 @@ from mt5connect.errors import MT5ConfigError
 
 @dataclass
 class MT5Config:
-    """
-    Configuration for the MT5 adapter.
-
-    Parameters
-    ----------
-    account : int
-        Your MT5 account number (shown in the top-left of the MT5 terminal).
-    password : str
-        Your MT5 account password.
-    server : str
-        Your broker's MT5 server name.
-        Find it in MT5 → File → Open Account → search your broker.
-        Examples:
-            Exness standard demo : "Exness-MT5Trial1" or "Exness-MT5Trial9"
-            Exness live          : "Exness-MT5Real8"
-            IC Markets demo      : "ICMarketsSC-Demo"
-    symbols : list[str]
-        Symbol names EXACTLY as they appear in MT5 Market Watch.
-        Different brokers use different naming conventions — use the exact
-        name shown in your MT5 terminal, including any suffixes.
-
-        Examples by broker:
-            Exness standard : ["EURUSDm", "XAUUSDm", "BTCUSDm"]
-            Exness zero/raw : ["EURUSD",  "XAUUSD",  "BTCUSD"]
-            IC Markets      : ["EURUSD",  "XAUUSD",  "BTCUSD"]
-            Pepperstone     : ["EURUSD",  "XAUUSD",  "BTCUSD"]
-
-        The adapter automatically handles suffix normalisation internally —
-        you just provide the exact broker symbol name and it works.
-
-    server_url : str
-        The MT5 server's HTTP API, e.g. "http://127.0.0.1:5000".
-    ws_url : str | None
-        The MT5 server's WebSocket tick hub. Default: derived from server_url, on port 9000.
-    exec_poll_interval_ms : int
-        How often (milliseconds) to poll MT5 for position/fill updates.
-        Default: 250ms.
-    magic_number : int
-        Unique order identifier for this bot instance.
-        Change if running multiple bots simultaneously.
-        Default: 510.
-    reconnect_initial_delay_s : float
-        Seconds before first reconnect attempt. Default: 1.0s.
-    reconnect_max_delay_s : float
-        Maximum seconds between reconnect attempts. Default: 60.0s.
-    reconnect_max_attempts : int
-        Give up after this many reconnect attempts. Default: 20.
-    timeout_s : float
-        Seconds to wait for MT5 terminal response. Default: 10.0s.
-
-    Examples
-    --------
-    Exness standard demo (symbols have 'm' suffix):
-        config = MT5Config(
-            account=12345678,
-            password="demo_password",
-            server="Exness-MT5Trial9",
-            symbols=["EURUSDm", "XAUUSDm", "BTCUSDm"],
-            server_url="http://127.0.0.1:5000",
-        )
-
-    Exness zero/raw account (no suffix):
-        config = MT5Config(
-            account=87654321,
-            password="live_password",
-            server="Exness-MT5Real8",
-            symbols=["EURUSD", "XAUUSD", "BTCUSD"],
-            server_url="http://127.0.0.1:5000",
-        )
-
-    IC Markets:
-        config = MT5Config(
-            account=11223344,
-            password="ic_password",
-            server="ICMarketsSC-Demo",
-            symbols=["EURUSD", "XAUUSD"],
-            server_url="http://127.0.0.1:5000",
-        )
-    """
+    """The account the adapter logs in to, the symbols it loads, the server it reaches, and its
+    polling and reconnect timings; README.md's configuration reference documents each field."""
 
     # ── Required ──────────────────────────────────────────────────────────────
     account: int
@@ -108,7 +30,6 @@ class MT5Config:
 
     # ── Optional / defaults ───────────────────────────────────────────────────
     exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
-    magic_number: int = MT5_MAGIC_NUMBER
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
     reconnect_max_delay_s: float = RECONNECT_MAX_DELAY_S
     reconnect_max_attempts: int = RECONNECT_MAX_ATTEMPTS

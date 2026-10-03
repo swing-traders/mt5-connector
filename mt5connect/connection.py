@@ -4,9 +4,11 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from enum import Enum, auto
+from decimal import Decimal
+from enum import Enum, StrEnum, auto
 from typing import TYPE_CHECKING
 
+from mt5connect import mirror
 from mt5connect import remote_mt5 as mt5
 from mt5connect.errors import MT5ConnectionError, MT5LoginError
 
@@ -39,53 +41,82 @@ class ConnectionState(Enum):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class MarginMode(StrEnum):
+    """How the account books positions, as `account_info().margin_mode` declares it."""
+
+    RETAIL_NETTING = "RETAIL_NETTING"
+    EXCHANGE = "EXCHANGE"
+    RETAIL_HEDGING = "RETAIL_HEDGING"
+
+
+_MARGIN_MODES = {
+    mirror.ACCOUNT_MARGIN_MODE_RETAIL_NETTING: MarginMode.RETAIL_NETTING,
+    mirror.ACCOUNT_MARGIN_MODE_EXCHANGE: MarginMode.EXCHANGE,
+    mirror.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: MarginMode.RETAIL_HEDGING,
+}
+
+
 @dataclass
 class AccountSnapshot:
-    """
-    Lightweight snapshot of MT5 account info.
-    Returned by MT5Connection.get_account_info().
-    Avoids leaking the raw MT5 AccountInfo namedtuple outside this module.
-    """
+    """The account as `account_info()` reports it, its money in `Decimal`."""
 
     login: int
     server: str
-    balance: float
-    equity: float
-    margin: float
-    margin_free: float
-    margin_level: float
+    balance: Decimal
+    equity: Decimal
+    margin: Decimal
+    margin_free: Decimal
+    margin_level: Decimal
+    credit: Decimal
+    profit: Decimal
     currency: str
-    leverage: int
-    profit: float
+    currency_digits: int
+    leverage: Decimal
+    margin_mode: MarginMode
+    trade_allowed: bool
     name: str
     company: str
 
     @classmethod
     def from_mt5(cls, info) -> AccountSnapshot:
-        """Build from the raw mt5.account_info() namedtuple."""
+        """Build from the raw mt5.account_info() namedtuple; raises MT5ConnectionError for a margin
+        mode the package does not define."""
+        if info.margin_mode not in _MARGIN_MODES:
+            raise MT5ConnectionError(f"account_info: margin mode {info.margin_mode} is unknown")
         return cls(
             login=info.login,
             server=info.server,
-            balance=info.balance,
-            equity=info.equity,
-            margin=info.margin,
-            margin_free=info.margin_free,
-            margin_level=info.margin_level,
+            balance=_finite(info.balance, "balance"),
+            equity=_finite(info.equity, "equity"),
+            margin=_finite(info.margin, "margin"),
+            margin_free=_finite(info.margin_free, "margin_free"),
+            margin_level=_finite(info.margin_level, "margin_level"),
+            credit=_finite(info.credit, "credit"),
+            profit=_finite(info.profit, "profit"),
             currency=info.currency,
-            leverage=info.leverage,
-            profit=info.profit,
+            currency_digits=info.currency_digits,
+            leverage=_finite(info.leverage, "leverage"),
+            margin_mode=_MARGIN_MODES[info.margin_mode],
+            trade_allowed=info.trade_allowed,
             name=info.name,
             company=info.company,
         )
 
     def __str__(self) -> str:
         return (
-            f"Account #{self.login} | {self.server} | "
+            f"Account | {self.server} | "
             f"Balance: {self.balance:.2f} {self.currency} | "
             f"Equity: {self.equity:.2f} | "
             f"Free Margin: {self.margin_free:.2f} | "
             f"Leverage: 1:{self.leverage}"
         )
+
+
+def _finite(value: float, field: str) -> Decimal:
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise MT5ConnectionError(f"account_info: {field} {value} is not finite")
+    return number
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,18 +300,20 @@ class MT5Connection:
 
     def get_terminal_info(self) -> dict:
         """
-        Return diagnostic info about the server's MT5 terminal.
-        Useful for logging on startup.
+        Return the server's MT5 terminal as `terminal_info()` reports it, its trading permission and
+        connection included. Raises MT5ConnectionError if not connected or if the call fails.
         """
         self.ensure_connected()
         info = mt5.terminal_info()
         if info is None:
-            return {}
+            code, msg = mt5.last_error()
+            raise MT5ConnectionError(f"mt5.terminal_info() returned None — error {code}: {msg}")
         return {
             "name": info.name,
             "path": info.path,
             "data_path": info.data_path,
             "connected": info.connected,
+            "trade_allowed": info.trade_allowed,
             "ping_last": info.ping_last,
             "retransmission": info.retransmission,
         }
@@ -320,10 +353,7 @@ class MT5Connection:
 
     def _login(self) -> None:
         """Authenticate with the broker. Must be called after _initialize()."""
-        logger.debug(
-            f"MT5Connection: logging in — "
-            f"account={self._config.account}, server={self._config.server}"
-        )
+        logger.debug(f"MT5Connection: logging in — server={self._config.server}")
         self._state = ConnectionState.LOGGING_IN
 
         ok = mt5.login(
@@ -337,9 +367,7 @@ class MT5Connection:
             code, msg = mt5.last_error()
             self._state = ConnectionState.INITIALIZED
             raise MT5LoginError(
-                f"mt5.login() failed for account {self._config.account} "
-                f"on {self._config.server} — error {code}: {msg}. "
-                "Check account number, password, and server name."
+                f"mt5.login() failed on {self._config.server} — error {code}: {msg}"
             )
 
         self._state = ConnectionState.CONNECTED
@@ -349,7 +377,7 @@ class MT5Connection:
         if info:
             logger.info(f"MT5Connection: connected — {AccountSnapshot.from_mt5(info)}")
         else:
-            logger.info(f"MT5Connection: connected to account {self._config.account}")
+            logger.info(f"MT5Connection: connected to {self._config.server}")
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -362,9 +390,4 @@ class MT5Connection:
         return False  # never suppress exceptions
 
     def __repr__(self) -> str:
-        return (
-            f"MT5Connection("
-            f"account={self._config.account}, "
-            f"server={self._config.server!r}, "
-            f"state={self._state.name})"
-        )
+        return f"MT5Connection(server={self._config.server!r}, state={self._state.name})"

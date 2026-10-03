@@ -10,7 +10,8 @@ MT5 has no push/event API for order state. Everything is polled.
 Architecture
 ------------
   _connect()
-    └─ verifies connection
+    └─ holds the account to a hedging, tradable session
+    └─ loads the instruments and registers the currencies they and the account book in
     └─ starts _exec_poll_loop() as asyncio Task
 
   _exec_poll_loop()  (runs every exec_poll_interval_ms, default 250ms)
@@ -45,6 +46,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from nautilus_trader.cache.cache import Cache
@@ -62,7 +65,6 @@ from nautilus_trader.execution.reports import (
     PositionStatusReport,
 )
 from nautilus_trader.live.execution_client import LiveExecutionClient
-from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     AccountType,
     LiquiditySide,
@@ -80,13 +82,16 @@ from nautilus_trader.model.identifiers import (
     StrategyId,
     Symbol,
     TradeId,
+    TraderId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 
 from mt5connect import remote_mt5 as mt5
+from mt5connect.connection import MarginMode
 from mt5connect.constants import MT5_VENUE
-from mt5connect.errors import MT5ConnectionError, MT5OrderError
+from mt5connect.currencies import register_venue_currency, venue_currency
+from mt5connect.errors import MT5ConfigError, MT5ConnectionError, MT5OrderError
 
 if TYPE_CHECKING:
     from mt5connect.config import MT5Config
@@ -94,6 +99,13 @@ if TYPE_CHECKING:
     from mt5connect.providers import MT5InstrumentProvider
 
 logger = logging.getLogger(__name__)
+
+
+def magic_for(trader_id: TraderId) -> int:
+    """The magic marking the orders of the trader `trader_id`: the first 8 bytes of its SHA-256,
+    masked to 63 bits so the venue's ulong and long readings of it agree."""
+    digest = sha256(trader_id.value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,31 +241,8 @@ def _mt5_retcode_to_str(retcode: int) -> str:
 
 
 class MT5LiveExecutionClient(LiveExecutionClient):
-    """
-    Live execution client for MT5. Submits orders and polls for fills.
-
-    Parameters
-    ----------
-    loop : asyncio.AbstractEventLoop
-    connection : MT5Connection
-    msgbus : MessageBus
-    cache : Cache
-    clock : LiveClock
-    instrument_provider : MT5InstrumentProvider
-    config : MT5Config
-    account_id : AccountId, optional
-        If omitted, built from the MT5 account number in config.
-
-    Notes
-    -----
-    MT5 has no WebSocket push API. This client polls at exec_poll_interval_ms
-    (default 250ms) for order state changes and deal history.
-
-    The magic_number in MT5Config is used to tag all orders sent by this
-    adapter. Only orders with the matching magic_number are tracked —
-    manually placed orders in the MT5 terminal are ignored. This makes it
-    safe to run the adapter alongside manual trading.
-    """
+    """Live execution client for an MT5 hedging account, trading for the one trader it is built
+    for."""
 
     def __init__(
         self,
@@ -264,16 +253,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         clock: LiveClock,
         instrument_provider: MT5InstrumentProvider,
         config: MT5Config,
-        account_id: AccountId | None = None,
     ) -> None:
-        if account_id is None:
-            account_id = AccountId(f"MT5-{config.account}")
-
         super().__init__(
             loop=loop,
             client_id=ClientId(MT5_VENUE.value),
             venue=MT5_VENUE,
-            oms_type=OmsType.NETTING,
+            oms_type=OmsType.HEDGING,
             account_type=AccountType.MARGIN,
             base_currency=None,  # MT5 accounts are multi-currency
             msgbus=msgbus,
@@ -281,11 +266,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             clock=clock,
             instrument_provider=instrument_provider,
         )
-        # Register with parent via _set_account_id so the C-level property is set.
-        self._set_account_id(account_id)
         self._conn = connection
         self._config = config
         self._provider = instrument_provider
+        self._magic = magic_for(self.trader_id)
+        self._account_currency: Currency | None = None
 
         # asyncio polling task — created in _connect, cancelled in _disconnect
         self._exec_poll_task: asyncio.Task | None = None
@@ -313,17 +298,32 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     async def _connect(self) -> None:
         """
-        Called by NautilusTrader on node startup.
-
-        Sequence:
-          1. Verify connection
-          2. Generate initial account state report
-          3. Reconcile any open orders and positions
-          4. Start execution polling loop
+        Holds the account to a hedging, tradable session before anything is reported or sent, books
+        under the account's login, loads the config's symbols and registers the currencies the
+        account and the loaded instruments book in, then reports the account, reconciles and starts
+        polling. Raises MT5ConfigError for an account that books another way or a read-only session.
         """
         self._conn.ensure_connected()
+        account = self._conn.get_account_info()
+        terminal = self._conn.get_terminal_info()
+        if account.margin_mode != MarginMode.RETAIL_HEDGING:
+            raise MT5ConfigError(
+                f"the client declares {self.oms_type.name}, the account's margin mode is "
+                f"{account.margin_mode}"
+            )
+        elif terminal["trade_allowed"] and not account.trade_allowed:
+            raise MT5ConfigError("read-only (investor) session: the account does not allow trading")
 
-        # Initial account state
+        self._set_account_id(AccountId(f"{MT5_VENUE}-{account.login}"))
+        await self._provider.load_ids_async(
+            [InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in self._config.symbols]
+        )
+        # Money mints at its currency's registered precision, which NT may hold at a guess.
+        self._account_currency = venue_currency(account.currency, account)
+        register_venue_currency(self._account_currency)
+        for instrument in self._provider.list_all():
+            register_venue_currency(instrument.quote_currency)
+
         await self._generate_account_state()
 
         # Reconcile existing open orders and positions at startup
@@ -420,7 +420,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             "sl": 0.0,  # set below if order has sl
             "tp": 0.0,  # set below if order has tp
             "deviation": 20,  # max price deviation (points) for market orders
-            "magic": self._config.magic_number,
+            "magic": self._magic,
             "comment": str(order.client_order_id),
             "type_filling": filling_mode,
             "type_time": _time_in_force_to_mt5(order.time_in_force),
@@ -552,7 +552,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 "position": ticket,
                 "price": close_price,
                 "deviation": 20,
-                "magic": self._config.magic_number,
+                "magic": self._magic,
                 "comment": f"close:{client_order_id_str}",
                 "type_filling": filling_mode,
             }
@@ -582,7 +582,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             return
 
         for order in orders:
-            if order.magic != self._config.magic_number:
+            if order.magic != self._magic:
                 continue  # not ours
             request = {
                 "action": mt5.TRADE_ACTION_REMOVE,
@@ -669,14 +669,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         Load all currently open pending orders at startup and register them
         so the polling loop can detect state changes.
 
-        Only processes orders with our magic_number.
+        Only processes orders with our magic.
         """
         orders = mt5.orders_get()
         if not orders:
             return
 
         for order in orders:
-            if order.magic != self._config.magic_number:
+            if order.magic != self._magic:
                 continue
             self._known_order_tickets.add(order.ticket)
             self._log.debug(
@@ -694,14 +694,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         Load all open positions at startup. Register them so the polling
         loop can detect closures.
 
-        Only processes positions with our magic_number.
+        Only processes positions with our magic.
         """
         positions = mt5.positions_get()
         if not positions:
             return
 
         for pos in positions:
-            if pos.magic != self._config.magic_number:
+            if pos.magic != self._magic:
                 continue
             self._known_position_tickets.add(pos.ticket)
             self._log.debug(
@@ -774,7 +774,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # ── 1. Pending orders ─────────────────────────────────────────────
 
         current_orders = mt5.orders_get() or ()
-        current_tickets = {o.ticket for o in current_orders if o.magic == self._config.magic_number}
+        current_tickets = {o.ticket for o in current_orders if o.magic == self._magic}
 
         # Detect orders that disappeared (filled or cancelled)
         disappeared = self._known_order_tickets - current_tickets
@@ -796,7 +796,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         deals = mt5.history_deals_get(from_dt, now)
         if deals:
             for deal in deals:
-                if deal.magic != self._config.magic_number:
+                if deal.magic != self._magic:
                     continue
                 deal_key = (deal.time, deal.ticket)
                 if deal_key in self._processed_deal_keys:
@@ -817,9 +817,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # ── 3. Open positions ─────────────────────────────────────────────
 
         current_positions = mt5.positions_get() or ()
-        current_pos_tickets = {
-            p.ticket for p in current_positions if p.magic == self._config.magic_number
-        }
+        current_pos_tickets = {p.ticket for p in current_positions if p.magic == self._magic}
 
         # New positions since last poll
         new_positions = current_pos_tickets - self._known_position_tickets
@@ -897,25 +895,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         order_side = OrderSide.BUY if deal.type == mt5.DEAL_TYPE_BUY else OrderSide.SELL
 
-        # ================================================================
-        # FIXED: Get account currency safely for commission
-        # ================================================================
-        try:
-            # Try to get currency from deal first
-            deal_currency = getattr(deal, "currency", None)
-            if deal_currency:
-                currency = _parse_account_currency(deal_currency)
-            else:
-                # Fallback: get account info
-                account_info = mt5.account_info()
-                if account_info and hasattr(account_info, "currency"):
-                    currency = _parse_account_currency(account_info.currency)
-                else:
-                    currency = USD
-        except Exception:
-            currency = USD
-
-        commission = Money(abs(deal.commission or 0.0), currency)
+        commission = Money(abs(deal.commission or 0.0), self._account_currency)
 
         ts_event = int(deal.time) * 1_000_000_000  # seconds → nanoseconds
 
@@ -964,12 +944,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._log.warning(f"MT5LiveExecutionClient: cannot refresh account state: {exc}")
             return
 
-        try:
-            currency = _parse_account_currency(snapshot.currency)
-        except Exception:
-            currency = USD
-
-        balances = [_make_account_balance(snapshot.balance, snapshot.equity, currency)]
+        balances = [_make_account_balance(snapshot.balance, self._account_currency)]
 
         self.generate_account_state(
             balances=balances,
@@ -1035,7 +1010,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         orders = mt5.orders_get(**kwargs) or ()
         for order in orders:
-            if order.magic != self._config.magic_number:
+            if order.magic != self._magic:
                 continue
             client_order_id_str = self._ticket_to_client_order_id.get(order.ticket)
             client_order_id = ClientOrderId(client_order_id_str) if client_order_id_str else None
@@ -1077,20 +1052,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
         symbol_filter = instrument_id.symbol.value if instrument_id else None
 
-        # ================================================================
-        # FIXED: Get account currency once for all deals
-        # ================================================================
-        try:
-            account_info = mt5.account_info()
-            if account_info and hasattr(account_info, "currency"):
-                account_currency = _parse_account_currency(account_info.currency)
-            else:
-                account_currency = USD
-        except Exception:
-            account_currency = USD
-
         for deal in deals:
-            if deal.magic != self._config.magic_number:
+            if deal.magic != self._magic:
                 continue
             if symbol_filter and deal.symbol != symbol_filter:
                 continue
@@ -1104,9 +1067,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
             pp = instrument.price_precision
 
-            # Use account currency for commission (fixed)
             commission_amount = abs(deal.commission or 0.0)
-            commission = Money(commission_amount, account_currency)
+            commission = Money(commission_amount, self._account_currency)
 
             report = FillReport(
                 account_id=self.account_id,
@@ -1145,7 +1107,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         reports = []
 
         for pos in positions:
-            if pos.magic != self._config.magic_number:
+            if pos.magic != self._magic:
                 continue
 
             iid = instrument_id or InstrumentId(Symbol(pos.symbol), MT5_VENUE)
@@ -1211,7 +1173,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def __repr__(self) -> str:
         return (
             f"MT5LiveExecutionClient("
-            f"account={self._config.account}, "
             f"orders={self.known_order_count}, "
             f"positions={self.known_position_count})"
         )
@@ -1242,29 +1203,7 @@ def _time_in_force_to_mt5(tif: TimeInForce) -> int:
     return mapping.get(tif, mt5.ORDER_TIME_GTC)
 
 
-def _parse_account_currency(code: str):
-    """
-    Parse account currency string, falling back to USD for unknown codes.
-
-    NautilusTrader Currency.from_str() never raises — it auto-creates a
-    crypto-type currency (iso4217=0) for anything it does not recognise.
-    We guard against that by rejecting iso4217==0 codes unless they are
-    known crypto currencies.
-    """
-    from nautilus_trader.model.currencies import Currency
-
-    _KNOWN_CRYPTOS = frozenset({"BTC", "ETH", "XRP", "LTC", "BCH", "SOL", "ADA", "DOT"})
-    code = code.strip().upper()
-    try:
-        currency = Currency.from_str(code)
-        if currency.iso4217 == 0 and code not in _KNOWN_CRYPTOS:
-            return USD
-        return currency
-    except Exception:
-        return USD
-
-
-def _make_account_balance(balance: float, equity: float, currency):
+def _make_account_balance(balance: Decimal, currency: Currency):
     """
     Build a NautilusTrader AccountBalance from MT5 account info snapshot.
 
@@ -1278,7 +1217,7 @@ def _make_account_balance(balance: float, equity: float, currency):
 
     return AccountBalance(
         total=Money(balance, currency),
-        locked=Money(0.0, currency),
+        locked=Money(0, currency),
         free=Money(balance, currency),
     )
 

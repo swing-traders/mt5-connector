@@ -326,7 +326,6 @@ def main():
     print(f"\n{'═' * 60}")
     print(f"  FVG Live Strategy — {MT5_SYMBOLS}")
     print(f"  Server  : {MT5_SERVER}")
-    print(f"  Account : {MT5_ACCOUNT}")
     print(f"  Size    : {TRADE_SIZE} lots")
     print(f"  Min FVG : {FVG_MIN_PIPS}")
     print(f"  RR      : 1:{RISK_REWARD}")

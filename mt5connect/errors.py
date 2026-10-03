@@ -9,7 +9,8 @@ class MT5Error(Exception):
 
 
 class MT5ConfigError(MT5Error):
-    """Raised when MT5Config is invalid (e.g. no server_url)."""
+    """Raised when the configuration, or the account it points at, cannot be run (e.g. no
+    server_url, an account that does not hedge)."""
 
 
 class MT5ConnectionError(MT5Error):

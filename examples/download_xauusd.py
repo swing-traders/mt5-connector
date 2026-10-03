@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 import mt5connect.remote_mt5 as mt5
@@ -83,7 +84,6 @@ def main():
     print("  XAUUSD Historical Data Downloader")
     print(f"  Symbol  : {SYMBOL}")
     print(f"  Server  : {SERVER}")
-    print(f"  Account : {ACCOUNT}")
     print(f"  Period  : {START.date()} → {END.date()}")
     print(f"  Catalog : {CATALOG}")
     print(f"{'=' * 60}\n")
@@ -101,7 +101,7 @@ def main():
     conn.connect()
     print(f"Connected: {conn}\n")
 
-    provider = MT5InstrumentProvider(conn)
+    provider = MT5InstrumentProvider(conn, clock=LiveClock())
     catalog = ParquetDataCatalog(CATALOG)
     downloader = MT5DataDownloader(conn, provider, catalog)
 

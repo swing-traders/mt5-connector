@@ -1,297 +1,231 @@
 """
 nautilus_mt5/providers.py
 
-MT5InstrumentProvider — loads all available Exness instruments into
-NautilusTrader's instrument cache using parsing.py for conversion.
+MT5InstrumentProvider — loads the symbols a run names into NautilusTrader's instrument cache, each
+typed and filled from the venue's own definition, and finds the venue symbol that quotes each
+currency pair.
 
-This is called once on startup (inside _connect()) before any data
-or execution clients begin working. NautilusTrader cannot process
-ticks or orders until instruments are registered.
-
-Two methods you must implement (NautilusTrader requires them):
-  load_all_async()  — load every symbol available on the broker
-  load_ids_async()  — load specific symbols by InstrumentId
-
-Additionally exposes:
-  load_symbol()     — load a single symbol by name (used internally)
-  get_instrument()  — fetch a loaded instrument by symbol string
+State: the loaded instruments, and the quoting symbol per currency pair the last load found; a load
+replaces both together, or neither when it fails.
 """
 
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
+from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
 from mt5connect import remote_mt5 as mt5
-from mt5connect.errors import MT5ConnectionError, MT5InstrumentError, MT5SymbolNotFoundError
-from mt5connect.parsing import InstrumentAny, parse_symbol_info
+from mt5connect.commissions import CommissionRule, parse_schedule, taker_fee
+from mt5connect.constants import MT5_VENUE
+from mt5connect.errors import (
+    MT5ConfigError,
+    MT5ConnectionError,
+    MT5InstrumentError,
+    MT5SymbolNotFoundError,
+)
+from mt5connect.parsing import (
+    FOREX_MODES,
+    InstrumentAny,
+    TradeMode,
+    calc_mode,
+    finite_decimal,
+    parse_symbol_info,
+    trade_mode,
+)
 
 if TYPE_CHECKING:
-    from mt5connect.connection import MT5Connection
+    from nautilus_trader.common.component import Clock
+    from nautilus_trader.config import InstrumentProviderConfig
+
+    from mt5connect.connection import AccountSnapshot, MT5Connection
 
 logger = logging.getLogger(__name__)
 
+# The venue symbol quoting each (base, profit) currency pair.
+_Pairs = dict[tuple[str, str], str]
+
 
 class MT5InstrumentProvider(InstrumentProvider):
-    """
-    Loads MT5 instrument definitions into NautilusTrader's cache.
+    """Loads MT5 symbol definitions into NautilusTrader's cache."""
 
-    Parameters
-    ----------
-    connection : MT5Connection
-        The active MT5 connection. Must be connected before any load call.
-
-    Usage
-    -----
-        provider = MT5InstrumentProvider(connection=conn)
-
-        # Load everything available on the broker
-        await provider.load_all_async()
-
-        # Load specific symbols only
-        from nautilus_trader.model.identifiers import InstrumentId
-        ids = [InstrumentId.from_str("EURUSD.MT5"), InstrumentId.from_str("XAUUSD.MT5")]
-        await provider.load_ids_async(ids)
-
-        # After loading, retrieve an instrument
-        inst = provider.find(InstrumentId.from_str("EURUSD.MT5"))
-        # or
-        inst = provider.get_instrument("EURUSD")
-    """
-
-    def __init__(self, connection: MT5Connection) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        connection: MT5Connection,
+        clock: Clock,
+        config: InstrumentProviderConfig | None = None,
+    ) -> None:
+        super().__init__(config)
         self._conn = connection
-        # Track symbols that failed to parse — logged but not fatal
-        self._failed_symbols: list[tuple[str, str]] = []
+        self._clock = clock
+        self._quoted_pairs: dict[tuple[str, str], str] = {}
 
     # ── Required NautilusTrader overrides ─────────────────────────────────────
 
     async def load_all_async(self, filters: dict | None = None) -> None:
-        """
-        Load ALL symbols available on the connected broker into the cache.
-
-        Calls mt5.symbols_get() to get the full symbol list, then
-        mt5.symbol_info() for each one, converts via parse_symbol_info(),
-        and registers with self.add().
-
-        Symbols that fail to parse are logged and skipped — they do not
-        crash the whole load. Check self.failed_symbols after loading
-        to see what was skipped and why.
-
-        Parameters
-        ----------
-        filters : dict, optional
-            Supports key "symbols" with a list of symbol name strings to
-            restrict loading. All other keys are ignored.
-            Example: {"symbols": ["EURUSD", "XAUUSD"]}
-        """
-        self._conn.ensure_connected()
-        self._failed_symbols.clear()
-
-        # Apply symbol filter if provided
-        # Use `is not None` (not just truthy) so an empty list [] means "load nothing"
-        symbol_filter: list[str] | None = None
-        if filters is not None and "symbols" in filters:
-            symbol_filter = [s.upper().strip() for s in filters["symbols"]]
-
-        # Get all available symbols from broker
-        all_symbols = mt5.symbols_get()
-        if all_symbols is None:
-            code, msg = mt5.last_error()
-            raise MT5ConnectionError(f"mt5.symbols_get() returned None — error {code}: {msg}")
-
-        total = len(all_symbols)
-        loaded = 0
-        skipped = 0
-        filtered = 0
-
-        logger.info(f"MT5InstrumentProvider: loading {total} symbols from broker")
-
-        for sym_info in all_symbols:
-            symbol = sym_info.name
-
-            # Apply filter — None means no filter (load all), [] means load none
-            if symbol_filter is not None and symbol not in symbol_filter:
-                filtered += 1
-                continue
-
-            # Select symbol in Market Watch (required before symbol_info works reliably)
-            mt5.symbol_select(symbol, True)
-
-            # Get full symbol details
-            info = mt5.symbol_info(symbol)
-            if info is None:
-                code, msg = mt5.last_error()
-                logger.warning(
-                    f"MT5InstrumentProvider: skipping '{symbol}' — "
-                    f"symbol_info() returned None (error {code}: {msg})"
-                )
-                self._failed_symbols.append((symbol, f"symbol_info() None: {msg}"))
-                skipped += 1
-                continue
-
-            # Parse into NautilusTrader instrument
-            try:
-                instrument = parse_symbol_info(info)
-                self.add(instrument)
-                loaded += 1
-            except MT5InstrumentError as exc:
-                logger.warning(f"MT5InstrumentProvider: skipping '{symbol}' — parse error: {exc}")
-                self._failed_symbols.append((symbol, str(exc)))
-                skipped += 1
-
-        logger.info(
-            f"MT5InstrumentProvider: loaded={loaded} "
-            f"skipped={skipped} "
-            f"filtered={filtered} "
-            f"total={total}"
-        )
-
-        if self._failed_symbols:
-            logger.warning(
-                f"MT5InstrumentProvider: {len(self._failed_symbols)} symbols failed to parse. "
-                "Check provider.failed_symbols for details."
-            )
+        """Loads every symbol the provider's config names."""
+        if self._config.load_ids is None:
+            raise MT5ConfigError("instrument provider: no symbols are configured")
+        self._load(sorted(instrument_id.symbol.value for instrument_id in self._config.load_ids))
 
     async def load_ids_async(
         self,
         instrument_ids: list[InstrumentId],
         filters: dict | None = None,
     ) -> None:
-        """
-        Load specific instruments by InstrumentId into the cache.
-
-        More efficient than load_all_async() when you only need a few symbols.
-        Each InstrumentId must be in the format "SYMBOL.MT5" (e.g. "EURUSD.MT5").
-
-        Parameters
-        ----------
-        instrument_ids : list[InstrumentId]
-            The specific instruments to load.
-        filters : dict, optional
-            Ignored — included for interface compatibility.
-
-        Raises
-        ------
-        MT5SymbolNotFoundError
-            If a requested symbol does not exist on the broker.
-        MT5InstrumentError
-            If a symbol exists but fails to parse.
-        """
-        self._conn.ensure_connected()
-
-        for instrument_id in instrument_ids:
-            symbol = instrument_id.symbol.value
-            await self._load_symbol_async(symbol)
-
-    # ── Single symbol loader ──────────────────────────────────────────────────
-
-    async def _load_symbol_async(self, symbol: str) -> InstrumentAny:
-        """
-        Load a single symbol by name. Internal async version.
-        Raises MT5SymbolNotFoundError or MT5InstrumentError on failure.
-        """
-        return self.load_symbol(symbol)
+        """Loads the symbols the instrument ids name."""
+        self._load([instrument_id.symbol.value for instrument_id in instrument_ids])
 
     def load_symbol(self, symbol: str) -> InstrumentAny:
-        """
-        Load a single symbol by name (synchronous).
+        """Loads one symbol, by its exact broker name, and returns its instrument."""
+        return self._load([symbol])[0]
 
-        Selects symbol in Market Watch, fetches symbol_info(),
-        parses into NautilusTrader instrument, registers with self.add().
+    # ── Loading ───────────────────────────────────────────────────────────────
 
-        Parameters
-        ----------
-        symbol : str
-            The MT5 symbol name (e.g. "EURUSD", "XAUUSD").
-
-        Returns
-        -------
-        InstrumentAny
-            The parsed and registered instrument.
-
-        Raises
-        ------
-        MT5ConnectionError
-            If not connected.
-        MT5SymbolNotFoundError
-            If the symbol doesn't exist on this broker.
-        MT5InstrumentError
-            If the symbol exists but fails to parse.
-        """
+    def _load(self, symbols: list[str]) -> list[InstrumentAny]:
+        """Selects and reads each symbol's definition, builds its instrument and adds them all;
+        raises naming the first symbol the venue does not know or whose definition is refused."""
         self._conn.ensure_connected()
+        account = self._conn.get_account_info()
+        ts = self._clock.timestamp_ns()
+        definitions = []
+        for symbol in symbols:
+            definitions.append(self._select_and_read(symbol))
+        loaded = {instrument.raw_symbol.value for instrument in self._instruments.values()}
+        pairs = self._select_quoted_pairs(loaded | set(symbols))
+        instruments = []
+        for info in definitions:
+            try:
+                instruments.append(self._load_definition(info, account, pairs, ts))
+            except MT5InstrumentError as exc:
+                raise MT5InstrumentError(f"{info.name}: {exc}") from exc
+        self._quoted_pairs = pairs
+        for instrument in instruments:
+            self.add(instrument)
+        logger.info(f"MT5InstrumentProvider: loaded {', '.join(symbols)}")
+        return instruments
 
-        symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
-
-        # Select in Market Watch — required for some brokers
-        selected = mt5.symbol_select(symbol, True)
-        if not selected:
+    def _select_and_read(self, symbol: str):
+        """Selects a symbol in Market Watch and reads its definition."""
+        if not mt5.symbol_select(symbol, True):
             raise MT5SymbolNotFoundError(symbol)
-
-        # Fetch full symbol details
         info = mt5.symbol_info(symbol)
         if info is None:
-            code, msg = mt5.last_error()
             raise MT5SymbolNotFoundError(symbol)
+        return info
 
-        # Parse and register
-        instrument = parse_symbol_info(info)
-        self.add(instrument)
+    def _load_definition(self, info, account: AccountSnapshot, pairs: _Pairs, ts: int):
+        """Builds the instrument a selected symbol's definition describes, its taker fee from the
+        commission rule the server relays, selecting the symbol that converts the rule's currency
+        into the quote currency first."""
+        rule = parse_schedule(mt5.commission_schedule(info.name))
+        if rule is not None and rule.currency != info.currency_profit:
+            converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
+            mt5.symbol_select(converter, True)
+        return parse_symbol_info(info, account, _taker_fee(info, rule, pairs), ts)
 
-        logger.debug(f"MT5InstrumentProvider: loaded '{symbol}' → {type(instrument).__name__}")
-        return instrument
+    # ── Conversion pairs ──────────────────────────────────────────────────────
+
+    def _select_quoted_pairs(self, loaded: set[str]) -> _Pairs:
+        """The venue symbol quoting each (base, profit) pair its FOREX symbols cover: one the run
+        loads, else one fully tradable, else the first that prices once selected, each in
+        alphabetical order."""
+        venue_symbols = mt5.symbols_get()
+        if venue_symbols is None:
+            code, msg = mt5.last_error()
+            raise MT5ConnectionError(f"mt5.symbols_get() returned None — error {code}: {msg}")
+        buckets: dict[tuple[str, str], list[tuple[str, TradeMode]]] = {}
+        for info in sorted(venue_symbols, key=attrgetter("name")):
+            try:
+                if calc_mode(info) in FOREX_MODES:
+                    pair = (info.currency_base, info.currency_profit)
+                    buckets.setdefault(pair, []).append((info.name, trade_mode(info)))
+            except MT5InstrumentError as exc:
+                raise MT5InstrumentError(f"{info.name}: {exc}") from exc
+        pairs = {}
+        for pair, candidates in buckets.items():
+            symbol = _select_quoting_symbol(candidates, loaded)
+            if symbol is not None:
+                pairs[pair] = symbol
+        return pairs
+
+    def quoted_pairs(self) -> _Pairs:
+        """The venue symbol quoting each (base, profit) currency pair, as the last load found it."""
+        return dict(self._quoted_pairs)
+
+    def account_currency(self) -> str:
+        """The account's currency code."""
+        return self._conn.get_account_info().currency
 
     # ── Convenience accessors ─────────────────────────────────────────────────
 
     def get_instrument(self, symbol: str) -> InstrumentAny | None:
-        """
-        Retrieve a loaded instrument by symbol name string.
-
-        More convenient than find(InstrumentId.from_str("EURUSD.MT5")).
-        Returns None if the symbol has not been loaded yet.
-
-        Parameters
-        ----------
-        symbol : str
-            Symbol name (e.g. "EURUSD", "XAUUSDm"). Exact broker casing
-            is preserved — do NOT uppercase. Brokers like Exness use
-            lowercase suffixes (e.g. "XAUUSDm"), and instruments are
-            registered under that exact casing in load_symbol(), so
-            uppercasing here would break the lookup for those symbols.
-        """
-        from mt5connect.constants import MT5_VENUE
-
-        instrument_id = InstrumentId(
-            Symbol(symbol.strip()),
-            MT5_VENUE,
-        )
-        return self.find(instrument_id)
-
-    @property
-    def loaded_symbols(self) -> list[str]:
-        """Return a list of all currently loaded symbol names."""
-        return [inst.id.symbol.value for inst in self.list_all()]
-
-    @property
-    def failed_symbols(self) -> list[tuple[str, str]]:
-        """
-        Return list of (symbol, reason) tuples for symbols that failed to load.
-        Populated after load_all_async() completes.
-        """
-        return list(self._failed_symbols)
-
-    @property
-    def count(self) -> int:
-        """Number of instruments currently loaded."""
-        return len(self.list_all())
+        """The loaded instrument of a symbol, by its exact broker name; None while not loaded."""
+        return self.find(InstrumentId(Symbol(symbol), MT5_VENUE))
 
     def __repr__(self) -> str:
-        return (
-            f"MT5InstrumentProvider("
-            f"loaded={self.count}, "
-            f"failed={len(self._failed_symbols)})"
-        )
+        return f"MT5InstrumentProvider(loaded={len(self._instruments)})"
+
+
+def _select_quoting_symbol(candidates: list[tuple[str, TradeMode]], loaded: set[str]) -> str | None:
+    for symbol, _ in candidates:
+        if symbol in loaded:
+            return symbol
+    for symbol, mode in candidates:
+        if mode == TradeMode.FULL:
+            return symbol
+    for symbol, _ in candidates:
+        # An unselected symbol quotes the all-zero struct.
+        if mt5.symbol_select(symbol, True):
+            quote = mt5.symbol_info_tick(symbol)
+            if quote is not None and quote.time != 0:
+                return symbol
+    return None
+
+
+def _taker_fee(info, rule: CommissionRule | None, pairs: _Pairs) -> Decimal:
+    """The symbol's taker fee under its commission rule, zero without one; the conversion into its
+    quote currency is the venue's own quote, never NT's."""
+    if rule is None:
+        return Decimal(0)
+    else:
+        rate = _rate(rule.currency, info.currency_profit, pairs)
+        contract_size = finite_decimal(info.trade_contract_size, "trade_contract_size")
+        return taker_fee(rule, rate, contract_size, _mid(info.name))
+
+
+def _rate(source: str, target: str, pairs: _Pairs) -> Decimal:
+    """`target` units per `source` unit at the mid of the venue's quote for the pair."""
+    if source == target:
+        return Decimal(1)
+    else:
+        symbol, inverse = _conversion(source, target, pairs)
+        if inverse:
+            return 1 / _mid(symbol)
+        else:
+            return _mid(symbol)
+
+
+def _conversion(source: str, target: str, pairs: _Pairs) -> tuple[str, bool]:
+    """The venue symbol quoting `source` against `target`, and whether it quotes it inversely;
+    raises MT5InstrumentError for a pair the venue does not quote."""
+    if (source, target) in pairs:
+        return pairs[(source, target)], False
+    elif (target, source) in pairs:
+        return pairs[(target, source)], True
+    else:
+        raise MT5InstrumentError(f"no venue symbol converts {source} into {target}")
+
+
+def _mid(symbol: str) -> Decimal:
+    """The mid of a selected symbol's last quote; raises MT5InstrumentError while it has none."""
+    quote = mt5.symbol_info_tick(symbol)
+    if quote is None or quote.time == 0:
+        raise MT5InstrumentError(f"{symbol} has no quote")
+    bid = finite_decimal(quote.bid, f"{symbol} bid")
+    ask = finite_decimal(quote.ask, f"{symbol} ask")
+    return (bid + ask) / 2
