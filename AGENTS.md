@@ -384,7 +384,6 @@ Measured on IC Markets and Bybit MT5 terminals; none of it is in the vendor's do
 
 - **Don't commit a credential, an `.env`, an account number, or a server name that identifies an account** — and don't log one. A settings error names the variable, never a credential's value.
 - **Don't patch NT to fit MT5.** The connector works the way NT expects an adapter to work; where the venue's shape differs (per-ticket hedging, venue-minted ids, bid-built bars), the adapter translates, and anything the adapter cannot translate is raised with the consumer, not papered over in NT.
-- **Don't read NT's cache from the adapter** to decide what the venue meant. The adapter reports what the venue said, keyed by the venue's own ids; the consumer does the binding.
 - **Don't hand-write what the inventory generates** — a route, a shim function, a struct, a conformance sample.
 - **Don't do clock math outside the server.** The server answers in true UTC, so a consumer that converts broker time converts it twice.
 - **Don't trust `[]`.** An empty package answer proves nothing on its own; the protocol's evidence rules decide what is canonical.
