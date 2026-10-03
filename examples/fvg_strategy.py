@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from decimal import Decimal
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from decimal import Decimal
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
@@ -11,10 +10,10 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.strategy import Strategy
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # TRADE RECORD
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class TradeRecord:
@@ -33,6 +32,7 @@ class TradeRecord:
 # FVG ZONE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class FVGZone:
     direction: OrderSide
@@ -48,6 +48,7 @@ class FVGZone:
 # STRATEGY CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class FVGStrategyConfig(StrategyConfig, frozen=True):
     instrument_id: str
     bar_type: str
@@ -62,6 +63,7 @@ class FVGStrategyConfig(StrategyConfig, frozen=True):
 # ─────────────────────────────────────────────────────────────────────────────
 # FVG STRATEGY
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class FVGStrategy(Strategy):
     """Fair Value Gap (FVG) strategy for XAUUSD."""
@@ -97,7 +99,7 @@ class FVGStrategy(Strategy):
         self._trades = 0
         self._wins = 0
         self._losses = 0
-        self._trade_log: List[TradeRecord] = []
+        self._trade_log: list[TradeRecord] = []
 
     def on_start(self) -> None:
         self.instrument = self.cache.instrument(self.instrument_id)
@@ -285,17 +287,19 @@ class FVGStrategy(Strategy):
                 self._losses += 1
                 status = "LOSS"
 
-            self._trade_log.append(TradeRecord(
-                direction="LONG" if self._position_side == OrderSide.BUY else "SHORT",
-                entry_price=self._entry_price,
-                exit_price=exit_price,
-                stop_loss=self._stop_loss,
-                take_profit=self._take_profit,
-                pnl=pnl_dollar,
-                pnl_points=pnl_points,
-                status=status,
-                time=str(bar.ts_event),
-            ))
+            self._trade_log.append(
+                TradeRecord(
+                    direction="LONG" if self._position_side == OrderSide.BUY else "SHORT",
+                    entry_price=self._entry_price,
+                    exit_price=exit_price,
+                    stop_loss=self._stop_loss,
+                    take_profit=self._take_profit,
+                    pnl=pnl_dollar,
+                    pnl_points=pnl_points,
+                    status=status,
+                    time=str(bar.ts_event),
+                )
+            )
 
             self._close_position()
 
@@ -319,14 +323,14 @@ class FVGStrategy(Strategy):
     def _sma(self) -> float | None:
         if len(self._closes) < self.sma_period:
             return None
-        return sum(self._closes[-self.sma_period:]) / self.sma_period
+        return sum(self._closes[-self.sma_period :]) / self.sma_period
 
     # ── Public methods for backtest reporting ─────────────────────────────────
 
-    def get_trade_log(self) -> List[TradeRecord]:
+    def get_trade_log(self) -> list[TradeRecord]:
         return self._trade_log
 
-    def get_stats(self, initial_cash: float) -> Dict:
+    def get_stats(self, initial_cash: float) -> dict:
         if not self._trade_log:
             return {
                 "total_trades": 0,
@@ -356,7 +360,11 @@ class FVGStrategy(Strategy):
         net_pnl = gross_profit - gross_loss
         total = len(self._trade_log)
         win_rate = (len(wins) / total * 100) if total > 0 else 0.0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else (float("inf") if gross_profit > 0 else 0.0)
+        )
 
         avg_win = gross_profit / len(wins) if wins else 0.0
         avg_loss = gross_loss / len(losses) if losses else 0.0
@@ -404,5 +412,7 @@ class FVGStrategy(Strategy):
         }
 
     def on_stop(self) -> None:
-        self.log.info(f"FVG Strategy stopped | trades={self._trades} wins={self._wins} losses={self._losses}")
+        self.log.info(
+            f"FVG Strategy stopped | trades={self._trades} wins={self._wins} losses={self._losses}"
+        )
         self._close_position()

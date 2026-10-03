@@ -9,7 +9,8 @@ class MT5Error(Exception):
 
 
 class MT5ConfigError(MT5Error):
-    """Raised when MT5Config is invalid (e.g. remote backend without server_url)."""
+    """Raised when the configuration, or the account it points at, cannot be run (e.g. no
+    server_url, an account that does not hedge)."""
 
 
 class MT5ConnectionError(MT5Error):
@@ -22,6 +23,20 @@ class MT5ConnectionError(MT5Error):
     - MT5 terminal is starting up (try again in a few seconds)
     - mt5.initialize() failed
     """
+
+
+class ServerUnreachable(MT5ConnectionError):
+    """Raised when the remote MT5 server cannot be reached or answers outside its contract."""
+
+
+class ResponseLost(ServerUnreachable):
+    """Raised when a request reached the remote MT5 server but no answer within its contract came
+    back, so the server may have acted on it."""
+
+
+class ServerBusy(MT5ConnectionError):
+    """Raised when the remote MT5 server refuses a call because every slot for a call that can reach
+    the terminal is taken; the server is up, so the caller decides whether to ask again."""
 
 
 class MT5LoginError(MT5Error):

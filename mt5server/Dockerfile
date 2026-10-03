@@ -28,11 +28,14 @@ RUN pacman -Sy --noconfirm \
 # Stage 2: Final image
 FROM base
 
-# Copy the scripts directory and convert start.sh to Unix format
-COPY app /app
-COPY scripts /scripts
-COPY root /
-COPY mt5ticks /mt5ticks
+# Built from the repository root: the server imports the client package's inventory, broker clock
+# and history vocabulary.
+COPY mt5connect/__init__.py mt5connect/mirror.py mt5connect/broker_clock.py mt5connect/history_wire.py /app/mt5connect/
+COPY mt5server/__init__.py /app/mt5server/
+COPY mt5server/app /app/mt5server/app
+COPY mt5server/scripts /scripts
+COPY mt5server/root /
+COPY mt5server/mt5ticks /mt5ticks
 RUN dos2unix /scripts/*.sh && \
     chmod +x /scripts/*.sh
 
@@ -43,4 +46,5 @@ RUN touch /var/log/mt5_setup.log && \
 EXPOSE 3000 5000 5001 8001 9000 18812
 ENV MT5_API_PORT=5000
 ENV WS_PORT=9000
+ENV MT5_TERMINAL_PATH="C:\\Program Files\\MetaTrader 5\\terminal64.exe"
 VOLUME /config

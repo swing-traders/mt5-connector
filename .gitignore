@@ -22,6 +22,7 @@ ENV/
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 .pytest_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
@@ -56,3 +57,9 @@ logs/
 # ── Secrets  ───────────────────────────────────────────────────────────────────
 
 secrets/
+
+# ── Ad-hoc tooling (never committed) ───────────────────────────────────────────
+/scripts/
+
+# ── GitHub Pages index build ───────────────────────────────────────────────────
+site/

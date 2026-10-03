@@ -1,115 +1,54 @@
-"""
-nautilus_mt5/downloader.py
-
-Downloads historical tick and bar data from MT5 and writes it
-into a NautilusTrader Parquet data catalog.
-
-Run this ONCE (or periodically) before backtesting.
-After it completes, backtesting runs fully offline — no MT5 needed.
-
-Two main classes:
-  MT5DataDownloader   — orchestrates the full download for one or more symbols
-  DownloadResult      — summary of what was downloaded (counts, errors)
-
-Usage
------
-    from datetime import datetime
-    from mt5connect.downloader import MT5DataDownloader
-    from mt5connect.config import MT5Config
-    from mt5connect.connection import MT5Connection
-    from mt5connect.providers import MT5InstrumentProvider
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-    config = MT5Config(
-        account=12345678,
-        password="demo_password",
-        server="Exness-MT5Trial1",
-        symbols=["EURUSD", "XAUUSD"],
-    )
-    conn = MT5Connection(config)
-    conn.connect()
-
-    provider = MT5InstrumentProvider(conn)
-    catalog  = ParquetDataCatalog("./catalog")
-
-    downloader = MT5DataDownloader(
-        connection=conn,
-        provider=provider,
-        catalog=catalog,
-    )
-
-    result = downloader.download_ticks(
-        symbol="EURUSD",
-        start=datetime(2024, 1, 1),
-        end=datetime(2024, 12, 31),
-    )
-    print(result)
-
-    conn.disconnect()
-"""
+"""Downloads a symbol's bars and ticks through the MT5 server's history routes into a NautilusTrader
+Parquet catalog, walking back from the end of a range until its start or the series' floor."""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-try:
-    import MetaTrader5 as mt5
-except ImportError:  # pragma: no cover - Windows-only dependency
-    mt5 = None  # bound to the real backend by mt5connect.backend.set_backend()
-import numpy as np
-
-from nautilus_trader.model.data import Bar, QuoteTick
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
-from mt5connect.errors import MT5ConnectionError, MT5SymbolNotFoundError
+from mt5connect import history
+from mt5connect import remote_mt5 as mt5
+from mt5connect.errors import MT5SymbolNotFoundError
+from mt5connect.history import HistoryRanges
+from mt5connect.history_wire import BAR_PERIOD_S, SPAN_MARGIN, Series, bar_series
 from mt5connect.parsing import parse_bar, parse_quote_tick
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from mt5connect.connection import MT5Connection
     from mt5connect.providers import MT5InstrumentProvider
 
 logger = logging.getLogger(__name__)
 
-# MT5 hard limits per API call
-_MAX_TICKS_PER_CALL = 2_000_000
-_MAX_BARS_PER_CALL  = 100_000
-
-# Chunk size for tick downloads (1 week per request to stay under MT5 limits)
-_TICK_CHUNK_DAYS  = 7
-_BAR_CHUNK_DAYS   = 365  # bars are much smaller — 1 year per request is fine
+_DAY_S = 86_400
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULT DATACLASS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class DownloadResult:
-    """
-    Summary of a completed download operation.
+    """What one download wrote, the windows it asked the server for, and what failed."""
 
-    Attributes
-    ----------
-    symbol : str
-    data_type : str          "ticks" or "bars"
-    total_written : int      total data points written to catalog
-    chunks_processed : int   number of time chunks fetched from MT5
-    chunks_empty : int       chunks that returned no data (e.g. weekend)
-    errors : list[str]       error messages for any failed chunks
-    start : datetime
-    end : datetime
-    """
     symbol: str
     data_type: str
     total_written: int = 0
     chunks_processed: int = 0
+    # Windows the server answered with no rows.
     chunks_empty: int = 0
     errors: list[str] = field(default_factory=list)
     start: datetime | None = None
     end: datetime | None = None
+    # Where the series begins, once the walk reached it.
+    floor: datetime | None = None
 
     @property
     def success(self) -> bool:
@@ -129,71 +68,29 @@ class DownloadResult:
 # DOWNLOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
-class MT5DataDownloader:
-    """
-    Downloads historical data from MT5 and writes to a Parquet catalog.
 
-    Parameters
-    ----------
-    connection : MT5Connection
-        Active MT5 connection.
-    provider : MT5InstrumentProvider
-        Instrument provider (instruments must be loaded before downloading).
-    catalog : ParquetDataCatalog
-        The NautilusTrader catalog to write data into.
-    chunk_days_ticks : int
-        How many days per MT5 API call for tick data. Default: 7.
-        Lower = safer (stays under MT5 limits), higher = fewer API calls.
-    chunk_days_bars : int
-        How many days per MT5 API call for bar data. Default: 365.
-    """
+class MT5DataDownloader:
+    """Downloads a symbol's history from the MT5 server into a Parquet catalog."""
 
     def __init__(
         self,
-        connection: "MT5Connection",
-        provider: "MT5InstrumentProvider",
+        connection: MT5Connection,
+        provider: MT5InstrumentProvider,
         catalog: ParquetDataCatalog,
-        chunk_days_ticks: int = _TICK_CHUNK_DAYS,
-        chunk_days_bars: int  = _BAR_CHUNK_DAYS,
     ) -> None:
-        self._conn     = connection
+        self._conn = connection
         self._provider = provider
-        self._catalog  = catalog
-        self._chunk_days_ticks = chunk_days_ticks
-        self._chunk_days_bars  = chunk_days_bars
+        self._catalog = catalog
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def download_ticks(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-    ) -> DownloadResult:
-        """
-        Download ALL tick data for a symbol between start and end.
-
-        Splits the range into weekly chunks to respect MT5 API limits.
-        Each chunk is fetched, converted to QuoteTick objects, and
-        written to the catalog immediately (no RAM buildup).
-
-        Parameters
-        ----------
-        symbol : str
-            MT5 symbol name (e.g. "EURUSD").
-        start : datetime
-            Start of the download range (UTC).
-        end : datetime
-            End of the download range (UTC).
-
-        Returns
-        -------
-        DownloadResult
-        """
-        symbol  = symbol.strip()   # preserve broker casing (EURUSDm, EURUSD, etc.)
-        start   = _ensure_utc(start)
-        end     = _ensure_utc(end)
-        result  = DownloadResult(symbol=symbol, data_type="ticks", start=start, end=end)
+    def download_ticks(self, symbol: str, start: datetime, end: datetime) -> DownloadResult:
+        """Writes the symbol's quote ticks between start and end, one UTC day per request, each
+        day as it arrives."""
+        symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
+        start = _ensure_utc(start)
+        end = _ensure_utc(end)
+        result = DownloadResult(symbol=symbol, data_type="ticks", start=start, end=end)
 
         self._conn.ensure_connected()
 
@@ -202,49 +99,27 @@ class MT5DataDownloader:
         if instrument is None:
             return result
 
-        logger.info(
-            f"Downloader: downloading ticks for {symbol} "
-            f"from {start.date()} to {end.date()}"
-        )
-
-        # Chunk by week
-        chunks = list(_date_chunks(start, end, days=self._chunk_days_ticks))
-        logger.info(f"Downloader: {len(chunks)} weekly chunks to fetch")
-
-        for chunk_start, chunk_end in chunks:
-            result.chunks_processed += 1
-            try:
-                raw = mt5.copy_ticks_range(
-                    symbol,
-                    chunk_start,
-                    chunk_end,
-                    mt5.COPY_TICKS_ALL,
-                )
-
-                if raw is None or len(raw) == 0:
-                    result.chunks_empty += 1
-                    logger.debug(
-                        f"Downloader: {symbol} {chunk_start.date()} → empty "
-                        f"(weekend or no data)"
-                    )
-                    continue
-
-                ticks = [parse_quote_tick(row, instrument) for row in raw]
-                self._catalog.write_data(ticks)
-                result.total_written += len(ticks)
-
-                logger.debug(
-                    f"Downloader: {symbol} {chunk_start.date()} → "
-                    f"{len(ticks):,} ticks written"
-                )
-
-            except Exception as exc:
-                msg = (
-                    f"Chunk {chunk_start.date()}–{chunk_end.date()} failed: {exc}"
-                )
-                logger.error(f"Downloader: {symbol} {msg}")
-                result.errors.append(msg)
-
+        ranges = history.ranges(symbol)
+        if ranges is None:
+            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+        else:
+            logger.info(f"Downloader: downloading ticks for {symbol} from {start} to {end}")
+            first = int(start.timestamp())
+            windows = []
+            window_end = int(end.timestamp())
+            while window_end >= first:
+                window_start = max(first, window_end - window_end % _DAY_S)
+                windows.append((window_start, window_end))
+                window_end = window_start - 1
+            self._walk_back(
+                result,
+                Series.TICKS,
+                first,
+                windows,
+                _advertised_floor(ranges, Series.TICKS),
+                lambda lo, hi: history.ticks(symbol, lo, hi),
+                lambda rows: [parse_quote_tick(row, instrument) for row in rows],
+            )
         logger.info(f"Downloader: {result}")
         return result
 
@@ -255,35 +130,15 @@ class MT5DataDownloader:
         end: datetime,
         timeframe: int | None = None,
     ) -> DownloadResult:
-        """
-        Download OHLCV bar data for a symbol between start and end.
-
-        Parameters
-        ----------
-        symbol : str
-            MT5 symbol name (e.g. "EURUSD").
-        start : datetime
-            Start of the download range (UTC).
-        end : datetime
-            End of the download range (UTC).
-        timeframe : int, optional
-            MT5 timeframe constant. Defaults to mt5.TIMEFRAME_H1.
-            Common values:
-                mt5.TIMEFRAME_M1  = 1      (1 minute)
-                mt5.TIMEFRAME_M5  = 5      (5 minutes)
-                mt5.TIMEFRAME_H1  = 16385  (1 hour)
-                mt5.TIMEFRAME_H4  = 16388  (4 hours)
-                mt5.TIMEFRAME_D1  = 16408  (daily)
-
-        Returns
-        -------
-        DownloadResult
-        """
-        symbol    = symbol.strip()   # preserve broker casing (EURUSDm, EURUSD, etc.)
-        start     = _ensure_utc(start)
-        end       = _ensure_utc(end)
+        """Writes the symbol's bars of an MT5 timeframe, H1 by default, closing between start and
+        end, stamped at their close; each request spans as many periods as the terminal answers in
+        one read."""
+        symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
+        start = _ensure_utc(start)
+        end = _ensure_utc(end)
         timeframe = timeframe or mt5.TIMEFRAME_H1
-        result    = DownloadResult(symbol=symbol, data_type="bars", start=start, end=end)
+        series = bar_series(timeframe)
+        result = DownloadResult(symbol=symbol, data_type="bars", start=start, end=end)
 
         self._conn.ensure_connected()
 
@@ -291,49 +146,32 @@ class MT5DataDownloader:
         if instrument is None:
             return result
 
-        logger.info(
-            f"Downloader: downloading bars TF={timeframe} for {symbol} "
-            f"from {start.date()} to {end.date()}"
-        )
-
-        chunks = list(_date_chunks(start, end, days=self._chunk_days_bars))
-        logger.info(f"Downloader: {len(chunks)} chunks to fetch")
-
-        for chunk_start, chunk_end in chunks:
-            result.chunks_processed += 1
-            try:
-                raw = mt5.copy_rates_range(
-                    symbol,
-                    timeframe,
-                    chunk_start,
-                    chunk_end,
-                )
-
-                if raw is None or len(raw) == 0:
-                    result.chunks_empty += 1
-                    logger.debug(
-                        f"Downloader: {symbol} TF={timeframe} "
-                        f"{chunk_start.date()} → empty"
-                    )
-                    continue
-
-                bars = [parse_bar(row, instrument, timeframe) for row in raw]
-                self._catalog.write_data(bars)
-                result.total_written += len(bars)
-
-                logger.debug(
-                    f"Downloader: {symbol} {chunk_start.date()} → "
-                    f"{len(bars):,} bars written"
-                )
-
-            except Exception as exc:
-                msg = (
-                    f"Chunk {chunk_start.date()}–{chunk_end.date()} "
-                    f"TF={timeframe} failed: {exc}"
-                )
-                logger.error(f"Downloader: {symbol} {msg}")
-                result.errors.append(msg)
-
+        ranges = history.ranges(symbol)
+        if ranges is None:
+            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+        else:
+            logger.info(
+                f"Downloader: downloading {series} bars for {symbol} closing from {start} to {end}"
+            )
+            # The range names closes; the server serves bars by their open.
+            period = BAR_PERIOD_S[series]
+            first = int(start.timestamp()) - period
+            span = (ranges.maxbars - SPAN_MARGIN) * period
+            windows = []
+            window_end = int(end.timestamp()) - period
+            while window_end >= first:
+                window_start = max(first, window_end - span)
+                windows.append((window_start, window_end))
+                window_end = window_start - 1
+            self._walk_back(
+                result,
+                series,
+                first,
+                windows,
+                _advertised_floor(ranges, series),
+                lambda lo, hi: history.bars(symbol, series, lo, hi),
+                lambda rows: [parse_bar(row, instrument, timeframe) for row in rows],
+            )
         logger.info(f"Downloader: {result}")
         return result
 
@@ -343,7 +181,7 @@ class MT5DataDownloader:
         start: datetime,
         end: datetime,
         include_ticks: bool = True,
-        include_bars: bool  = True,
+        include_bars: bool = True,
         timeframes: list[int] | None = None,
     ) -> dict[str, list[DownloadResult]]:
         """
@@ -390,6 +228,56 @@ class MT5DataDownloader:
 
     # ── Private ───────────────────────────────────────────────────────────────
 
+    def _walk_back(
+        self,
+        result: DownloadResult,
+        series: Series,
+        first: int,
+        windows: list[tuple[int, int]],
+        floor: int | None,
+        read: Callable[[int, int], np.ndarray | None],
+        convert: Callable[[np.ndarray], list],
+    ) -> None:
+        """Requests the windows newest-first, writing the rows each answers, until the next lies
+        wholly before the series' floor, and records the floor when it lies after `first`. The
+        floor is read again after a window answered no rows and once the walk ends, since the server
+        measures one while answering."""
+        for lo, hi in windows:
+            if floor is not None and hi < floor:
+                break
+            result.chunks_processed += 1
+            label = f"{_iso(lo)}..{_iso(hi)}"
+            try:
+                rows = read(lo, hi)
+            except Exception as exc:
+                _record_error(result, f"Window {label} failed: {exc}")
+                continue
+            if rows is None:
+                _record_error(result, f"Window {label} failed: {mt5.last_error()}")
+            elif len(rows) == 0:
+                result.chunks_empty += 1
+                floor = self._refresh_floor(result, series, floor)
+            else:
+                data = convert(rows)
+                self._catalog.write_data(data)
+                result.total_written += len(data)
+                logger.debug(f"Downloader: {result.symbol} {label} → {len(data):,} written")
+        floor = self._refresh_floor(result, series, floor)
+        if floor is not None and floor > first:
+            result.floor = datetime.fromtimestamp(floor, UTC)
+
+    def _refresh_floor(
+        self, result: DownloadResult, series: Series, floor: int | None
+    ) -> int | None:
+        """Reads the series' floor the server advertises now; a failed read is recorded as an error
+        and leaves the floor known before."""
+        ranges = history.ranges(result.symbol)
+        if ranges is None:
+            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+            return floor
+        else:
+            return _advertised_floor(ranges, series)
+
     def _ensure_instrument(self, symbol: str, result: DownloadResult):
         """
         Get the loaded instrument for a symbol.
@@ -420,31 +308,26 @@ class MT5DataDownloader:
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _ensure_utc(dt: datetime) -> datetime:
     """Make a datetime timezone-aware (UTC) if it isn't already."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=UTC)
     return dt
 
 
-def _date_chunks(
-    start: datetime,
-    end: datetime,
-    days: int,
-) -> list[tuple[datetime, datetime]]:
-    """
-    Split [start, end] into chunks of `days` days.
-    The last chunk may be shorter than `days`.
+def _advertised_floor(ranges: HistoryRanges, series: Series) -> int | None:
+    """The series' floor among the ranges the server advertises, or None before it measures one."""
+    if series in ranges.series:
+        return ranges.series[series].floor
+    else:
+        return None
 
-    Returns list of (chunk_start, chunk_end) tuples.
-    """
-    chunks = []
-    current = start
-    delta   = timedelta(days=days)
 
-    while current < end:
-        chunk_end = min(current + delta, end)
-        chunks.append((current, chunk_end))
-        current = chunk_end
+def _record_error(result: DownloadResult, message: str) -> None:
+    logger.error(f"Downloader: {result.symbol} {message}")
+    result.errors.append(message)
 
-    return chunks
+
+def _iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")

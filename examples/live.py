@@ -13,22 +13,20 @@ from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
-
+from nautilus_trader.config import StrategyConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.config import StrategyConfig
 
 from mt5connect.config import MT5Config
 from mt5connect.factories import (
-    build_mt5_node_config,
     MT5LiveDataClientFactory,
     MT5LiveExecClientFactory,
+    build_mt5_node_config,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — loaded from .env
@@ -36,26 +34,30 @@ from mt5connect.factories import (
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+
 def _require(key: str) -> str:
     val = os.getenv(key)
     if not val:
         sys.exit(f"ERROR: '{key}' is not set. Add it to your .env file.")
     return val
 
-MT5_ACCOUNT  = int(_require("MT5_ACCOUNT"))
+
+MT5_ACCOUNT = int(_require("MT5_ACCOUNT"))
 MT5_PASSWORD = _require("MT5_PASSWORD")
-MT5_SERVER   = _require("MT5_SERVER")
-MT5_SYMBOLS  = [s.strip() for s in _require("MT5_SYMBOLS").split(",")]
+MT5_SERVER = _require("MT5_SERVER")
+MT5_SYMBOLS = [s.strip() for s in _require("MT5_SYMBOLS").split(",")]
+MT5_SERVER_URL = os.getenv("MT5_SERVER_URL", "http://127.0.0.1:5000")
 
 # Strategy parameters
 FVG_MIN_PIPS = float(os.getenv("FVG_MIN_PIPS", "0.50"))
-RISK_REWARD  = float(os.getenv("RISK_REWARD", "2.0"))
-TRADE_SIZE   = Decimal(os.getenv("TRADE_SIZE", "0.01"))
+RISK_REWARD = float(os.getenv("RISK_REWARD", "2.0"))
+TRADE_SIZE = Decimal(os.getenv("TRADE_SIZE", "0.01"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FVG ZONE DATACLASS
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class FVGZone:
     def __init__(self, direction, gap_low, gap_high, stop_loss, formed_at):
@@ -71,6 +73,7 @@ class FVGZone:
 # STRATEGY CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class FVGStrategyConfig(StrategyConfig, frozen=True):
     instrument_id: str
     bar_type: str
@@ -82,6 +85,7 @@ class FVGStrategyConfig(StrategyConfig, frozen=True):
 # ─────────────────────────────────────────────────────────────────────────────
 # FVG STRATEGY (bypasses reconciliation by not using complex reporting)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class FVGStrategy(Strategy):
     """Fair Value Gap strategy - matches SMA pattern exactly."""
@@ -271,7 +275,10 @@ class FVGStrategy(Strategy):
             pnl_dollar = round(pnl_points * float(self.trade_size) * 100, 2)
 
             self.log.info(f"EXIT {reason} | {self._position_side.name} | {pnl_points:+.2f} pts")
-            print(f"\n🔚 EXIT {reason}: {self._position_side.name} | PnL: {pnl_points:+.2f} pts (${pnl_dollar:.2f})\n")
+            print(
+                f"\n🔚 EXIT {reason}: {self._position_side.name} | "
+                f"PnL: {pnl_points:+.2f} pts (${pnl_dollar:.2f})\n"
+            )
 
             self.close_all_positions(self.instrument_id)
 
@@ -314,15 +321,15 @@ class FVGStrategy(Strategy):
 # NODE SETUP AND RUN
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def main():
     print(f"\n{'═' * 60}")
     print(f"  FVG Live Strategy — {MT5_SYMBOLS}")
     print(f"  Server  : {MT5_SERVER}")
-    print(f"  Account : {MT5_ACCOUNT}")
     print(f"  Size    : {TRADE_SIZE} lots")
     print(f"  Min FVG : {FVG_MIN_PIPS}")
     print(f"  RR      : 1:{RISK_REWARD}")
-    print(f"  Press Ctrl+C to stop and close all positions")
+    print("  Press Ctrl+C to stop and close all positions")
     print(f"{'═' * 60}\n")
 
     # MT5 connection config
@@ -331,7 +338,7 @@ def main():
         password=MT5_PASSWORD,
         server=MT5_SERVER,
         symbols=MT5_SYMBOLS,
-        poll_interval_ms=100,
+        server_url=MT5_SERVER_URL,
         exec_poll_interval_ms=250,
     )
 

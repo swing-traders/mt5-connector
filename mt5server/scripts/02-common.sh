@@ -16,12 +16,6 @@ log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - [$level] $message" >> /var/log/mt5_setup.log
 }
 
-# Function to check if a Python package is installed in Wine
-is_wine_python_package_installed() {
-    $wine_executable python -c "import pkg_resources; pkg_resources.require('$1')" 2>/dev/null
-    return $?
-}
-
 # Function to check if a Python package is installed in Linux
 is_python_package_installed() {
     python3 -c "import pkg_resources; pkg_resources.require('$1')" 2>/dev/null

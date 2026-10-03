@@ -30,24 +30,31 @@ Test groups:
 """
 
 import asyncio
-import pytest
-from unittest.mock import MagicMock, call, patch
-from mt5connect.connection import MT5Connection, ConnectionState, AccountSnapshot
-from mt5connect.errors import MT5ConnectionError, MT5LoginError
+from unittest.mock import patch
 
+import pytest
+
+from mt5connect.connection import AccountSnapshot, ConnectionState, MT5Connection
+from mt5connect.errors import MT5ConnectionError, MT5LoginError
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. ConnectionState enum
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestConnectionState:
 
     def test_all_states_exist(self):
         states = {s.name for s in ConnectionState}
         assert states == {
-            "DISCONNECTED", "INITIALIZING", "INITIALIZED",
-            "LOGGING_IN", "CONNECTED", "RECONNECTING",
-            "SHUTTING_DOWN", "FAILED",
+            "DISCONNECTED",
+            "INITIALIZING",
+            "INITIALIZED",
+            "LOGGING_IN",
+            "CONNECTED",
+            "RECONNECTING",
+            "SHUTTING_DOWN",
+            "FAILED",
         }
 
     def test_states_are_unique(self):
@@ -58,6 +65,7 @@ class TestConnectionState:
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. Initial state
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestInitialState:
 
@@ -77,7 +85,6 @@ class TestInitialState:
         conn = MT5Connection(config)
         r = repr(conn)
         assert "DISCONNECTED" in r
-        assert "12345678" in r
         assert "Exness-MT5Trial1" in r
 
 
@@ -85,7 +92,16 @@ class TestInitialState:
 # 3. Successful connect / disconnect
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestSuccessfulConnect:
+
+    def test_connect_binds_the_shim_to_the_configured_server_before_initializing(
+        self, config, mock_mt5
+    ):
+        conn = MT5Connection(config)
+        conn.connect()
+        mock_mt5.configure.assert_called_once_with("http://127.0.0.1:5000", "ws://127.0.0.1:9000")
+        assert [name for name, _, _ in mock_mt5.mock_calls][:2] == ["configure", "initialize"]
 
     def test_connect_calls_initialize_and_login(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -143,6 +159,7 @@ class TestSuccessfulConnect:
 # 4. initialize() failure
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestInitializeFailure:
 
     def test_raises_connection_error_when_initialize_fails(self, config, mock_mt5):
@@ -176,6 +193,7 @@ class TestInitializeFailure:
 # 5. login() failure
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestLoginFailure:
 
     def test_raises_login_error_when_login_fails(self, config, mock_mt5):
@@ -185,7 +203,7 @@ class TestLoginFailure:
         with pytest.raises(MT5LoginError) as exc_info:
             conn.connect()
         assert "mt5.login() failed" in str(exc_info.value)
-        assert "12345678" in str(exc_info.value)
+        assert "12345678" not in str(exc_info.value)
 
     def test_state_stays_initialized_after_login_failure(self, config, mock_mt5):
         """Terminal IPC is up, only login failed — state must be INITIALIZED not DISCONNECTED."""
@@ -216,6 +234,7 @@ class TestLoginFailure:
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. ensure_connected() — all states
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestEnsureConnected:
 
@@ -265,6 +284,7 @@ class TestEnsureConnected:
 # 7. Reconnect (sync) — success path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestReconnectSync:
 
     def test_reconnect_succeeds_first_attempt(self, config, mock_mt5):
@@ -296,9 +316,11 @@ class TestReconnectSync:
     def test_reconnect_succeeds_after_initial_failures(self, config, mock_mt5):
         """Fails first 2 attempts, succeeds on 3rd."""
         call_count = {"n": 0}
+
         def flaky_init():
             call_count["n"] += 1
             return call_count["n"] >= 3  # fail twice, then succeed
+
         mock_mt5.initialize.side_effect = flaky_init
 
         conn = MT5Connection(config)
@@ -310,6 +332,7 @@ class TestReconnectSync:
 # ═════════════════════════════════════════════════════════════════════════════
 # 8. Reconnect (sync) — failure / max attempts
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestReconnectSyncFailure:
 
@@ -349,6 +372,7 @@ class TestReconnectSyncFailure:
 # 9. Reconnect (async) — success path
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestReconnectAsync:
 
     @pytest.mark.asyncio
@@ -373,9 +397,11 @@ class TestReconnectAsync:
     @pytest.mark.asyncio
     async def test_async_reconnect_succeeds_after_initial_failures(self, config, mock_mt5):
         call_count = {"n": 0}
+
         def flaky_init():
             call_count["n"] += 1
             return call_count["n"] >= 2
+
         mock_mt5.initialize.side_effect = flaky_init
 
         conn = MT5Connection(config)
@@ -386,6 +412,7 @@ class TestReconnectAsync:
 # ═════════════════════════════════════════════════════════════════════════════
 # 10. Reconnect (async) — failure / max attempts
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestReconnectAsyncFailure:
 
@@ -406,9 +433,31 @@ class TestReconnectAsyncFailure:
         assert conn.state == ConnectionState.FAILED
 
 
+class TestReconnectAsyncSerialised:
+    """Clients sharing one connection reconnect it once between them."""
+
+    async def test_a_concurrent_second_caller_awaits_the_first_reconnect(self, config, mock_mt5):
+        conn = MT5Connection(config)
+        first, second = await asyncio.gather(conn.reconnect_async(), conn.reconnect_async())
+        assert (first, second) == (True, True)
+        assert mock_mt5.initialize.call_count == 1
+        assert mock_mt5.login.call_count == 1
+        assert conn.state == ConnectionState.CONNECTED
+
+    async def test_a_concurrent_second_caller_shares_the_first_ones_failure(self, config, mock_mt5):
+        mock_mt5.initialize.return_value = False
+        mock_mt5.last_error.return_value = (5, "IPC timeout")
+        conn = MT5Connection(config)
+        first, second = await asyncio.gather(conn.reconnect_async(), conn.reconnect_async())
+        assert (first, second) == (False, False)
+        assert mock_mt5.initialize.call_count == config.reconnect_max_attempts
+        assert conn.state == ConnectionState.FAILED
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 11. get_account_info()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestGetAccountInfo:
 
@@ -456,6 +505,7 @@ class TestGetAccountInfo:
 # 12. get_terminal_info()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestGetTerminalInfo:
 
     def test_returns_dict(self, config, mock_mt5):
@@ -472,11 +522,13 @@ class TestGetTerminalInfo:
         assert "connected" in info
         assert "ping_last" in info
 
-    def test_returns_empty_dict_when_terminal_info_none(self, config, mock_mt5):
+    def test_raises_when_terminal_info_returns_none(self, config, mock_mt5):
         mock_mt5.terminal_info.return_value = None
+        mock_mt5.last_error.return_value = (6, "No connection")
         conn = MT5Connection(config)
         conn.connect()
-        assert conn.get_terminal_info() == {}
+        with pytest.raises(MT5ConnectionError, match="None"):
+            conn.get_terminal_info()
 
     def test_raises_when_not_connected(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -487,6 +539,7 @@ class TestGetTerminalInfo:
 # ═════════════════════════════════════════════════════════════════════════════
 # 13. last_error()
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestLastError:
 
@@ -509,6 +562,7 @@ class TestLastError:
 # 14. uptime_seconds()
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestUptime:
 
     def test_none_before_connect(self, config, mock_mt5):
@@ -530,6 +584,7 @@ class TestUptime:
 # ═════════════════════════════════════════════════════════════════════════════
 # 15. Context manager
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestContextManager:
 
@@ -562,11 +617,12 @@ class TestContextManager:
 # 16. __repr__
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestRepr:
 
-    def test_repr_contains_account(self, config, mock_mt5):
+    def test_repr_omits_the_login(self, config, mock_mt5):
         conn = MT5Connection(config)
-        assert "12345678" in repr(conn)
+        assert "12345678" not in repr(conn)
 
     def test_repr_contains_server(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -583,6 +639,7 @@ class TestRepr:
 # 17. Backoff delay calculation
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestBackoffDelays:
 
     def test_delay_doubles_each_attempt(self, config, mock_mt5):
@@ -591,9 +648,7 @@ class TestBackoffDelays:
         mock_mt5.last_error.return_value = (5, "IPC timeout")
 
         delays_seen = []
-        original_sleep = __import__("time").sleep
 
-        import time as time_module
         with patch("time.sleep", side_effect=lambda d: delays_seen.append(d)):
             conn = MT5Connection(config)
             conn.reconnect()
@@ -621,6 +676,7 @@ class TestBackoffDelays:
 # 18. Disconnect idempotency
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestDisconnectIdempotency:
 
     def test_disconnect_when_already_disconnected_does_not_raise(self, config, mock_mt5):
@@ -639,6 +695,7 @@ class TestDisconnectIdempotency:
 # ═════════════════════════════════════════════════════════════════════════════
 # 19. State integrity after login failure
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class TestStateIntegrity:
 
@@ -668,6 +725,7 @@ class TestStateIntegrity:
 # 20. AccountSnapshot
 # ═════════════════════════════════════════════════════════════════════════════
 
+
 class TestAccountSnapshot:
 
     def test_from_mt5_builds_correctly(self, config, mock_mt5):
@@ -679,12 +737,12 @@ class TestAccountSnapshot:
         assert snap.leverage == 2000
         assert snap.company == "Exness Technologies Ltd"
 
-    def test_str_contains_all_key_fields(self, config, mock_mt5):
+    def test_str_carries_the_account_but_not_its_login(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn.connect()
         snap = conn.get_account_info()
         s = str(snap)
-        assert "12345678" in s
+        assert "12345678" not in s
         assert "10000.00" in s
         assert "USD" in s
         assert "2000" in s
