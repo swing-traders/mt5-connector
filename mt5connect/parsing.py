@@ -1,459 +1,218 @@
 """
 nautilus_mt5/parsing.py
 
-Converts MT5 raw data structures into NautilusTrader domain objects.
-
-This is the most detail-critical file in the adapter.
-Every number must be exact — wrong price precision or lot size
-means your backtest runs with wrong fills and your live orders
-get rejected by the broker.
-
-Three main conversion functions:
-  parse_symbol_info()   -> InstrumentAny  (the main entry point)
-  parse_quote_tick()    -> QuoteTick      (used in data.py polling loop)
-  parse_bar()          -> Bar             (used in downloader.py)
-
-Instrument type decision tree (based on MT5 symbol name + calc_mode):
-  EURUSD, GBPUSD ...  -> CurrencyPair   (FX spot)
-  XAUUSD, XAGUSD ...  -> Cfd            (metals)
-  USOIL, UKOIL ...    -> Cfd            (energies)
-  US500, DE40  ...    -> Cfd            (indices)
-  BTCUSD, ETHUSD ...  -> CryptoPerpetual
-  everything else     -> Cfd            (safe fallback)
+Converts the terminal's symbol definitions, ticks and bars into NautilusTrader domain objects. A
+definition is typed by its calc mode and filled from the venue's own facts alone.
 """
 
 from __future__ import annotations
 
+import calendar
 import time
 from decimal import Decimal
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from nautilus_trader.model.currencies import Currency
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
-from nautilus_trader.model.instruments import Cfd, CryptoPerpetual, CurrencyPair
+from nautilus_trader.model.instruments import Cfd, CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
-from mt5connect.constants import (
-    CRYPTO_SYMBOLS,
-    ENERGY_SYMBOLS,
-    FX_SYMBOLS,
-    INDEX_SYMBOLS,
-    METAL_SYMBOLS,
-    MT5_VENUE,
-    PRICE_PRECISION_OVERRIDES,
-    normalize_symbol,
-)
+from mt5connect import mirror
+from mt5connect.constants import MT5_VENUE
+from mt5connect.currencies import base_currency, venue_currency
 from mt5connect.errors import MT5InstrumentError
 
-# Union type for any instrument this adapter produces
-InstrumentAny = CurrencyPair | Cfd | CryptoPerpetual
+if TYPE_CHECKING:
+    from mt5connect.connection import AccountSnapshot
 
-# MT5 calc_mode constants (from MQL5 docs)
-_CALC_MODE_FOREX = 0
-_CALC_MODE_FUTURES = 1
-_CALC_MODE_CFD = 2
+InstrumentAny = CurrencyPair | Cfd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INSTRUMENT TYPE DETECTION
+# THE VENUE'S CLOSED SETS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def detect_instrument_type(symbol: str) -> str:
-    """
-    Determine what NautilusTrader instrument type to create for a given symbol.
+class CalcMode(StrEnum):
+    """How the venue calculates a symbol's profit and margin: `symbol_info().trade_calc_mode`."""
 
-    Returns one of: 'fx', 'metal', 'energy', 'index', 'crypto', 'cfd'
+    FOREX = "FOREX"
+    FOREX_NO_LEVERAGE = "FOREX_NO_LEVERAGE"
+    FUTURES = "FUTURES"
+    CFD = "CFD"
+    CFDINDEX = "CFDINDEX"
+    CFDLEVERAGE = "CFDLEVERAGE"
+    EXCH_STOCKS = "EXCH_STOCKS"
+    EXCH_FUTURES = "EXCH_FUTURES"
+    EXCH_OPTIONS = "EXCH_OPTIONS"
+    EXCH_OPTIONS_MARGIN = "EXCH_OPTIONS_MARGIN"
+    EXCH_BONDS = "EXCH_BONDS"
+    EXCH_STOCKS_MOEX = "EXCH_STOCKS_MOEX"
+    EXCH_BONDS_MOEX = "EXCH_BONDS_MOEX"
+    SERV_COLLATERAL = "SERV_COLLATERAL"
 
-    Strips broker-specific suffixes before classification so that
-    "EURUSDm" (Exness), "EURUSD." (some brokers), and "EURUSD" (IC Markets)
-    all correctly resolve to 'fx'.
 
-    The original broker symbol name is preserved for all MT5 API calls —
-    this function only affects classification.
-    """
-    # Strip broker suffix for classification only
-    canonical = normalize_symbol(symbol)
+class TradeMode(StrEnum):
+    """What the venue lets a run do with a symbol: `symbol_info().trade_mode`."""
 
-    if canonical in FX_SYMBOLS:
-        return "fx"
-    if canonical in METAL_SYMBOLS:
-        return "metal"
-    if canonical in ENERGY_SYMBOLS:
-        return "energy"
-    if canonical in INDEX_SYMBOLS:
-        return "index"
-    if canonical in CRYPTO_SYMBOLS:
-        return "crypto"
+    DISABLED = "DISABLED"
+    LONGONLY = "LONGONLY"
+    SHORTONLY = "SHORTONLY"
+    CLOSEONLY = "CLOSEONLY"
+    FULL = "FULL"
 
-    return "cfd"
+
+class ChartMode(StrEnum):
+    """The one price a symbol's bars are built from: `symbol_info().chart_mode`."""
+
+    BID = "BID"
+    LAST = "LAST"
+
+
+class BarVolume(StrEnum):
+    """What a bar's volume counts."""
+
+    TICK_COUNT = "tick_count"
+
+
+_CALC_MODES = {
+    mirror.SYMBOL_CALC_MODE_FOREX: CalcMode.FOREX,
+    mirror.SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE: CalcMode.FOREX_NO_LEVERAGE,
+    mirror.SYMBOL_CALC_MODE_FUTURES: CalcMode.FUTURES,
+    mirror.SYMBOL_CALC_MODE_CFD: CalcMode.CFD,
+    mirror.SYMBOL_CALC_MODE_CFDINDEX: CalcMode.CFDINDEX,
+    mirror.SYMBOL_CALC_MODE_CFDLEVERAGE: CalcMode.CFDLEVERAGE,
+    mirror.SYMBOL_CALC_MODE_EXCH_STOCKS: CalcMode.EXCH_STOCKS,
+    mirror.SYMBOL_CALC_MODE_EXCH_FUTURES: CalcMode.EXCH_FUTURES,
+    mirror.SYMBOL_CALC_MODE_EXCH_OPTIONS: CalcMode.EXCH_OPTIONS,
+    mirror.SYMBOL_CALC_MODE_EXCH_OPTIONS_MARGIN: CalcMode.EXCH_OPTIONS_MARGIN,
+    mirror.SYMBOL_CALC_MODE_EXCH_BONDS: CalcMode.EXCH_BONDS,
+    mirror.SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX: CalcMode.EXCH_STOCKS_MOEX,
+    mirror.SYMBOL_CALC_MODE_EXCH_BONDS_MOEX: CalcMode.EXCH_BONDS_MOEX,
+    mirror.SYMBOL_CALC_MODE_SERV_COLLATERAL: CalcMode.SERV_COLLATERAL,
+}
+_TRADE_MODES = {
+    mirror.SYMBOL_TRADE_MODE_DISABLED: TradeMode.DISABLED,
+    mirror.SYMBOL_TRADE_MODE_LONGONLY: TradeMode.LONGONLY,
+    mirror.SYMBOL_TRADE_MODE_SHORTONLY: TradeMode.SHORTONLY,
+    mirror.SYMBOL_TRADE_MODE_CLOSEONLY: TradeMode.CLOSEONLY,
+    mirror.SYMBOL_TRADE_MODE_FULL: TradeMode.FULL,
+}
+_CHART_MODES = {
+    mirror.SYMBOL_CHART_MODE_BID: ChartMode.BID,
+    mirror.SYMBOL_CHART_MODE_LAST: ChartMode.LAST,
+}
+
+FOREX_MODES = frozenset({CalcMode.FOREX, CalcMode.FOREX_NO_LEVERAGE})
+CFD_MODES = frozenset({CalcMode.CFD, CalcMode.CFDINDEX, CalcMode.CFDLEVERAGE})
+
+# The venue's trading day opens at broker midnight, 17:00 in New York, and its week on Sunday's.
+_SESSION_TZ = "America/New_York"
+_SESSION_DAY_OPEN = "17:00"
+_SESSION_WEEK_OPEN = calendar.Day.SUNDAY.name
+
+
+def calc_mode(info) -> CalcMode:
+    """The symbol's calc mode; raises MT5InstrumentError for a value the package lacks."""
+    return _member(info.trade_calc_mode, _CALC_MODES, "trade_calc_mode")
+
+
+def trade_mode(info) -> TradeMode:
+    """The symbol's trade mode; raises MT5InstrumentError for a value the package lacks."""
+    return _member(info.trade_mode, _TRADE_MODES, "trade_mode")
+
+
+def chart_mode(info) -> ChartMode:
+    """The symbol's chart mode; raises MT5InstrumentError for a value the package lacks."""
+    return _member(info.chart_mode, _CHART_MODES, "chart_mode")
+
+
+def _member(value: int, members: dict, field: str):
+    if value not in members:
+        raise MT5InstrumentError(f"{field} {value} is unknown")
+    return members[value]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRECISION AND INCREMENT HELPERS
+# SYMBOL DEFINITIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def resolve_price_precision(symbol: str, digits: int) -> int:
-    """
-    Return the price precision (decimal places) for a symbol.
-
-    Strips broker suffixes before checking overrides so that
-    "XAUUSDm" correctly resolves to the XAUUSD override of 2.
-
-    Uses PRICE_PRECISION_OVERRIDES first, then MT5's symbol_info().digits.
-    """
-    canonical = normalize_symbol(symbol)
-    return PRICE_PRECISION_OVERRIDES.get(canonical, digits)
-
-
-def make_price_increment(price_precision: int) -> Price:
-    """
-    Build the minimum price increment (tick size) from price precision.
-
-    Examples:
-        precision=5  ->  Price(0.00001, 5)   [EURUSD]
-        precision=2  ->  Price(0.01,    2)   [XAUUSD]
-        precision=1  ->  Price(0.1,     1)   [US500]
-        precision=0  ->  Price(1.0,     0)   [rare]
-    """
-    increment = 10**-price_precision
-    return Price(increment, price_precision)
-
-
-def make_size_increment(volume_step: float) -> tuple[Quantity, int]:
-    """
-    Derive the size increment and size precision from MT5's volume_step.
-
-    MT5 volume_step is the minimum lot change (e.g. 0.01 = micro lots).
-    Returns (size_increment, size_precision).
-
-    Examples:
-        volume_step=0.01  ->  (Quantity(0.01, 2), 2)
-        volume_step=0.1   ->  (Quantity(0.1,  1), 1)
-        volume_step=1.0   ->  (Quantity(1.0,  0), 0)
-    """
-    # Count decimal places in volume_step
-    step_str = f"{volume_step:.10f}".rstrip("0")
-    if "." in step_str:
-        size_precision = len(step_str.split(".")[1])
+def parse_symbol_info(info, account: AccountSnapshot, taker_fee: Decimal, ts: int) -> InstrumentAny:
+    """The instrument an mt5.symbol_info() definition describes: a FOREX calc mode is a
+    CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
+    Margins stay NT's defaults: the venue states them as money per lot, which no ratio expresses
+    without a price."""
+    kind = calc_mode(info)
+    if kind in FOREX_MODES:
+        return CurrencyPair(**_definition(info, kind, account, taker_fee, ts))
+    elif kind in CFD_MODES:
+        return Cfd(
+            asset_class=_asset_class(kind), **_definition(info, kind, account, taker_fee, ts)
+        )
     else:
-        size_precision = 0
-
-    return Quantity(volume_step, size_precision), size_precision
+        raise MT5InstrumentError(f"trade_calc_mode {kind} is not one this adapter trades")
 
 
-def make_margin(margin_value: float) -> Decimal:
-    """
-    Convert MT5 margin percentage (0–100) to NautilusTrader Decimal (0.0–1.0).
-
-    MT5 stores margin_initial as a percentage: 3.0 means 3%.
-    NautilusTrader expects a fraction: 0.03 means 3%.
-
-    If the value is 0 (no margin data from broker), use a safe default of 1%
-    to avoid division-by-zero issues in NautilusTrader's margin engine.
-    """
-    if margin_value <= 0:
-        return Decimal("0.01")  # safe 1% default
-    # MT5 can return 100.0 for 100% margin (no leverage on this symbol)
-    # NautilusTrader expects fraction, so divide by 100
-    fraction = margin_value / 100.0
-    return Decimal(str(round(fraction, 6)))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CURRENCY HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def parse_currency(code: str) -> Currency:
-    """
-    Parse a currency code string into a NautilusTrader Currency object.
-
-    Handles edge cases:
-    - Empty string -> raises MT5InstrumentError
-    - Unknown crypto codes (e.g. 'BTC', 'ETH') -> uses Currency.from_str()
-      which handles crypto codes natively in NautilusTrader
-
-    """
-    code = code.strip().upper()
-    if not code:
-        raise MT5InstrumentError("Empty currency code. Check symbol_info().currency_base/profit.")
-    try:
-        return Currency.from_str(code)
-    except Exception as exc:
-        raise MT5InstrumentError(f"Cannot parse currency code '{code}': {exc}") from exc
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN INSTRUMENT PARSER
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def parse_symbol_info(info) -> InstrumentAny:
-    """
-    Convert an MT5 symbol_info() namedtuple into a NautilusTrader instrument.
-
-    This is the main entry point called by MT5InstrumentProvider for each symbol.
-
-    Parameters
-    ----------
-    info : MT5 SymbolInfo namedtuple
-        The raw object returned by mt5.symbol_info(symbol).
-
-    Returns
-    -------
-    CurrencyPair | Cfd | CryptoPerpetual
-
-    Raises
-    ------
-    MT5InstrumentError
-        If required fields are missing or unparseable.
-    """
-    if info is None:
-        raise MT5InstrumentError(
-            "mt5.symbol_info() returned None. "
-            "Check the symbol exists and is added to Market Watch."
-        )
-
-    symbol = info.name
-    instrument_type = detect_instrument_type(symbol)
-
-    # Resolve precision
-    price_precision = resolve_price_precision(symbol, info.digits)
-    price_increment = make_price_increment(price_precision)
-    size_increment, size_precision = make_size_increment(info.volume_step)
-
-    # Build identifiers
-    instrument_id = InstrumentId(Symbol(symbol), MT5_VENUE)
-    raw_symbol = Symbol(symbol)
-
-    # Lot sizes
-    min_qty = Quantity(info.volume_min, size_precision)
-    max_qty = Quantity(info.volume_max, size_precision)
-    lot_size = (
-        Quantity(info.trade_contract_size, 0) if info.trade_contract_size >= 1 else Quantity(1.0, 0)
-    )
-
-    # Margins
-    margin_init = make_margin(info.margin_initial)
-    margin_maint = make_margin(info.margin_maintenance)
-
-    # Timestamp
-    ts_now = time.time_ns()
-
-    if instrument_type == "fx":
-        return _parse_fx(
-            instrument_id,
-            raw_symbol,
-            info,
-            price_precision,
-            price_increment,
-            size_precision,
-            size_increment,
-            min_qty,
-            max_qty,
-            lot_size,
-            margin_init,
-            margin_maint,
-            ts_now,
-        )
-
-    elif instrument_type == "crypto":
-        return _parse_crypto(
-            instrument_id,
-            raw_symbol,
-            info,
-            price_precision,
-            price_increment,
-            size_precision,
-            size_increment,
-            min_qty,
-            max_qty,
-            margin_init,
-            margin_maint,
-            ts_now,
-        )
-
-    else:
-        # metal, energy, index, cfd — all become Cfd
-        return _parse_cfd(
-            instrument_id,
-            raw_symbol,
-            info,
-            instrument_type,
-            price_precision,
-            price_increment,
-            size_precision,
-            size_increment,
-            min_qty,
-            max_qty,
-            lot_size,
-            margin_init,
-            margin_maint,
-            ts_now,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PER-TYPE BUILDERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _parse_fx(
-    instrument_id,
-    raw_symbol,
-    info,
-    price_precision,
-    price_increment,
-    size_precision,
-    size_increment,
-    min_qty,
-    max_qty,
-    lot_size,
-    margin_init,
-    margin_maint,
-    ts_now,
-) -> CurrencyPair:
-    """Build a CurrencyPair for FX spot symbols (EURUSD, GBPUSD, etc.)"""
-    try:
-        base_currency = parse_currency(info.currency_base)
-        quote_currency = parse_currency(info.currency_profit)
-    except MT5InstrumentError as exc:
-        raise MT5InstrumentError(f"FX symbol '{info.name}' has invalid currency: {exc}") from exc
-
-    return CurrencyPair(
-        instrument_id=instrument_id,
-        raw_symbol=raw_symbol,
-        base_currency=base_currency,
-        quote_currency=quote_currency,
-        price_precision=price_precision,
-        size_precision=size_precision,
-        price_increment=price_increment,
-        size_increment=size_increment,
-        lot_size=lot_size,
-        max_quantity=max_qty,
-        min_quantity=min_qty,
-        max_notional=None,
-        min_notional=None,
-        max_price=None,
-        min_price=None,
-        margin_init=margin_init,
-        margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
-        ts_event=ts_now,
-        ts_init=ts_now,
-    )
-
-
-def _parse_cfd(
-    instrument_id,
-    raw_symbol,
-    info,
-    instrument_type,
-    price_precision,
-    price_increment,
-    size_precision,
-    size_increment,
-    min_qty,
-    max_qty,
-    lot_size,
-    margin_init,
-    margin_maint,
-    ts_now,
-) -> Cfd:
-    """Build a Cfd for metals, energies, indices, and unknown CFDs."""
-    # Map instrument type to NautilusTrader AssetClass
-    asset_class_map = {
-        "metal": AssetClass.COMMODITY,
-        "energy": AssetClass.COMMODITY,
-        "index": AssetClass.INDEX,
-        "cfd": AssetClass.ALTERNATIVE,
+def _definition(
+    info, kind: CalcMode, account: AccountSnapshot, taker_fee: Decimal, ts: int
+) -> dict:
+    if info.trade_tick_size <= 0:
+        raise MT5InstrumentError(f"trade_tick_size {info.trade_tick_size} is not positive")
+    size_precision = _decimals(info.volume_step)
+    return {
+        "instrument_id": InstrumentId(Symbol(info.name), MT5_VENUE),
+        "raw_symbol": Symbol(info.name),
+        "base_currency": base_currency(info.currency_base, account),
+        "quote_currency": venue_currency(info.currency_profit, account),
+        "price_precision": info.digits,
+        "size_precision": size_precision,
+        "price_increment": Price(info.trade_tick_size, info.digits),
+        "size_increment": Quantity(info.volume_step, size_precision),
+        "multiplier": Quantity(info.trade_contract_size, _decimals(info.trade_contract_size)),
+        "min_quantity": Quantity(info.volume_min, size_precision),
+        "max_quantity": Quantity(info.volume_max, size_precision),
+        "maker_fee": Decimal(0),
+        "taker_fee": taker_fee,
+        "ts_event": ts,
+        "ts_init": ts,
+        "info": {
+            "chart_mode": chart_mode(info).value,
+            "filling_mode": info.filling_mode,
+            "trade_calc_mode": kind.value,
+            "trade_mode": trade_mode(info).value,
+            "trade_stops_level": info.trade_stops_level,
+            "trade_freeze_level": info.trade_freeze_level,
+            "volume_limit": info.volume_limit,
+            "currency_margin": info.currency_margin,
+            "session_tz": _SESSION_TZ,
+            "session_day_open": _SESSION_DAY_OPEN,
+            "session_week_open": _SESSION_WEEK_OPEN,
+            "bar_volume": BarVolume.TICK_COUNT.value,
+        },
     }
-    asset_class = asset_class_map.get(instrument_type, AssetClass.ALTERNATIVE)
-
-    try:
-        quote_currency = parse_currency(info.currency_profit)
-    except MT5InstrumentError as exc:
-        raise MT5InstrumentError(
-            f"CFD symbol '{info.name}' has invalid quote currency: {exc}"
-        ) from exc
-
-    return Cfd(
-        instrument_id=instrument_id,
-        raw_symbol=raw_symbol,
-        asset_class=asset_class,
-        quote_currency=quote_currency,
-        price_precision=price_precision,
-        size_precision=size_precision,
-        price_increment=price_increment,
-        size_increment=size_increment,
-        lot_size=lot_size,
-        max_quantity=max_qty,
-        min_quantity=min_qty,
-        max_notional=None,
-        min_notional=None,
-        max_price=None,
-        min_price=None,
-        margin_init=margin_init,
-        margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
-        ts_event=ts_now,
-        ts_init=ts_now,
-    )
 
 
-def _parse_crypto(
-    instrument_id,
-    raw_symbol,
-    info,
-    price_precision,
-    price_increment,
-    size_precision,
-    size_increment,
-    min_qty,
-    max_qty,
-    margin_init,
-    margin_maint,
-    ts_now,
-) -> CryptoPerpetual:
-    """Build a CryptoPerpetual for crypto CFD symbols (BTCUSD, ETHUSD, etc.)"""
-    try:
-        base_currency = parse_currency(info.currency_base)
-        quote_currency = parse_currency(info.currency_profit)
-        settlement_currency = parse_currency(info.currency_profit)
-    except MT5InstrumentError as exc:
-        raise MT5InstrumentError(
-            f"Crypto symbol '{info.name}' has invalid currency: {exc}"
-        ) from exc
+def _asset_class(kind: CalcMode) -> AssetClass:
+    if kind == CalcMode.CFDINDEX:
+        return AssetClass.INDEX
+    else:
+        return AssetClass.ALTERNATIVE
 
-    return CryptoPerpetual(
-        instrument_id=instrument_id,
-        raw_symbol=raw_symbol,
-        base_currency=base_currency,
-        quote_currency=quote_currency,
-        settlement_currency=settlement_currency,
-        is_inverse=False,  # Exness crypto CFDs are all linear (USD-settled)
-        price_precision=price_precision,
-        size_precision=size_precision,
-        price_increment=price_increment,
-        size_increment=size_increment,
-        max_quantity=max_qty,
-        min_quantity=min_qty,
-        max_notional=None,
-        min_notional=None,
-        max_price=None,
-        min_price=None,
-        margin_init=margin_init,
-        margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
-        ts_event=ts_now,
-        ts_init=ts_now,
-    )
+
+def finite_decimal(value: float, field: str) -> Decimal:
+    """A raw terminal number as an exact Decimal; raises MT5InstrumentError for NaN or infinity."""
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise MT5InstrumentError(f"{field} {value} is not finite")
+    return number
+
+
+def _decimals(value: float) -> int:
+    """The decimal places of a step or size as the terminal states it."""
+    return max(0, -Decimal(str(value)).normalize().as_tuple().exponent)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,7 +237,7 @@ def parse_quote_tick(symbol_info_tick, instrument: InstrumentAny) -> QuoteTick:
     ----------
     symbol_info_tick : MT5 Tick namedtuple or numpy.void row
         Has fields: bid, ask, time (epoch seconds).
-    instrument : CurrencyPair | Cfd | CryptoPerpetual
+    instrument : CurrencyPair | Cfd
         The instrument this tick belongs to (for precision info).
 
     Returns

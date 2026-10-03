@@ -56,7 +56,7 @@ from nautilus_trader.config import (
     TradingNodeConfig,
 )
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
-from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
 from mt5connect.config import MT5Config
 from mt5connect.connection import MT5Connection
@@ -74,10 +74,9 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED CONNECTION REGISTRY
 #
-# Both factories need to share a single MT5Connection and
-# MT5InstrumentProvider instance — one IPC channel to the terminal,
-# one instrument cache. This registry creates them once per (config, loop)
-# pair and reuses them on subsequent calls.
+# Both factories need to share a single MT5Connection and MT5InstrumentProvider instance — one
+# channel to the terminal, one instrument cache. This registry creates them once per account and
+# server and reuses them on subsequent calls.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _connection_registry: dict[int, tuple[MT5Connection, MT5InstrumentProvider]] = {}
@@ -90,7 +89,7 @@ _mt5_config_registry: dict[str, dict] = {}
 
 def _get_or_create_connection(
     config: MT5Config,
-    loop: asyncio.AbstractEventLoop,
+    clock: LiveClock,
 ) -> tuple[MT5Connection, MT5InstrumentProvider]:
     """
     Return the shared MT5Connection and MT5InstrumentProvider for this config.
@@ -102,12 +101,9 @@ def _get_or_create_connection(
     registry_key = hash((config.account, config.server))
 
     if registry_key not in _connection_registry:
-        logger.info(
-            f"MT5 factories: creating connection for account={config.account} "
-            f"server={config.server}"
-        )
+        logger.info(f"MT5 factories: creating connection for server={config.server}")
         conn = MT5Connection(config)
-        provider = MT5InstrumentProvider(conn)
+        provider = MT5InstrumentProvider(conn, clock=clock, config=_provider_config(config))
 
         conn.connect()
 
@@ -115,6 +111,13 @@ def _get_or_create_connection(
         logger.info(f"MT5 factories: connection established — {conn}")
 
     return _connection_registry[registry_key]
+
+
+def _provider_config(config: MT5Config) -> InstrumentProviderConfig:
+    """The provider loads exactly the symbols the config names."""
+    return InstrumentProviderConfig(
+        load_ids=frozenset(InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in config.symbols)
+    )
 
 
 def clear_connection_registry() -> None:
@@ -190,7 +193,7 @@ class MT5LiveDataClientFactory(LiveDataClientFactory):
         )
         if mt5_config is None:
             raise RuntimeError("MT5LiveDataClientFactory: no MT5Config found.")
-        conn, provider = _get_or_create_connection(mt5_config, loop)
+        conn, provider = _get_or_create_connection(mt5_config, clock)
 
         return MT5DataClient(
             loop=loop,
@@ -257,9 +260,7 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
         )
         if mt5_config is None:
             raise RuntimeError("MT5LiveExecClientFactory: no MT5Config found.")
-        conn, provider = _get_or_create_connection(mt5_config, loop)
-
-        account_id = AccountId(f"MT5-{mt5_config.account}")
+        conn, provider = _get_or_create_connection(mt5_config, clock)
 
         return MT5LiveExecutionClient(
             loop=loop,
@@ -269,7 +270,6 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
             clock=clock,
             instrument_provider=provider,
             config=mt5_config,
-            account_id=account_id,
         )
 
 
@@ -323,7 +323,6 @@ def build_mt5_node_config(
         "mt5_config": mt5_config,
         "data_factory": MT5LiveDataClientFactory,
         "exec_factory": MT5LiveExecClientFactory,
-        "account_id": f"MT5-{mt5_config.account}",
         "load_ids": [f"{s}.{venue_str}" for s in mt5_config.symbols],
     }
 
@@ -335,11 +334,11 @@ def build_mt5_node_config(
     # TradingNodeConfig just needs the client config stubs so build() knows
     # which names to iterate over.
     data_client_cfg = LiveDataClientConfig(
-        instrument_provider=InstrumentProviderConfig(load_all=True),
+        instrument_provider=_provider_config(mt5_config),
         routing=RoutingConfig(default=True, venues=frozenset({venue_str})),
     )
     exec_client_cfg = LiveExecClientConfig(
-        instrument_provider=InstrumentProviderConfig(load_all=True),
+        instrument_provider=_provider_config(mt5_config),
         routing=RoutingConfig(default=True, venues=frozenset({venue_str})),
     )
 

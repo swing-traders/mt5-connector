@@ -21,8 +21,10 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+from nautilus_trader.model.identifiers import TraderId
 
 from mt5connect import remote_mt5 as mt5
+from mt5connect.execution import magic_for
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -40,11 +42,11 @@ SERVER = _require("MT5_SERVER")
 SERVER_URL = os.getenv("MT5_SERVER_URL", "http://127.0.0.1:5000")
 SYMBOL = os.getenv("MT5_SYMBOLS", "XAUUSD").split(",")[0].strip()
 VOLUME = 0.01
-MAGIC = 510
+MAGIC = magic_for(TraderId("PLACE-ORDER-001"))
 
 
 def connect():
-    print(f"Connecting to MT5 — account {ACCOUNT} on {SERVER} via {SERVER_URL}...")
+    print(f"Connecting to MT5 on {SERVER} via {SERVER_URL}...")
     mt5.configure(SERVER_URL)
     if not mt5.initialize():
         sys.exit(f"mt5.initialize() failed: {mt5.last_error()}")

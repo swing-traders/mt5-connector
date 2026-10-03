@@ -43,7 +43,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from nautilus_trader.model.currencies import Currency
+from nautilus_trader.model.currencies import USD, Currency
 from nautilus_trader.model.enums import (
     OrderSide,
     OrderType,
@@ -57,19 +57,23 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
+from venue_doubles import account_info
 
 from mt5connect import remote_mt5 as mt5
+from mt5connect.connection import AccountSnapshot
 from mt5connect.errors import MT5ConnectionError
 from mt5connect.execution import (
     MT5LiveExecutionClient,
     _mt5_retcode_to_str,
     _nautilus_order_to_mt5_pending,
     _nautilus_side_to_mt5_market,
-    _parse_account_currency,
     _time_in_force_to_mt5,
+    magic_for,
 )
 
-MAGIC = 510
+# The magic of the trader the stub message bus carries.
+MAGIC = magic_for(TestIdStubs.trader_id())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +242,7 @@ def make_provider(instrument=None):
     provider.load_symbol = MagicMock(return_value=inst)
     provider.list_all = MagicMock(return_value=[inst])
     provider.load_all_async = AsyncMock()
+    provider.load_ids_async = AsyncMock()
 
     return provider
 
@@ -255,11 +260,10 @@ def make_exec_client(config, mock_mt5_exec) -> MT5LiveExecutionClient:
     conn = MagicMock()
     conn.is_connected = True
     conn.ensure_connected = MagicMock()
-    account_snap = MagicMock()
-    account_snap.balance = 10000.0
-    account_snap.equity = 10000.0  # keep equal to balance — no unrealised P&L in tests
-    account_snap.currency = "USD"
-    conn.get_account_info = MagicMock(return_value=account_snap)
+    # Equity equal to balance: no unrealised P&L in these tests.
+    snapshot = AccountSnapshot.from_mt5(account_info(balance=10000.0, equity=10000.0))
+    conn.get_account_info = MagicMock(return_value=snapshot)
+    conn.get_terminal_info = MagicMock(return_value={"connected": True, "trade_allowed": True})
     conn.reconnect_async = AsyncMock(return_value=True)
 
     provider = make_provider()
@@ -278,6 +282,8 @@ def make_exec_client(config, mock_mt5_exec) -> MT5LiveExecutionClient:
         instrument_provider=provider,
         config=config,
     )
+    # The account currency as the connect registers it.
+    client._account_currency = USD
     # Patch the internal generate methods so we can inspect calls
     client.generate_order_accepted = MagicMock()
     client.generate_order_rejected = MagicMock()
@@ -372,28 +378,6 @@ class TestNautilusOrderToMt5Pending:
 
         with pytest.raises(MT5OrderError):
             _nautilus_order_to_mt5_pending(OrderType.TRAILING_STOP_MARKET, OrderSide.BUY)
-
-
-class TestParseAccountCurrency:
-    def test_usd(self):
-        from nautilus_trader.model.currencies import USD
-
-        assert _parse_account_currency("USD") == USD
-
-    def test_eur(self):
-        from nautilus_trader.model.currencies import EUR
-
-        assert _parse_account_currency("EUR") == EUR
-
-    def test_fallback_to_usd(self):
-        from nautilus_trader.model.currencies import USD
-
-        assert _parse_account_currency("XXXX") == USD
-
-    def test_case_insensitive(self):
-        from nautilus_trader.model.currencies import USD
-
-        assert _parse_account_currency("usd") == USD
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,7 +551,7 @@ class TestSubmitMarketOrder:
         client.generate_order_accepted.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_magic_number_set_in_request(self, config, mock_mt5_exec):
+    async def test_the_derived_magic_is_set_in_the_request(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
         order = make_mock_order()
         cmd = MagicMock()
@@ -576,7 +560,7 @@ class TestSubmitMarketOrder:
         await client._submit_order(cmd)
 
         req = mock_mt5_exec.order_send.call_args[0][0]
-        assert req["magic"] == config.magic_number
+        assert req["magic"] == MAGIC
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1145,10 +1129,10 @@ class TestProperties:
         client._known_position_tickets = {10, 20}
         assert client.known_position_count == 2
 
-    def test_repr_contains_account(self, config, mock_mt5_exec):
+    def test_repr_omits_the_login(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)
         r = repr(client)
-        assert "12345678" in r
+        assert "12345678" not in r
 
     def test_repr_contains_orders_and_positions(self, config, mock_mt5_exec):
         client = make_exec_client(config, mock_mt5_exec)

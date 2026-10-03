@@ -122,7 +122,8 @@ Find your server name in MT5 → File → Open Account → search your broker.
 from mt5connect import remote_mt5 as mt5
 
 mt5.configure("http://127.0.0.1:5000")
-print(mt5.account_info())
+info = mt5.account_info()
+print(info.currency, info.balance)
 ```
 
 **5. Run the example live strategy:**
@@ -166,9 +167,6 @@ config = MT5Config(
     # Order/position polling interval
     exec_poll_interval_ms = 250,   # default: 250ms
 
-    # Order tagging — change if running multiple bots simultaneously
-    magic_number = 510,
-
     # Reconnection
     reconnect_initial_delay_s = 1.0,
     reconnect_max_delay_s     = 60.0,
@@ -209,7 +207,13 @@ Different brokers use different symbol names. Always use the **exact name shown 
 | IC Markets | `EURUSD` | `XAUUSD` | `BTCUSD` |
 | Pepperstone | `EURUSD` | `XAUUSD` | `BTCUSD` |
 
-The adapter handles suffix normalisation internally for instrument classification — you just provide the exact broker symbol name.
+The instrument provider loads exactly these symbols and builds each one from the venue's own definition — nothing is inferred from a symbol's name:
+
+- **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
+- **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
+- **Currencies**: the base is `currency_base` and the quote — the settlement currency — `currency_profit`, each at NT's precision, else the account's currency digits for the account currency, else its ISO 4217 minor units. A settlement code none of those covers is refused at load; a base code is built as NT builds a code it does not know. The account currency and every settlement currency are registered with NT before the first account state; base-only codes never are.
+- **Taker fee** from the commission schedule the server relays for the symbol: a money rule per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote and halved when charged on entry alone. With none relayed it is zero; a rule of any other mode is refused at load.
+- **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, the session calendar (`session_tz`, `session_day_open`, `session_week_open`) and `bar_volume` (`tick_count`).
 
 ---
 
@@ -799,9 +803,11 @@ The conformance suite's static tier downloads the pinned `MetaTrader5` wheel onc
 ```
 mt5-connector/
 ├── mt5connect/
+│   ├── commissions.py   # the relayed commission rule and the taker fee it implies
 │   ├── config.py        # MT5Config — all user-facing configuration
 │   ├── connection.py    # MT5Connection — server connection lifecycle
-│   ├── constants.py     # venue, magic number, symbol sets, normalize_symbol()
+│   ├── constants.py     # venue, polling and reconnect defaults
+│   ├── currencies.py    # the precision ladder a venue currency code is built by
 │   ├── data.py          # MT5DataClient — WebSocket tick stream and history requests
 │   ├── downloader.py    # MT5DataDownloader — historical bar download
 │   ├── errors.py        # custom exceptions
@@ -866,9 +872,9 @@ Check that the bar type string in your strategy config exactly matches the bar t
 ## Safety notes
 
 - Always use a **demo account** until you have verified your strategy behaves correctly.
-- The `magic_number` in `MT5Config` (default: `510`) tags every order placed by the adapter. Orders without this magic number are ignored — safe to trade the same account manually alongside the bot.
-- Change `magic_number` if you run multiple bots simultaneously to avoid one bot managing the other's positions.
-- The adapter uses netting mode (one position per symbol) matching how MT5 accounts work by default. Hedging accounts are not currently supported.
+- Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, so manual trading on the same account, or a node with another trader id, is left alone.
+- The adapter runs on hedging accounts only: it declares NT's `HEDGING` position model and refuses to connect to an account whose margin mode is netting or exchange, or to a read-only (investor) session.
+- The execution account id is `MT5-<login>`, the login read from the account at connect.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
 
 ---

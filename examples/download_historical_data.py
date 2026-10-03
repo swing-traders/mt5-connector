@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connect.config import MT5Config
@@ -52,7 +53,7 @@ config = MT5Config(
 conn = MT5Connection(config)
 conn.connect()
 
-provider = MT5InstrumentProvider(conn)
+provider = MT5InstrumentProvider(conn, clock=LiveClock())
 catalog = ParquetDataCatalog(CATALOG)
 
 # Load and write the instrument definition first

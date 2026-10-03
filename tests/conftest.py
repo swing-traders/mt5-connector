@@ -7,6 +7,7 @@ Shared fixtures: a valid MT5Config, and the shim mocked inside mt5connect.connec
 from unittest.mock import MagicMock, patch
 
 import pytest
+from venue_doubles import account_info
 
 from mt5connect.config import MT5Config
 
@@ -54,27 +55,27 @@ def mock_mt5():
         mock.login.return_value = True
         mock.last_error.return_value = (0, "No error")
 
-        # Realistic Exness demo account
-        account = MagicMock()
-        account.login = 12345678
-        account.server = "Exness-MT5Trial1"
-        account.balance = 10000.00
-        account.equity = 10050.25
-        account.margin = 100.00
-        account.margin_free = 9950.25
-        account.margin_level = 10050.25
-        account.currency = "USD"
-        account.leverage = 2000
-        account.profit = 50.25
-        account.name = "Test Trader"
-        account.company = "Exness Technologies Ltd"
-        mock.account_info.return_value = account
+        mock.account_info.return_value = account_info(
+            login=12345678,
+            server="Exness-MT5Trial1",
+            balance=10000.00,
+            equity=10050.25,
+            margin=100.00,
+            margin_free=9950.25,
+            margin_level=10050.25,
+            currency="USD",
+            leverage=2000,
+            profit=50.25,
+            name="Test Trader",
+            company="Exness Technologies Ltd",
+        )
 
         terminal = MagicMock()
         terminal.name = "MetaTrader 5"
         terminal.path = "C:\\Program Files\\MetaTrader 5"
         terminal.data_path = "C:\\Users\\Trader\\AppData\\Roaming\\MetaQuotes\\Terminal"
         terminal.connected = True
+        terminal.trade_allowed = True
         terminal.ping_last = 3
         terminal.retransmission = 0.0
         mock.terminal_info.return_value = terminal
