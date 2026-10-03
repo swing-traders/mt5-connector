@@ -1,5 +1,5 @@
-"""The MT5 server's history routes, called through the remote backend's session: the rows of a bar
-or tick window once the server vouches for them, and the floors it advertises."""
+"""The MT5 server's history routes, called through the shim's session (`remote_mt5`): the rows of a
+bar or tick window once the server vouches for them, and the floors it advertises."""
 
 import math
 import threading

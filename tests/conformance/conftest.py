@@ -1,5 +1,4 @@
 import importlib
-import sys
 
 import pytest
 from mt5_wheel import PackageSurface, fetch_wheel, read_surface
@@ -12,10 +11,7 @@ def package_surface(request) -> PackageSurface:
 
 @pytest.fixture(scope="module")
 def package():
-    # tests/conftest.py stands a MagicMock in for MetaTrader5; the real package replaces it here.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.delitem(sys.modules, "MetaTrader5", raising=False)
-        yield importlib.import_module("MetaTrader5")
+    return importlib.import_module("MetaTrader5")
 
 
 @pytest.fixture(scope="module")

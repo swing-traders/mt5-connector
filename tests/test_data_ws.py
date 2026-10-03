@@ -13,7 +13,6 @@ def _remote_config():
         password="p",
         server="s",
         symbols=["EURUSD"],
-        backend="remote",
         server_url="http://127.0.0.1:5000",
         ws_url="ws://127.0.0.1:9000",
     )
@@ -99,14 +98,13 @@ def _client():
 
 
 @pytest.mark.asyncio
-async def test_connect_starts_ws_stream_not_poll_loop():
+async def test_connect_starts_ws_stream():
     client = _client()
     with patch("mt5connect.ws_stream.WSStreamClient", return_value=FakeStream()) as ws_cls:
         await client._connect()
         assert ws_cls.called
         assert client._ws is not None
         assert client._ws.start_calls == 1
-        assert client._poll_task is None
 
 
 @pytest.mark.asyncio

@@ -6,16 +6,14 @@ Exhaustive tests for MT5DataClient.
 Tests are split into:
   1.  Helpers (_epoch_s, _bar_spec_to_mt5_timeframe)
   2.  Initial state
-  3.  _connect() — instrument loading, poll task creation
-  4.  _disconnect() — task cancellation, state cleanup
+  3.  _connect() — instrument loading
+  4.  _disconnect() — state cleanup
   5.  _subscribe_quote_ticks() / _unsubscribe_quote_ticks()
   6.  _subscribe_bars() / _unsubscribe_bars()
-  7.  _poll_once() — tick emission, duplicate suppression
-  8.  _poll_loop() — reconnect on connection error, stop on failure
-  9.  _request_quote_ticks() — historical ticks through the server's history routes
-  10. _request_bars() — historical bars through the server's history routes
-  11. No-op methods — don't raise
-  12. Properties — subscribed_quote_ticks, is_polling
+  7.  _request_quote_ticks() — historical ticks through the server's history routes
+  8.  _request_bars() — historical bars through the server's history routes
+  9.  No-op methods — don't raise
+  10. Properties — subscribed_quote_ticks
 """
 
 import asyncio
@@ -26,7 +24,6 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
@@ -40,13 +37,6 @@ from mt5connect.history_wire import Series
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-disconnect_raises = pytest.mark.xfail(
-    strict=True,
-    raises=asyncio.CancelledError,
-    reason="_disconnect awaits the poll task it cancelled without absorbing the CancelledError, "
-    "so it raises and skips the rest of its cleanup",
-)
 
 
 def make_instrument(symbol="EURUSDm"):
@@ -78,17 +68,6 @@ def make_instrument(symbol="EURUSDm"):
     )
 
 
-def make_raw_tick(bid=1.085, ask=1.0852, time_s=1_700_000_000, time_msc=None):
-    tick = MagicMock()
-    tick.bid = bid
-    tick.ask = ask
-    tick.time = time_s
-    tick.time_msc = time_msc or (time_s * 1000)
-    tick.last = bid
-    tick.volume = 1
-    return tick
-
-
 def make_raw_rate(
     time_s=1_700_000_000, open_=1.085, high=1.090, low=1.080, close=1.088, tick_volume=1000
 ):
@@ -116,7 +95,7 @@ def make_config(symbols=None):
         password="test",
         server="Exness-MT5Trial1",
         symbols=symbols or ["EURUSDm"],
-        poll_interval_ms=50,
+        server_url="http://127.0.0.1:5000",
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
         reconnect_max_attempts=2,
@@ -165,6 +144,15 @@ def make_provider(instrument=None):
     provider.load_all_async = AsyncMock()
 
     return provider
+
+
+def make_stream():
+    """A stand-in for the WebSocket tick stream the client starts on connect."""
+    stream = MagicMock()
+    stream.start = AsyncMock()
+    stream.stop = AsyncMock()
+    stream.send = AsyncMock()
+    return stream
 
 
 class RecordedDataClient(MT5DataClient):
@@ -324,15 +312,6 @@ class TestInitialState:
     def test_no_subscribed_ticks_initially(self, client):
         assert client.subscribed_quote_ticks() == []
 
-    def test_not_polling_initially(self, client):
-        assert client.is_polling is False
-
-    def test_poll_task_none_initially(self, client):
-        assert client._poll_task is None
-
-    def test_last_tick_time_empty(self, client):
-        assert client._last_tick_time == {}
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 3. _connect()
@@ -341,55 +320,29 @@ class TestInitialState:
 
 class TestConnect:
 
-    @disconnect_raises
     @pytest.mark.asyncio
     async def test_connect_checks_connection(self):
         c, conn, prov, loop = make_client()
-        try:
+        with patch("mt5connect.ws_stream.WSStreamClient", return_value=make_stream()):
             await c._connect()
-            conn.ensure_connected.assert_called()
-        finally:
-            await c._disconnect()
+        conn.ensure_connected.assert_called()
+        await c._disconnect()
 
-    @disconnect_raises
     @pytest.mark.asyncio
     async def test_connect_loads_instruments(self):
         c, conn, prov, loop = make_client()
-        try:
+        with patch("mt5connect.ws_stream.WSStreamClient", return_value=make_stream()):
             await c._connect()
-            prov.get_instrument.assert_called()
-        finally:
-            await c._disconnect()
+        prov.get_instrument.assert_called()
+        await c._disconnect()
 
-    @disconnect_raises
     @pytest.mark.asyncio
     async def test_connect_emits_instruments(self):
         c, conn, prov, loop = make_client()
-        try:
+        with patch("mt5connect.ws_stream.WSStreamClient", return_value=make_stream()):
             await c._connect()
-            c._handle_data.assert_called()
-        finally:
-            await c._disconnect()
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_connect_starts_poll_task(self):
-        c, conn, prov, loop = make_client()
-        try:
-            await c._connect()
-            assert c._poll_task is not None
-        finally:
-            await c._disconnect()
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_connect_poll_task_is_running(self):
-        c, conn, prov, loop = make_client()
-        try:
-            await c._connect()
-            assert not c._poll_task.done()
-        finally:
-            await c._disconnect()
+        c._handle_data.assert_called()
+        await c._disconnect()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -399,48 +352,14 @@ class TestConnect:
 
 class TestDisconnect:
 
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_disconnect_cancels_poll_task(self):
-        c, conn, prov, loop = make_client()
-        await c._connect()
-        task = c._poll_task
-        await c._disconnect()
-        assert task.cancelled() or task.done()
-
-    @disconnect_raises
     @pytest.mark.asyncio
     async def test_disconnect_clears_subscriptions(self):
         c, conn, prov, loop = make_client()
-        await c._connect()
+        with patch("mt5connect.ws_stream.WSStreamClient", return_value=make_stream()):
+            await c._connect()
         c._subscribed_symbols.add("EURUSDm")
         await c._disconnect()
         assert c._subscribed_symbols == set()
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_disconnect_clears_last_tick_time(self):
-        c, conn, prov, loop = make_client()
-        await c._connect()
-        c._last_tick_time["EURUSDm"] = 123456
-        await c._disconnect()
-        assert c._last_tick_time == {}
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_disconnect_sets_poll_task_none(self):
-        c, conn, prov, loop = make_client()
-        await c._connect()
-        await c._disconnect()
-        assert c._poll_task is None
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_not_polling_after_disconnect(self):
-        c, conn, prov, loop = make_client()
-        await c._connect()
-        await c._disconnect()
-        assert c.is_polling is False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -474,15 +393,6 @@ class TestSubscribeQuoteTicks:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._unsubscribe_quote_ticks(cmd)
         assert "EURUSDm" not in client._subscribed_symbols
-
-    @pytest.mark.asyncio
-    async def test_unsubscribe_clears_last_tick_time(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        client._last_tick_time["EURUSDm"] = 123456789
-        cmd = MagicMock()
-        cmd.instrument_id.symbol.value = "EURUSDm"
-        await client._unsubscribe_quote_ticks(cmd)
-        assert "EURUSDm" not in client._last_tick_time
 
     @pytest.mark.asyncio
     async def test_unsubscribe_non_subscribed_does_not_raise(self, client):
@@ -525,181 +435,7 @@ class TestSubscribeBars:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. _poll_once()
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-class TestPollOnce:
-
-    @pytest.mark.asyncio
-    async def test_does_nothing_when_no_subscriptions(self, client):
-        client._subscribed_symbols.clear()
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            await client._poll_once()
-        mock_mt5.symbol_info_tick.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_calls_symbol_info_tick_for_subscribed(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = make_raw_tick()
-            await client._poll_once()
-        mock_mt5.symbol_info_tick.assert_called_once_with("EURUSDm")
-
-    @pytest.mark.asyncio
-    async def test_emits_quote_tick_on_new_data(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        raw = make_raw_tick(time_msc=1_700_000_000_000)
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = raw
-            await client._poll_once()
-        client._handle_data.assert_called_once()
-        args = client._handle_data.call_args[0]
-        assert isinstance(args[0], QuoteTick)
-
-    @pytest.mark.asyncio
-    async def test_suppresses_duplicate_tick(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        raw = make_raw_tick(time_msc=1_700_000_000_000)
-        # Pre-set last known time to same value
-        client._last_tick_time["EURUSDm"] = 1_700_000_000_000
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = raw
-            await client._poll_once()
-        # Should NOT emit because time_msc unchanged
-        client._handle_data.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_emits_after_tick_time_changes(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        # First tick
-        client._last_tick_time["EURUSDm"] = 1_700_000_000_000
-        raw = make_raw_tick(time_msc=1_700_000_001_000)  # new time
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = raw
-            await client._poll_once()
-        client._handle_data.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_updates_last_tick_time(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        raw = make_raw_tick(time_msc=9_999_999_000)
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = raw
-            await client._poll_once()
-        assert client._last_tick_time["EURUSDm"] == 9_999_999_000
-
-    @pytest.mark.asyncio
-    async def test_skips_none_tick(self, client):
-        client._subscribed_symbols.add("EURUSDm")
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = None
-            await client._poll_once()
-        client._handle_data.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_skips_symbol_with_no_instrument(self, client):
-        client._subscribed_symbols.add("UNKNOWN")
-        client._provider.get_instrument.return_value = None
-        raw = make_raw_tick(time_msc=1_700_000_000_000)
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = raw
-            await client._poll_once()
-        client._handle_data.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_polls_multiple_symbols(self, client):
-        for sym in ["EURUSDm", "XAUUSDm"]:
-            client._subscribed_symbols.add(sym)
-        raw = make_raw_tick(time_msc=1_700_000_000_000)
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = raw
-            await client._poll_once()
-        assert mock_mt5.symbol_info_tick.call_count == 2
-
-    @pytest.mark.xfail(
-        strict=True,
-        raises=RuntimeError,
-        reason="_poll_once lets one symbol's exception escape, aborting the poll of every other "
-        "subscribed symbol",
-    )
-    @pytest.mark.asyncio
-    async def test_error_in_one_symbol_does_not_stop_others(self, client):
-        client._subscribed_symbols = {"EURUSDm", "XAUUSDm"}
-        call_count = {"n": 0}
-
-        def side_effect(sym):
-            call_count["n"] += 1
-            if sym == "EURUSDm":
-                raise RuntimeError("IPC error")
-            return make_raw_tick(time_msc=1_700_000_000_000)
-
-        with patch("mt5connect.data.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.side_effect = side_effect
-            await client._poll_once()
-        # Both symbols were attempted
-        assert call_count["n"] == 2
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 8. _poll_loop() reconnect behaviour
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-poll_loop_never_reconnects = pytest.mark.xfail(
-    strict=True,
-    raises=MT5ConnectionError,
-    reason="_poll_loop handles no error: an MT5ConnectionError ends the loop instead of "
-    "triggering reconnect_async",
-)
-
-
-class TestPollLoop:
-
-    @poll_loop_never_reconnects
-    @pytest.mark.asyncio
-    async def test_poll_loop_reconnects_on_connection_error(self):
-        c, conn, prov, loop = make_client()
-
-        call_count = {"n": 0}
-
-        async def flaky_poll():
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise MT5ConnectionError("lost")
-            await asyncio.sleep(10)  # block until cancelled
-
-        c._poll_once = flaky_poll
-        conn.reconnect_async = AsyncMock(return_value=True)
-
-        task = loop.create_task(c._poll_loop())
-        await asyncio.sleep(0.1)  # let it run
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        conn.reconnect_async.assert_called()
-
-    @poll_loop_never_reconnects
-    @pytest.mark.asyncio
-    async def test_poll_loop_stops_when_reconnect_fails(self):
-        c, conn, prov, loop = make_client()
-
-        async def always_fails():
-            raise MT5ConnectionError("lost")
-
-        c._poll_once = always_fails
-        conn.reconnect_async = AsyncMock(return_value=False)
-
-        # loop should exit on its own when reconnect fails
-        await asyncio.wait_for(c._poll_loop(), timeout=2.0)
-        conn.reconnect_async.assert_called()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 9. _request_quote_ticks()
+# 7. _request_quote_ticks()
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -787,7 +523,7 @@ class TestRequestQuoteTicks:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 10. _request_bars()
+# 8. _request_bars()
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -861,7 +597,7 @@ class TestRequestBars:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 11. No-op methods — don't raise
+# 9. No-op methods — don't raise
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -905,7 +641,7 @@ class TestNoOpMethods:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 12. Properties
+# 10. Properties
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -921,24 +657,3 @@ class TestProperties:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
         assert InstrumentId.from_str("EURUSDm.MT5") in client.subscribed_quote_ticks()
-
-    def test_is_polling_false_initially(self, client):
-        assert client.is_polling is False
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_is_polling_true_after_connect(self):
-        c, conn, prov, loop = make_client()
-        try:
-            await c._connect()
-            assert c.is_polling is True
-        finally:
-            await c._disconnect()
-
-    @disconnect_raises
-    @pytest.mark.asyncio
-    async def test_is_polling_false_after_disconnect(self):
-        c, conn, prov, loop = make_client()
-        await c._connect()
-        await c._disconnect()
-        assert c.is_polling is False

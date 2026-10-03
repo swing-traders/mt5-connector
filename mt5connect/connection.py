@@ -7,11 +7,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
-try:
-    import MetaTrader5 as mt5
-except ImportError:  # pragma: no cover - Windows-only dependency
-    mt5 = None  # bound to the real backend by mt5connect.backend.set_backend()
-
+from mt5connect import remote_mt5 as mt5
 from mt5connect.errors import MT5ConnectionError, MT5LoginError
 
 if TYPE_CHECKING:
@@ -29,8 +25,8 @@ class ConnectionState(Enum):
     """Tracks exactly where in the lifecycle the connection is."""
 
     DISCONNECTED = auto()  # nothing attempted yet
-    INITIALIZING = auto()  # mt5.initialize() in progress
-    INITIALIZED = auto()  # terminal IPC established, not logged in
+    INITIALIZING = auto()  # server initialize in progress
+    INITIALIZED = auto()  # server initialized, not logged in
     LOGGING_IN = auto()  # mt5.login() in progress
     CONNECTED = auto()  # fully ready to use
     RECONNECTING = auto()  # lost connection, retrying
@@ -99,7 +95,7 @@ class AccountSnapshot:
 
 class MT5Connection:
     """
-    Owns the entire MT5 terminal connection lifecycle.
+    Owns the connection lifecycle to the MT5 terminal behind the server.
 
     Usage
     -----
@@ -114,9 +110,9 @@ class MT5Connection:
         with MT5Connection(config) as conn:
             info = conn.get_account_info()
 
-    All core methods are synchronous because MetaTrader5 Python lib
-    is synchronous (Windows IPC). reconnect_async() is provided for
-    use inside asyncio polling loops.
+    All core methods are synchronous because the shim's calls to the server
+    are synchronous. reconnect_async() is provided for use inside asyncio
+    polling loops.
     """
 
     def __init__(self, config: MT5Config) -> None:
@@ -140,9 +136,10 @@ class MT5Connection:
 
     def connect(self) -> None:
         """
-        Full connection: initialize terminal IPC then login to broker.
+        Full connection: bind the shim to the configured server, initialize, then login to broker.
         Raises MT5ConnectionError or MT5LoginError on failure.
         """
+        mt5.configure(self._config.server_url, self._config.ws_url)
         self._initialize()
         self._login()
         self._attempt = 0  # reset backoff counter on clean connect
@@ -272,7 +269,7 @@ class MT5Connection:
 
     def get_terminal_info(self) -> dict:
         """
-        Return diagnostic info about the running MT5 terminal.
+        Return diagnostic info about the server's MT5 terminal.
         Useful for logging on startup.
         """
         self.ensure_connected()
@@ -306,7 +303,7 @@ class MT5Connection:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _initialize(self) -> None:
-        """Boot the IPC channel to the MT5 terminal process."""
+        """Ask the server to initialize its MT5 terminal."""
         logger.debug("MT5Connection: calling mt5.initialize()")
         self._state = ConnectionState.INITIALIZING
 
@@ -315,12 +312,11 @@ class MT5Connection:
             code, msg = mt5.last_error()
             self._state = ConnectionState.DISCONNECTED
             raise MT5ConnectionError(
-                f"mt5.initialize() failed — error {code}: {msg}. "
-                "Is the MT5 terminal open and running?"
+                f"mt5.initialize() failed on the server's MT5 terminal — error {code}: {msg}"
             )
 
         self._state = ConnectionState.INITIALIZED
-        logger.debug("MT5Connection: terminal IPC established")
+        logger.debug("MT5Connection: server initialized")
 
     def _login(self) -> None:
         """Authenticate with the broker. Must be called after _initialize()."""
