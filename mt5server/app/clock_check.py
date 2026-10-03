@@ -1,8 +1,8 @@
 """The broker clock's verification against the trade-server time the terminal's EA relays.
 
-State: `status`, the latest verification, held while the latest relayed sample is fresh and cleared
-while it is not; the server exits on a sample the broker clock contradicts, and when no fresh sample
-arrives at connect."""
+State: `status`, the latest verification, held while the latest relayed sample is fresh and the
+terminal has been connected without a break for the maximum age, and cleared while it is not; the
+server exits on a sample the broker clock contradicts, and when none verifies it at connect."""
 
 import logging
 import os
@@ -75,7 +75,7 @@ class ClockCheck:
         self.status = ClockStatus()
 
     def run(self) -> None:
-        """Verifies the first fresh sample, then follows the samples until the process ends."""
+        """Verifies the first verifiable sample, then follows the samples until the process ends."""
         try:
             received = self._bootstrap()
             self._watch(received)
@@ -87,30 +87,45 @@ class ClockCheck:
             os._exit(1)
 
     def _bootstrap(self) -> Received:
-        """Verifies the first fresh sample to arrive within the bootstrap window."""
+        """Verifies the first sample to become verifiable within the bootstrap window."""
         deadline = time.monotonic() + self._bootstrap_s
         received = None
-        while not self._is_fresh(received, time.monotonic()):
-            remaining = deadline - time.monotonic()
+        while not self._is_verifiable(received, time.monotonic()):
+            now = time.monotonic()
+            remaining = deadline - now
+            fresh = self._is_fresh(received, now)
             if remaining <= 0:
-                raise ClockCheckFailed(f"no fresh server-time sample in {self._bootstrap_s} s")
-            received = self._server_times.wait_newer(received, remaining)
+                if fresh:
+                    raise ClockCheckFailed(
+                        f"the terminal was not connected for {self._max_age_s} s without a break "
+                        f"in {self._bootstrap_s} s"
+                    )
+                else:
+                    raise ClockCheckFailed(f"no fresh server-time sample in {self._bootstrap_s} s")
+            elif fresh:
+                timeout = min(remaining, received.connected_since + self._max_age_s - now)
+            else:
+                timeout = remaining
+            received = self._server_times.wait_newer(received, timeout)
         self.status.set(self._verify(received.sample))
         logger.info("broker clock verified")
         return received
 
     def _watch(self, received: Received) -> None:
-        """Wakes when a sample arrives, when the latest goes stale, and when a re-verification of it
-        is due."""
+        """Wakes when a sample arrives, when the latest goes stale, when its connected run matures,
+        and when a re-verification of it is due."""
         due = time.monotonic() + self._check_s
         while True:
-            if self.status.read() is None:
-                timeout = None
+            now = time.monotonic()
+            if self.status.read() is not None:
+                timeout = min(due, received.arrived + self._max_age_s) - now
+            elif self._is_fresh(received, now):
+                timeout = received.connected_since + self._max_age_s - now
             else:
-                timeout = min(due, received.arrived + self._max_age_s) - time.monotonic()
+                timeout = None
             received = self._server_times.wait_newer(received, timeout)
             now = time.monotonic()
-            if not self._is_fresh(received, now):
+            if not self._is_verifiable(received, now):
                 if self.status.read() is not None:
                     self.status.clear()
                     logger.info(
@@ -135,6 +150,11 @@ class ClockCheck:
             and received.sample.connected
             and now - received.arrived < self._max_age_s
         )
+
+    def _is_verifiable(self, received: Received | None, now: float) -> bool:
+        """Whether a sample is fresh and the terminal has been connected without a break for the
+        maximum age."""
+        return self._is_fresh(received, now) and now - received.connected_since >= self._max_age_s
 
     def _verify(self, sample: ServerTimeSample) -> ClockVerification:
         """Measures the sample's trade-server time against the server's clock; raises

@@ -1,6 +1,8 @@
 """The trade-server time the terminal's EA relays through the hub, and the latest sample of it.
 
-State: the latest sample and the monotonic time it arrived; nothing is persisted."""
+State: the latest sample, the monotonic time it arrived, and when the terminal's current unbroken
+run of connected samples began; a disconnected sample, or a gap of the maximum age between two
+samples, breaks the run. Nothing is persisted."""
 
 import threading
 import time
@@ -28,18 +30,33 @@ class ServerTimeSample:
 class Received:
     sample: ServerTimeSample
     arrived: float
+    connected_since: float | None
 
 
 class ServerTimeSink:
-    """The latest relayed sample, with the time it arrived on the monotonic clock."""
+    """The latest relayed sample, with the time it arrived on the monotonic clock and the start of
+    the connected run it belongs to."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_age_s: int) -> None:
+        self._max_age_s = max_age_s
         self._latest: Received | None = None
         self._arrival = threading.Condition()
 
     def write(self, sample: ServerTimeSample) -> None:
         with self._arrival:
-            self._latest = Received(sample, time.monotonic())
+            arrived = time.monotonic()
+            previous = self._latest
+            if not sample.connected:
+                connected_since = None
+            elif (
+                previous is not None
+                and previous.connected_since is not None
+                and arrived - previous.arrived < self._max_age_s
+            ):
+                connected_since = previous.connected_since
+            else:
+                connected_since = arrived
+            self._latest = Received(sample, arrived, connected_since)
             self._arrival.notify_all()
 
     def latest(self) -> Received | None:

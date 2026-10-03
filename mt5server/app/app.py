@@ -411,7 +411,7 @@ def main() -> None:
 
     terminal = Terminal(MetaTrader5)
     connect_terminal(terminal, settings)
-    server_times = ServerTimeSink()
+    server_times = ServerTimeSink(max_age_s=settings.clock_sample_max_age_seconds)
     clock_check = ClockCheck(
         server_times,
         clock,
