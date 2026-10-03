@@ -12,14 +12,17 @@ This file holds GUIDELINES and rules of engagement. How a subsystem works belong
 
 An owned hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5-connector): a [NautilusTrader](https://nautilustrader.io/) (NT) adapter for MetaTrader 5. It does not track upstream.
 
-- **Client package** (`mt5connect/`) — NT data and execution clients, instrument provider, factories, and the remote backend client.
-- **Server** (`mt5server/`) — the containerised MT5 terminal with the HTTP and WebSocket API the remote backend talks to.
+- **Client package** (`mt5connect/`) — the only package in the wheel: NT data and execution clients, the instrument provider, the factories, the remote backend (an HTTP shim generated from the inventory), the history client and the downloader.
+- **Wire vocabulary** (`mt5connect/mirror.py`, `broker_clock.py`, `history_wire.py`) — the inventory of the pinned `MetaTrader5` package, the broker-clock conversion and the history protocol's names. The server imports these three and nothing else from the client package, and the image copies exactly these (with the package's empty `__init__.py`); the client imports the inventory and the history vocabulary.
+- **Server** (`mt5server/`) — the containerised terminal: the Flask app the remote backend talks to and the tick hub (`app/`), the boot sequence (`scripts/`, numbered, run in order by `01-start.sh`), and the EA with its vendored MQL5 WebSocket library (`mt5ticks/`).
+
+**This repository is public.** Nothing in it names a private repository, a deployment, an account, a login number, a server name that identifies an account, or a credential — not in code, tests, docs, commit messages, PR text or review files. A commit here stands on its own: it is written for a reader who has never seen the consumer that pins this fork. Credentials reach the container as environment variables, never baked into the image or committed in an `.env`, and a settings error never echoes a credential.
 
 Delivery:
 
-- PRs merge to `main`.
-- A release is a `v0.4.0+st.N` tag; CI builds it into a wheel and publishes it on the fork's GitHub Pages package index.
-- Consumers pin a release exactly, by its full version, from that index.
+- PRs merge to `main`; CI runs `just lint` and `just test` on every PR and push to `main`.
+- A release is a `v0.4.0+st.N` tag; CI builds it into a `py3-none-any` wheel with a sha256 sidecar, publishes a GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages.
+- Consumers pin a release exactly, by its full local version, from that index; PyPI can never satisfy a `+st` version, so the pin proves provenance.
 
 ---
 
@@ -197,7 +200,7 @@ Never `pip install <pkg>` straight into the env: it leaves the package **undecla
 
 ### 9. Ad-hoc tooling belongs in `scripts/`
 
-One-off migrations, audits, studies, and repair utilities belong under the gitignored `scripts/` directory at the repository root, never in the package or a supported CLI. Production code, tests, and READMEs must not import or depend on them. Promote a script into the main codebase only when it becomes a recurring, supported workflow with a maintained contract.
+One-off migrations, audits, studies, and repair utilities belong under the gitignored `scripts/` directory at the repository root, never in the package or a supported CLI. `mt5server/scripts/` is not that directory: it is the container's boot sequence, production code held to every rule here. Production code, tests, and READMEs must not import or depend on them. Promote a script into the main codebase only when it becomes a recurring, supported workflow with a maintained contract.
 
 ### 10. Tests never shape production code
 
@@ -254,3 +257,136 @@ This file is rules of engagement: guidelines, hard requirements, and non-obvious
 - **Describe the present, never the transition.** "No longer", "now", "superseded by" are drift — this file is always current state, exactly like a §7 comment.
 - **How a subsystem works goes to the code it governs** — legible code, §7 comments for the deliberate decisions, and a README for usage plus high-level principles. How to USE or RUN a subsystem, tool, or test — its commands, env vars, flags, invocations — is usage and lives in its README or module docstring, never here; the repo-wide workflow commands this file itself mandates (the lint/test gate, the env sync) are rules of engagement, not usage. If a subsystem needs presence here, it gets one pointer plus its rules of engagement.
 - **Size is a hard budget: the whole file must fit ONE bare Read (~70KB).** An addition that would cross it is not done until the file shrinks elsewhere first.
+
+---
+
+## Architecture (layered, top-down)
+
+```
+NT TradingNode ──> mt5connect/ (data + exec clients, provider, factories, history client)
+                      │
+                      ├── remote_mt5 (the HTTP shim generated from the inventory)
+                      └── ws_stream (the WebSocket client)
+                                 │                       │
+                                 ▼                       ▼
+                     mt5server/app (Flask under   mt5server/app/ws_server.py (hub, Linux
+                     Wine's Windows Python)       Python) <── mt5ticks EA inside the terminal
+                                 │
+                                 ▼
+                     the MetaTrader5 package ──> the terminal ──> the broker
+```
+
+The adapter reaches the terminal through the server alone: every module that calls the package imports the shim, as `mt5`, and the shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. The server imports nothing from the client package but its three vocabulary modules: the inventory, the broker clock, the history protocol's names and codes.
+
+---
+
+## The server — rules of engagement
+
+The design documents itself in-repo: `mt5server/app/` module docstrings carry the contracts, and `README.md`'s "Dockerized MT5 server" section the usage and the envelope. What an agent must not get wrong when touching anything nearby:
+
+- **The inventory is the single source.** `mt5connect/mirror.py` declares every mirrored function, its parameters, its structs with their epoch fields and units, the dtypes and the constants; the server's routes, the shim's functions and namedtuples, and the conformance samples are all generated from it. Adding or changing a package function is one inventory row — never a hand-written route, shim function or sample. The static conformance tier decodes the pinned wheel (`MetaTrader5==5.0.6231`, verified by sha256) against the inventory; **the package wins** over any recollection of its API.
+- **One lock, one read.** Every package call runs through `Terminal.call`, which holds the one lock around the call and its `last_error()` read, so an answer's error is always its own. Nothing calls the package around it, nothing reads a terminal flag for synchronisation, and nothing waits while holding the lock.
+- **The envelope is the contract.** `{ok, result | error, last_error}` on every mirror route. A failure is `ok: false` carrying the package's `last_error` pair, never a success with an empty result. A mirror route passes the package's own answer through, so its `[]` is as ambiguous as the package's; the history routes are what prove emptiness. `shutdown` keeps the server's session: every client shares one terminal connection. Unknown, missing or non-epoch parameters, and a history query in none of its call forms, are refused with HTTP 400 before the package is asked.
+- **UTC on the wire, broker time only inside the package.** The server converts every epoch field it answers and every window it is asked through `BrokerClock` at the era of the timestamp itself; a consumer never does clock math — it adds a bar's interval for NT's close stamp and subtracts it for a query. A skipped wall-clock hour is a server error; a repeated hour reads as its first occurrence with one warning. A zero epoch stays zero.
+- **The bootstrap gate.** While the clock is not verified against a fresh server-time sample the EA relayed, every route but `/health` and the server-time relay answers 503 with the failure envelope, and `/health` answers 503 itself; health reads that verification state and never calls the terminal. The relay route accepts loopback callers only. A missed bootstrap window or a verified mismatch exits the server process.
+- **One worker is always free.** Every call that can reach the terminal — the mirror routes and the three history routes — takes a slot from a pool one smaller than the worker count (`MT5_API_THREADS`, at least 2), without waiting; a call that finds none is refused at once with the busy code and `Retry-After`, never queued on a worker. `/health`, the relay and the commission read take no slot. The worker count is set from the peak `/health` reports, with a margin, so normal operation never refuses.
+- **No authentication.** The API trusts its network. Ports stay bound to loopback in the compose file; exposing one is a design change.
+- **Two Pythons.** The Flask app runs under Wine's Windows Python with its own `requirements.txt` pins (the terminal's package is Windows-only); the hub runs under the image's Linux Python, its packages from the Dockerfile's package list. A dependency the server needs is declared in both places it is imported from, and `tzdata` is pinned because the Windows Python has no system zone database.
+- **The image's build context is the repository root**, because the server imports the three vocabulary modules from the client package. `.dockerignore` must whitelist exactly what the Dockerfile copies.
+
+---
+
+## The history protocol — rules of engagement
+
+The terminal substitutes nearest-available data, serves only what it has synced locally, caps a request's span, and answers over-span or unsynced requests with an empty result that looks like "no data". The server owns the protocol that turns those answers into honest ones; `mt5server/app/history.py` documents it. The rules:
+
+- **A 200 is canonical rows, an empty list included** — only rows the terminal's own answers prove: rows read with a success `last_error`, a window wholly before the floor, records on both sides of it, or the part past the symbol's last quote (the live edge). There is no state beside the rows: a window beginning before the floor answers the rows from the floor on, and the floor itself is a fact of `/history/ranges` alone.
+- **A window nothing proves yet is a 503 with `Retry-After`** and the syncing code, never a wait: the server makes its reads and answers; the reads it made are what drive the terminal's backfill, and the client's retry is the sync loop, bounded only by its caller. The server never sleeps or retries inside a request.
+- **A window starting after the terminal's time is a 400**, never a retry.
+- **No calendar.** Nothing in the server knows when a market is open: no weekday, session or holiday logic, only gap arithmetic on the rows the terminal returned. A weekend is a stretch the terminal has no records for.
+- **The span cap is `maxbars − SPAN_MARGIN` periods** (`history_wire.py`), `maxbars` read from `terminal_info` at request time, never hard-coded; a longer window is chunked. A cap breach never resolves on retry.
+- **Floors are measured, not assumed** — by the stub the terminal answers for a window before any plausible history, or past a coarse prefix at the series' start, sought only in an answer that begins at the floor. A floor the coarse prefix set is never moved back by a later stub.
+- **Every bar is held to its timeframe's grid, and ticks to time order**; a row that breaks either fails the answer.
+- **Bars leave the server open-stamped**, as MT5 stamps them; the client stamps the close by adding the interval and asks in open-time bounds.
+- **The client retries only what the server tells it to**: the syncing and busy 503s, sleeping the advertised `Retry-After`, until the server answers otherwise or its caller cancels; it has no deadline of its own.
+
+---
+
+## The EA and the hub — rules of engagement
+
+- The EA (`ticks.mq5`) and its startup script (`ticks_setup.mq5`, which opens a chart per symbol and attaches the EA) are the only code inside the terminal. The EA publishes ticks, relays `TimeTradeServer` every `RelaySeconds`, and drains its socket on its timer and on every tick, so the vendored library answers the hub's keepalive pings and acknowledges a hub close. It reconnects on `TimeLocal()`, because the last-quote time stands still while the market is closed.
+- The hub broadcasts ticks to adapters, hands the EA's `server_time` frame to the server's relay off the event loop so a slow server never holds back ticks, and never broadcasts the relay. The `type` of an EA frame is a `FrameType` member. A frame the hub cannot handle closes its connection with a warning; a frame of an unknown kind is logged and skipped.
+- The EA and its script are compiled at container start by `MetaEditor64.exe` (`scripts/04-install-mt5.sh`), each from the space-free `C:\mt5build`: MetaEditor honours only the last `/compile` argument and truncates paths with spaces, the binary's name is case-sensitive on the Wine prefix's volume, and the chart template must be UTF-16LE with a BOM and CRLF.
+- Nothing in the test suite runs the EA. A change to it is proven by the compile (`0 errors, 0 warnings`) and by a running container whose `/health` stays 200, which takes a fresh server time relayed by the EA; a claim beyond those is unverified.
+
+---
+
+## MT5 pitfalls (the long list)
+
+Measured on IC Markets and Bybit MT5 terminals; none of it is in the vendor's documentation. Internalize them.
+
+### The broker clock
+
+- **Every epoch the package returns is broker wall-clock time**, on every surface — ticks, bars, deals, orders, positions — not UTC as the documentation claims. The rule is `America/New_York + 7 h`, so the offset is +10,800 s in summer and +7,200 s in winter and changes on US DST weekends.
+- **Query windows are compared in the broker base**: `copy_rates_range`, `copy_ticks_range` and `history_*` bounds pass through unconverted, so the conversion runs in both directions.
+- **`TimeTradeServer()` is computed in the terminal** from the host clock and a learned offset; it moves while the market is closed, where `TimeCurrent()` (the last quote) stands still. That is why it is the verification source and why a weekend start reaches healthy.
+- **A pending order's `expiration` is a broker-time field too.**
+
+### History answers
+
+- **Empty is ambiguous.** `[]` with `last_error` success means any of: the series never existed, the symbol is unselected, the span is at or over the cap, or the region is not yet synced locally. It is never a discriminator on its own.
+- **The span cap is the span, not the row count**: `MaxBars − 11` periods is accepted, `MaxBars − 10` answers `[]`, at both 100,000 and 1,000,000. `terminal_info.maxbars` carries the configured value.
+- **A request into an unsynced region triggers an async backfill**; a retry seconds to a minute later returns data. Coarse-before-fine does nothing for the finer series. A first wide tick read can block for ~90 s and come back `None` with `last_error (-1, "Terminal: Call failed")`; the retry returns the rows.
+- **A narrow tick window into an unsynced region never syncs it**: a one-day `copy_ticks_range` answers `[]` with success and no retry of the same window loads it — hence the widening to the UTC day, then the week.
+- **There is no sync signal.** `SeriesInfoInteger(SERIES_SYNCHRONIZED)` stays 1 through a backfill; reading it on an unselected symbol adds the symbol to Market Watch.
+- **The floor stub**: a request fully before a synced series' floor returns exactly one out-of-window row, the floor bar; a straddling window silently left-clamps.
+- **History depth is per broker and per series**: a sliding `MaxBars` window on M1, hourly only from some date on H1 with daily-spaced rows before it. Synced depth survives a terminal restart.
+- **Trade ticks do not exist** on this venue class: `copy_ticks_range(flags=COPY_TICKS_TRADE)` returns 0 rows; quote ticks carry real sub-second `time_msc`. The flag values are `INFO=1`, `TRADE=2`, `ALL=-1`.
+- **Bars are built from one price per symbol**, declared by `symbol_info.chart_mode` (0 is BID); `MqlRates.spread` is one scalar per bar; no ask-side bar series exists.
+- **Pre-1970 epochs** answer HTTP 500 from the package path; the floor probe asks a window from 1970-01-02.
+
+### Symbols, currencies and sessions
+
+- **The venue is the judge of what exists.** `symbol_info` says what a symbol is; no in-repo list of symbols, suffixes or currencies decides a request. Suffixed pairs (`EURUSD.a`) can be the tradeable universe while the base names are close-only.
+- **`currency_profit` alone names settlement.** `currency_base` is meaningless for a CFD (a `DE40` listed with base USD settles EUR) and `currency_margin` is not always the base. Account currencies can be non-ISO (`UST`).
+- **An unselected or closed symbol quotes zeros**: `symbol_info_tick` returns an all-zero struct with `time=0`; a real tick has `time != 0`.
+- **`symbol_info` carries 96 fields and no commission**; deals carry `commission` and `fee`. A commission schedule exists only in MQL5 (`SymbolInfoCommissions`), one rule with one tier per symbol, charged on both legs by one broker and on entry alone by another.
+- **Weeks run Monday 00:00 to Friday 23:00 in broker time** with no weekend bars; H2 and coarser bars open on broker-midnight multiples.
+
+### Orders, positions and the transaction stream
+
+- **Hedging is per ticket.** A position's identifier is its opening order's ticket, stable across a partial close, with the average price retained; every deal (`OUT`, `OUT_BY`, stop-loss) carries `position_id`. Comments are venue-mutated and refused outright at 30 characters or more, never truncated.
+- **One exit bracket per position.** A pending order carrying `position=ticket` is accepted and the binding silently ignored; its fill opens a new, opposite position. A second `TRADE_ACTION_SLTP` overwrites the first; SLTP on a position confirms as a POSITION transaction alone, and the position's `time_update_msc` does not move on it.
+- **`MqlTradeRequest.magic` is `ulong`, `ORDER_MAGIC` reads back `long`**; 63 bits are safely positive in both views.
+- **The filling mode is per symbol**, a bitmask on `symbol_info().filling_mode`; a wrong mode is retcode 10030.
+- **`order_send` can report "no connection" (10031) for a trade the server executed.** The order exists; the reply does not say so.
+- **`account_info.trade_allowed == false` under `terminal_info.trade_allowed == true` marks an investor (read-only) session** — a configuration error to fail at startup, not a refusal to discover on the first order.
+- **`OnTradeTransaction` is account-scoped and complete through one EA**: two EAs receive byte-identical streams. `DEAL_ADD` alone carries the fill; `order_state` on it is a meaningless default; fill ordering against `ORDER_DELETE`/`HISTORY_ADD` is not guaranteed; `TRADE_TRANSACTION_REQUEST` trails the lifecycle events with the full request and result.
+
+### The terminal under Wine
+
+- **The WebRequest/socket allowlist lives in memory** and is wiped by any terminal restart; the `setup.ini` WebRequest key is MT4-only and MT5 ignores it. The boot sequence re-adds `127.0.0.1` by UI automation after each start, and clicking OK re-initialises attached EAs.
+- **`MetaTrader5.initialize()` blocks on an IPC timeout without an account.**
+- **The Windows Python's `numpy` is held at 2.2.1**: later releases crash under Wine 10.
+- **The terminal never updates itself**; its update dialog is harmless and nothing prevents it.
+
+---
+
+## Test tiers
+
+- **Every test runs without a terminal.** Client tests patch the shim where a module imported it (`tests/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and points the shim at it. The server imports the package only inside `main()`.
+- **The static conformance tier** (`tests/conformance/test_static_conformance.py`) fetches the pinned wheel by sha256 (`MT5_WHEEL_PATH` for an offline copy) and checks the inventory and shim against it. **The live tier** needs a Windows host and a terminal and runs only under `MT5_LIVE_CONFORMANCE=1`.
+- **An `xfail` is `strict=True` and names the defect it pins.** An xfail that starts passing is a fix to record, never a marker to leave.
+
+---
+
+## Things never to do
+
+- **Don't commit a credential, an `.env`, an account number, or a server name that identifies an account** — and don't log one. A settings error names the variable, never a credential's value.
+- **Don't patch NT to fit MT5.** The connector works the way NT expects an adapter to work; where the venue's shape differs (per-ticket hedging, venue-minted ids, bid-built bars), the adapter translates, and anything the adapter cannot translate is raised with the consumer, not papered over in NT.
+- **Don't read NT's cache from the adapter** to decide what the venue meant. The adapter reports what the venue said, keyed by the venue's own ids; the consumer does the binding.
+- **Don't hand-write what the inventory generates** — a route, a shim function, a struct, a conformance sample.
+- **Don't do clock math outside the server.** The server answers in true UTC, so a consumer that converts broker time converts it twice.
+- **Don't trust `[]`.** An empty package answer proves nothing on its own; the protocol's evidence rules decide what is canonical.
+- **Don't `pip install` into any of the Pythons.** The mamba env, the Windows `requirements.txt` and the Dockerfile's package list are the declarations.
+- **Don't reach for a second lock, a lock bypass or a wait inside a request** when a terminal call is slow; health does not need the terminal, a call that cannot get a slot is refused, and a window that cannot be proven is a 503 the client retries.
