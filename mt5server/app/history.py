@@ -23,8 +23,8 @@ from mt5connect.history_wire import (
     BAR_TIMEFRAME,
     SPAN_MARGIN,
     TICK_FLAGS,
-    HistoryCode,
     Series,
+    ServerCode,
     TickFlags,
 )
 from mt5server.app.encoding import broker_datetime, encode
@@ -593,7 +593,7 @@ class History:
     def _syncing(self, what: str, unproven: _Unproven) -> Syncing:
         message = f"{what}: syncing"
         logger.info("%s; %s", message, unproven)
-        return Syncing((HistoryCode.SYNCING, message), self._retry_s)
+        return Syncing((ServerCode.SYNCING, message), self._retry_s)
 
     def _utc_floor(self, series: Series, floor: Floor) -> int:
         if series is Series.TICKS:

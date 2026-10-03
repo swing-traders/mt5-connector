@@ -67,9 +67,24 @@ def history(terminal, floors):
 
 
 @pytest.fixture
-def app(terminal, commissions, server_times, clock_status, history):
-    """The app with the broker clock verified."""
-    return create_app(terminal, commissions, CLOCK, server_times, clock_status, history)
+def workers():
+    """The server's worker threads: one kept free, so two terminal-bound calls at once."""
+    return 3
+
+
+@pytest.fixture
+def app(terminal, commissions, server_times, clock_status, history, workers):
+    """The app with the broker clock verified, refusing a call past its cap with Retry-After 5."""
+    return create_app(
+        terminal,
+        commissions,
+        CLOCK,
+        server_times,
+        clock_status,
+        history,
+        workers=workers,
+        retry_s=5,
+    )
 
 
 @pytest.fixture
@@ -78,9 +93,9 @@ def client(app):
 
 
 @pytest.fixture
-def served(app):
+def served(app, workers):
     """The app served by waitress on a free loopback port; yields its base URL."""
-    server = waitress.create_server(app, host="127.0.0.1", port=0, threads=4)
+    server = waitress.create_server(app, host="127.0.0.1", port=0, threads=workers)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{server.effective_port}"

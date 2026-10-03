@@ -32,8 +32,9 @@ class Settings:
             raise SettingsError(f"login_timeout_ms {self.login_timeout_ms} is not positive")
         elif not 1 <= self.api_port <= 65535:
             raise SettingsError(f"api_port {self.api_port} is not a TCP port")
-        elif self.api_threads < 1:
-            raise SettingsError(f"api_threads {self.api_threads} is not positive")
+        elif self.api_threads < 2:
+            # One worker is kept free for /health and the relay.
+            raise SettingsError(f"api_threads {self.api_threads} is below 2")
         elif self.clock_check_seconds < 1:
             raise SettingsError(f"clock_check_seconds {self.clock_check_seconds} is not positive")
         elif self.clock_sample_max_age_seconds < 1:
@@ -64,7 +65,7 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         ),
         api_host=environ.get("MT5_API_HOST", "0.0.0.0"),
         api_port=_integer("MT5_API_PORT", environ.get("MT5_API_PORT", "5000")),
-        api_threads=_integer("MT5_API_THREADS", environ.get("MT5_API_THREADS", "4")),
+        api_threads=_integer("MT5_API_THREADS", environ.get("MT5_API_THREADS", "5")),
         broker_tz=_zone("MT5_BROKER_TZ", environ.get("MT5_BROKER_TZ", "America/New_York")),
         broker_offset_hours=_integer(
             "MT5_BROKER_OFFSET_HOURS", environ.get("MT5_BROKER_OFFSET_HOURS", "7")

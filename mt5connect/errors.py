@@ -28,6 +28,11 @@ class ServerUnreachable(MT5ConnectionError):
     """Raised when the remote MT5 server cannot be reached or answers outside its contract."""
 
 
+class ServerBusy(MT5ConnectionError):
+    """Raised when the remote MT5 server refuses a call because every slot for a call that can reach
+    the terminal is taken; the server is up, so the caller decides whether to ask again."""
+
+
 class MT5LoginError(MT5Error):
     """
     Raised when login to the broker account fails.

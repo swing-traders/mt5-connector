@@ -28,7 +28,7 @@ def test_settings_read_the_environment_with_defaults():
     assert settings.login_timeout_ms == 60000
     assert settings.api_host == "0.0.0.0"
     assert settings.api_port == 5000
-    assert settings.api_threads == 4
+    assert settings.api_threads == 5
     assert settings.broker_tz == ZoneInfo("America/New_York")
     assert settings.broker_offset_hours == 7
     assert settings.clock_check_seconds == 300
@@ -82,6 +82,7 @@ def test_settings_refuse_a_missing_variable(name):
     ("variable", "value", "field"),
     [
         ("MT5_API_THREADS", "0", "api_threads"),
+        ("MT5_API_THREADS", "1", "api_threads"),
         ("MT5_API_PORT", "0", "api_port"),
         ("MT5_API_PORT", "65536", "api_port"),
         ("MT5_LOGIN_TIMEOUT_MS", "0", "login_timeout_ms"),
@@ -100,6 +101,10 @@ def test_settings_refuse_a_missing_variable(name):
 def test_settings_refuse_an_out_of_range_value(variable, value, field):
     with pytest.raises(SettingsError, match=field):
         read_settings(ENVIRONMENT | {variable: value})
+
+
+def test_settings_accept_two_api_threads():
+    assert read_settings(ENVIRONMENT | {"MT5_API_THREADS": "2"}).api_threads == 2
 
 
 def test_settings_built_directly_refuse_an_out_of_range_value():
@@ -175,7 +180,7 @@ def test_start_initializes_the_configured_terminal_once(
 
     connect_terminal(terminal, read_settings(ENVIRONMENT))
     client = create_app(
-        terminal, commissions, CLOCK, server_times, clock_status, history
+        terminal, commissions, CLOCK, server_times, clock_status, history, workers=3, retry_s=5
     ).test_client()
     for _ in range(3):
         assert client.get("/health").status_code == 200
@@ -212,6 +217,10 @@ def test_health_answers_the_verification_without_calling_the_terminal(client, st
             "gmt": 1_752_570_000,
             "skew_s": -30,
             "offset_s": 10_800,
+            "in_flight": 0,
+            "peak_in_flight": 0,
+            "refusals": 0,
+            "workers": 3,
         },
     }
     assert stub.mock_calls == []

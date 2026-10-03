@@ -1,6 +1,9 @@
 """The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, the
 history windows it vouches for, its liveness, and what the terminal's EA relays — its trade-server
-time and its commission schedules."""
+time and its commission schedules.
+
+State: the calls that can reach the terminal in flight now, the most in flight at once and the calls
+refused since start; nothing is persisted."""
 
 import dataclasses
 import logging
@@ -10,13 +13,21 @@ import time
 from collections.abc import Callable
 from datetime import timedelta
 from enum import StrEnum
+from http import HTTPStatus
 
 import waitress
-from flask import Flask, request
+from flask import Flask, make_response, request
 
 from mt5connect import mirror
 from mt5connect.broker_clock import BrokerClock
-from mt5connect.history_wire import BARS_PATH, RANGES_PATH, TICKS_PATH, Series, TickFlags
+from mt5connect.history_wire import (
+    BARS_PATH,
+    RANGES_PATH,
+    TICKS_PATH,
+    Series,
+    ServerCode,
+    TickFlags,
+)
 from mt5server.app.clock_check import ClockCheck, ClockStatus
 from mt5server.app.commissions import CommissionStore
 from mt5server.app.encoding import encode, non_epochs, package_arguments
@@ -65,6 +76,50 @@ def connect_terminal(terminal: Terminal, settings: Settings) -> None:
         raise TerminalStartError(f"initialize failed: {outcome.last_error}")
 
 
+class _Concurrency:
+    """The cap on calls that can reach the terminal, one below the server's workers so one is always
+    free for /health and the relay, and its counters."""
+
+    def __init__(self, workers: int) -> None:
+        self._workers = workers
+        self._slots = threading.BoundedSemaphore(workers - 1)
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self._peak_in_flight = 0
+        self._refusals = 0
+
+    def enter(self, route: str) -> bool:
+        """Takes a slot without waiting for one; whether one was free. A refusal is counted and
+        logged."""
+        if self._slots.acquire(blocking=False):
+            with self._lock:
+                self._in_flight += 1
+                self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
+            return True
+        else:
+            with self._lock:
+                self._refusals += 1
+                in_flight = self._in_flight
+            logger.warning("%s refused: %d calls to the terminal in flight", route, in_flight)
+            return False
+
+    def leave(self) -> None:
+        """Gives back the slot enter() took."""
+        # Counted out before the slot is free, so in_flight never exceeds the cap.
+        with self._lock:
+            self._in_flight -= 1
+        self._slots.release()
+
+    def read(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "in_flight": self._in_flight,
+                "peak_in_flight": self._peak_in_flight,
+                "refusals": self._refusals,
+                "workers": self._workers,
+            }
+
+
 def create_app(
     terminal: Terminal,
     commissions: CommissionStore,
@@ -72,11 +127,16 @@ def create_app(
     server_times: ServerTimeSink,
     clock_status: ClockStatus,
     history: History,
+    *,
+    workers: int,
+    retry_s: int,
 ) -> Flask:
     """The server's routes: POST /mt5/<function> for every package function, GET /health, GET
     /commissions/<symbol>, POST /relay/server_time, POST /history/bars and /history/ticks, and GET
     /history/ranges. Every route but /health and the relay answers 503 while `clock_status` holds no
-    verification."""
+    verification. A route that can reach the terminal answers 503 with Retry-After `retry_s` when
+    `workers` − 1 such calls are already in flight."""
+    concurrency = _Concurrency(workers)
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
     app.before_request(_clock_gate(clock_status))
@@ -84,13 +144,13 @@ def create_app(
         app.add_url_rule(
             f"/mt5/{function.name}",
             endpoint=function.name.value,
-            view_func=_mirror_view(terminal, function, clock),
+            view_func=_capped(concurrency, retry_s, _mirror_view(terminal, function, clock)),
             methods=["POST"],
         )
     app.add_url_rule(
         "/health",
         endpoint=_Endpoint.HEALTH.value,
-        view_func=_health_view(clock_status),
+        view_func=_health_view(clock_status, concurrency),
         methods=["GET"],
     )
     app.add_url_rule(
@@ -108,19 +168,19 @@ def create_app(
     app.add_url_rule(
         BARS_PATH,
         endpoint=_Endpoint.HISTORY_BARS.value,
-        view_func=_history_bars_view(history, server_times, clock),
+        view_func=_capped(concurrency, retry_s, _history_bars_view(history, server_times, clock)),
         methods=["POST"],
     )
     app.add_url_rule(
         TICKS_PATH,
         endpoint=_Endpoint.HISTORY_TICKS.value,
-        view_func=_history_ticks_view(history, server_times, clock),
+        view_func=_capped(concurrency, retry_s, _history_ticks_view(history, server_times, clock)),
         methods=["POST"],
     )
     app.add_url_rule(
         RANGES_PATH,
         endpoint=_Endpoint.HISTORY_RANGES.value,
-        view_func=_history_ranges_view(history),
+        view_func=_capped(concurrency, retry_s, _history_ranges_view(history)),
         methods=["GET"],
     )
     return app
@@ -132,6 +192,25 @@ def _clock_gate(clock_status: ClockStatus) -> Callable:
             return _clock_unverified(), 503
 
     return gate
+
+
+def _capped(concurrency: _Concurrency, retry_s: int, view: Callable) -> Callable:
+    """The view run in a slot of the cap, or refused at once when none is free: a call never waits
+    on a worker for one."""
+
+    def capped():
+        if concurrency.enter(request.path):
+            try:
+                # Built in the slot, so serializing a large answer counts against the cap.
+                return make_response(view())
+            finally:
+                concurrency.leave()
+        else:
+            message = f"{request.path}: the server is busy"
+            headers = {"Retry-After": str(retry_s)}
+            return _failure(ServerCode.BUSY, message), HTTPStatus.SERVICE_UNAVAILABLE, headers
+
+    return capped
 
 
 def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClock) -> Callable:
@@ -160,15 +239,18 @@ def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClo
     return view
 
 
-def _health_view(clock_status: ClockStatus) -> Callable:
-    # The clock's status alone answers it, so it never waits on the terminal's lock; no package call
-    # answers it, so its envelope carries no last_error.
+def _health_view(clock_status: ClockStatus, concurrency: _Concurrency) -> Callable:
+    # The clock's status and the cap's counters answer it, so it never waits on the terminal's lock;
+    # no package call answers it, so its envelope carries no last_error.
     def view():
         verification = clock_status.read()
         if verification is None:
             return _clock_unverified(), 503
         else:
-            return {"ok": True, "result": dataclasses.asdict(verification)}, 200
+            return {
+                "ok": True,
+                "result": dataclasses.asdict(verification) | concurrency.read(),
+            }, 200
 
     return view
 
@@ -345,8 +427,18 @@ def main() -> None:
         retry_s=settings.history_retry_seconds,
         floor_ttl_s=settings.floor_ttl_seconds,
     )
+    app = create_app(
+        terminal,
+        CommissionStore(),
+        clock,
+        server_times,
+        clock_check.status,
+        history,
+        workers=settings.api_threads,
+        retry_s=settings.history_retry_seconds,
+    )
     waitress.serve(
-        create_app(terminal, CommissionStore(), clock, server_times, clock_check.status, history),
+        app,
         host=settings.api_host,
         port=settings.api_port,
         threads=settings.api_threads,
