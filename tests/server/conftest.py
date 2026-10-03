@@ -7,7 +7,9 @@ from mirror_samples import CLOCK
 
 import mt5connect.remote_mt5 as shim
 from mt5server.app.app import create_app
+from mt5server.app.clock_check import ClockStatus, ClockVerification
 from mt5server.app.commissions import CommissionStore
+from mt5server.app.server_time import ServerTimeSink
 from mt5server.app.terminal import Terminal
 
 
@@ -30,11 +32,32 @@ def terminal(stub):
 
 
 @pytest.fixture
-def app(terminal, commissions):
+def server_times():
+    return ServerTimeSink()
+
+
+@pytest.fixture
+def clock_status():
+    """The broker clock verified on EURUSD's trade server at 2025-07-15T09:00:00Z, 30 s behind the
+    server's clock, under EDT."""
+    status = ClockStatus()
+    status.set(
+        ClockVerification(
+            symbol="EURUSD",
+            trade_server=1_752_570_000,
+            current=1_752_569_998,
+            gmt=1_752_570_000,
+            skew_s=-30,
+            offset_s=10_800,
+        )
+    )
+    return status
+
+
+@pytest.fixture
+def app(terminal, commissions, server_times, clock_status):
     """The app with the broker clock verified."""
-    ready = threading.Event()
-    ready.set()
-    return create_app(terminal, commissions, CLOCK, ready)
+    return create_app(terminal, commissions, CLOCK, server_times, clock_status)
 
 
 @pytest.fixture

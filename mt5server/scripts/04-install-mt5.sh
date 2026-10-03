@@ -172,6 +172,7 @@ expertmode=5
 <inputs>
 Server=${MT5_WS_URL:-ws://127.0.0.1:9000}
 ReconnectIntervalSec=3
+RelaySeconds=5
 </inputs>
 </expert>
 

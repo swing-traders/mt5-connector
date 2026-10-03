@@ -1,5 +1,5 @@
 """The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, its
-liveness, and the commission schedules the terminal's EA relays."""
+liveness, and what the terminal's EA relays — its trade-server time and its commission schedules."""
 
 import dataclasses
 import logging
@@ -7,21 +7,35 @@ import os
 import threading
 from collections.abc import Callable
 from datetime import timedelta
+from enum import StrEnum
 
 import waitress
 from flask import Flask, request
 
 from mt5connect import mirror
 from mt5connect.broker_clock import BrokerClock
-from mt5server.app.clock_check import ClockCheck
+from mt5server.app.clock_check import ClockCheck, ClockStatus
 from mt5server.app.commissions import CommissionStore
 from mt5server.app.encoding import encode, non_epochs, package_arguments
+from mt5server.app.server_time import ServerTimeSink, server_time_refusal, server_time_sample
 from mt5server.app.settings import Settings, read_settings
 from mt5server.app.terminal import Failed, Terminal
+from mt5server.app.ws_server import SERVER_TIME_RELAY_PATH
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_INFO = mirror.FUNCTIONS[mirror.FunctionName.TERMINAL_INFO]
+_LOOPBACK = "127.0.0.1"
+
+
+class _Endpoint(StrEnum):
+    HEALTH = "health"
+    COMMISSIONS = "commissions"
+    SERVER_TIME_RELAY = "server_time_relay"
+
+
+# The routes that answer while the broker clock is not verified: the liveness, and the relay that
+# verifies it.
+_UNGATED = frozenset({_Endpoint.HEALTH, _Endpoint.SERVER_TIME_RELAY})
 
 
 class TerminalStartError(Exception):
@@ -45,12 +59,18 @@ def connect_terminal(terminal: Terminal, settings: Settings) -> None:
 
 
 def create_app(
-    terminal: Terminal, commissions: CommissionStore, clock: BrokerClock, ready: threading.Event
+    terminal: Terminal,
+    commissions: CommissionStore,
+    clock: BrokerClock,
+    server_times: ServerTimeSink,
+    clock_status: ClockStatus,
 ) -> Flask:
-    """The server's routes: POST /mt5/<function> for every package function, GET /health and GET
-    /commissions/<symbol>. /health answers 503 until `ready` is set."""
+    """The server's routes: POST /mt5/<function> for every package function, GET /health, GET
+    /commissions/<symbol> and POST /relay/server_time. Every route but /health and the relay answers
+    503 while `clock_status` holds no verification."""
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
+    app.before_request(_clock_gate(clock_status))
     for function in mirror.FUNCTIONS.values():
         app.add_url_rule(
             f"/mt5/{function.name}",
@@ -60,17 +80,31 @@ def create_app(
         )
     app.add_url_rule(
         "/health",
-        endpoint="health",
-        view_func=_health_view(terminal, clock, ready),
+        endpoint=_Endpoint.HEALTH.value,
+        view_func=_health_view(clock_status),
         methods=["GET"],
     )
     app.add_url_rule(
         "/commissions/<symbol>",
-        endpoint="commissions",
+        endpoint=_Endpoint.COMMISSIONS.value,
         view_func=_commissions_view(commissions),
         methods=["GET"],
     )
+    app.add_url_rule(
+        SERVER_TIME_RELAY_PATH,
+        endpoint=_Endpoint.SERVER_TIME_RELAY.value,
+        view_func=_server_time_relay_view(server_times),
+        methods=["POST"],
+    )
     return app
+
+
+def _clock_gate(clock_status: ClockStatus) -> Callable:
+    def gate():
+        if request.endpoint not in _UNGATED and clock_status.read() is None:
+            return _clock_unverified(), 503
+
+    return gate
 
 
 def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClock) -> Callable:
@@ -99,21 +133,15 @@ def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClo
     return view
 
 
-def _health_view(terminal: Terminal, clock: BrokerClock, ready: threading.Event) -> Callable:
-    watch = _ConnectionWatch()
-
+def _health_view(clock_status: ClockStatus) -> Callable:
+    # The clock's status alone answers it, so it never waits on the terminal's lock; no package call
+    # answers it, so its envelope carries no last_error.
     def view():
-        if not ready.is_set():
-            # No package call answers it, so this envelope carries no last_error.
-            message = "the broker clock is not verified"
-            return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}, 503
-        outcome = terminal.call(_TERMINAL_INFO, {})
-        if isinstance(outcome, Failed):
-            return _failure(*outcome.last_error), 503
+        verification = clock_status.read()
+        if verification is None:
+            return _clock_unverified(), 503
         else:
-            info = encode(_TERMINAL_INFO, outcome.value, clock)
-            watch.observe(info["connected"])
-            return _answer(info, outcome.last_error), 200
+            return {"ok": True, "result": dataclasses.asdict(verification)}, 200
 
     return view
 
@@ -131,19 +159,28 @@ def _commissions_view(commissions: CommissionStore) -> Callable:
     return view
 
 
-class _ConnectionWatch:
-    """Logs the terminal's broker connection at INFO each time it changes."""
+def _server_time_relay_view(server_times: ServerTimeSink) -> Callable:
+    # No package call answers a relayed frame, so these envelopes carry no last_error.
+    def view():
+        frame = _body_arguments()
+        refusal = server_time_refusal(frame)
+        if request.remote_addr != _LOOPBACK:
+            message = f"{request.remote_addr} is not loopback"
+            return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}, 403
+        elif refusal is not None:
+            error = {"code": mirror.RES_E_INVALID_PARAMS, "message": refusal}
+            return {"ok": False, "error": error}, 400
+        else:
+            server_times.write(server_time_sample(frame))
+            return {"ok": True, "result": None}, 200
 
-    def __init__(self) -> None:
-        self._connected: bool | None = None
-        self._lock = threading.Lock()
+    return view
 
-    def observe(self, connected: bool) -> None:
-        with self._lock:
-            changed = connected != self._connected
-            self._connected = connected
-        if changed:
-            logger.info("terminal broker connection: connected=%s", connected)
+
+def _clock_unverified() -> dict[str, object]:
+    """The envelope of a route refused while the broker clock is not verified."""
+    message = "the broker clock is not verified"
+    return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}
 
 
 def _body_arguments() -> object:
@@ -196,25 +233,26 @@ def main() -> None:
     settings = read_settings(os.environ)
     clock = BrokerClock(settings.broker_tz, timedelta(hours=settings.broker_offset_hours))
     logger.info(
-        "broker clock: %s %+d h, verified on %s every %d s",
+        "broker clock: %s %+d h, verified against the relayed trade-server time every %d s",
         settings.broker_tz.key,
         settings.broker_offset_hours,
-        settings.clock_symbol,
         settings.clock_check_seconds,
     )
     import MetaTrader5
 
     terminal = Terminal(MetaTrader5)
     connect_terminal(terminal, settings)
-    clock_check = ClockCheck(terminal, clock, settings.clock_symbol)
-    threading.Thread(
-        target=clock_check.run,
-        args=(settings.clock_check_seconds,),
-        name="broker-clock-check",
-        daemon=True,
-    ).start()
+    server_times = ServerTimeSink()
+    clock_check = ClockCheck(
+        server_times,
+        clock,
+        max_age_s=settings.clock_sample_max_age_seconds,
+        check_s=settings.clock_check_seconds,
+        bootstrap_s=settings.clock_bootstrap_seconds,
+    )
+    threading.Thread(target=clock_check.run, name="broker-clock-check", daemon=True).start()
     waitress.serve(
-        create_app(terminal, CommissionStore(), clock, clock_check.ready),
+        create_app(terminal, CommissionStore(), clock, server_times, clock_check.status),
         host=settings.api_host,
         port=settings.api_port,
         threads=settings.api_threads,

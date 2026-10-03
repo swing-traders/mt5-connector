@@ -21,8 +21,9 @@ class Settings:
     api_threads: int
     broker_tz: ZoneInfo
     broker_offset_hours: int
-    clock_symbol: str
     clock_check_seconds: int
+    clock_sample_max_age_seconds: int
+    clock_bootstrap_seconds: int
 
     def __post_init__(self) -> None:
         if self.login_timeout_ms <= 0:
@@ -33,6 +34,14 @@ class Settings:
             raise SettingsError(f"api_threads {self.api_threads} is not positive")
         elif self.clock_check_seconds < 1:
             raise SettingsError(f"clock_check_seconds {self.clock_check_seconds} is not positive")
+        elif self.clock_sample_max_age_seconds < 1:
+            raise SettingsError(
+                f"clock_sample_max_age_seconds {self.clock_sample_max_age_seconds} is not positive"
+            )
+        elif self.clock_bootstrap_seconds < 1:
+            raise SettingsError(
+                f"clock_bootstrap_seconds {self.clock_bootstrap_seconds} is not positive"
+            )
 
 
 def read_settings(environ: Mapping[str, str]) -> Settings:
@@ -52,9 +61,15 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         broker_offset_hours=_integer(
             "MT5_BROKER_OFFSET_HOURS", environ.get("MT5_BROKER_OFFSET_HOURS", "7")
         ),
-        clock_symbol=_required(environ, "MT5_CLOCK_SYMBOL"),
         clock_check_seconds=_integer(
             "MT5_CLOCK_CHECK_SECONDS", environ.get("MT5_CLOCK_CHECK_SECONDS", "300")
+        ),
+        clock_sample_max_age_seconds=_integer(
+            "MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS",
+            environ.get("MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS", "30"),
+        ),
+        clock_bootstrap_seconds=_integer(
+            "MT5_CLOCK_BOOTSTRAP_SECONDS", environ.get("MT5_CLOCK_BOOTSTRAP_SECONDS", "120")
         ),
     )
 

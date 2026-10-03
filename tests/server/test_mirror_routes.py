@@ -28,7 +28,10 @@ LISTING = [function for function in FUNCTIONS if function.result is mirror.Resul
 FAILURE_ANSWERS = {mirror.Failure.NONE: None, mirror.Failure.FALSE: False}
 
 
-def test_the_server_routes_the_mirror_health_and_commissions(app):
+UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
+
+
+def test_the_server_routes_the_mirror_health_commissions_and_the_server_time_relay(app):
     routes = {
         (rule.rule, method)
         for rule in app.url_map.iter_rules()
@@ -37,7 +40,28 @@ def test_the_server_routes_the_mirror_health_and_commissions(app):
     assert routes == {(f"/mt5/{function.name}", "POST") for function in FUNCTIONS} | {
         ("/health", "GET"),
         ("/commissions/<symbol>", "GET"),
+        ("/relay/server_time", "POST"),
     }
+
+
+@pytest.mark.parametrize("function", FUNCTIONS, ids=str)
+def test_every_mirror_route_is_unavailable_while_the_clock_is_not_verified(
+    client, stub, clock_status, function
+):
+    clock_status.clear()
+
+    response = client.post(f"/mt5/{function.name}", json=argument_samples(function))
+
+    assert (response.status_code, response.json) == (503, UNVERIFIED)
+    assert stub.mock_calls == []
+
+
+def test_commissions_are_unavailable_while_the_clock_is_not_verified(client, clock_status):
+    clock_status.clear()
+
+    response = client.get("/commissions/EURUSD")
+
+    assert (response.status_code, response.json) == (503, UNVERIFIED)
 
 
 def test_answer_carries_the_last_error_read_after_the_call(client, stub):
