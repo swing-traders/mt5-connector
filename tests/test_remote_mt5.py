@@ -12,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 import mt5connect.remote_mt5 as rmt5
-from mt5connect.errors import MT5ConfigError, MT5ConnectionError, ServerUnreachable
+from mt5connect import errors
+from mt5connect.errors import MT5ConfigError, MT5ConnectionError, ServerBusy, ServerUnreachable
 
 JSON = "application/json"
 
@@ -32,6 +33,10 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         self.server.stand_in.received.append((self.path, json.loads(body), self.client_address))
+        if self.server.stand_in.drop:
+            # The request arrived; the connection closes before any reply.
+            self.close_connection = True
+            return
         status, content_type, payload, delay = self.server.stand_in.answer
         time.sleep(delay)
         self.send_response(status)
@@ -51,6 +56,7 @@ class _StandIn:
         self.url = url
         self.received = []
         self.answer = (200, JSON, json.dumps(_answer(None)).encode(), 0.0)
+        self.drop = False
 
     def reply(self, status: int, body, content_type: str = JSON, delay: float = 0.0) -> None:
         payload = body.encode() if isinstance(body, str) else json.dumps(body).encode()
@@ -125,22 +131,45 @@ def test_refused_connection_raises_server_unreachable(monkeypatch):
     monkeypatch.setattr(rmt5, "_session", None)
     monkeypatch.setattr(rmt5, "_server_url", None)
     rmt5.configure(f"http://127.0.0.1:{port}")
-    with pytest.raises(ServerUnreachable):
-        rmt5.positions_get()
+    with pytest.raises(ServerUnreachable) as refused:
+        rmt5.order_send({"action": 1})
+    assert not isinstance(refused.value, errors.ResponseLost)
     assert issubclass(ServerUnreachable, MT5ConnectionError)
     rmt5._session.close()
 
 
-def test_html_server_error_raises_server_unreachable(stand_in):
+def test_html_server_error_raises_response_lost(stand_in):
     stand_in.reply(500, "<html><body>Internal Server Error</body></html>", content_type="text/html")
-    with pytest.raises(ServerUnreachable, match="HTTP 500"):
-        rmt5.terminal_info()
+    with pytest.raises(errors.ResponseLost, match="HTTP 500"):
+        rmt5.order_send({"action": 1})
+    assert issubclass(errors.ResponseLost, ServerUnreachable)
 
 
-def test_non_json_answer_raises_server_unreachable(stand_in):
+def test_non_json_answer_raises_response_lost(stand_in):
     stand_in.reply(200, "not json", content_type="text/plain")
-    with pytest.raises(ServerUnreachable, match="not JSON"):
-        rmt5.account_info()
+    with pytest.raises(errors.ResponseLost, match="not JSON"):
+        rmt5.order_send({"action": 1})
+
+
+def test_a_connection_closed_after_the_request_arrived_raises_response_lost(stand_in):
+    stand_in.drop = True
+    with pytest.raises(errors.ResponseLost, match="order_send"):
+        rmt5.order_send({"action": 1})
+    assert stand_in.received[0][:2] == ("/mt5/order_send", {"request": {"action": 1}})
+
+
+def test_the_unverified_clock_gate_raises_server_unreachable_not_a_lost_response(stand_in):
+    message = "the broker clock is not verified"
+    stand_in.reply(503, {"ok": False, "error": {"code": -1, "message": message}})
+    with pytest.raises(ServerUnreachable, match="server not ready") as refused:
+        rmt5.order_send({"action": 1})
+    assert not isinstance(refused.value, errors.ResponseLost)
+
+
+def test_a_busy_server_raises_server_busy_not_a_lost_response(stand_in):
+    stand_in.reply(503, _failure(-20_002, "/mt5/order_send: the server is busy"))
+    with pytest.raises(ServerBusy):
+        rmt5.order_send({"action": 1})
 
 
 @pytest.mark.parametrize("status", [200, 400, 503])
@@ -173,9 +202,9 @@ def test_failure_whose_error_is_not_its_last_error_raises_server_unreachable(
         "failure-without-last-error",
     ],
 )
-def test_json_that_is_not_an_envelope_raises_server_unreachable(stand_in, body):
+def test_json_that_is_not_an_envelope_raises_response_lost(stand_in, body):
     stand_in.reply(200, body)
-    with pytest.raises(ServerUnreachable, match="not an envelope"):
+    with pytest.raises(errors.ResponseLost, match="not an envelope"):
         rmt5.initialize()
 
 
@@ -251,17 +280,23 @@ def test_array_value_outside_its_dtype_raises_server_unreachable(stand_in, row):
         "none-bool",
     ],
 )
-def test_result_outside_its_kind_raises_server_unreachable(stand_in, function, result):
+def test_result_outside_its_kind_raises_response_lost(stand_in, function, result):
     stand_in.reply(200, _answer(result))
-    with pytest.raises(ServerUnreachable, match=function):
+    with pytest.raises(errors.ResponseLost, match=function):
         getattr(rmt5, function)()
 
 
-def test_read_timeout_raises_server_unreachable(stand_in, monkeypatch):
+def test_an_order_send_result_outside_its_struct_raises_response_lost(stand_in):
+    stand_in.reply(200, _answer({"retcode": 10009}))
+    with pytest.raises(errors.ResponseLost, match="OrderSendResult"):
+        rmt5.order_send({"action": 1})
+
+
+def test_read_timeout_raises_response_lost(stand_in, monkeypatch):
     monkeypatch.setattr(rmt5, "READ_TIMEOUT_S", 0.2)
-    stand_in.reply(200, _answer(0), delay=0.6)
-    with pytest.raises(ServerUnreachable):
-        rmt5.positions_total()
+    stand_in.reply(200, _answer(None), delay=0.6)
+    with pytest.raises(errors.ResponseLost):
+        rmt5.order_send({"action": 1})
 
 
 def test_login_timeout_reaches_the_terminal_and_extends_the_read_timeout(stand_in, monkeypatch):

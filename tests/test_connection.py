@@ -29,6 +29,7 @@ Test groups:
   20. reconnect() resets attempt counter on success
 """
 
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -429,6 +430,27 @@ class TestReconnectAsyncFailure:
         mock_mt5.last_error.return_value = (5, "IPC timeout")
         conn = MT5Connection(config)
         await conn.reconnect_async()
+        assert conn.state == ConnectionState.FAILED
+
+
+class TestReconnectAsyncSerialised:
+    """Clients sharing one connection reconnect it once between them."""
+
+    async def test_a_concurrent_second_caller_awaits_the_first_reconnect(self, config, mock_mt5):
+        conn = MT5Connection(config)
+        first, second = await asyncio.gather(conn.reconnect_async(), conn.reconnect_async())
+        assert (first, second) == (True, True)
+        assert mock_mt5.initialize.call_count == 1
+        assert mock_mt5.login.call_count == 1
+        assert conn.state == ConnectionState.CONNECTED
+
+    async def test_a_concurrent_second_caller_shares_the_first_ones_failure(self, config, mock_mt5):
+        mock_mt5.initialize.return_value = False
+        mock_mt5.last_error.return_value = (5, "IPC timeout")
+        conn = MT5Connection(config)
+        first, second = await asyncio.gather(conn.reconnect_async(), conn.reconnect_async())
+        assert (first, second) == (False, False)
+        assert mock_mt5.initialize.call_count == config.reconnect_max_attempts
         assert conn.state == ConnectionState.FAILED
 
 

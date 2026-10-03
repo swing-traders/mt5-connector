@@ -17,9 +17,10 @@ from urllib.parse import quote
 
 import numpy as np
 import requests
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
 
 from mt5connect import mirror
-from mt5connect.errors import MT5ConfigError, ServerBusy, ServerUnreachable
+from mt5connect.errors import MT5ConfigError, ResponseLost, ServerBusy, ServerUnreachable
 from mt5connect.history_wire import ServerCode
 
 __version__ = mirror.PACKAGE_VERSION
@@ -165,7 +166,7 @@ def _exchange(
             timeout=(CONNECT_TIMEOUT_S, read_timeout_s),
         )
     except requests.RequestException as exc:
-        raise ServerUnreachable(f"{name}: {exc}") from exc
+        raise _unanswered(name, exc) from exc
     envelope = _envelope(name, response)
     code, message = envelope["last_error"]
     _last_error = (code, message)
@@ -184,11 +185,11 @@ def commission_schedule(symbol: str) -> dict | None:
             timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
         )
     except requests.RequestException as exc:
-        raise ServerUnreachable(f"{name}: {exc}") from exc
+        raise _unanswered(name, exc) from exc
     try:
         envelope = response.json()
     except requests.JSONDecodeError as exc:
-        raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not JSON") from exc
+        raise ResponseLost(f"{name}: HTTP {response.status_code} body is not JSON") from exc
     if response.status_code == HTTPStatus.OK and _is_relayed(envelope):
         return envelope["result"]
     elif (
@@ -200,7 +201,17 @@ def commission_schedule(symbol: str) -> dict | None:
     elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(envelope):
         raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
     else:
-        raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not an envelope")
+        raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
+
+
+def _unanswered(name: str, exc: requests.RequestException) -> ServerUnreachable:
+    """The error for a request no reply answered: ServerUnreachable when the connection was never
+    made, so the server cannot have seen it, else ResponseLost."""
+    cause = exc.args[0] if exc.args else None
+    if isinstance(cause, MaxRetryError) and isinstance(cause.reason, ConnectTimeoutError):
+        return ServerUnreachable(f"{name}: {exc}")
+    else:
+        return ResponseLost(f"{name}: {exc}")
 
 
 def _read_timeout_s(function: mirror.Function, body: dict[str, object]) -> float:
@@ -213,13 +224,14 @@ def _read_timeout_s(function: mirror.Function, body: dict[str, object]) -> float
 
 
 def _envelope(name: str, response: requests.Response) -> dict:
-    """The response's envelope; raises ServerUnreachable for anything outside the contract."""
+    """The response's envelope; raises ServerUnreachable for the server refusing the request before
+    serving it, ResponseLost for any other answer outside the contract."""
     if response.status_code not in _ENVELOPE_STATUSES:
-        raise ServerUnreachable(f"{name}: HTTP {response.status_code}")
+        raise ResponseLost(f"{name}: HTTP {response.status_code}")
     try:
         envelope = response.json()
     except requests.JSONDecodeError as exc:
-        raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not JSON") from exc
+        raise ResponseLost(f"{name}: HTTP {response.status_code} body is not JSON") from exc
     if response.status_code == HTTPStatus.OK and _is_answer(envelope):
         return envelope
     elif _is_error(envelope):
@@ -227,7 +239,7 @@ def _envelope(name: str, response: requests.Response) -> dict:
     elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(envelope):
         raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
     else:
-        raise ServerUnreachable(f"{name}: HTTP {response.status_code} body is not an envelope")
+        raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
 
 
 def _with_server_code(envelope: dict) -> dict:
@@ -298,9 +310,9 @@ def _is_code_and_message(code: object, message: object) -> bool:
 
 
 def _decode(function: mirror.Function, result: object) -> object:
-    """The result in the package's types; raises ServerUnreachable for any other shape."""
+    """The result in the package's types; raises ResponseLost for any other shape."""
     if not _has_result_shape(function.result, result):
-        raise ServerUnreachable(f"{function.name}: the result is not a {function.result} answer")
+        raise ResponseLost(f"{function.name}: the result is not a {function.result} answer")
     if function.result is mirror.ResultKind.STRUCT:
         return _struct(function.name, mirror.STRUCTS[function.struct], result)
     elif function.result is mirror.ResultKind.STRUCTS:
@@ -329,7 +341,7 @@ def _has_result_shape(kind: mirror.ResultKind, result: object) -> bool:
 
 def _struct(name: str, struct: mirror.Struct, data: object) -> tuple:
     if not isinstance(data, dict) or set(data) != set(struct.fields):
-        raise ServerUnreachable(f"{name}: the {struct.name} fields are not the package's")
+        raise ResponseLost(f"{name}: the {struct.name} fields are not the package's")
     values = {}
     for field in struct.fields:
         if field in struct.nested:
@@ -340,8 +352,8 @@ def _struct(name: str, struct: mirror.Struct, data: object) -> tuple:
 
 
 def decode_array(name: str, array: mirror.Array, rows: list) -> np.ndarray:
-    """The rows as the package's structured array; raises ServerUnreachable for a row that does not
-    fit its dtype."""
+    """The rows as the package's structured array; raises ResponseLost for a row that does not fit
+    its dtype."""
     records = []
     for row in rows:
         if (
@@ -349,7 +361,7 @@ def decode_array(name: str, array: mirror.Array, rows: list) -> np.ndarray:
             or set(row) != set(array.names)
             or not all(_fits(row[field], numpy_type) for field, numpy_type in array.dtype)
         ):
-            raise ServerUnreachable(f"{name}: a {array.name} row does not fit the package's dtype")
+            raise ResponseLost(f"{name}: a {array.name} row does not fit the package's dtype")
         records.append(tuple(row[field] for field in array.names))
     return np.array(records, dtype=np.dtype(list(array.dtype)))
 

@@ -19,8 +19,7 @@ from mt5connect.errors import MT5ConfigError
 
 @dataclass
 class MT5Config:
-    """The account the adapter logs in to, the symbols it loads, the server it reaches, and its
-    polling and reconnect timings; README.md's configuration reference documents each field."""
+    """What the adapter runs with; README.md's configuration reference documents each field."""
 
     # ── Required ──────────────────────────────────────────────────────────────
     account: int
@@ -30,6 +29,9 @@ class MT5Config:
 
     # ── Optional / defaults ───────────────────────────────────────────────────
     exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
+    deviation_points: int = 20
+    account_refresh_seconds: int = 10
+    history_lookback_mins: int = 60
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
     reconnect_max_delay_s: float = RECONNECT_MAX_DELAY_S
     reconnect_max_attempts: int = RECONNECT_MAX_ATTEMPTS
@@ -56,6 +58,12 @@ class MT5Config:
 
         if self.exec_poll_interval_ms < 50:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")
+        if self.deviation_points < 0:
+            raise ValueError("deviation_points must not be negative.")
+        if self.account_refresh_seconds < 1:
+            raise ValueError("account_refresh_seconds must be at least 1.")
+        if self.history_lookback_mins <= 0:
+            raise ValueError("history_lookback_mins must be positive.")
 
         if not self.server_url:
             raise MT5ConfigError("MT5Config.server_url cannot be empty.")
