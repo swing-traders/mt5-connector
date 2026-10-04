@@ -2,6 +2,7 @@
 history as the terminal does."""
 
 import calendar
+import logging
 import threading
 import time
 import types
@@ -1121,6 +1122,71 @@ def test_ranges_without_a_symbol_are_refused(client, stub):
         "missing parameter: symbol",
     )
     assert stub.calls == []
+
+
+# ── The repeated hour ─────────────────────────────────────────────────────────
+
+# Broker 08:30 on 2025-11-02 and on 2024-11-03 is New York's repeated 01:30, each first occurring
+# under EDT.
+REPEATED = broker(2025, 11, 2, 8, 30)
+REPEATED_A_YEAR_BEFORE = broker(2024, 11, 3, 8, 30)
+
+
+def mirror_ticks(client, start: int, end: int):
+    body = {"symbol": "EURUSD", "date_from": start, "date_to": end, "flags": INFO}
+    return client.post("/mt5/copy_ticks_range", json=body)
+
+
+def repeated_hour_warning(epoch: int) -> str:
+    return (
+        f"copy_ticks_range: ticks.time {epoch} is in the broker's repeated hour, read as its first "
+        "occurrence"
+    )
+
+
+def encoding_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "mt5connector.server.encoding" and record.levelno == logging.WARNING
+    ]
+
+
+def test_each_repeated_broker_hour_is_warned_of_once_across_answers_and_routes(
+    client, stub, floors, caplog
+):
+    stub.ticks = ticks(REPEATED_A_YEAR_BEFORE * 1000, REPEATED * 1000, (REPEATED + MINUTE) * 1000)
+    kept(floors, Series.TICKS, broker(2024, 10, 1) * 1000)
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.encoding")
+
+    answers = [
+        mirror_ticks(client, REPEATED - EDT, REPEATED - EDT),
+        mirror_ticks(client, REPEATED + MINUTE - EDT, REPEATED + MINUTE - EDT),
+        post_ticks(client, REPEATED - EDT, REPEATED + MINUTE - EDT),
+    ]
+    in_one_hour = encoding_warnings(caplog)
+    answers.append(mirror_ticks(client, REPEATED_A_YEAR_BEFORE - EDT, REPEATED_A_YEAR_BEFORE - EDT))
+    answers.append(post_ticks(client, REPEATED - EDT, REPEATED - EDT))
+
+    assert [len(answer.json["result"]) for answer in answers] == [1, 1, 2, 1, 1]
+    assert in_one_hour == [repeated_hour_warning(REPEATED)]
+    assert encoding_warnings(caplog) == [
+        repeated_hour_warning(REPEATED),
+        repeated_hour_warning(REPEATED_A_YEAR_BEFORE),
+    ]
+
+
+def test_an_answer_spanning_two_repeated_hours_warns_of_each(client, stub, caplog):
+    stub.ticks = ticks(REPEATED_A_YEAR_BEFORE * 1000, REPEATED * 1000)
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.encoding")
+
+    answer = mirror_ticks(client, REPEATED_A_YEAR_BEFORE - EDT, REPEATED - EDT)
+
+    assert len(answer.json["result"]) == 2
+    assert encoding_warnings(caplog) == [
+        repeated_hour_warning(REPEATED_A_YEAR_BEFORE),
+        repeated_hour_warning(REPEATED),
+    ]
 
 
 # ── The client ────────────────────────────────────────────────────────────────

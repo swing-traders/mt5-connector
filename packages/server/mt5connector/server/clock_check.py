@@ -162,6 +162,12 @@ class ClockCheck:
         now = int(time.time())
         offset_s = int(self._clock.offset_at(now).total_seconds())
         trade_server = self._clock.to_utc(sample.trade_server)
+        # A sample in the broker's repeated hour may name either occurrence: the one nearer the
+        # server's clock is measured.
+        if self._clock.is_ambiguous(sample.trade_server):
+            second = self._clock.to_utc_second_occurrence(sample.trade_server)
+            if abs(second - now) < abs(trade_server - now):
+                trade_server = second
         skew_s = trade_server - now
         logger.info(
             "broker clock measured on %s: trade server at %s, %+d s from the server clock; "

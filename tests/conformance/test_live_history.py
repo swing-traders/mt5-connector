@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pytest
 
+from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History, Syncing
 from mt5connector.server.terminal import Answered, Failed, Terminal
 from mt5connector.server.wire import mirror
@@ -35,7 +36,9 @@ def clock() -> BrokerClock:
 
 @pytest.fixture(scope="module")
 def history(terminal, clock) -> History:
-    return History(Terminal(terminal), clock, FloorStore(), retry_s=5, floor_ttl_s=900)
+    return History(
+        Terminal(terminal), clock, RepeatedHours(), FloorStore(), retry_s=5, floor_ttl_s=900
+    )
 
 
 def answered(read: Callable[[], Answered | Failed | Syncing]) -> list:

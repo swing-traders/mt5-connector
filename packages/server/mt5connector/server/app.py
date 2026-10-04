@@ -26,7 +26,7 @@ from mt5connector.server.commissions import (
     commission_schedule,
     commissions_refusal,
 )
-from mt5connector.server.encoding import encode, non_epochs, package_arguments
+from mt5connector.server.encoding import RepeatedHours, encode, non_epochs, package_arguments
 from mt5connector.server.history import FloorStore, History, Syncing, bars_refusal, ticks_refusal
 from mt5connector.server.server_time import ServerTimeSink, server_time_refusal, server_time_sample
 from mt5connector.server.settings import Settings, read_settings
@@ -143,6 +143,7 @@ def create_app(
     terminal: Terminal,
     commissions: CommissionStore,
     clock: BrokerClock,
+    repeated_hours: RepeatedHours,
     server_times: ServerTimeSink,
     clock_status: ClockStatus,
     history: History,
@@ -163,7 +164,9 @@ def create_app(
         app.add_url_rule(
             f"/mt5/{function.name}",
             endpoint=function.name.value,
-            view_func=_capped(concurrency, retry_s, _mirror_view(terminal, function, clock)),
+            view_func=_capped(
+                concurrency, retry_s, _mirror_view(terminal, function, clock, repeated_hours)
+            ),
             methods=["POST"],
         )
     app.add_url_rule(
@@ -293,7 +296,12 @@ def _capped(concurrency: _Concurrency, retry_s: int, view: Callable) -> Callable
     return capped
 
 
-def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClock) -> Callable:
+def _mirror_view(
+    terminal: Terminal,
+    function: mirror.Function,
+    clock: BrokerClock,
+    repeated_hours: RepeatedHours,
+) -> Callable:
     def view():
         arguments = _body_arguments()
         refusal = _refusal(function, arguments)
@@ -315,7 +323,9 @@ def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClo
                 return _failure(*outcome.last_error), status
             else:
                 return (
-                    _answer(encode(function, outcome.value, clock), outcome.last_error),
+                    _answer(
+                        encode(function, outcome.value, clock, repeated_hours), outcome.last_error
+                    ),
                     HTTPStatus.OK,
                 )
 
@@ -551,9 +561,11 @@ def main() -> None:
         bootstrap_s=settings.clock_bootstrap_seconds,
     )
     threading.Thread(target=clock_check.run, name="broker-clock-check", daemon=True).start()
+    repeated_hours = RepeatedHours()
     history = History(
         terminal,
         clock,
+        repeated_hours,
         FloorStore(),
         retry_s=settings.history_retry_seconds,
         floor_ttl_s=settings.floor_ttl_seconds,
@@ -568,6 +580,7 @@ def main() -> None:
         terminal,
         CommissionStore(),
         clock,
+        repeated_hours,
         server_times,
         clock_check.status,
         history,

@@ -619,6 +619,38 @@ bool ChartServes(const string name)
     return false;
 }
 
+// The chart of the symbol that runs this EA, other than this EA's own, or -1 when none does.
+long PublisherChart(const string name)
+{
+    long chart = ChartFirst();
+    while (chart != -1)
+    {
+        string expert;
+        if (chart != ChartID()
+            && ChartSymbol(chart) == name
+            && ChartGetString(chart, CHART_EXPERT_NAME, expert)
+            && expert == MQLInfoString(MQL_PROGRAM_NAME))
+            return chart;
+        chart = ChartNext(chart);
+    }
+    return -1;
+}
+
+// Takes the symbol out of Market Watch; the terminal may still count a chart just closed open, so a
+// refused deselect is tried again.
+void Deselect(const string name)
+{
+    if (SymbolSelect(name, false))
+    {
+        PrintFormat("ticks: took '%s' out of Market Watch", name);
+    }
+    else
+    {
+        PrintFormat("ticks: '%s' leaves Market Watch once allowed", name);
+        KeepDeselecting(name);
+    }
+}
+
 //+------------------------------------------------------------------+
 //| Open an M1 chart of the symbol with the EA's template, unless a  |
 //| chart already serves it, and tell the hub whether one does       |
@@ -672,10 +704,10 @@ void OpenChart(const string name)
 }
 
 //+------------------------------------------------------------------+
-//| Close the chart the spawner opened for the symbol, then take the |
-//| symbol out of Market Watch, which the terminal refuses while a   |
-//| chart of it is open or it has open positions; a symbol with open |
-//| positions or pending orders keeps its chart, and the hub is told |
+//| Close the symbol's chart, then take the symbol out of Market     |
+//| Watch, which the terminal refuses while a chart of it is open or |
+//| it has open positions; a symbol with open positions or pending   |
+//| orders keeps its chart, and the hub is told                      |
 //+------------------------------------------------------------------+
 void CloseOpenedChart(const string name)
 {
@@ -692,7 +724,22 @@ void CloseOpenedChart(const string name)
     }
     else if (index < 0)
     {
-        PrintFormat("ticks: no open chart was opened for '%s'", name);
+        // A publisher that predates this spawner runs on a chart it did not open.
+        const long chart = PublisherChart(name);
+        if (chart < 0)
+        {
+            PrintFormat("ticks: no '%s' chart runs this EA", name);
+            Deselect(name);
+        }
+        else if (!ChartClose(chart))
+        {
+            PrintFormat("ticks: ChartClose of the '%s' chart failed: %d", name, GetLastError());
+        }
+        else
+        {
+            PrintFormat("ticks: closed the '%s' chart", name);
+            Deselect(name);
+        }
     }
     else if (!ChartClose(g_openedCharts[index]))
     {
@@ -702,16 +749,8 @@ void CloseOpenedChart(const string name)
     {
         ArrayRemove(g_openedCharts, index, 1);
         ArrayRemove(g_openedSymbols, index, 1);
-        // The terminal may still count the chart open, so a refused deselect is tried again.
-        if (SymbolSelect(name, false))
-        {
-            PrintFormat("ticks: closed the '%s' chart and took it out of Market Watch", name);
-        }
-        else
-        {
-            PrintFormat("ticks: closed the '%s' chart; it leaves Market Watch once allowed", name);
-            KeepDeselecting(name);
-        }
+        PrintFormat("ticks: closed the '%s' chart", name);
+        Deselect(name);
     }
 }
 

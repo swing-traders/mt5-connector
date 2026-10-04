@@ -13,7 +13,7 @@ from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 from mt5connector.server import ws_server
 from mt5connector.server.server_time import ServerTimeSample
 from mt5connector.server.wire import mirror
-from mt5connector.server.wire.push_wire import ChartState
+from mt5connector.server.wire.push_wire import ChartState, FrameType
 from mt5connector.server.ws_server import (
     COMMISSIONS_RELAY_PATH,
     SERVER_TIME_RELAY_PATH,
@@ -854,6 +854,144 @@ async def test_the_hub_serves_a_10_s_ping_interval_a_30_s_ping_timeout_and_a_10_
         10,
     )
     await _close(server, adapter)
+
+
+# ── Connections leaving while the hub sends ──────────────────────────────────
+
+
+class LeavingOnSend(Peer):
+    """A connection double whose send of a frame of `kind` has `leaving` go away and yields until
+    the hub has dropped it, as a peer closing while the hub waits on a send does."""
+
+    def __init__(self, kind: FrameType):
+        super().__init__()
+        self.kind = kind
+        self.leaving = None
+
+    async def send(self, raw):
+        await super().send(raw)
+        if FrameType(json.loads(raw)["type"]) == self.kind and self.leaving is not None:
+            leaving, self.leaving = self.leaving, None
+            await leaving.close()
+            await _settle()
+
+
+async def test_an_idle_sweep_whose_spawner_leaves_mid_sweep_stops_and_the_next_spawner_is_told(
+    clock,
+):
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    spawner = LeavingOnSend(FrameType.CLOSE_CHART)
+    spawner.leaving = spawner
+    gbpusd = Peer()
+    usdjpy = Peer()
+    tasks = await _spawning(hub, (spawner, "EURUSD"), (gbpusd, "GBPUSD"), (usdjpy, "USDJPY"))
+    clock[0] = 1_000.0 + IDLE_S
+
+    await hub.close_idle_charts()
+    successor = Peer()
+    tasks.append(asyncio.create_task(hub.handler(successor)))
+    successor.put(ea_hello("EURUSD", spawner=True))
+    await _settle()
+    await hub.close_idle_charts()
+
+    assert spawner.sent == [wanted("EURUSD"), addressed("close_chart", "GBPUSD")]
+    assert successor.sent == [
+        wanted("EURUSD"),
+        addressed("close_chart", "GBPUSD"),
+        addressed("close_chart", "USDJPY"),
+    ]
+    await _closed(tasks, successor, gbpusd, usdjpy)
+
+
+async def test_a_publisher_that_leaves_mid_sweep_is_skipped_and_closed_when_idle_on_its_return(
+    clock,
+):
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    spawner = LeavingOnSend(FrameType.CLOSE_CHART)
+    gbpusd = Peer()
+    usdjpy = Peer()
+    tasks = await _spawning(hub, (spawner, "EURUSD"), (gbpusd, "GBPUSD"), (usdjpy, "USDJPY"))
+    spawner.leaving = usdjpy
+    clock[0] = 1_000.0 + IDLE_S
+
+    await hub.close_idle_charts()
+    swept = list(spawner.sent)
+    returned = Peer()
+    tasks.append(asyncio.create_task(hub.handler(returned)))
+    returned.put(ea_hello("USDJPY"))
+    await _settle()
+    clock[0] = 1_000.0 + 2 * IDLE_S
+    await hub.close_idle_charts()
+
+    assert swept == [wanted("EURUSD"), addressed("close_chart", "GBPUSD")]
+    assert spawner.sent == [
+        wanted("EURUSD"),
+        addressed("close_chart", "GBPUSD"),
+        addressed("close_chart", "USDJPY"),
+    ]
+    await _closed(tasks, spawner, gbpusd, returned)
+
+
+async def test_a_publisher_leaving_while_another_is_told_its_wanted_frame_breaks_no_subscription():
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    eurusd = LeavingOnSend(FrameType.WANTED)
+    gbpusd = Peer()
+    adapter = Peer()
+    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (eurusd, gbpusd, adapter)]
+    eurusd.put(ea_hello("EURUSD"))
+    gbpusd.put(ea_hello("GBPUSD"))
+    adapter.put(adapter_hello())
+    await _settle()
+    eurusd.leaving = gbpusd
+
+    adapter.put(subscribe(1, "ticks", symbol="EURUSD"))
+    await _settle()
+    eurusd.put(tick())
+    await _settle()
+    returned = Peer()
+    tasks.append(asyncio.create_task(hub.handler(returned)))
+    returned.put(ea_hello("GBPUSD"))
+    await _settle()
+
+    assert adapter.closed is None
+    assert adapter.sent == [{"v": 1, "type": "ack", "id": 1}, utc_tick()]
+    assert eurusd.sent == [wanted("EURUSD"), wanted("EURUSD", ticks=True)]
+    assert returned.sent == [wanted("GBPUSD")]
+    await _closed(tasks, adapter, eurusd, returned)
+
+
+async def test_a_publisher_leaving_while_a_consumers_leaving_is_told_ends_its_handler_cleanly():
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    eurusd = LeavingOnSend(FrameType.WANTED)
+    gbpusd = Peer()
+    leaving = Peer()
+    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (eurusd, gbpusd, leaving)]
+    eurusd.put(ea_hello("EURUSD"))
+    gbpusd.put(ea_hello("GBPUSD"))
+    leaving.put(adapter_hello())
+    leaving.put(subscribe(1, "ticks", symbol="EURUSD"))
+    leaving.put(subscribe(2, "ticks", symbol="GBPUSD"))
+    await _settle()
+    eurusd.leaving = gbpusd
+
+    await leaving.close()
+    await asyncio.wait_for(asyncio.gather(*tasks[1:]), timeout=1)
+    staying = Peer()
+    tasks.append(asyncio.create_task(hub.handler(staying)))
+    staying.put(adapter_hello())
+    staying.put(subscribe(1, "ticks", symbol="EURUSD"))
+    await _settle()
+    eurusd.put(tick())
+    await _settle()
+
+    assert eurusd.sent == [
+        wanted("EURUSD"),
+        wanted("EURUSD", ticks=True),
+        wanted("EURUSD"),
+        wanted("EURUSD", ticks=True),
+    ]
+    assert staying.sent == [{"v": 1, "type": "ack", "id": 1}, utc_tick()]
+    await _closed(tasks, eurusd, staying)
 
 
 # ── Roles, kinds and malformed frames ────────────────────────────────────────

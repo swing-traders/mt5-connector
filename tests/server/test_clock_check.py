@@ -1,11 +1,13 @@
 """The broker clock's check against the trade-server time the EA relays, and the routes it gates."""
 
+import calendar
 import logging
 import math
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 from chart_posts import ChartPosts, publishers_on
@@ -13,6 +15,7 @@ from mirror_samples import CLOCK
 
 from mt5connector.server.app import create_app
 from mt5connector.server.clock_check import ClockCheck
+from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
 
@@ -115,11 +118,13 @@ def clock_check(timeline: Timeline) -> ClockCheck:
 
 
 def routes(terminal, commissions, check: ClockCheck):
-    history = History(terminal, CLOCK, FloorStore(), retry_s=0.01, floor_ttl_s=900)
+    repeated_hours = RepeatedHours()
+    history = History(terminal, CLOCK, repeated_hours, FloorStore(), retry_s=0.01, floor_ttl_s=900)
     return create_app(
         terminal,
         commissions,
         CLOCK,
+        repeated_hours,
         ServerTimeSink(max_age_s=MAX_AGE_S),
         check.status,
         history,
@@ -463,4 +468,79 @@ def test_a_run_not_mature_at_the_end_of_the_bootstrap_window_exits(timeline_at, 
     assert check.status.read() is None
     assert messages(caplog, logging.CRITICAL) == [
         "broker clock: the terminal was not connected for 30 s without a break in 120 s"
+    ]
+
+
+# New York's 2026 autumn change: 01:00-02:00 local, broker 08:00-09:00, runs under EDT from 05:00Z
+# and again under EST from 06:00Z. Each case: the true-UTC instant the clock is checked at, the
+# broker epoch a correct clock samples then, and the offset in effect.
+AUTUMN_CHECKS = [
+    (calendar.timegm((2026, 11, 1, 5, 30, 0)), calendar.timegm((2026, 11, 1, 8, 30, 0)), 10_800),
+    (calendar.timegm((2026, 11, 1, 6, 30, 0)), calendar.timegm((2026, 11, 1, 8, 30, 0)), 7_200),
+    (calendar.timegm((2026, 11, 1, 7, 30, 0)), calendar.timegm((2026, 11, 1, 9, 30, 0)), 7_200),
+]
+AUTUMN_IDS = ["first-occurrence", "second-occurrence", "after-the-hour"]
+
+
+def connected_samples_until(timeline: Timeline, broker_at_check: int) -> None:
+    """Connected samples every 10 s through t=30, the last one naming `broker_at_check`."""
+    for at in range(0, 31, 10):
+        timeline.arrive(at, sample(broker_at_check - 30 + at))
+
+
+@pytest.mark.parametrize(("utc", "broker", "offset_s"), AUTUMN_CHECKS, ids=AUTUMN_IDS)
+def test_a_correct_clock_verifies_through_the_repeated_autumn_hour(
+    utc, broker, offset_s, timeline_at, exits, caplog
+):
+    timeline = timeline_at(utc - 30)
+    check = clock_check(timeline)
+    connected_samples_until(timeline, broker)
+
+    run_to_its_end(check)
+
+    assert exits == []
+    iso = datetime.fromtimestamp(utc, UTC).isoformat()
+    assert messages(caplog, logging.INFO)[:2] == [
+        f"broker clock measured on EURUSD: trade server at {iso}, +0 s from the server clock; "
+        f"offset +{offset_s} s",
+        "broker clock verified",
+    ]
+
+
+@pytest.mark.parametrize("error_s", [3_600, -3_600], ids=["an-hour-ahead", "an-hour-behind"])
+@pytest.mark.parametrize(("utc", "broker", "offset_s"), AUTUMN_CHECKS, ids=AUTUMN_IDS)
+def test_a_clock_an_hour_off_exits_through_the_repeated_autumn_hour(
+    utc, broker, offset_s, error_s, timeline_at, exits, caplog
+):
+    timeline = timeline_at(utc - 30)
+    check = clock_check(timeline)
+    connected_samples_until(timeline, broker + error_s)
+
+    check.run()
+
+    assert exits == [1]
+    assert check.status.read() is None
+    (critical,) = messages(caplog, logging.CRITICAL)
+    assert critical.startswith(
+        f"broker clock: EURUSD trade server at broker epoch {broker + error_s} reads "
+    )
+
+
+def test_a_sample_from_before_the_autumn_change_checked_after_it_verifies_the_clock(
+    timeline_at, exits, caplog
+):
+    # Sampled at 05:59:50Z, broker 08:59:50 under EDT; checked at 06:00:10Z, under EST.
+    sampled = calendar.timegm((2026, 11, 1, 5, 59, 50))
+    timeline = timeline_at(sampled - 10)
+    check = clock_check(timeline)
+    timeline.arrive(0, sample(calendar.timegm((2026, 11, 1, 8, 59, 40))))
+    timeline.arrive(10, sample(calendar.timegm((2026, 11, 1, 8, 59, 50))))
+
+    run_to_its_end(check)
+
+    assert exits == []
+    assert messages(caplog, logging.INFO)[:2] == [
+        "broker clock measured on EURUSD: trade server at 2026-11-01T05:59:50+00:00, -20 s from "
+        "the server clock; offset +7200 s",
+        "broker clock verified",
     ]

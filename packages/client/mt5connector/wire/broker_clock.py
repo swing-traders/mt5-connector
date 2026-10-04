@@ -30,6 +30,14 @@ class BrokerClock:
         else:
             return (self._local(broker_epoch) - _EPOCH_UTC) // _SECOND
 
+    def to_utc_second_occurrence(self, broker_epoch: int) -> int:
+        """The true-UTC epoch of a broker epoch in seconds; a repeated wall time reads as its second
+        occurrence."""
+        if broker_epoch == 0:
+            return 0
+        else:
+            return (self._local(broker_epoch).replace(fold=1) - _EPOCH_UTC) // _SECOND
+
     def to_utc_msc(self, broker_epoch_msc: int) -> int:
         """The true-UTC epoch of a broker epoch in milliseconds."""
         if broker_epoch_msc == 0:

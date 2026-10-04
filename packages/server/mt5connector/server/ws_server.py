@@ -164,17 +164,28 @@ class Hub:
             return ChartState.REQUESTED
 
     async def close_idle_charts(self) -> None:
-        """Tells the spawner, which opened them, to close the chart of each symbol out of use for
-        the idle period, once per spawner connection; the spawner's own chart never closes."""
-        if self._spawner is None:
+        """Tells the spawner to close the chart of each symbol out of use for the idle period, once
+        per spawner connection; the spawner's own chart never closes."""
+        spawner = self._spawner
+        if spawner is None:
             return
         now = time.monotonic()
         for symbol, ws in sorted(self._publishers.items()):
-            idle = not self._in_use(symbol, now)
-            if idle and ws is not self._spawner and symbol not in self._close_sent:
+            # Each send yields: the sweep ends with its spawner's connection, and passes over a
+            # publisher that left since it began.
+            if self._spawner is not spawner:
+                break
+            elif (
+                self._publishers.get(symbol) is ws
+                and ws is not spawner
+                and symbol not in self._close_sent
+                and not self._in_use(symbol, now)
+            ):
+                # Marked before the send: a chart_kept answering it may arrive before the send
+                # returns, and a drop or a spawner's hello meanwhile takes the mark back.
                 self._close_sent.add(symbol)
                 logger.info("%s out of use for %d s: closing its chart", symbol, self._idle_s)
-                await self._send(self._spawner, _addressed(FrameType.CLOSE_CHART, symbol))
+                await self._send(spawner, _addressed(FrameType.CLOSE_CHART, symbol))
 
     async def _on_frame(self, ws, raw) -> None:
         frame = json.loads(raw)
@@ -399,10 +410,12 @@ class Hub:
         """Tells each symbol's EA its symbol's wanted frame when it differs from the one last
         told."""
         for symbol, ws in list(self._publishers.items()):
-            wanted = self._wanted(symbol)
-            if wanted != self._told[symbol]:
-                self._told[symbol] = wanted
-                await self._send(ws, wanted)
+            # Each send yields: a publisher that left since the loop began is passed over.
+            if self._publishers.get(symbol) is ws:
+                wanted = self._wanted(symbol)
+                if wanted != self._told[symbol]:
+                    self._told[symbol] = wanted
+                    await self._send(ws, wanted)
 
     def _wanted(self, symbol: str) -> dict[str, object]:
         """The wanted frame of a symbol: whether some consumer subscribes to its ticks, and the

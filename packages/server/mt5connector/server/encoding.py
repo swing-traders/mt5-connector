@@ -1,7 +1,11 @@
 """The wire's conversions, shaped by the inventory: package answers to JSON and client arguments to
-the package's, with true-UTC epochs on the wire and the broker's clock at the package."""
+the package's, with true-UTC epochs on the wire and the broker's clock at the package.
+
+State: RepeatedHours, the broker's repeated hours already warned of, across every answer; nothing is
+persisted."""
 
 import logging
+import threading
 from datetime import UTC, datetime
 
 import numpy as np
@@ -12,13 +16,38 @@ from mt5connector.server.wire.broker_clock import BrokerClock
 logger = logging.getLogger(__name__)
 
 _TRADE_REQUEST = mirror.STRUCTS[mirror.StructName.TRADE_REQUEST]
+_HOUR_S = 3_600
 
 
 class ShapeError(Exception):
     """Raised when the package answers in a shape the inventory does not describe."""
 
 
-def encode(function: mirror.Function, value: object, clock: BrokerClock) -> object:
+class RepeatedHours:
+    """The warning that an epoch in the broker's repeated hour reads as its first occurrence, given
+    once per broker hour across every answer the server's worker threads encode."""
+
+    def __init__(self) -> None:
+        self._warned: set[int] = set()
+        self._lock = threading.Lock()
+
+    def warn(self, function: mirror.Function, field: str, epoch: int, hour: int) -> None:
+        """Warns of an answer's epoch in a repeated broker hour, unless that hour was warned of."""
+        with self._lock:
+            warned = hour in self._warned
+            self._warned.add(hour)
+        if not warned:
+            logger.warning(
+                "%s: %s %d is in the broker's repeated hour, read as its first occurrence",
+                function.name,
+                field,
+                epoch,
+            )
+
+
+def encode(
+    function: mirror.Function, value: object, clock: BrokerClock, repeated_hours: RepeatedHours
+) -> object:
     """The JSON value of a successful answer: structs as objects in field order, arrays as a list of
     objects keyed by the dtype's fields, numpy scalars as plain numbers, and epochs in true UTC."""
     answer = _Answer(clock)
@@ -34,14 +63,8 @@ def encode(function: mirror.Function, value: object, clock: BrokerClock) -> obje
         encoded = [_plain(item) for item in value]
     else:
         encoded = _plain(value)
-    if answer.ambiguous is not None:
-        field, epoch = answer.ambiguous
-        logger.warning(
-            "%s: %s %d is in the broker's repeated hour, read as its first occurrence",
-            function.name,
-            field,
-            epoch,
-        )
+    for hour, (field, epoch) in answer.ambiguous.items():
+        repeated_hours.warn(function, field, epoch, hour)
     return encoded
 
 
@@ -93,11 +116,13 @@ def _broker_request(request: dict[str, object], clock: BrokerClock) -> dict[str,
 
 
 class _Answer:
-    """One answer's encoding; remembers the first epoch it read in the broker's repeated hour."""
+    """One answer's encoding; remembers the first epoch it read in each of the broker's repeated
+    hours."""
 
     def __init__(self, clock: BrokerClock) -> None:
         self._clock = clock
-        self.ambiguous: tuple[str, int] | None = None
+        # The field and epoch of the first epoch read in each repeated broker hour, by the hour.
+        self.ambiguous: dict[int, tuple[str, int]] = {}
 
     def struct(self, struct: mirror.Struct, value: tuple) -> dict[str, object]:
         if len(value) != len(struct.fields):
@@ -138,8 +163,9 @@ class _Answer:
         else:
             utc = self._clock.to_utc_msc(value)
             seconds = value // 1000
-        if self.ambiguous is None and value != 0 and self._clock.is_ambiguous(seconds):
-            self.ambiguous = (field, value)
+        hour = seconds // _HOUR_S
+        if value != 0 and hour not in self.ambiguous and self._clock.is_ambiguous(seconds):
+            self.ambiguous[hour] = (field, value)
         return utc
 
 

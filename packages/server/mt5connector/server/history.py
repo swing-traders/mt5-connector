@@ -16,7 +16,7 @@ from enum import StrEnum
 
 import numpy as np
 
-from mt5connector.server.encoding import broker_datetime, encode
+from mt5connector.server.encoding import RepeatedHours, broker_datetime, encode
 from mt5connector.server.terminal import Answered, Failed, Terminal
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
@@ -162,6 +162,7 @@ class History:
         self,
         terminal: Terminal,
         clock: BrokerClock,
+        repeated_hours: RepeatedHours,
         floors: FloorStore,
         *,
         retry_s: int,
@@ -169,6 +170,7 @@ class History:
     ) -> None:
         self._terminal = terminal
         self._clock = clock
+        self._repeated_hours = repeated_hours
         self._floors = floors
         self._retry_s = retry_s
         self._floor_ttl_s = floor_ttl_s
@@ -187,7 +189,9 @@ class History:
         except _Unproven as unproven:
             outcome = self._syncing(f"{symbol} {series} {start}..{end}", unproven)
         else:
-            outcome = Answered(encode(_COPY_RATES_RANGE, rows, self._clock), calls.last_error)
+            outcome = Answered(
+                encode(_COPY_RATES_RANGE, rows, self._clock, self._repeated_hours), calls.last_error
+            )
         return outcome
 
     def ticks(
@@ -204,7 +208,9 @@ class History:
         except _Unproven as unproven:
             outcome = self._syncing(f"{symbol} {Series.TICKS} {start}..{end}", unproven)
         else:
-            outcome = Answered(encode(_COPY_TICKS_RANGE, rows, self._clock), calls.last_error)
+            outcome = Answered(
+                encode(_COPY_TICKS_RANGE, rows, self._clock, self._repeated_hours), calls.last_error
+            )
         return outcome
 
     def ranges(self, symbol: str) -> Answered | Failed:

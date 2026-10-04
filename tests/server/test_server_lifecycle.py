@@ -9,6 +9,7 @@ from mirror_samples import CLOCK
 
 from mt5connector.server.app import TerminalStartError, connect_terminal, create_app
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
+from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.settings import (
     Settings,
@@ -241,13 +242,15 @@ def test_start_initializes_the_configured_terminal_once(
     stub.positions_total.return_value = 0
     terminal = Terminal(stub)
 
-    history = History(terminal, CLOCK, FloorStore(), retry_s=0.01, floor_ttl_s=900)
+    repeated_hours = RepeatedHours()
+    history = History(terminal, CLOCK, repeated_hours, FloorStore(), retry_s=0.01, floor_ttl_s=900)
 
     connect_terminal(terminal, read_settings(ENVIRONMENT))
     client = create_app(
         terminal,
         commissions,
         CLOCK,
+        repeated_hours,
         server_times,
         clock_status,
         history,

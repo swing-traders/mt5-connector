@@ -161,7 +161,7 @@ class _SinkEndingTheCheck(ServerTimeSink):
 
 
 def test_a_frame_relayed_through_the_route_verifies_the_clock(
-    terminal, commissions, history, monkeypatch
+    terminal, commissions, repeated_hours, history, monkeypatch
 ):
     exits = []
     monkeypatch.setattr(os, "_exit", exits.append)
@@ -174,6 +174,7 @@ def test_a_frame_relayed_through_the_route_verifies_the_clock(
         terminal,
         commissions,
         CLOCK,
+        repeated_hours,
         server_times,
         check.status,
         history,

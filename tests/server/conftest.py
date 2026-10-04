@@ -11,6 +11,7 @@ import mt5connector.client.remote_mt5 as shim
 from mt5connector.server.app import create_app
 from mt5connector.server.clock_check import ClockStatus, ClockVerification
 from mt5connector.server.commissions import CommissionStore
+from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.server_time import ServerTimeSink
 from mt5connector.server.terminal import Terminal
@@ -63,9 +64,15 @@ def floors():
 
 
 @pytest.fixture
-def history(terminal, floors):
+def repeated_hours():
+    """The repeated broker hours warned of, shared by the history protocol and the app."""
+    return RepeatedHours()
+
+
+@pytest.fixture
+def history(terminal, repeated_hours, floors):
     """The history protocol under the settings' defaults."""
-    return History(terminal, CLOCK, floors, retry_s=5, floor_ttl_s=900)
+    return History(terminal, CLOCK, repeated_hours, floors, retry_s=5, floor_ttl_s=900)
 
 
 @pytest.fixture
@@ -86,12 +93,22 @@ def workers():
 
 
 @pytest.fixture
-def app(terminal, commissions, server_times, clock_status, history, publishers, workers):
+def app(
+    terminal,
+    commissions,
+    repeated_hours,
+    server_times,
+    clock_status,
+    history,
+    publishers,
+    workers,
+):
     """The app with the broker clock verified, refusing a call past its cap with Retry-After 5."""
     return create_app(
         terminal,
         commissions,
         CLOCK,
+        repeated_hours,
         server_times,
         clock_status,
         history,
