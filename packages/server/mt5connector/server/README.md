@@ -221,7 +221,7 @@ The terminal is started as `terminal64.exe /config:<setup.ini> /portable`, so it
 | | `Enabled` | `1`: algorithmic trading on, without which the terminal refuses every order the adapter sends |
 | | `WebRequest` | `1` |
 | `[StartUp]` | `Script` | `ticks_setup` |
-| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, and its own chart stays open. The deployment sets the symbol: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
+| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, then closes its own. The deployment sets the symbol: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
 
 The terminal must know the trade server `MT5_SERVER` names — its `Config\servers.dat` lists it — before the login can succeed: a server a fresh install does not know is added by searching for its name once (File → Open an Account), or by copying in a `servers.dat` that lists it.
 
@@ -243,9 +243,9 @@ Both sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `
 - It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5`, with the `Include\` tree beside it — and the `.ex5` copied into place.
 - A clean compile writes `0 errors, 0 warnings` to its `/log:` file; a missing `.ex5` is a failed compile.
 
-On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner. It closes no chart, its own included: the terminal starts with none, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
+On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
 
-- The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's and the startup script's included.
+- The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's included.
 - A chart that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
 - The spawner refused as a duplicate keeps its chart and says hello again every `ReconnectIntervalSec`; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
 - A chart closes once its symbol has been out of use for `MT5_CHART_IDLE_SECONDS`: the spawner closes it and takes the symbol out of Market Watch, where the terminal would keep processing its ticks.

@@ -1,12 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                        ticks_setup.mq5           |
 //| Startup script: open the spawner's chart - an M1 chart of the    |
-//| symbol the script runs on - with the spawner template. The       |
-//| terminal starts from an empty profile, so a chart already        |
-//| running the ticks EA is a boot defect: the script reports it and |
-//| opens nothing. It closes no chart, its own included; every other |
-//| chart opens on demand. No includes - compiles with a bare        |
-//| MetaEditor.                                                      |
+//| symbol the script runs on - with the spawner template, then      |
+//| close the chart the script runs on, which would hold a           |
+//| CHARTS_MAX slot for nothing. The terminal starts from an empty   |
+//| profile, so a chart already running the ticks EA is a boot       |
+//| defect: the script reports it and opens and closes nothing.      |
+//| Every other chart opens on demand. No includes - compiles with a |
+//| bare MetaEditor.                                                 |
 //+------------------------------------------------------------------+
 #property script_show_inputs
 
@@ -40,6 +41,7 @@ void OnStart()
         {
             PrintFormat("ticks_setup: '%s' attached to a '%s' chart as the spawner", ExpertName,
                         Symbol());
+            ChartClose(ChartID());
         }
     }
 }

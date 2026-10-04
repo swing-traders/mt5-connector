@@ -380,7 +380,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ### Charts
 
-- **At most `CHARTS_MAX` (100) charts are open at once** (MQL5 reference), the spawner's and the startup script's included; `ChartOpen` past it returns 0. The symbols in use at once stay below it.
+- **At most `CHARTS_MAX` (100) charts are open at once** (MQL5 reference), the spawner's included; `ChartOpen` past it returns 0. The symbols in use at once stay below it.
 - **A chart that does not open is reported, never waited on**: the spawner answers every `open_chart` with `chart_opened` or `chart_failed` and the failing call's error, and a read of the symbol the server posts to the hub fails naming it until a chart of it opens or its EA says hello.
 - **An EA answered `duplicate` closes its own chart; the spawner first outlasts a stale connection**: it says hello again every `ReconnectIntervalSec` and closes its chart only when still refused `HubPingTimeoutSec`, the longest the hub takes to drop a dead connection while its writes to it drain, after its first refusal.
 - **A symbol leaves Market Watch only with no chart of it open and no open position** (MQL5 reference, `SymbolSelect`), so the idle close closes the chart first, then deselects. A chart closes once its symbol is out of use for `MT5_CHART_IDLE_SECONDS`, and the spawner closes it — one it opened, or, for a publisher that predates it, the chart of the symbol running the EA.
