@@ -1,12 +1,16 @@
-"""The NT execution client for an MT5 hedging account: one trader's orders at the venue, the order
-events the venue confirms, and the reports NT's reconciliation reads.
+"""The NT execution client for an MT5 hedging account: one trader's orders and position exits at the
+venue, the order events the venue confirms, and the reports NT's reconciliation reads.
 
-State, none of which survives a restart on its own — connect rebuilds it from NT's cache and the
-venue:
+An exit order is no state of the client's: its synthetic venue order id,
+`{identifier}-{SL|TP}-{generation}`, names the bracket it occupies, and the venue's brackets with
+NT's cache say the rest; each time the bracket executes, the order takes the ticket of the order
+the venue executed it with. The client's state, none of which survives a restart on its own —
+connect rebuilds it from NT's cache and the venue:
 
-- the ticket index, venue order ticket ↔ client order id: rebuilt at connect from NT's orders the
-  venue accepted, extended by each accepted submit and each comment the digest lane matches;
-- the deals already seen, and the time of the last one, where the next deal read starts;
+- the ticket index, venue order ticket ↔ client order id: rebuilt at connect from every ticket
+  NT's orders hold or held as their venue order id, extended by each accepted submit, each comment
+  the digest lane matches and each execution an exit takes the ticket of;
+- the deals already seen, and the time the next deal read starts from;
 - the tickets of this trader's orders resting at the venue at the last poll, and those that left it
   with no final state in the venue's history yet;
 - the tickets no NT order explains, logged once each;
@@ -16,9 +20,11 @@ venue:
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import IntFlag, StrEnum
 from hashlib import sha256
 from operator import attrgetter
@@ -70,7 +76,7 @@ from nautilus_trader.model.identifiers import (
     TraderId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import AccountBalance, Currency, Money, Price
+from nautilus_trader.model.objects import AccountBalance, Currency, Money, Price, Quantity
 
 from mt5connect import mirror
 from mt5connect import remote_mt5 as mt5
@@ -135,11 +141,82 @@ class OrderState(StrEnum):
     REQUEST_CANCEL = "REQUEST_CANCEL"
 
 
+class DealType(StrEnum):
+    """What a deal is: `TradeDeal.type`."""
+
+    BUY = "BUY"
+    SELL = "SELL"
+    BALANCE = "BALANCE"
+    CREDIT = "CREDIT"
+    CHARGE = "CHARGE"
+    CORRECTION = "CORRECTION"
+    BONUS = "BONUS"
+    COMMISSION = "COMMISSION"
+    COMMISSION_DAILY = "COMMISSION_DAILY"
+    COMMISSION_MONTHLY = "COMMISSION_MONTHLY"
+    COMMISSION_AGENT_DAILY = "COMMISSION_AGENT_DAILY"
+    COMMISSION_AGENT_MONTHLY = "COMMISSION_AGENT_MONTHLY"
+    INTEREST = "INTEREST"
+    BUY_CANCELED = "BUY_CANCELED"
+    SELL_CANCELED = "SELL_CANCELED"
+    DIVIDEND = "DIVIDEND"
+    DIVIDEND_FRANKED = "DIVIDEND_FRANKED"
+    TAX = "TAX"
+
+
+class DealEntry(StrEnum):
+    """How a deal stands to its position: `TradeDeal.entry`."""
+
+    IN = "IN"
+    OUT = "OUT"
+    INOUT = "INOUT"
+    OUT_BY = "OUT_BY"
+
+
+class Reason(StrEnum):
+    """What made a deal: `TradeDeal.reason`."""
+
+    CLIENT = "CLIENT"
+    MOBILE = "MOBILE"
+    WEB = "WEB"
+    EXPERT = "EXPERT"
+    SL = "SL"
+    TP = "TP"
+    SO = "SO"
+    ROLLOVER = "ROLLOVER"
+    VMARGIN = "VMARGIN"
+    SPLIT = "SPLIT"
+
+
 class PollStep(StrEnum):
     """The independently retried steps of an execution poll."""
 
     VENUE_READ = "venue read"
     ACCOUNT_REPORT = "account report"
+
+
+class Slot(StrEnum):
+    """A position's exit bracket at the venue, which holds one of each."""
+
+    SL = "SL"
+    TP = "TP"
+
+
+@dataclass(frozen=True)
+class _ExitId:
+    """An exit order's synthetic venue order id: the position it exits, the bracket it occupies, and
+    its place among the orders that have occupied that bracket."""
+
+    identifier: int
+    slot: Slot
+    generation: int
+
+    @property
+    def venue_order_id(self) -> VenueOrderId:
+        return VenueOrderId(f"{self.identifier}-{self.slot}-{self.generation}")
+
+
+_EXIT_ID = re.compile(r"(\d+)-(SL|TP)-(\d+)")
 
 
 class SendOutcome(StrEnum):
@@ -219,12 +296,52 @@ _TIMES_IN_FORCE_SENT = frozenset({TimeInForce.GTC, TimeInForce.GTD})
 _DONE_RETCODES = frozenset(
     {mirror.TRADE_RETCODE_DONE, mirror.TRADE_RETCODE_PLACED, mirror.TRADE_RETCODE_DONE_PARTIAL}
 )
+# The venue answers a bracket request that sets what it already holds with "no changes".
+_BRACKET_DONE_RETCODES = _DONE_RETCODES | {mirror.TRADE_RETCODE_NO_CHANGES}
 _RETCODE_NAMES = {
     value: name for name, value in mirror.CONSTANTS.items() if name.startswith("TRADE_RETCODE_")
 }
-_FILL_ENTRIES = frozenset(
-    {mirror.DEAL_ENTRY_IN, mirror.DEAL_ENTRY_OUT, mirror.DEAL_ENTRY_INOUT, mirror.DEAL_ENTRY_OUT_BY}
-)
+_DEAL_TYPES = {
+    mirror.DEAL_TYPE_BUY: DealType.BUY,
+    mirror.DEAL_TYPE_SELL: DealType.SELL,
+    mirror.DEAL_TYPE_BALANCE: DealType.BALANCE,
+    mirror.DEAL_TYPE_CREDIT: DealType.CREDIT,
+    mirror.DEAL_TYPE_CHARGE: DealType.CHARGE,
+    mirror.DEAL_TYPE_CORRECTION: DealType.CORRECTION,
+    mirror.DEAL_TYPE_BONUS: DealType.BONUS,
+    mirror.DEAL_TYPE_COMMISSION: DealType.COMMISSION,
+    mirror.DEAL_TYPE_COMMISSION_DAILY: DealType.COMMISSION_DAILY,
+    mirror.DEAL_TYPE_COMMISSION_MONTHLY: DealType.COMMISSION_MONTHLY,
+    mirror.DEAL_TYPE_COMMISSION_AGENT_DAILY: DealType.COMMISSION_AGENT_DAILY,
+    mirror.DEAL_TYPE_COMMISSION_AGENT_MONTHLY: DealType.COMMISSION_AGENT_MONTHLY,
+    mirror.DEAL_TYPE_INTEREST: DealType.INTEREST,
+    mirror.DEAL_TYPE_BUY_CANCELED: DealType.BUY_CANCELED,
+    mirror.DEAL_TYPE_SELL_CANCELED: DealType.SELL_CANCELED,
+    mirror.DEAL_DIVIDEND: DealType.DIVIDEND,
+    mirror.DEAL_DIVIDEND_FRANKED: DealType.DIVIDEND_FRANKED,
+    mirror.DEAL_TAX: DealType.TAX,
+}
+_DEAL_ENTRIES = {
+    mirror.DEAL_ENTRY_IN: DealEntry.IN,
+    mirror.DEAL_ENTRY_OUT: DealEntry.OUT,
+    mirror.DEAL_ENTRY_INOUT: DealEntry.INOUT,
+    mirror.DEAL_ENTRY_OUT_BY: DealEntry.OUT_BY,
+}
+_CLOSING_ENTRIES = frozenset({DealEntry.OUT, DealEntry.OUT_BY})
+_DEAL_REASONS = {
+    mirror.DEAL_REASON_CLIENT: Reason.CLIENT,
+    mirror.DEAL_REASON_MOBILE: Reason.MOBILE,
+    mirror.DEAL_REASON_WEB: Reason.WEB,
+    mirror.DEAL_REASON_EXPERT: Reason.EXPERT,
+    mirror.DEAL_REASON_SL: Reason.SL,
+    mirror.DEAL_REASON_TP: Reason.TP,
+    mirror.DEAL_REASON_SO: Reason.SO,
+    mirror.DEAL_REASON_ROLLOVER: Reason.ROLLOVER,
+    mirror.DEAL_REASON_VMARGIN: Reason.VMARGIN,
+    mirror.DEAL_REASON_SPLIT: Reason.SPLIT,
+}
+# A stop-out closes a position where its stop loss would have.
+_BRACKET_SLOTS = {Reason.SL: Slot.SL, Reason.SO: Slot.SL, Reason.TP: Slot.TP}
 
 
 class MT5LiveExecutionClient(LiveExecutionClient):
@@ -275,9 +392,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """Holds the account to a hedging, tradable session before anything is reported or sent,
         books under the account's login, loads the config's symbols and registers the currencies the
         account and the loaded instruments book in; then indexes NT's orders, takes in what the
-        venue already holds, reports the account and starts polling. Raises MT5ConfigError for an
-        account that books another way or a read-only session, RuntimeError on a connected client.
-        """
+        venue already holds, emits the bracket fills NT has yet to book, reports the account and
+        starts polling. Raises MT5ConfigError for an account that books another way or a read-only
+        session, MT5OrderError naming a deal whose owed fill cannot be built, RuntimeError on a
+        connected client."""
         if self._exec_poll_task is not None:
             raise RuntimeError("execution client: already connected")
         self._conn.ensure_connected()
@@ -302,7 +420,13 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             register_venue_currency(instrument.quote_currency)
 
         self._index_nt_orders()
-        self._take_in_venue()
+        for deal in self._take_in_venue():
+            try:
+                self._on_deal(deal)
+            except Exception as exc:
+                raise MT5OrderError(
+                    f"deal {deal.ticket}: cannot emit owed bracket fill: {exc}"
+                ) from exc
         self._refresh_account()
         self._outages.clear()
         self._exec_poll_task = self._loop.create_task(
@@ -331,30 +455,43 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._log.info("disconnected")
 
     def _index_nt_orders(self) -> None:
-        """Rebuilds the ticket index from NT's orders at this venue that carry the venue's ticket;
-        an order the venue never accepted has none and is reconciliation's to resolve."""
+        """Rebuilds the ticket index from every ticket NT's orders at this venue hold or held as
+        their venue order id, so an exit keeps each execution its bracket took; an order the venue
+        never accepted has none and is reconciliation's to resolve."""
         self._client_order_ids.clear()
         self._tickets.clear()
         for order in self._cache.orders(venue=self.venue):
-            if order.venue_order_id is not None:
-                if order.venue_order_id.value.isdigit():
-                    self._index(int(order.venue_order_id.value), order.client_order_id)
-                else:
-                    self._log.debug(f"{order.venue_order_id!r} is not a venue ticket")
+            self._index_nt_order(order)
 
-    def _take_in_venue(self) -> None:
-        """Marks every deal in the history over the lookback as seen — a deal present at connect is
-        never emitted — and takes this trader's resting orders as the ones the poll watches."""
+    def _index_nt_order(self, order: Order) -> None:
+        venue_order_ids = [
+            venue_order_id
+            for venue_order_id in (*order.venue_order_ids, order.venue_order_id)
+            if venue_order_id is not None
+        ]
+        for venue_order_id in venue_order_ids:
+            if venue_order_id.value.isdigit():
+                self._index(int(venue_order_id.value), order.client_order_id)
+            else:
+                self._log.debug(f"{venue_order_id!r} is not a venue ticket")
+
+    def _take_in_venue(self) -> list:
+        """Marks every deal in the history over the lookback as seen, so none present at connect is
+        emitted — but a bracket's deal NT has not booked to the exit bound to its ticket or
+        occupying its bracket, which it returns in the venue's order. Takes this trader's resting
+        orders as the ones the poll watches."""
         now = self._clock.utc_now()
         since = now - timedelta(minutes=self._config.history_lookback_mins)
         deals = _answer("history_deals_get", mt5.history_deals_get(since, now))
-        self._seen_deals = {deal.ticket for deal in deals}
+        owed = [deal for deal in deals if self._owed_bracket_fill(deal)]
+        self._seen_deals = {deal.ticket for deal in deals} - {deal.ticket for deal in owed}
         self._deals_since_ms = max(
             (deal.time_msc for deal in deals), default=since.value // 1_000_000
         )
         self._resting = {order.ticket for order in self._resting_orders()}
         self._vanished = set()
         self._unresolved = set()
+        return sorted(owed, key=attrgetter("time_msc", "ticket"))
 
     # ── The poll ──────────────────────────────────────────────────────────────
 
@@ -424,28 +561,57 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._on_vanished(ticket)
 
     def _on_deal(self, deal) -> None:
-        """Emits the fill a deal of this trader carries, once per deal ticket. A deal whose order no
-        order of NT's explains is logged and left to NT's reconciliation; one whose fill cannot be
-        built raises before it counts as seen, so a later turn emits it."""
+        """Emits the fill a deal carries, once per deal ticket, under the venue order the deal
+        executed: a bracket's deal NT has not booked fills the exit bound to its ticket, else the
+        order occupying the bracket, whatever magic the venue stamped on it, and any other deal of
+        this trader the order its ticket or comment names. A deal of this trader no order of NT's
+        explains is logged and left to NT's reconciliation; one whose fill cannot be built raises
+        before it counts as seen, so a later turn emits it."""
         if deal.ticket in self._seen_deals:
             return
-        fill = self._is_fill(deal)
-        fields = None
-        if fill:
+        slot = _bracket_slot(deal)
+        execution = VenueOrderId(str(deal.order))
+        booked = None
+        order = None
+        if slot is not None:
+            booked = _booked(self._cache.orders(venue=self.venue), deal, slot)
+            if booked is None:
+                order = self._bracket_owner(deal)
+        elif self._is_fill(deal):
             self._learn_ticket(deal.order)
             order = self._indexed_order(deal.order)
-            if order is not None:
-                fields = self._fill_fields(order, deal)
+        fields = None
+        if order is not None:
+            fields = self._fill_fields(order, execution, deal)
         self._seen_deals.add(deal.ticket)
         self._deals_since_ms = max(self._deals_since_ms, deal.time_msc)
         if fields is not None:
+            if slot is not None and self._cache.venue_order_id(order.client_order_id) != execution:
+                self._bind_to_execution(order, execution, deal.time_msc * 1_000_000)
             self.generate_order_filled(**fields)
             self._account_owed = True
-        elif fill:
+        elif booked is None and self._is_fill(deal):
             self._log.info(
                 f"deal {deal.ticket} of order {deal.order}: no order of this trader matches it, "
                 "left to reconciliation"
             )
+
+    def _bind_to_execution(self, order: Order, execution: VenueOrderId, ts_event: int) -> None:
+        """Gives an exit the ticket of the order the venue executed its bracket with, in NT's index
+        and the client's, then as its venue order id: NT applies a fill only under that id."""
+        self._cache.add_venue_order_id(order.client_order_id, execution, overwrite=True)
+        self._index(int(execution.value), order.client_order_id)
+        self.generate_order_updated(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            execution,
+            order.quantity,
+            _limit_price(order),
+            _trigger_price(order),
+            ts_event,
+            venue_order_id_modified=True,
+        )
 
     def _on_resting(self, venue_order) -> None:
         """Indexes a resting order of this trader the index lacks when its comment is the digest of
@@ -529,7 +695,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             )
         self._account_owed = True
 
-    def _fill_fields(self, order: Order, deal) -> dict:
+    def _fill_fields(self, order: Order, venue_order_id: VenueOrderId, deal) -> dict:
         """The OrderFilled a deal of an NT order carries, as generate_order_filled takes it; raises
         for a deal no fill can be built from."""
         instrument = self._instrument(deal.symbol)
@@ -537,7 +703,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             "strategy_id": order.strategy_id,
             "instrument_id": order.instrument_id,
             "client_order_id": order.client_order_id,
-            "venue_order_id": VenueOrderId(str(deal.order)),
+            "venue_order_id": venue_order_id,
             "venue_position_id": PositionId(str(deal.position_id)),
             "trade_id": TradeId(str(deal.ticket)),
             "order_side": _deal_side(deal),
@@ -573,17 +739,20 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     # ── Submit ────────────────────────────────────────────────────────────────
 
     async def _submit_order(self, command: SubmitOrder) -> None:
-        """Sends an order as the venue's market deal or pending order, refusing before sending one
-        the venue cannot hold as stated."""
+        """Sends an order as the venue's market deal or pending order, and a reduce-only one as an
+        exit of the position the command names, refusing before sending one the venue cannot hold as
+        stated."""
         self.generate_order_submitted(
             command.order.strategy_id,
             command.order.instrument_id,
             command.order.client_order_id,
             self._clock.timestamp_ns(),
         )
-        refusal = _refusal(command.order)
+        refusal = _refusal(command.order, command.position_id)
         if refusal is not None:
             self._reject(command.order, refusal)
+        elif command.order.is_reduce_only:
+            self._place_exit(command.order, int(command.position_id.value))
         else:
             self._place(command.order)
 
@@ -631,29 +800,39 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _new_order_request(self, order: Order) -> dict:
         """The trade request placing an order; raises when the venue cannot be asked for it."""
         instrument = self._instrument(order.instrument_id.symbol.value)
-        request = {
-            "symbol": instrument.raw_symbol.value,
-            "volume": order.quantity.as_double(),
-            "magic": self._magic,
-            "comment": order_comment(order.client_order_id),
-            "sl": 0.0,
-            "tp": 0.0,
-        }
         if order.order_type == OrderType.MARKET:
-            if order.side == OrderSide.BUY:
-                request["type"] = mirror.ORDER_TYPE_BUY
-            else:
-                request["type"] = mirror.ORDER_TYPE_SELL
-            request["action"] = mirror.TRADE_ACTION_DEAL
-            request["price"] = self._market_price(order)
-            request["deviation"] = self._config.deviation_points
-            request["type_filling"] = _market_filling(instrument)
+            request = self._deal_request(order, instrument)
         else:
-            request["type"] = _PENDING_TYPES[(order.order_type, order.side)]
-            request["action"] = mirror.TRADE_ACTION_PENDING
-            request["type_filling"] = mirror.ORDER_FILLING_RETURN
+            request = {
+                "action": mirror.TRADE_ACTION_PENDING,
+                "symbol": instrument.raw_symbol.value,
+                "volume": order.quantity.as_double(),
+                "type": _PENDING_TYPES[(order.order_type, order.side)],
+                "magic": self._magic,
+                "comment": order_comment(order.client_order_id),
+                "type_filling": mirror.ORDER_FILLING_RETURN,
+            }
             request |= _pending_prices(order, _limit_price(order), _trigger_price(order))
             request |= _expiry(order)
+        return request | {"sl": 0.0, "tp": 0.0}
+
+    def _deal_request(self, order: Order, instrument: InstrumentAny) -> dict:
+        """A market deal of the order's side and quantity at the price that side trades at; raises
+        MT5OrderError while the symbol has no quote."""
+        request = {
+            "action": mirror.TRADE_ACTION_DEAL,
+            "symbol": instrument.raw_symbol.value,
+            "volume": order.quantity.as_double(),
+            "price": self._market_price(order),
+            "deviation": self._config.deviation_points,
+            "magic": self._magic,
+            "comment": order_comment(order.client_order_id),
+            "type_filling": _market_filling(instrument),
+        }
+        if order.side == OrderSide.BUY:
+            request["type"] = mirror.ORDER_TYPE_BUY
+        else:
+            request["type"] = mirror.ORDER_TYPE_SELL
         return request
 
     def _market_price(self, order: Order) -> float:
@@ -683,20 +862,267 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._clock.timestamp_ns(),
         )
 
+    # ── Exits ─────────────────────────────────────────────────────────────────
+
+    def _place_exit(self, order: Order, identifier: int) -> None:
+        """Sends a reduce-only order as the exit the venue holds for a position: a market order
+        closes it, a stop becomes its stop loss and a limit its take profit."""
+        if order.order_type == OrderType.MARKET:
+            self._place_close(order, identifier)
+        elif order.order_type == OrderType.STOP_MARKET:
+            self._place_bracket(order, identifier, Slot.SL, order.trigger_price)
+        else:
+            self._place_bracket(order, identifier, Slot.TP, order.price)
+
+    def _place_close(self, order: Order, identifier: int) -> None:
+        try:
+            self._conn.ensure_connected()
+            request = self._close_request(order, identifier)
+        except (MT5ConnectionError, MT5InstrumentError, MT5OrderError) as exc:
+            self._reject(order, f"not sent: {exc}")
+        else:
+            self._on_new_order_sent(order, _send(request))
+
+    def _close_request(self, order: Order, identifier: int) -> dict:
+        """The deal closing the order's quantity of a position; raises MT5OrderError for a position
+        the venue does not hold, and for a partial close while a target stands, which the venue's
+        whole-position target cannot follow."""
+        instrument = self._instrument(order.instrument_id.symbol.value)
+        position = self._held_position(identifier, order.instrument_id.symbol.value)
+        target = self._occupant(identifier, Slot.TP)
+        if target is not None and order.quantity != instrument.make_qty(position.volume):
+            raise MT5OrderError(
+                f"a partial close of position {identifier} while {target.venue_order_id} stands"
+            )
+        return self._deal_request(order, instrument) | {"position": position.ticket}
+
+    def _place_bracket(self, order: Order, identifier: int, slot: Slot, level: Price) -> None:
+        try:
+            self._conn.ensure_connected()
+            position = self._held_position(identifier, order.instrument_id.symbol.value)
+        except (MT5ConnectionError, MT5OrderError) as exc:
+            self._reject(order, f"not sent: {exc}")
+        else:
+            venue_order_id = _next_exit_id(self._cache.orders(venue=self.venue), identifier, slot)
+            displaced = self._occupant(identifier, slot)
+            sent = _send(_sltp_request(position, slot, level, self._magic), _BRACKET_DONE_RETCODES)
+            self._on_bracket_sent(order, venue_order_id, displaced, sent)
+
+    def _on_bracket_sent(
+        self, order: Order, venue_order_id: VenueOrderId, displaced: Order | None, sent: _Sent
+    ) -> None:
+        if sent.outcome == SendOutcome.DONE:
+            ts_event = self._clock.timestamp_ns()
+            self.generate_order_accepted(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                venue_order_id,
+                ts_event,
+            )
+            # The venue holds one bracket of each kind: setting it took the place of the last.
+            if displaced is not None:
+                self.generate_order_canceled(
+                    displaced.strategy_id,
+                    displaced.instrument_id,
+                    displaced.client_order_id,
+                    displaced.venue_order_id,
+                    ts_event,
+                )
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.REFUSED:
+            self._reject(order, sent.reason)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.NOT_SENT:
+            self._reject(order, sent.reason)
+        else:
+            self._log.warning(f"{order.client_order_id!r} exit: {sent.reason}; {_LOST}")
+
+    def _modify_exit(self, order: Order, exit_id: _ExitId, command: ModifyOrder) -> None:
+        """Moves the bracket an exit occupies to the level the modify states. The bracket is the
+        whole position's, so the only quantity it takes is the order's fills and the position's
+        volume together, and that one changes nothing at the venue."""
+        refusal = self._not_occupying(order, exit_id)
+        if refusal is not None:
+            self._modify_rejected(order, order.venue_order_id, refusal)
+        else:
+            self._amend_bracket(order, exit_id, command)
+
+    def _amend_bracket(self, order: Order, exit_id: _ExitId, command: ModifyOrder) -> None:
+        try:
+            self._conn.ensure_connected()
+            instrument = self._instrument(order.instrument_id.symbol.value)
+            position = self._held_position(exit_id.identifier, order.instrument_id.symbol.value)
+        except (MT5ConnectionError, MT5InstrumentError, MT5OrderError) as exc:
+            self._modify_rejected(order, order.venue_order_id, f"not sent: {exc}")
+        else:
+            level = _stated_level(command, exit_id.slot)
+            whole = order.filled_qty + instrument.make_qty(position.volume)
+            if command.quantity is not None and command.quantity != whole:
+                self._modify_rejected(
+                    order,
+                    order.venue_order_id,
+                    f"unsupported: quantity {command.quantity}, the whole position is {whole}",
+                )
+                self._refresh_account()
+            elif level is None:
+                self._exit_updated(order, exit_id.slot, command.quantity, level)
+                self._refresh_account()
+            else:
+                sent = _send(
+                    _sltp_request(position, exit_id.slot, level, self._magic),
+                    _BRACKET_DONE_RETCODES,
+                )
+                self._on_amend_sent(order, exit_id.slot, command.quantity, level, sent)
+
+    def _on_amend_sent(
+        self, order: Order, slot: Slot, quantity: Quantity | None, level: Price, sent: _Sent
+    ) -> None:
+        if sent.outcome == SendOutcome.DONE:
+            self._exit_updated(order, slot, quantity, level)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.REFUSED:
+            self._modify_rejected(order, order.venue_order_id, sent.reason)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.NOT_SENT:
+            self._modify_rejected(order, order.venue_order_id, sent.reason)
+        else:
+            self._log.warning(f"{order.client_order_id!r} modify: {sent.reason}; {_LOST}")
+
+    def _exit_updated(
+        self, order: Order, slot: Slot, quantity: Quantity | None, level: Price | None
+    ) -> None:
+        price, trigger = _exit_prices(order, slot, level)
+        self.generate_order_updated(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            order.venue_order_id,
+            _stated(quantity, order.quantity),
+            price,
+            trigger,
+            self._clock.timestamp_ns(),
+        )
+
+    def _cancel_exit(self, order: Order, exit_id: _ExitId) -> None:
+        """Clears the bracket an exit occupies; a cancel never closes a position."""
+        refusal = self._not_occupying(order, exit_id)
+        if refusal is not None:
+            self._cancel_rejected(order, order.venue_order_id, refusal)
+        else:
+            self._clear_bracket(order, exit_id)
+
+    def _clear_bracket(self, order: Order, exit_id: _ExitId) -> None:
+        try:
+            self._conn.ensure_connected()
+            position = self._position(exit_id.identifier, order.instrument_id.symbol.value)
+            deals = ()
+            if position is None:
+                deals = _answer(
+                    "history_deals_get", mt5.history_deals_get(position=exit_id.identifier)
+                )
+        except MT5ConnectionError as exc:
+            self._cancel_rejected(order, order.venue_order_id, f"not sent: {exc}")
+        else:
+            if position is not None:
+                sent = _send(
+                    _sltp_request(position, exit_id.slot, None, self._magic), _BRACKET_DONE_RETCODES
+                )
+                self._on_clear_sent(order, sent)
+            else:
+                self._cancel_closed(order, exit_id, deals)
+                self._refresh_account()
+
+    def _cancel_closed(self, order: Order, exit_id: _ExitId, deals) -> None:
+        """Answers the cancel of an exit whose position the venue no longer holds, from the
+        position's deals: the venue dropped the bracket with the position, so the exit is canceled —
+        unless its bracket closed the position by a deal NT has yet to book to it."""
+        closing = _closing_deal(deals)
+        if closing is None:
+            self._cancel_rejected(
+                order, order.venue_order_id, f"the venue holds no position {exit_id.identifier}"
+            )
+        elif _bracket_slot(closing) == exit_id.slot and _owes_fills(
+            self._cache.orders(venue=self.venue), deals, exit_id.slot
+        ):
+            self._cancel_rejected(
+                order, order.venue_order_id, f"its bracket closed position {exit_id.identifier}"
+            )
+        else:
+            self.generate_order_canceled(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                order.venue_order_id,
+                closing.time_msc * 1_000_000,
+            )
+
+    def _on_clear_sent(self, order: Order, sent: _Sent) -> None:
+        if sent.outcome == SendOutcome.DONE:
+            self.generate_order_canceled(
+                order.strategy_id,
+                order.instrument_id,
+                order.client_order_id,
+                order.venue_order_id,
+                self._clock.timestamp_ns(),
+            )
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.REFUSED:
+            self._cancel_rejected(order, order.venue_order_id, sent.reason)
+            self._refresh_account()
+        elif sent.outcome == SendOutcome.NOT_SENT:
+            self._cancel_rejected(order, order.venue_order_id, sent.reason)
+        else:
+            self._log.warning(f"{order.client_order_id!r} cancel: {sent.reason}; {_LOST}")
+
+    def _not_occupying(self, order: Order, exit_id: _ExitId) -> str | None:
+        """None while an exit order occupies its position's bracket; else why it does not: the state
+        NT closed it in, or the later order that took its place."""
+        occupant = self._occupant(exit_id.identifier, exit_id.slot)
+        if not order.is_open:
+            return f"the order is {order.status_string()}"
+        elif occupant.client_order_id != order.client_order_id:
+            return f"{occupant.venue_order_id} took its place"
+        else:
+            return None
+
+    def _occupant(self, identifier: int, slot: Slot) -> Order | None:
+        """The exit order occupying a position's bracket: of those NT holds open, the latest."""
+        held = _bracket_orders(self._cache.orders_open(venue=self.venue), identifier, slot)
+        if held:
+            return held[max(held)]
+        else:
+            return None
+
+    def _owed_bracket_fill(self, deal) -> bool:
+        """Whether a deal is a bracket's that no order of NT's has booked, while an exit is bound to
+        its ticket or occupies the bracket."""
+        slot = _bracket_slot(deal)
+        owner = None
+        if slot is not None and _booked(self._cache.orders(venue=self.venue), deal, slot) is None:
+            owner = self._bracket_owner(deal)
+        return owner is not None
+
     # ── Modify ────────────────────────────────────────────────────────────────
 
     async def _modify_order(self, command: ModifyOrder) -> None:
-        """Moves a pending order's prices at the venue, which cannot change an order's quantity."""
+        """Moves a pending order's prices at the venue, which cannot change an order's quantity, and
+        an exit's level in its position's bracket."""
         order = self._cache.order(command.client_order_id)
+        exit_id = _exit_id_of(order)
         ticket = self._ticket(order)
-        if command.quantity is not None and command.quantity != order.quantity:
-            self._modify_rejected(order, ticket, "unsupported: quantity changes")
+        if exit_id is not None:
+            self._modify_exit(order, exit_id, command)
+        elif command.quantity is not None and command.quantity != order.quantity:
+            self._modify_rejected(order, _venue_order_id(ticket), "unsupported: quantity changes")
         elif order.order_type not in _PENDING_ORDER_TYPES:
             self._modify_rejected(
-                order, ticket, f"unsupported: modifying a {order_type_to_str(order.order_type)}"
+                order,
+                _venue_order_id(ticket),
+                f"unsupported: modifying a {order_type_to_str(order.order_type)}",
             )
         elif ticket is None:
-            self._modify_rejected(order, ticket, "no venue order is known for it")
+            self._modify_rejected(order, None, "no venue order is known for it")
         else:
             self._modify_resting(order, ticket, command)
 
@@ -705,7 +1131,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._conn.ensure_connected()
             refusal = self._not_resting(ticket)
         except MT5ConnectionError as exc:
-            self._modify_rejected(order, ticket, f"not sent: {exc}")
+            self._modify_rejected(order, _venue_order_id(ticket), f"not sent: {exc}")
         else:
             if refusal is None:
                 price = _stated(command.price, _limit_price(order))
@@ -719,7 +1145,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 request |= _pending_prices(order, price, trigger) | _expiry(order)
                 self._on_modify_sent(order, ticket, price, trigger, _send(request))
             else:
-                self._modify_rejected(order, ticket, refusal)
+                self._modify_rejected(order, _venue_order_id(ticket), refusal)
                 self._refresh_account()
 
     def _on_modify_sent(
@@ -738,19 +1164,21 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             )
             self._refresh_account()
         elif sent.outcome == SendOutcome.REFUSED:
-            self._modify_rejected(order, ticket, sent.reason)
+            self._modify_rejected(order, _venue_order_id(ticket), sent.reason)
             self._refresh_account()
         elif sent.outcome == SendOutcome.NOT_SENT:
-            self._modify_rejected(order, ticket, sent.reason)
+            self._modify_rejected(order, _venue_order_id(ticket), sent.reason)
         else:
             self._log.warning(f"{order.client_order_id!r} modify: {sent.reason}; {_LOST}")
 
-    def _modify_rejected(self, order: Order, ticket: int | None, reason: str) -> None:
+    def _modify_rejected(
+        self, order: Order, venue_order_id: VenueOrderId | None, reason: str
+    ) -> None:
         self.generate_order_modify_rejected(
             order.strategy_id,
             order.instrument_id,
             order.client_order_id,
-            _venue_order_id(ticket),
+            venue_order_id,
             reason,
             self._clock.timestamp_ns(),
         )
@@ -758,7 +1186,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     # ── Cancel ────────────────────────────────────────────────────────────────
 
     async def _cancel_order(self, command: CancelOrder) -> None:
-        """Removes a pending order from the venue; a cancel never closes a position."""
+        """Removes a pending order from the venue, and an exit from its position's bracket; a cancel
+        never closes a position."""
         self._cancel(self._cache.order(command.client_order_id))
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
@@ -780,9 +1209,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._cancel(self._cache.order(cancel.client_order_id))
 
     def _cancel(self, order: Order) -> None:
+        exit_id = _exit_id_of(order)
         ticket = self._ticket(order)
-        if ticket is None:
-            self._cancel_rejected(order, ticket, "no venue order is known for it")
+        if exit_id is not None:
+            self._cancel_exit(order, exit_id)
+        elif ticket is None:
+            self._cancel_rejected(order, None, "no venue order is known for it")
         else:
             self._remove(order, ticket)
 
@@ -791,13 +1223,13 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._conn.ensure_connected()
             refusal = self._not_resting(ticket)
         except MT5ConnectionError as exc:
-            self._cancel_rejected(order, ticket, f"not sent: {exc}")
+            self._cancel_rejected(order, _venue_order_id(ticket), f"not sent: {exc}")
         else:
             if refusal is None:
                 request = {"action": mirror.TRADE_ACTION_REMOVE, "order": ticket}
                 self._on_remove_sent(order, ticket, _send(request))
             else:
-                self._cancel_rejected(order, ticket, refusal)
+                self._cancel_rejected(order, _venue_order_id(ticket), refusal)
                 self._refresh_account()
 
     def _on_remove_sent(self, order: Order, ticket: int, sent: _Sent) -> None:
@@ -814,19 +1246,21 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             )
             self._refresh_account()
         elif sent.outcome == SendOutcome.REFUSED:
-            self._cancel_rejected(order, ticket, sent.reason)
+            self._cancel_rejected(order, _venue_order_id(ticket), sent.reason)
             self._refresh_account()
         elif sent.outcome == SendOutcome.NOT_SENT:
-            self._cancel_rejected(order, ticket, sent.reason)
+            self._cancel_rejected(order, _venue_order_id(ticket), sent.reason)
         else:
             self._log.warning(f"{order.client_order_id!r} cancel: {sent.reason}; {_LOST}")
 
-    def _cancel_rejected(self, order: Order, ticket: int | None, reason: str) -> None:
+    def _cancel_rejected(
+        self, order: Order, venue_order_id: VenueOrderId | None, reason: str
+    ) -> None:
         self.generate_order_cancel_rejected(
             order.strategy_id,
             order.instrument_id,
             order.client_order_id,
-            _venue_order_id(ticket),
+            venue_order_id,
             reason,
             self._clock.timestamp_ns(),
         )
@@ -848,29 +1282,30 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        """The venue's order an NT order names — by its ticket, else by its comment's digest among
-        the resting orders and the lookback's history — or None when the venue holds none."""
+        """The report of the order a command names: an exit's from the bracket it occupies, else
+        that of the venue order the command's ticket, its exit's ticket, or its client order id's
+        digest names among the resting orders and the lookback's history; None when the venue holds
+        none."""
         if command.client_order_id is None and command.venue_order_id is None:
             raise ValueError("an order status report needs a client or a venue order id")
         self._conn.ensure_connected()
-        ticket = self._report_ticket(command)
-        if ticket is not None:
-            venue_order = self._venue_order(ticket)
+        exit_order = self._exit_named(command)
+        exit_report = None
+        if exit_order is not None:
+            exit_report = self._exit_report(exit_order)
+        if exit_report is not None:
+            return exit_report
         else:
-            venue_order = self._venue_order_by_comment(order_comment(command.client_order_id))
-        if venue_order is None:
-            return None
-        elif venue_order.magic != self._magic:
-            raise MT5OrderError(f"order {venue_order.ticket} carries another trader's magic")
-        else:
-            return self._order_report(venue_order)
+            return self._ticket_report(command, exit_order)
 
     async def generate_order_status_reports(
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
         """This trader's resting orders, with its orders in the venue's history over the command's
-        window unless it asks for open orders only; one report per ticket."""
+        window unless it asks for open orders only, one report per ticket; and the exits NT holds
+        open, each from the bracket it occupies. An exit the venue executed under one or more of
+        those tickets reports once, in their place."""
         self._conn.ensure_connected()
         if command.instrument_id is None:
             resting = _answer("orders_get", mt5.orders_get())
@@ -885,20 +1320,41 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             for order in historical:
                 if order.magic == self._magic and _in_scope(order.symbol, command.instrument_id):
                     venue_orders.setdefault(order.ticket, order)
-        return [self._order_report(venue_order) for venue_order in venue_orders.values()]
+        reports = []
+        executed = {}
+        for venue_order in venue_orders.values():
+            exit_order = self._bound_exit(venue_order.ticket)
+            if exit_order is None:
+                reports.append(self._venue_order_report(venue_order))
+            else:
+                executed[exit_order.client_order_id] = exit_order
+        exit_reports = {
+            report.client_order_id: report for report in self._exit_reports(command.instrument_id)
+        }
+        for client_order_id, exit_order in executed.items():
+            if client_order_id not in exit_reports:
+                exit_reports[client_order_id] = self._executed_exit_report(exit_order)
+        for report in exit_reports.values():
+            if report.is_open or not command.open_only:
+                reports.append(report)
+        return reports
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
-        """The fills of this trader's deals in the venue's history over the command's window."""
+        """The fills of this trader's deals in the venue's history over the command's window, each
+        under the venue order the deal executed: a bracket's deal fills the order NT booked it to,
+        else the exit bound to its ticket, else the order occupying the bracket, and answers a
+        command naming that order's synthetic id too."""
         self._conn.ensure_connected()
         date_from, date_to = self._window(command)
         reports = []
         for deal in _answer("history_deals_get", mt5.history_deals_get(date_from, date_to)):
+            owner = self._bracket_owner(deal)
             if (
-                self._is_fill(deal)
+                (owner is not None or self._is_fill(deal))
                 and _in_scope(deal.symbol, command.instrument_id)
-                and _of_order(deal, command.venue_order_id)
+                and _of_order(deal, owner, command.venue_order_id)
             ):
-                reports.append(self._fill_report(deal))
+                reports.append(self._fill_report(deal, owner))
         return reports
 
     async def generate_position_status_reports(
@@ -908,17 +1364,280 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """One report per venue position of this trader: the venue hedges each under its own
         identifier."""
         self._conn.ensure_connected()
-        if command.instrument_id is None:
-            positions = _answer("positions_get", mt5.positions_get())
-        else:
-            positions = _answer(
-                "positions_get", mt5.positions_get(symbol=command.instrument_id.symbol.value)
-            )
         reports = []
-        for position in positions:
+        for position in self._venue_positions(command.instrument_id):
             if position.magic == self._magic:
                 reports.append(self._position_report(position))
         return reports
+
+    def _ticket_report(
+        self, command: GenerateOrderStatusReport, exit_order: Order | None
+    ) -> OrderStatusReport | None:
+        """The report of the venue order a command names by its ticket, else under the ticket of its
+        exit order, else by its client order id's digest; None when the venue holds none."""
+        ticket = self._report_ticket(command)
+        if ticket is None and exit_order is not None:
+            ticket = self._ticket(exit_order)
+        venue_order = None
+        if ticket is not None:
+            venue_order = self._venue_order(ticket)
+        elif command.client_order_id is not None:
+            venue_order = self._venue_order_by_comment(order_comment(command.client_order_id))
+        if venue_order is None:
+            return None
+        elif venue_order.magic != self._magic:
+            raise MT5OrderError(f"order {venue_order.ticket} carries another trader's magic")
+        else:
+            return self._order_report(venue_order)
+
+    def _exit_named(self, command: GenerateOrderStatusReport) -> Order | None:
+        """NT's exit order a report command names: by its client order id, a venue order id NT
+        indexes it under, or the synthetic id it holds or held, which NT's index no longer carries
+        once rebuilt after the order took its execution's ticket."""
+        client_order_id = command.client_order_id
+        if client_order_id is None:
+            client_order_id = self._cache.client_order_id(command.venue_order_id)
+        exit_id = _exit_id(command.venue_order_id)
+        order = None
+        if client_order_id is not None:
+            order = self._cache.order(client_order_id)
+        elif exit_id is not None:
+            in_bracket = _bracket_orders(
+                self._cache.orders(venue=self.venue), exit_id.identifier, exit_id.slot
+            )
+            order = in_bracket.get(exit_id.generation)
+        if order is not None and _exit_id_of(order) is not None:
+            return order
+        else:
+            return None
+
+    def _exit_report(self, order: Order) -> OrderStatusReport | None:
+        """An exit order's report from the bracket it occupied; None when the bracket reports
+        nothing for it, or the venue knows nothing of its position."""
+        exit_id = _exit_id_of(order)
+        position = self._position(exit_id.identifier, order.instrument_id.symbol.value)
+        reports = self._bracket_reports(
+            exit_id.identifier, exit_id.slot, self._cache.orders(venue=self.venue), position
+        )
+        for report in reports:
+            if report.client_order_id == order.client_order_id:
+                return report
+        return None
+
+    def _exit_reports(self, instrument_id: InstrumentId | None) -> list[OrderStatusReport]:
+        """The exit orders NT holds open, each reported from the bracket it occupies."""
+        orders = self._cache.orders(venue=self.venue, instrument_id=instrument_id)
+        brackets = set()
+        for order in orders:
+            exit_id = _exit_id_of(order)
+            if exit_id is not None and order.is_open:
+                brackets.add((exit_id.identifier, exit_id.slot))
+        reports = []
+        if brackets:
+            positions = {
+                position.identifier: position for position in self._venue_positions(instrument_id)
+            }
+            for identifier, slot in sorted(brackets):
+                reports += self._bracket_reports(
+                    identifier, slot, orders, positions.get(identifier)
+                )
+        return reports
+
+    def _bracket_reports(
+        self, identifier: int, slot: Slot, orders: list[Order], position
+    ) -> list[OrderStatusReport]:
+        """Reports the exit orders among `orders` in one bracket of a position from what the venue
+        holds for it, open or closed; a position the venue knows nothing of reports nothing."""
+        in_bracket = _bracket_orders(orders, identifier, slot)
+        deals = ()
+        if position is None:
+            deals = _answer("history_deals_get", mt5.history_deals_get(position=identifier))
+        closing = _closing_deal(deals)
+        if position is not None:
+            return self._open_bracket_reports(identifier, slot, in_bracket, position)
+        elif closing is not None:
+            return self._closed_bracket_reports(identifier, slot, in_bracket, deals, closing)
+        else:
+            return []
+
+    def _open_bracket_reports(
+        self, identifier: int, slot: Slot, in_bracket: dict[int, Order], position
+    ) -> list[OrderStatusReport]:
+        """An open position's bracket: while the venue sets it, the latest order NT holds open
+        occupies it at the venue's level; every other order NT holds open is canceled."""
+        held = {generation: order for generation, order in in_bracket.items() if order.is_open}
+        level = _level(position, slot)
+        ts_last = self._clock.timestamp_ns()
+        occupant = None
+        standing = None
+        if level != 0 and held:
+            occupant = held[max(held)]
+            standing = self._instrument(position.symbol).make_price(level)
+        reports = []
+        for order in held.values():
+            if order is occupant:
+                reports.append(
+                    self._exit_order_report(
+                        identifier, slot, order, _standing_status(order), ts_last, level=standing
+                    )
+                )
+            else:
+                reports.append(
+                    self._exit_order_report(identifier, slot, order, OrderStatus.CANCELED, ts_last)
+                )
+        return reports
+
+    def _closed_bracket_reports(
+        self, identifier: int, slot: Slot, in_bracket: dict[int, Order], deals, closing
+    ) -> list[OrderStatusReport]:
+        """A closed position's bracket. When its own deals closed the position, the order bound to
+        the execution that closed it reports FILLED by its executions' deals, and until an order is
+        bound the occupant stands at its own level; every other order NT holds open, and every one
+        when another deal closed the position, is canceled."""
+        held = {generation: order for generation, order in in_bracket.items() if order.is_open}
+        bound = None
+        occupant = None
+        if _bracket_slot(closing) == slot:
+            bound = self._bound_exit(closing.order)
+            # The order NT holds takes the ticket only once NT applies the bind's update.
+            if bound is not None and _exit_id(bound.venue_order_id) is not None:
+                bound = None
+            if bound is None and held:
+                occupant = held[max(held)]
+        ts_last = closing.time_msc * 1_000_000
+        reports = []
+        for order in in_bracket.values():
+            if order is bound:
+                instrument = self._instrument(order.instrument_id.symbol.value)
+                filled, avg_px = _execution_fills(self._executions(deals, order), instrument)
+                reports.append(
+                    self._exit_order_report(
+                        identifier,
+                        slot,
+                        order,
+                        OrderStatus.FILLED,
+                        ts_last,
+                        filled=filled,
+                        avg_px=avg_px,
+                    )
+                )
+            elif order is occupant:
+                reports.append(
+                    self._exit_order_report(
+                        identifier, slot, order, _standing_status(order), ts_last
+                    )
+                )
+            elif order.is_open:
+                reports.append(
+                    self._exit_order_report(identifier, slot, order, OrderStatus.CANCELED, ts_last)
+                )
+        return reports
+
+    def _exit_order_report(
+        self,
+        identifier: int,
+        slot: Slot,
+        order: Order,
+        status: OrderStatus,
+        ts_last: int,
+        level: Price | None = None,
+        filled: Quantity | None = None,
+        avg_px: Decimal | None = None,
+    ) -> OrderStatusReport:
+        """An exit order's report under its venue order id, for its whole quantity: at the venue's
+        `level` when one is stated, else at its own; filled by what NT booked to it, or by the
+        `filled` volume its bracket's executions closed at their average price when stated."""
+        price, trigger = _exit_prices(order, slot, level)
+        if trigger is None:
+            trigger_type = TriggerType.NO_TRIGGER
+        else:
+            trigger_type = TriggerType.DEFAULT
+        if filled is None:
+            filled_qty = order.filled_qty
+        else:
+            filled_qty = filled
+        return OrderStatusReport(
+            account_id=self.account_id,
+            instrument_id=order.instrument_id,
+            venue_order_id=order.venue_order_id,
+            venue_position_id=PositionId(str(identifier)),
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=status,
+            quantity=order.quantity,
+            filled_qty=filled_qty,
+            report_id=UUID4(),
+            ts_accepted=order.ts_accepted,
+            ts_last=ts_last,
+            ts_init=self._clock.timestamp_ns(),
+            client_order_id=order.client_order_id,
+            price=price,
+            trigger_price=trigger,
+            trigger_type=trigger_type,
+            avg_px=avg_px,
+            post_only=False,
+            reduce_only=True,
+        )
+
+    def _bracket_owner(self, deal) -> Order | None:
+        """The exit order a bracket's deal fills: the order NT booked it to, else the exit bound to
+        its ticket, else the order occupying the bracket; None for any other deal."""
+        slot = _bracket_slot(deal)
+        owner = None
+        if slot is not None:
+            owner = _booked(self._cache.orders(venue=self.venue), deal, slot)
+            if owner is None:
+                owner = self._bound_exit(deal.order)
+            if owner is None:
+                owner = self._occupant(deal.position_id, slot)
+        return owner
+
+    def _bound_exit(self, ticket: int) -> Order | None:
+        """The exit order whose bracket the venue executed with the order under a ticket."""
+        order = self._indexed_order(ticket)
+        if order is not None and _exit_id_of(order) is not None:
+            return order
+        else:
+            return None
+
+    def _executions(self, deals, order: Order) -> list:
+        """The deals among `deals` that executed an exit's bracket for it: those of the tickets
+        bound to it, but those NT booked to another order of the bracket."""
+        orders = self._cache.orders(venue=self.venue)
+        slot = _exit_id_of(order).slot
+        executions = []
+        for deal in deals:
+            booked = _booked(orders, deal, slot)
+            if self._bound_exit(deal.order) is order and (booked is None or booked is order):
+                executions.append(deal)
+        return executions
+
+    def _executed_exit_report(self, order: Order) -> OrderStatusReport:
+        """The report of an exit the venue executed: from the bracket it occupied while the bracket
+        reports it; else filled when its executions filled it and canceled when they did not, since
+        its bracket no longer holds it."""
+        report = self._exit_report(order)
+        if report is None:
+            exit_id = _exit_id_of(order)
+            deals = _answer("history_deals_get", mt5.history_deals_get(position=exit_id.identifier))
+            executions = self._executions(deals, order)
+            instrument = self._instrument(order.instrument_id.symbol.value)
+            filled, avg_px = _execution_fills(executions, instrument)
+            if filled >= order.quantity:
+                status = OrderStatus.FILLED
+            else:
+                status = OrderStatus.CANCELED
+            report = self._exit_order_report(
+                exit_id.identifier,
+                exit_id.slot,
+                order,
+                status,
+                max(deal.time_msc for deal in executions) * 1_000_000,
+                filled=filled,
+                avg_px=avg_px,
+            )
+        return report
 
     def _report_ticket(self, command: GenerateOrderStatusReport) -> int | None:
         if command.venue_order_id is not None and command.venue_order_id.value.isdigit():
@@ -954,6 +1673,15 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         return None
 
     def _order_report(self, venue_order) -> OrderStatusReport:
+        """A venue order's report: the report of the exit whose bracket it executed, when it
+        executed one, else its own."""
+        exit_order = self._bound_exit(venue_order.ticket)
+        if exit_order is not None:
+            return self._executed_exit_report(exit_order)
+        else:
+            return self._venue_order_report(venue_order)
+
+    def _venue_order_report(self, venue_order) -> OrderStatusReport:
         instrument = self._instrument(venue_order.symbol)
         side, order_type = _venue_order_type(venue_order)
         time_in_force = _time_in_force(venue_order)
@@ -991,9 +1719,15 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             reduce_only=False,
         )
 
-    def _fill_report(self, deal) -> FillReport:
+    def _fill_report(self, deal, bracket_order: Order | None) -> FillReport:
+        """A deal's fill report under the venue order the deal executed, of the exit order it fills
+        when it is a bracket's."""
         instrument = self._instrument(deal.symbol)
-        client_order_id, order_type = self._deal_order(deal)
+        if bracket_order is not None:
+            client_order_id = bracket_order.client_order_id
+            order_type = bracket_order.order_type
+        else:
+            client_order_id, order_type = self._deal_order(deal)
         return FillReport(
             account_id=self.account_id,
             instrument_id=instrument.id,
@@ -1122,15 +1856,35 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         else:
             return None
 
+    def _position(self, identifier: int, symbol: str):
+        """The venue's open position under an identifier, at whatever ticket the venue holds it
+        under now — a service operation can move a position to a new ticket while its identifier
+        stays — or None when it holds none."""
+        for position in _answer("positions_get", mt5.positions_get(ticket=identifier)):
+            if position.identifier == identifier:
+                return position
+        for position in _answer("positions_get", mt5.positions_get(symbol=symbol)):
+            if position.identifier == identifier:
+                return position
+        return None
+
+    def _held_position(self, identifier: int, symbol: str):
+        """The venue's open position under an identifier; raises MT5OrderError for none."""
+        position = self._position(identifier, symbol)
+        if position is None:
+            raise MT5OrderError(f"the venue holds no position {identifier}")
+        return position
+
+    def _venue_positions(self, instrument_id: InstrumentId | None) -> tuple:
+        """The venue's open positions, of the instrument when one is named."""
+        if instrument_id is None:
+            return _answer("positions_get", mt5.positions_get())
+        else:
+            return _answer("positions_get", mt5.positions_get(symbol=instrument_id.symbol.value))
+
     def _is_fill(self, deal) -> bool:
-        """Whether a deal is a fill of this trader's: a buy or a sell of some volume that enters or
-        leaves a position."""
-        return (
-            deal.magic == self._magic
-            and deal.type in (mirror.DEAL_TYPE_BUY, mirror.DEAL_TYPE_SELL)
-            and deal.entry in _FILL_ENTRIES
-            and deal.volume > 0
-        )
+        """Whether a deal is a fill of this trader's."""
+        return deal.magic == self._magic and _is_trade(deal)
 
     def _instrument(self, symbol: str) -> InstrumentAny:
         """The loaded instrument of a venue symbol; raises MT5InstrumentError for one the provider
@@ -1162,8 +1916,9 @@ def _answer(function: str, value):
     return value
 
 
-def _send(request: dict) -> _Sent:
-    """Sends a trade request and classifies what the venue's answer to it proves."""
+def _send(request: dict, done: frozenset[int] = _DONE_RETCODES) -> _Sent:
+    """Sends a trade request and classifies what the venue's answer to it proves, `done` naming the
+    retcodes that confirm it."""
     try:
         result = mt5.order_send(request)
     except ResponseLost as exc:
@@ -1173,7 +1928,7 @@ def _send(request: dict) -> _Sent:
     if result is None:
         code, message = mt5.last_error()
         return _Sent(SendOutcome.LOST, f"order_send failed — error {code}: {message}")
-    elif result.retcode in _DONE_RETCODES:
+    elif result.retcode in done:
         return _Sent(SendOutcome.DONE, _retcode_reason(result), result)
     elif result.retcode == mirror.TRADE_RETCODE_CONNECTION:
         return _Sent(SendOutcome.LOST, _retcode_reason(result), result)
@@ -1188,11 +1943,15 @@ def _retcode_reason(result) -> str:
         return f"retcode {result.retcode}: {result.comment}"
 
 
-def _refusal(order: Order) -> str | None:
-    """Why the venue cannot hold an order as it is stated, or None when it can."""
-    if order.is_reduce_only:
-        return "unsupported: reduce-only orders (position exits are not translated)"
-    elif order.order_type not in _ORDER_TYPES:
+# The venue accepts a pending order bound to a position and ignores the binding: its fill opens a
+# new, opposite position.
+_BOUND_PENDING = "unsupported: a pending order bound to a position"
+
+
+def _refusal(order: Order, position_id: PositionId | None) -> str | None:
+    """Why the venue cannot hold an order as it is stated, sent against `position_id` when the
+    command names one; None when it can."""
+    if order.order_type not in _ORDER_TYPES:
         return f"unsupported: order type {order_type_to_str(order.order_type)}"
     elif order.time_in_force not in _TIMES_IN_FORCE_SENT:
         return f"unsupported: time in force {time_in_force_to_str(order.time_in_force)}"
@@ -1200,6 +1959,25 @@ def _refusal(order: Order) -> str | None:
         return "unsupported: post-only"
     elif order.contingency_type != ContingencyType.NO_CONTINGENCY:
         return "unsupported: contingent orders"
+    elif order.is_reduce_only:
+        return _exit_refusal(order, position_id)
+    elif position_id is not None and order.order_type != OrderType.MARKET:
+        return _BOUND_PENDING
+    else:
+        return None
+
+
+def _exit_refusal(order: Order, position_id: PositionId | None) -> str | None:
+    """Why a reduce-only order cannot be its position's exit at the venue — a close, or the stop
+    loss or take profit, which never expire — or None when it can."""
+    if position_id is None:
+        return "unsupported: a reduce-only order naming no position"
+    elif not position_id.value.isdigit():
+        return f"unsupported: {position_id} is no venue position"
+    elif order.order_type == OrderType.STOP_LIMIT:
+        return _BOUND_PENDING
+    elif order.order_type != OrderType.MARKET and order.time_in_force != TimeInForce.GTC:
+        return f"unsupported: an exit's time in force {time_in_force_to_str(order.time_in_force)}"
     else:
         return None
 
@@ -1238,8 +2016,8 @@ def _expiry(order: Order) -> dict:
         return {"type_time": mirror.ORDER_TIME_GTC}
 
 
-def _stated(value: Price | None, current: Price | None) -> Price | None:
-    """The price a modify states, else the order's current one."""
+def _stated(value: Price | Quantity | None, current: Price | Quantity | None):
+    """The value a modify states, else the order's current one."""
     if value is not None:
         return value
     else:
@@ -1271,8 +2049,14 @@ def _in_scope(symbol: str, instrument_id: InstrumentId | None) -> bool:
     return instrument_id is None or instrument_id.symbol.value == symbol
 
 
-def _of_order(deal, venue_order_id: VenueOrderId | None) -> bool:
-    return venue_order_id is None or venue_order_id.value == str(deal.order)
+def _of_order(deal, owner: Order | None, named: VenueOrderId | None) -> bool:
+    """Whether a deal's fill answers a command naming the venue order `named`: the order the deal
+    executed, or the synthetic id of the exit order it fills."""
+    return (
+        named is None
+        or named.value == str(deal.order)
+        or (owner is not None and named == _exit_id_of(owner).venue_order_id)
+    )
 
 
 def _commanded(order: Order, command: CancelAllOrders) -> bool:
@@ -1284,8 +2068,172 @@ def _commanded(order: Order, command: CancelAllOrders) -> bool:
     )
 
 
+def _exit_id(venue_order_id: VenueOrderId | None) -> _ExitId | None:
+    """The synthetic id an exit order's venue order id is; None for a venue ticket or no id."""
+    match = None
+    if venue_order_id is not None:
+        match = _EXIT_ID.fullmatch(venue_order_id.value)
+    if match is not None:
+        return _ExitId(int(match[1]), Slot(match[2]), int(match[3]))
+    else:
+        return None
+
+
+def _exit_id_of(order: Order) -> _ExitId | None:
+    """The synthetic id of an exit order — its venue order id, or the one it held until it took the
+    ticket of its bracket's execution — or None for any other order."""
+    for venue_order_id in (order.venue_order_id, *order.venue_order_ids):
+        exit_id = _exit_id(venue_order_id)
+        if exit_id is not None:
+            return exit_id
+    return None
+
+
+def _bracket_orders(orders: list[Order], identifier: int, slot: Slot) -> dict[int, Order]:
+    """The orders among `orders` that have occupied a position's bracket, by generation."""
+    found = {}
+    for order in orders:
+        exit_id = _exit_id_of(order)
+        if exit_id is not None and exit_id.identifier == identifier and exit_id.slot == slot:
+            found[exit_id.generation] = order
+    return found
+
+
+def _booked(orders: list[Order], deal, slot: Slot) -> Order | None:
+    """The order of a deal's position's bracket NT booked the deal's fill to, if any."""
+    trade_id = TradeId(str(deal.ticket))
+    for order in _bracket_orders(orders, deal.position_id, slot).values():
+        if trade_id in order.trade_ids:
+            return order
+    return None
+
+
+def _execution_fills(executions, instrument: InstrumentAny) -> tuple[Quantity, Decimal]:
+    """The volume a bracket's executions closed, and the average price they closed at."""
+    volume = Quantity.zero(instrument.size_precision)
+    weighted = Decimal(0)
+    for deal in executions:
+        closed = instrument.make_qty(deal.volume)
+        volume += closed
+        weighted += instrument.make_price(deal.price).as_decimal() * closed.as_decimal()
+    return volume, weighted / volume.as_decimal()
+
+
+def _owes_fills(orders: list[Order], deals, slot: Slot) -> bool:
+    """Whether a position's bracket executed a deal no order of the bracket has booked yet."""
+    for deal in deals:
+        if _bracket_slot(deal) == slot and _booked(orders, deal, slot) is None:
+            return True
+    return False
+
+
+def _next_exit_id(orders, identifier: int, slot: Slot) -> VenueOrderId:
+    """The synthetic id one generation above the latest among `orders` for a position's bracket, the
+    first generation when none has occupied it."""
+    generation = max(_bracket_orders(orders, identifier, slot), default=0) + 1
+    return _ExitId(identifier, slot, generation).venue_order_id
+
+
+def _is_trade(deal) -> bool:
+    """Whether a deal is a buy or a sell of some volume: a trade into or out of a position. Raises
+    MT5OrderError for a deal whose type the package does not name."""
+    return _deal_type(deal) in (DealType.BUY, DealType.SELL) and deal.volume > 0
+
+
+def _bracket_slot(deal) -> Slot | None:
+    """The bracket a deal executes — a trade out of a position by its stop loss, a stop-out or its
+    take profit — or None for any other deal; raises MT5OrderError for a trade whose entry or reason
+    the package does not name."""
+    slot = None
+    if _is_trade(deal) and _deal_entry(deal) == DealEntry.OUT:
+        slot = _BRACKET_SLOTS.get(_deal_reason(deal))
+    return slot
+
+
+def _closing_deal(deals):
+    """The deal that closed a position: the last of its deals out of it; None when it has none."""
+    closing = [deal for deal in deals if _deal_entry(deal) in _CLOSING_ENTRIES]
+    return max(closing, key=attrgetter("time_msc", "ticket"), default=None)
+
+
+def _deal_type(deal) -> DealType:
+    if deal.type not in _DEAL_TYPES:
+        raise MT5OrderError(f"deal {deal.ticket}: type {deal.type} is unknown")
+    return _DEAL_TYPES[deal.type]
+
+
+def _deal_entry(deal) -> DealEntry:
+    if deal.entry not in _DEAL_ENTRIES:
+        raise MT5OrderError(f"deal {deal.ticket}: entry {deal.entry} is unknown")
+    return _DEAL_ENTRIES[deal.entry]
+
+
+def _deal_reason(deal) -> Reason:
+    if deal.reason not in _DEAL_REASONS:
+        raise MT5OrderError(f"deal {deal.ticket}: reason {deal.reason} is unknown")
+    return _DEAL_REASONS[deal.reason]
+
+
+def _level(position, slot: Slot) -> float:
+    """The level the venue holds a position's bracket at, 0 when it sets none."""
+    if slot == Slot.SL:
+        return position.sl
+    else:
+        return position.tp
+
+
+def _sltp_request(position, slot: Slot, level: Price | None, magic: int) -> dict:
+    """The request setting a position's bracket to `level`, None clearing it, with the other bracket
+    carried as the venue holds it: the venue sets both at once."""
+    if level is None:
+        value = 0.0
+    else:
+        value = level.as_double()
+    request = {
+        "action": mirror.TRADE_ACTION_SLTP,
+        "symbol": position.symbol,
+        "position": position.ticket,
+        "magic": magic,
+    }
+    if slot == Slot.SL:
+        request["sl"] = value
+        request["tp"] = position.tp
+    else:
+        request["sl"] = position.sl
+        request["tp"] = value
+    return request
+
+
+def _stated_level(command: ModifyOrder, slot: Slot) -> Price | None:
+    """The level a modify states for an exit: a stop's trigger, a target's price."""
+    if slot == Slot.SL:
+        return command.trigger_price
+    else:
+        return command.price
+
+
+def _exit_prices(
+    order: Order, slot: Slot, level: Price | None
+) -> tuple[Price | None, Price | None]:
+    """An exit order's limit price and trigger: a stop triggers and a target rests at `level`, else
+    at the order's own."""
+    if slot == Slot.SL:
+        return None, _stated(level, order.trigger_price)
+    else:
+        return _stated(level, order.price), None
+
+
+def _standing_status(order: Order) -> OrderStatus:
+    """The status of an exit whose bracket the venue still holds: partly filled once its bracket has
+    executed some of the position."""
+    if order.filled_qty > 0:
+        return OrderStatus.PARTIALLY_FILLED
+    else:
+        return OrderStatus.ACCEPTED
+
+
 def _deal_side(deal) -> OrderSide:
-    if deal.type == mirror.DEAL_TYPE_BUY:
+    if _deal_type(deal) == DealType.BUY:
         return OrderSide.BUY
     else:
         return OrderSide.SELL

@@ -258,14 +258,6 @@ async def test_a_stop_market_buy_is_a_buy_stop_at_its_trigger(h):
 # ── Submit: what the client refuses before sending ───────────────────────────
 
 
-async def test_a_reduce_only_order_is_rejected_naming_the_exits_and_nothing_is_sent(h):
-    await submit(h, h.market(OrderSide.SELL, reduce_only=True))
-    assert h.names() == ["OrderSubmitted", "OrderRejected"]
-    assert "reduce-only" in h.events[1].reason
-    assert "exits" in h.events[1].reason
-    h.venue.order_send.assert_not_called()
-
-
 @pytest.mark.parametrize(
     ("make", "named"),
     [

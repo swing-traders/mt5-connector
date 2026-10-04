@@ -46,20 +46,26 @@ FILLING_IOC = 2
 FILLING_BOC = 4
 
 
-def instrument(symbol: str = "EURUSD", filling_mode: int = FILLING_FOK | FILLING_IOC):
-    """A five-digit pair settling in USD, sized in hundredths of a lot, as the provider types it."""
+def instrument(
+    symbol: str = "EURUSD",
+    filling_mode: int = FILLING_FOK | FILLING_IOC,
+    lot_step: str = "0.01",
+):
+    """A five-digit pair settling in USD, sized in steps of `lot_step` lots, as the provider types
+    it."""
+    step = Quantity.from_str(lot_step)
     return CurrencyPair(
         instrument_id=InstrumentId(Symbol(symbol), EURUSD.venue),
         raw_symbol=Symbol(symbol),
         base_currency=Currency.from_str("EUR"),
         quote_currency=USD,
         price_precision=5,
-        size_precision=2,
+        size_precision=step.precision,
         price_increment=Price.from_str("0.00001"),
-        size_increment=Quantity.from_str("0.01"),
+        size_increment=step,
         multiplier=Quantity.from_str("100000"),
-        min_quantity=Quantity.from_str("0.01"),
-        max_quantity=Quantity.from_str("500.00"),
+        min_quantity=step,
+        max_quantity=Quantity(500, step.precision),
         maker_fee=Decimal(0),
         taker_fee=Decimal(0),
         ts_event=0,

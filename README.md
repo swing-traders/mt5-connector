@@ -27,7 +27,7 @@ MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
 **What you get:**
 
 - Live tick data streamed from the MT5 server over WebSocket, aggregated into any bar type NautilusTrader supports
-- Order lifecycle for entries: market, limit, stop and stop-limit orders, their fills booked to the venue's hedging positions
+- Order lifecycle: market, limit, stop and stop-limit entries, their fills booked to the venue's hedging positions, and each position's exits — its stop, its target and its closes — as the venue's own stop loss, take profit and closing deals
 - Account state and position reconciliation on startup and continuously
 - Historical bar data download into a NautilusTrader Parquet catalog for backtesting
 - Automatic reconnection with exponential backoff
@@ -879,13 +879,22 @@ Check that the bar type string in your strategy config exactly matches the bar t
 ## Safety notes
 
 - Always use a **demo account** until you have verified your strategy behaves correctly.
-- Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, so manual trading on the same account, or a node with another trader id, is left alone.
+- Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, and the stop-loss and take-profit deals of the positions it holds exits for, so manual trading on the same account, or a node with another trader id, is left alone.
 - The adapter runs on hedging accounts only: it declares NT's `HEDGING` position model and refuses to connect to an account whose margin mode is netting or exchange, or to a read-only (investor) session.
 - The execution account id is `MT5-<login>`, the login read from the account at connect.
 - An order's comment at the venue is the first 29 hex digits of its client order id's SHA-256. Venue tickets map to NT orders through NT's own order records, and through that digest for an order whose submit got no answer; a deal or order neither explains is logged and left to NT's reconciliation.
-- Reduce-only orders, order lists, post-only and trailing orders, and times in force other than GTC and GTD are rejected before anything is sent: the client translates entries, not position exits.
+- Order lists, post-only and trailing orders, and times in force other than GTC and GTD are rejected before anything is sent.
+- A reduce-only order is an exit of the position its submit names (NT's position id, the venue's position identifier), translated into what the venue holds for one, which is one stop loss and one take profit per position:
+  - A stop-market order becomes the position's stop loss and a limit order its take profit. The order's venue order id is synthetic, `<identifier>-SL-<n>` or `<identifier>-TP-<n>`; a later order of the same kind moves the bracket and cancels the order it took the place of.
+  - A cancel clears the bracket, and a modify moves it; the only quantity a modify takes is the order's fills plus the position's volume, which changes nothing at the venue.
+  - The venue answers a request setting a bracket to what it already holds with "no changes" (10025), which confirms the setting: a stop or target sent again to the level the venue holds is accepted like any other.
+  - A market order closes the position by its current ticket. A partial close is refused while a target stands, since the venue's take profit covers the whole position.
+  - A stop loss or take profit that fires is a fill of the order holding that bracket, and a stop-out a fill of the stop. The order first takes the ticket of the order the venue executed the bracket with as its venue order id, and each fill reports under the ticket of its execution.
+  - A bracket can execute in parts, each part an execution of its own: the order keeps every execution ticket it took, across a restart too, and a later deal of one of them fills that order even after another order took the bracket.
+  - An exit order reports once, under the ticket it took last, however many executions the venue records for it, and always as the exit: its own type, quantity and level. Once its bracket no longer holds it, the report carries the volume its executions filled at their average price, and reads filled when they filled the order, canceled when they did not.
+  - A pending order bound to a position, a reduce-only stop-limit order, and an exit that expires are rejected before anything is sent: the venue ignores a pending order's position, and its fill would open a new one.
 - A submit, modify or cancel the venue may have acted on without the client learning it — `order_send` answering 10031, a read timeout, a connection closed after the request arrived — emits no event and logs a warning; the poll or NT's reconciliation settles the order. A request that never left the client is rejected at once as `not sent`.
-- Fills come from the venue's deals alone, once per deal; deals already in the history when the client connects are never emitted.
+- Fills come from the venue's deals alone, once per deal; deals already in the history when the client connects are never emitted, except a stop loss's or take profit's deal no exit order in NT's cache has booked while an exit holds its execution or occupies that bracket. Connect emits those before it returns, and fails naming the deal when it cannot build one, so the next start tries again.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
 
 ---
