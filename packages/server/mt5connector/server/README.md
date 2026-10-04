@@ -406,4 +406,4 @@ Each EA's socket reaches only a host on the terminal's allowlist — Tools → O
 ### Network
 
 - The adapter needs two ports: the HTTP server's `MT5_API_PORT` and the hub's `MT5_HUB_PORT`. It derives the hub's URL from `server_url` on port 9000 unless its config names `ws_url`.
-- There is no authentication: the API trusts its network. Both ports are published on loopback alone; exposing either is a design change.
+- There is no authentication: the API and the hub trust their network. The image publishes no host port, loopback included: both are reachable on the container network alone, and publishing either port is a design change.

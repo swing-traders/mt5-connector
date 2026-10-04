@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass, field
 from enum import StrEnum
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import ParseResult, urlparse, urlunparse
 
 from mt5connector.client.constants import (
     DEFAULT_EXEC_POLL_INTERVAL_MS,
@@ -12,6 +12,13 @@ from mt5connector.client.constants import (
     RECONNECT_MAX_DELAY_S,
 )
 from mt5connector.client.errors import MT5ConfigError
+
+
+class HttpScheme(StrEnum):
+    """The schemes the server's URL may name."""
+
+    HTTP = "http"
+    HTTPS = "https"
 
 
 class WebSocketScheme(StrEnum):
@@ -90,16 +97,13 @@ class MT5Config:
 
         if not self.server_url:
             raise MT5ConfigError("MT5Config.server_url cannot be empty.")
-        url = urlparse(self.server_url)
-        if not (url.scheme and url.hostname):
-            raise MT5ConfigError("MT5Config.server_url has no scheme or no host")
+        server = _endpoint("server_url", self.server_url)
+        if server.scheme not in set(HttpScheme) or not server.hostname:
+            raise MT5ConfigError("MT5Config.server_url is no http or https URL with a host")
         if self.ws_url is None:
             self.ws_url = derive_ws_url(self.server_url)
         else:
-            try:
-                ws = urlparse(self.ws_url)
-            except ValueError as exc:
-                raise MT5ConfigError(f"MT5Config.ws_url is malformed: {exc}") from exc
+            ws = _endpoint("ws_url", self.ws_url)
             if ws.scheme not in set(WebSocketScheme) or not ws.hostname:
                 raise MT5ConfigError("MT5Config.ws_url is no ws or wss URL with a host")
 
@@ -107,12 +111,31 @@ class MT5Config:
     def exec_poll_interval_s(self) -> float:
         return self.exec_poll_interval_ms / 1000.0
 
+    @property
+    def ws_display_url(self) -> str:
+        """The hub's URL as it may be shown: its scheme, host, port and path, without the userinfo
+        or query that can carry credentials."""
+        ws = urlparse(self.ws_url)
+        return urlunparse((ws.scheme, ws.netloc.rpartition("@")[2], ws.path, "", "", ""))
+
+
+def _endpoint(name: str, url: str) -> ParseResult:
+    """The URL of the field `name`, parsed; raises MT5ConfigError naming the field for a malformed
+    URL or a port outside 1-65535, without the parser's error, which can carry the URL's
+    credentials."""
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        raise MT5ConfigError(f"MT5Config.{name} is malformed") from None
+    if port is not None and not 1 <= port <= 65535:
+        raise MT5ConfigError(f"MT5Config.{name} port {port} is not in 1-65535")
+    return parsed
+
 
 def derive_ws_url(server_url: str) -> str:
     """Derive the WebSocket hub URL from the REST server URL (port 9000)."""
     p = urlparse(server_url)
-    if p.scheme == WebSocketScheme.WS and p.port == 9000:
-        return server_url
     # The netloc's host keeps an IPv6 address's brackets, which `hostname` strips.
     host = p.netloc.rpartition("@")[2]
     if host.startswith("["):

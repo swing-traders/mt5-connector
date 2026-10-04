@@ -113,7 +113,9 @@ class MT5DataClient(LiveMarketDataClient):
             self._handle_data(instrument)
             self._log.info(f"MT5DataClient: loaded instrument {symbol}")
         await self._push.connect()
-        self._log.info(f"MT5DataClient: connected, the push channel at {self._config.ws_url}")
+        self._log.info(
+            f"MT5DataClient: connected, the push channel at {self._config.ws_display_url}"
+        )
 
     async def _disconnect(self) -> None:
         """Disconnects the push channel; what NT subscribes stays wanted for the next connect."""

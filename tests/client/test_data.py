@@ -76,7 +76,7 @@ def make_raw_rate(
     return arr[0]
 
 
-def make_config(symbols=None):
+def make_config(symbols=None, ws_url=None):
     from mt5connector.client.config import MT5Config
 
     return MT5Config(
@@ -85,6 +85,7 @@ def make_config(symbols=None):
         server="Exness-MT5Trial1",
         symbols=symbols or ["EURUSDm"],
         server_url="http://127.0.0.1:5000",
+        ws_url=ws_url,
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
         reconnect_max_attempts=2,
@@ -106,22 +107,18 @@ def make_provider(instrument=None):
     from mt5connector.client.connection import MT5Connection
     from mt5connector.client.providers import MT5InstrumentProvider
 
-    # Minimal connection mock that satisfies MT5Connection's interface
     conn = MagicMock(spec=MT5Connection)
     conn.ensure_connected = MagicMock()
 
     inst = instrument or make_instrument("EURUSDm")
 
     provider = MT5InstrumentProvider.__new__(MT5InstrumentProvider)
-    # Manually initialise the InstrumentProvider base
     from nautilus_trader.common.providers import InstrumentProvider
 
     InstrumentProvider.__init__(provider)
-    # Set our test attributes
     provider._conn = conn
     provider._failed_symbols = []
 
-    # Override methods to return test data
     provider.get_instrument = MagicMock(return_value=inst)
     provider.load_symbol = MagicMock(return_value=inst)
     provider.list_all = MagicMock(return_value=[inst])
@@ -143,7 +140,12 @@ class RecordedDataClient(MT5DataClient):
 
 
 def make_client(
-    symbols=None, connected=True, instrument=None, client_class=MT5DataClient, nt_handlers=False
+    symbols=None,
+    connected=True,
+    instrument=None,
+    client_class=MT5DataClient,
+    nt_handlers=False,
+    ws_url=None,
 ):
     """Build a fully wired MT5DataClient with real NautilusTrader components, its handlers recorded
     unless `nt_handlers` keeps NT's own."""
@@ -156,7 +158,7 @@ def make_client(
     except RuntimeError:
         loop = asyncio.new_event_loop()
 
-    config = make_config(symbols)
+    config = make_config(symbols, ws_url)
     conn = make_conn(connected)
     provider = make_provider(instrument)
 
@@ -248,6 +250,19 @@ class TestConnect:
         prov.get_instrument.assert_called()
         await c._disconnect()
 
+    @pytest.mark.asyncio
+    async def test_connect_logs_the_push_channel_without_its_credentials(self):
+        c, conn, prov, loop = make_client(
+            client_class=RecordedDataClient,
+            ws_url="ws://hub:SYNTHETIC_SECRET@127.0.0.1:9000/push",
+        )
+        await c._connect()
+        await c._disconnect()
+        assert not any("SYNTHETIC_SECRET" in str(call) for call in c.recorded_log.mock_calls)
+        c.recorded_log.info.assert_any_call(
+            "MT5DataClient: connected, the push channel at ws://127.0.0.1:9000/push"
+        )
+
     @pytest.mark.parametrize("held", [False, True], ids=["loaded-at-connect", "already-held"])
     @pytest.mark.asyncio
     async def test_connect_registers_the_settlement_currency_of_each_instrument_it_hands(
@@ -335,7 +350,7 @@ class TestSubscribeQuoteTicks:
     async def test_unsubscribe_non_subscribed_does_not_raise(self, client):
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "FAKESYM"
-        await client._unsubscribe_quote_ticks(cmd)  # must not raise
+        await client._unsubscribe_quote_ticks(cmd)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

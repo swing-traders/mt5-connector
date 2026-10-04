@@ -1,6 +1,5 @@
 """The push protocol's vocabulary, shared by the hub, its consumers and the server: its frames,
-roles, streams and chart route, and the MQL5 trade-transaction and commission names its frames
-carry."""
+roles, streams and chart route, and the MQL5 names its frames carry."""
 
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum

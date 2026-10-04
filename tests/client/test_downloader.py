@@ -144,7 +144,7 @@ def from_str_sym(s):
 def make_conn(connected=True):
     conn = MagicMock()
     if connected:
-        conn.ensure_connected = MagicMock()  # no-op
+        conn.ensure_connected = MagicMock()
     else:
         conn.ensure_connected = MagicMock(side_effect=MT5ConnectionError("Not connected"))
     return conn

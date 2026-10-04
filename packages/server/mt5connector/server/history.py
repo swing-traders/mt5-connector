@@ -43,6 +43,7 @@ _TERMINAL_INFO = mirror.FUNCTIONS[mirror.FunctionName.TERMINAL_INFO]
 _NO_RATES = np.zeros(0, dtype=np.dtype(list(mirror.RATES.dtype)))
 _NO_TICKS = np.zeros(0, dtype=np.dtype(list(mirror.TICKS.dtype)))
 
+_HOUR_S = 3_600
 _DAY_S = 86_400
 _WEEK_S = 7 * _DAY_S
 # UTC weeks start on Monday; 1970-01-05 was the first.
@@ -225,7 +226,7 @@ class History:
             for series in Series:
                 if series in floors:
                     ranges[series.value] = {
-                        "floor": self._utc_floor(series, floors[series]),
+                        "floor": self._advertised_floor(symbol, series, floors[series]),
                         "measured_at": floors[series].measured_at,
                         "generation": floors[series].generation,
                     }
@@ -339,7 +340,7 @@ class History:
         elif floor is None:
             rows = self._read_ticks(calls, symbol, start, end, flags, floor, kept)
         else:
-            read_from = max(start, self._utc_floor(Series.TICKS, floor))
+            read_from = max(start, self._clock.to_utc_msc(floor.value) // 1000)
             rows = self._read_ticks(calls, symbol, read_from, end, flags, floor, kept)
         return rows
 
@@ -604,11 +605,20 @@ class History:
         logger.info("%s; %s", message, unproven)
         return Syncing((ServerCode.SYNCING, message), self._retry_s)
 
-    def _utc_floor(self, series: Series, floor: Floor) -> int:
+    def _advertised_floor(self, symbol: str, series: Series, floor: Floor) -> int:
+        """A floor in true-UTC seconds, warned of through the process's RepeatedHours when it lies
+        in the broker's repeated hour."""
         if series is Series.TICKS:
-            return self._clock.to_utc_msc(floor.value) // 1000
+            utc = self._clock.to_utc_msc(floor.value) // 1000
+            seconds = floor.value // 1000
         else:
-            return self._clock.to_utc(floor.value)
+            utc = self._clock.to_utc(floor.value)
+            seconds = floor.value
+        if self._clock.is_ambiguous(seconds):
+            self._repeated_hours.warn(
+                f"{symbol} {series}", "floor", floor.value, seconds // _HOUR_S
+            )
+        return utc
 
     def _rates_arguments(self, symbol: str, series: Series, lo: int, hi: int) -> dict[str, object]:
         return {

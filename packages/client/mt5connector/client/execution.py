@@ -434,7 +434,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._account_loop(),
             name="MT5LiveExecutionClient._account_loop",
         )
-        self._log.info(f"connected, the push channel at {self._config.ws_url}")
+        self._log.info(f"connected, the push channel at {self._config.ws_display_url}")
 
     async def _disconnect(self) -> None:
         """Stops the account loop and the push channel and drops the client's view of the venue;

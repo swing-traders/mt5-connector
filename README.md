@@ -26,7 +26,7 @@ MT5 server ←→ mt5-connector-client ←→ NautilusTrader
 
 **What you get:**
 
-- Live quote ticks, a mark price at the mid of each, and the venue's own closed bars, pushed from the terminal over WebSocket; the ticks aggregate into any bar type NautilusTrader supports
+- Live quote ticks, a mark price at the mid of each, and the venue's own closed bars, pushed from the terminal over WebSocket; the ticks aggregate into any bid, ask or mid bar type NautilusTrader supports
 - Order lifecycle: market, limit, stop and stop-limit entries, their fills booked to the venue's hedging positions, and each position's exits — its stop, its target and its closes — as the venue's own stop loss, take profit and closing deals; every fill, cancel and expiry pushed from the terminal as it happens
 - Account state and position reconciliation on startup and continuously
 - Historical bar data download into a NautilusTrader Parquet catalog for backtesting
@@ -131,7 +131,13 @@ print(info.currency, info.balance)
 
 ## Configuration
 
-All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL. A config is refused when it is built without a `server_url`, with a `server_url` that names no scheme or no host, or with a `ws_url` that is not a well-formed `ws` or `wss` URL naming a host. Its repr and string name none of the credentials: the login, the password and the broker server's name.
+All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL. A config is refused when it is built:
+
+- without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
+- with a `ws_url` that is not a `ws` or `wss` URL naming a host;
+- with either URL malformed, or naming a port outside 1–65535.
+
+Its repr and string name none of the credentials: the login, the password and the broker server's name.
 
 ```python
 from mt5connector.client.config import MT5Config
@@ -318,22 +324,12 @@ node.run()    # connects the clients: loads the config's symbols and starts the 
 
 ### Bar types
 
-A bar type aggregated `EXTERNAL` is the venue's own bar: the terminal's bar of that timeframe — 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 or 30 minutes, 1, 2, 3, 4, 6, 8 or 12 hours, a day or a week — pushed when it closes and stamped at its close, its prices and tick volume the venue's. A step the terminal has no timeframe for is refused at subscription and at a history request. `"EURUSDm.MT5-5-MINUTE-BID-EXTERNAL"` is the venue's 5-minute bar.
+A bar type aggregated `EXTERNAL` is the venue's own bar: the terminal's bar of that timeframe — 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 or 30 minutes, 1, 2, 3, 4, 6, 8 or 12 hours, a day or a week — pushed when it closes and stamped at its close, its prices and tick volume the venue's. Its price type is the one price the terminal builds the symbol's bars from, as its chart mode names it: `BID` or `LAST`. A step the terminal has no timeframe for is refused at subscription and at a history request. `"EURUSDm.MT5-5-MINUTE-BID-EXTERNAL"` is the venue's 5-minute bar of a symbol charted by bid.
 
-Any other bar type NautilusTrader aggregates from the ticks itself, and never carries the venue's bar type. The bar type string format is:
+Any other bar type is `INTERNAL`: NautilusTrader aggregates it from the symbol's quote ticks itself, priced `BID`, `ASK` or `MID`, and it never carries the venue's bar type. `LAST` internal bars are not available on this venue: NautilusTrader aggregates them from trade ticks, which MT5 does not provide. The bar type string format is:
 
 ```
 {symbol}.{venue}-{step}-{aggregation}-{price_type}-{aggregation_source}
-```
-
-Common examples:
-
-```python
-"EURUSDm.MT5-1-MINUTE-LAST-INTERNAL"    # 1-minute bars
-"EURUSDm.MT5-5-MINUTE-LAST-INTERNAL"    # 5-minute bars
-"EURUSDm.MT5-1-HOUR-LAST-INTERNAL"      # 1-hour bars
-"EURUSDm.MT5-100-TICK-LAST-INTERNAL"    # 100-tick bars
-"EURUSDm.MT5-1000-VOLUME-LAST-INTERNAL" # volume bars
 ```
 
 ---
@@ -350,7 +346,7 @@ The adapter runs against `mt5-connector-server`: an HTTP server under the termin
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
-- `MT5Config` requires the server's `server_url` (HTTP) and derives its `ws_url` (WebSocket) from the same host on port 9000 unless one is given; a given `ws_url` must be a `ws` or `wss` URL naming a host — see `packages/client/mt5connector/client/config.py`.
+- `MT5Config` requires the server's `server_url`, an `http` or `https` URL, and derives its `ws_url` (WebSocket) from the same host on port 9000 unless one is given; a given `ws_url` must be a `ws` or `wss` URL naming a host, and a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
 - The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
 - A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
 - Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
@@ -358,7 +354,7 @@ The adapter runs against `mt5-connector-server`: an HTTP server under the termin
   - The execution client subscribes the account's trade transactions: a `DEAL_ADD` is a fill, read from the venue's history by its ticket; an `ORDER_DELETE` or `HISTORY_ADD` ends the order the venue cancelled, expired or rejected; a `TRADE_TRANSACTION_REQUEST` links the ticket of an order whose submit got no answer through its comment's digest, and accepts it. A transaction naming a ticket the client cannot resolve is left to NautilusTrader's reconciliation, never booked as an external order.
   - Each symbol's EA publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
 - The execution client polls nothing for events: what the push channel misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop checks the terminal session and reports the account.
-- There is no authentication: the server trusts its network, so its ports stay on loopback and are never exposed to an untrusted one.
+- There is no authentication: the server trusts its network. Its image publishes no host port, loopback included, so the API and the hub are reachable on the container network alone.
 
 The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function and carrying the delay the server's `Retry-After` gives as `retry_after_s`, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets the shim's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
 

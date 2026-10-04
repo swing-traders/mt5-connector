@@ -67,6 +67,14 @@ async def test_connect_subscribes_the_accounts_trade_transactions_on_the_push_ch
     assert not h.push.connected
 
 
+async def test_connect_logs_the_push_channel_without_its_credentials(exec_shim):
+    h = await connected(exec_shim, ws_url="wss://hub:SYNTHETIC_SECRET@127.0.0.1:9000/push")
+    await h.client._disconnect()
+
+    assert not any("SYNTHETIC_SECRET" in str(call) for call in h.client.recorded_log.mock_calls)
+    assert "connected, the push channel at wss://127.0.0.1:9000/push" in h.logged(LogLevel.INFO)
+
+
 # ── The ticket index ─────────────────────────────────────────────────────────
 
 

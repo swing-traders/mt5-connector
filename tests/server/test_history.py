@@ -1207,6 +1207,55 @@ def test_an_answer_spanning_two_repeated_hours_warns_of_each(client, stub, caplo
     ]
 
 
+def floor_warning(series: str, epoch: int) -> str:
+    return (
+        f"EURUSD {series}: floor {epoch} is in the broker's repeated hour, read as its first "
+        "occurrence"
+    )
+
+
+def test_floors_in_a_repeated_hour_are_warned_of_once_across_range_reads_and_answers(
+    client, stub, floors, caplog
+):
+    stub.ticks = ticks(REPEATED * 1000)
+    kept(floors, Series.H1, REPEATED)
+    kept(floors, Series.TICKS, REPEATED * 1000)
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
+
+    reads = [client.get("/history/ranges?symbol=EURUSD").json for _ in range(2)]
+    answer = post_ticks(client, REPEATED - EDT, REPEATED - EDT)
+
+    for read in reads:
+        assert {series: entry["floor"] for series, entry in read["result"]["ranges"].items()} == {
+            "H1": REPEATED - EDT,
+            "ticks": REPEATED - EDT,
+        }
+    assert answer.json == ok([tick_json((REPEATED - EDT) * 1000)])
+    assert repeated_hours_warnings(caplog) == [floor_warning("H1", REPEATED)]
+
+
+def test_a_floor_in_a_repeated_hour_an_answer_warned_of_adds_no_warning(
+    client, stub, floors, caplog
+):
+    stub.ticks = ticks(REPEATED * 1000)
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
+    answer = mirror_ticks(client, REPEATED - EDT, REPEATED - EDT)
+    kept(floors, Series.H1, REPEATED)
+    kept(floors, Series.TICKS, REPEATED_A_YEAR_BEFORE * 1000 + 250)
+
+    read = client.get("/history/ranges?symbol=EURUSD").json
+
+    assert len(answer.json["result"]) == 1
+    assert {series: entry["floor"] for series, entry in read["result"]["ranges"].items()} == {
+        "H1": REPEATED - EDT,
+        "ticks": REPEATED_A_YEAR_BEFORE - EDT,
+    }
+    assert repeated_hours_warnings(caplog) == [
+        repeated_hour_warning(REPEATED),
+        floor_warning("ticks", REPEATED_A_YEAR_BEFORE * 1000 + 250),
+    ]
+
+
 # ── The client ────────────────────────────────────────────────────────────────
 
 
