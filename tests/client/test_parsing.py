@@ -1,21 +1,23 @@
-"""The terminal's ticks and bars as NautilusTrader data: quote ticks from a live tick or a history
-row, bars stamped at their close, and the timeframe map."""
+"""The terminal's ticks and bars as NautilusTrader data: quote ticks from a history row, venue bars
+stamped at their close and typed by the price the venue charts them on, and the timeframe map."""
 
 from decimal import Decimal
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from nautilus_trader.model.data import Bar, QuoteTick
+from nautilus_trader.model.data import Bar, BarType, QuoteTick
 from nautilus_trader.model.enums import BarAggregation
+from nautilus_trader.model.instruments import CurrencyPair
+from nautilus_trader.model.objects import Price, Quantity
 from venue_doubles import account_info, symbol_info
 
 from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.parsing import (
     _MT5_TIMEFRAME_MAP,
-    parse_bar,
     parse_quote_tick,
     parse_symbol_info,
+    venue_bar,
+    venue_bar_type,
 )
 from mt5connector.wire import mirror
 
@@ -30,32 +32,12 @@ def instrument(**fields):
     return parse_symbol_info(symbol_info(**fields), account, Decimal(0), 0)
 
 
-def make_tick(bid=1.08500, ask=1.08502, last=1.08501, volume=1, time_s=1700000000, time_msc=None):
-    tick = MagicMock()
-    tick.bid = bid
-    tick.ask = ask
-    tick.last = last
-    tick.volume = volume
-    tick.time = time_s
-    tick.time_msc = time_msc or (time_s * 1000)
-    return tick
+TICKS = np.dtype(list(mirror.TICKS.dtype))
 
 
-def make_tick_row(bid=1.08500, ask=1.08502, time_s=1700000000, time_msc=1700000000123):
-    """Build a numpy structured array row matching mt5.copy_ticks_range() output."""
-    dtype = np.dtype(
-        [
-            ("time", np.int64),
-            ("bid", np.float64),
-            ("ask", np.float64),
-            ("last", np.float64),
-            ("volume", np.uint64),
-            ("time_msc", np.int64),
-            ("flags", np.uint32),
-            ("volume_real", np.float64),
-        ]
-    )
-    return np.array([(time_s, bid, ask, 0.0, 0, time_msc, 6, 0.0)], dtype=dtype)[0]
+def make_tick_row(bid=1.08500, ask=1.08502, time_msc=1700000000123):
+    """A history tick row as the shim decodes it."""
+    return np.array([(time_msc // 1000, bid, ask, 0.0, 0, time_msc, 6, 0.0)], dtype=TICKS)[0]
 
 
 def make_rate(
@@ -99,57 +81,28 @@ class TestParseQuoteTick:
         return instrument(name="EURUSD")
 
     def test_returns_quote_tick(self, eurusd):
-        tick = make_tick(bid=1.08500, ask=1.08502)
-        result = parse_quote_tick(tick, eurusd)
+        result = parse_quote_tick(make_tick_row(bid=1.08500, ask=1.08502), eurusd)
         assert isinstance(result, QuoteTick)
 
     def test_instrument_id_matches(self, eurusd):
-        tick = make_tick()
-        result = parse_quote_tick(tick, eurusd)
+        result = parse_quote_tick(make_tick_row(), eurusd)
         assert result.instrument_id == eurusd.id
 
-    def test_bid_price_correct(self, eurusd):
-        tick = make_tick(bid=1.08500)
-        result = parse_quote_tick(tick, eurusd)
-        assert float(result.bid_price) == pytest.approx(1.08500)
+    def test_bid_and_ask_are_the_venues_at_the_instruments_precision(self, eurusd):
+        result = parse_quote_tick(make_tick_row(bid=1.08500, ask=1.08502), eurusd)
+        assert (result.bid_price, result.ask_price) == (
+            Price.from_str("1.08500"),
+            Price.from_str("1.08502"),
+        )
 
-    def test_ask_price_correct(self, eurusd):
-        tick = make_tick(ask=1.08502)
-        result = parse_quote_tick(tick, eurusd)
-        assert float(result.ask_price) == pytest.approx(1.08502)
-
-    def test_bid_price_precision(self, eurusd):
-        tick = make_tick(bid=1.08500)
-        result = parse_quote_tick(tick, eurusd)
-        assert result.bid_price.precision == 5
-
-    def test_ask_price_precision(self, eurusd):
-        tick = make_tick(ask=1.08502)
-        result = parse_quote_tick(tick, eurusd)
-        assert result.ask_price.precision == 5
-
-    def test_ts_event_in_nanoseconds(self):
-        inst = instrument(name="EURUSD")
-        tick = make_tick(time_s=1700000000)
-        result = parse_quote_tick(tick, inst)
-        expected_ns = 1700000000 * 1_000_000_000
-        assert result.ts_event == expected_ns
-
-    def test_structured_row_keeps_millisecond_time(self, eurusd):
-        row = make_tick_row(time_s=1700000000, time_msc=1700000000123)
-        result = parse_quote_tick(row, eurusd)
+    def test_ts_event_is_the_rows_millisecond_time(self, eurusd):
+        result = parse_quote_tick(make_tick_row(time_msc=1700000000123), eurusd)
         assert result.ts_event == 1700000000123 * 1_000_000
 
-    def test_bid_size_nominal(self, eurusd):
-        """MT5 has no depth — bid_size should be a large nominal value."""
-        tick = make_tick()
-        result = parse_quote_tick(tick, eurusd)
-        assert float(result.bid_size) == 1_000_000
-
-    def test_ask_size_nominal(self, eurusd):
-        tick = make_tick()
-        result = parse_quote_tick(tick, eurusd)
-        assert float(result.ask_size) == 1_000_000
+    def test_both_sizes_are_the_instruments_largest_order(self):
+        inst = instrument(name="EURUSD", volume_max=500.0, volume_step=0.01)
+        result = parse_quote_tick(make_tick_row(), inst)
+        assert (result.bid_size, result.ask_size) == (Quantity(500, 2), Quantity(500, 2))
 
     def test_gold_tick_precision(self):
         inst = instrument(
@@ -161,100 +114,50 @@ class TestParseQuoteTick:
             currency_profit="USD",
             trade_contract_size=100.0,
         )
-        tick = make_tick(bid=1985.50, ask=1985.75)
-        result = parse_quote_tick(tick, inst)
-        assert result.bid_price.precision == 2
-        assert float(result.bid_price) == pytest.approx(1985.50)
+        result = parse_quote_tick(make_tick_row(bid=1985.50, ask=1985.75), inst)
+        assert result.bid_price == Price.from_str("1985.50")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 15. parse_bar()
+# 15. venue_bar_type() and venue_bar()
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-class TestParseBar:
+class TestVenueBarType:
 
-    @pytest.fixture
-    def eurusd(self):
-        return instrument(name="EURUSD")
+    def test_a_bid_charted_symbols_bars_are_bid(self):
+        eurusd = instrument(name="EURUSD", chart_mode=mirror.SYMBOL_CHART_MODE_BID)
+        assert venue_bar_type(eurusd, mirror.TIMEFRAME_H1) == BarType.from_str(
+            "EURUSD.MT5-1-HOUR-BID-EXTERNAL"
+        )
 
-    def test_returns_bar(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=16385)  # H1
-        assert isinstance(result, Bar)
+    def test_a_last_charted_symbols_bars_are_last(self):
+        eurusd = instrument(name="EURUSD", chart_mode=mirror.SYMBOL_CHART_MODE_LAST)
+        assert venue_bar_type(eurusd, mirror.TIMEFRAME_H1) == BarType.from_str(
+            "EURUSD.MT5-1-HOUR-LAST-EXTERNAL"
+        )
 
-    def test_open_price(self, eurusd):
-        rate = make_rate(open_=1.085)
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert float(result.open) == pytest.approx(1.085)
+    @pytest.mark.parametrize("info", [{}, None])
+    def test_a_definition_stating_no_chart_mode_is_last(self, info):
+        eurusd = instrument(name="EURUSD")
+        unstated = CurrencyPair.from_dict(CurrencyPair.to_dict(eurusd) | {"info": info})
+        assert venue_bar_type(unstated, mirror.TIMEFRAME_M5) == BarType.from_str(
+            "EURUSD.MT5-5-MINUTE-LAST-EXTERNAL"
+        )
 
-    def test_high_price(self, eurusd):
-        rate = make_rate(high=1.090)
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert float(result.high) == pytest.approx(1.090)
+    def test_a_chart_mode_outside_the_venues_is_refused(self):
+        eurusd = instrument(name="EURUSD")
+        odd = CurrencyPair.from_dict(CurrencyPair.to_dict(eurusd) | {"info": {"chart_mode": "ASK"}})
+        with pytest.raises(ValueError, match="ASK"):
+            venue_bar_type(odd, mirror.TIMEFRAME_H1)
 
-    def test_low_price(self, eurusd):
-        rate = make_rate(low=1.080)
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert float(result.low) == pytest.approx(1.080)
-
-    def test_close_price(self, eurusd):
-        rate = make_rate(close=1.088)
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert float(result.close) == pytest.approx(1.088)
-
-    def test_volume(self, eurusd):
-        rate = make_rate(tick_volume=1500)
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert float(result.volume) == pytest.approx(1500)
-
-    def test_ts_event_is_the_close_in_nanoseconds(self, eurusd):
-        rate = make_rate(time_s=1700000000)
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert result.ts_event == (1700000000 + 3600) * 1_000_000_000
-
-    def test_a_minute_bar_is_stamped_at_its_close_in_event_and_init(self, eurusd):
-        rate = make_rate(time_s=1_752_570_000)
-        result = parse_bar(rate, eurusd, timeframe=1)
-        assert result.ts_event == 1_752_570_060 * 1_000_000_000
-        assert result.ts_init == result.ts_event
-
-    def test_a_month_bar_has_no_close_to_stamp(self, eurusd):
+    def test_a_month_has_no_fixed_interval(self):
         with pytest.raises(ValueError, match="49153"):
-            parse_bar(make_rate(), eurusd, timeframe=49153)
+            venue_bar_type(instrument(name="EURUSD"), mirror.TIMEFRAME_MN1)
 
-    def test_bar_type_instrument_id(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert result.bar_type.instrument_id == eurusd.id
-
-    def test_m1_aggregation(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=1)
-        assert result.bar_type.spec.aggregation == BarAggregation.MINUTE
-        assert result.bar_type.spec.step == 1
-
-    def test_h1_aggregation(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=16385)
-        assert result.bar_type.spec.aggregation == BarAggregation.HOUR
-        assert result.bar_type.spec.step == 1
-
-    def test_h4_aggregation(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=16388)
-        assert result.bar_type.spec.aggregation == BarAggregation.HOUR
-        assert result.bar_type.spec.step == 4
-
-    def test_d1_aggregation(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=16408)
-        assert result.bar_type.spec.aggregation == BarAggregation.DAY
-        assert result.bar_type.spec.step == 1
-
-    def test_an_unknown_timeframe_raises_naming_it(self, eurusd):
+    def test_an_unknown_timeframe_raises_naming_it(self):
         with pytest.raises(ValueError, match="99999"):
-            parse_bar(make_rate(), eurusd, timeframe=99999)
+            venue_bar_type(instrument(name="EURUSD"), 99999)
 
     @pytest.mark.parametrize(
         ("timeframe", "step", "aggregation"),
@@ -282,10 +185,35 @@ class TestParseBar:
         ],
     )
     def test_each_timeframe_with_a_fixed_period_is_its_step_and_aggregation(
-        self, eurusd, timeframe, step, aggregation
+        self, timeframe, step, aggregation
     ):
-        spec = parse_bar(make_rate(), eurusd, timeframe=timeframe).bar_type.spec
+        spec = venue_bar_type(instrument(name="EURUSD"), timeframe).spec
         assert (spec.step, spec.aggregation) == (step, aggregation)
+
+
+class TestVenueBar:
+
+    @pytest.fixture
+    def eurusd(self):
+        return instrument(name="EURUSD")
+
+    def test_prices_and_tick_volume_are_the_venues(self, eurusd):
+        bar_type = venue_bar_type(eurusd, mirror.TIMEFRAME_H1)
+        result = venue_bar(make_rate(1.085, 1.090, 1.080, 1.088, 1500), bar_type, eurusd)
+        assert isinstance(result, Bar)
+        assert (result.open, result.high, result.low, result.close, result.volume) == (
+            Price.from_str("1.08500"),
+            Price.from_str("1.09000"),
+            Price.from_str("1.08000"),
+            Price.from_str("1.08800"),
+            Quantity(1500, 0),
+        )
+        assert result.bar_type == bar_type
+
+    def test_a_bar_is_stamped_at_its_close_in_event_and_init(self, eurusd):
+        bar_type = venue_bar_type(eurusd, mirror.TIMEFRAME_M1)
+        result = venue_bar(make_rate(time_s=1_752_570_000), bar_type, eurusd)
+        assert (result.ts_event, result.ts_init) == (1_752_570_060 * 1_000_000_000,) * 2
 
 
 # ═════════════════════════════════════════════════════════════════════════════

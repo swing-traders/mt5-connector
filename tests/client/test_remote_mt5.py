@@ -37,16 +37,24 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        self.server.stand_in.received.append((self.path, json.loads(body), self.client_address))
+        self._answer(json.loads(body))
+
+    def do_GET(self):
+        self._answer(None)
+
+    def _answer(self, body):
+        self.server.stand_in.received.append((self.path, body, self.client_address))
         if self.server.stand_in.drop:
             # The request arrived; the connection closes before any reply.
             self.close_connection = True
             return
-        status, content_type, payload, delay = self.server.stand_in.answer
+        status, content_type, payload, delay, headers = self.server.stand_in.answer
         time.sleep(delay)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -60,12 +68,14 @@ class _StandIn:
     def __init__(self, url: str) -> None:
         self.url = url
         self.received = []
-        self.answer = (200, JSON, json.dumps(_answer(None)).encode(), 0.0)
+        self.answer = (200, JSON, json.dumps(_answer(None)).encode(), 0.0, {})
         self.drop = False
 
-    def reply(self, status: int, body, content_type: str = JSON, delay: float = 0.0) -> None:
+    def reply(
+        self, status: int, body, content_type: str = JSON, delay: float = 0.0, headers=None
+    ) -> None:
         payload = body.encode() if isinstance(body, str) else json.dumps(body).encode()
-        self.answer = (status, content_type, payload, delay)
+        self.answer = (status, content_type, payload, delay, headers or {})
 
 
 @pytest.fixture
@@ -171,10 +181,24 @@ def test_the_unverified_clock_gate_raises_server_unreachable_not_a_lost_response
     assert not isinstance(refused.value, errors.ResponseLost)
 
 
-def test_a_busy_server_raises_server_busy_not_a_lost_response(stand_in):
-    stand_in.reply(503, _failure(-20_002, "/mt5/order_send: the server is busy"))
-    with pytest.raises(ServerBusy):
+def test_a_busy_server_raises_server_busy_carrying_its_retry_after(stand_in):
+    stand_in.reply(
+        503, _failure(-20_002, "/mt5/order_send: the server is busy"), headers={"Retry-After": "7"}
+    )
+    with pytest.raises(ServerBusy, match="^order_send: server busy$") as refused:
         rmt5.order_send({"action": 1})
+    assert refused.value.retry_after_s == 7
+
+
+def test_a_busy_commission_read_raises_server_busy_carrying_its_retry_after(stand_in):
+    stand_in.reply(
+        503,
+        _failure(-20_002, "/commissions/EURUSD: the server is busy"),
+        headers={"Retry-After": "7"},
+    )
+    with pytest.raises(ServerBusy, match="^commissions: server busy$") as refused:
+        rmt5.commission_schedule("EURUSD")
+    assert refused.value.retry_after_s == 7
 
 
 @pytest.mark.parametrize("status", [200, 400, 503])

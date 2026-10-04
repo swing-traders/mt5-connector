@@ -138,10 +138,9 @@ def _member(value: int, members: dict, field: str):
 
 
 def parse_symbol_info(info, account: AccountSnapshot, taker_fee: Decimal, ts: int) -> InstrumentAny:
-    """The instrument an mt5.symbol_info() definition describes: a FOREX calc mode is a
-    CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
-    Margins stay NT's defaults: the venue states them as money per lot, which no ratio expresses
-    without a price."""
+    """The instrument an mt5.symbol_info() definition describes: a FOREX calc mode is a CurrencyPair
+    and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it. Margins stay NT's
+    defaults: the venue states them as money per lot, which no ratio expresses without a price."""
     kind = calc_mode(info)
     if kind in FOREX_MODES:
         return CurrencyPair(**_definition(info, kind, account, taker_fee, ts))
@@ -213,71 +212,23 @@ def _decimals(value: float) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TICK PARSER  (used by MT5DataClient polling loop)
+# TICKS AND BARS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def parse_quote_tick(symbol_info_tick, instrument: InstrumentAny) -> QuoteTick:
-    """
-    Convert an MT5 tick into a NautilusTrader QuoteTick.
-
-    Handles two sources:
-    - mt5.symbol_info_tick(symbol)   → namedtuple  (live polling)
-    - mt5.copy_ticks_range(...)      → numpy structured array row (downloader)
-
-    Both are accessed the same way: numpy void supports both
-    attribute-style (row.bid) and key-style (row["bid"]) access
-    via numpy's structured array interface. We use key-style to be
-    safe with both numpy rows and MagicMock objects in tests.
-
-    Parameters
-    ----------
-    symbol_info_tick : MT5 Tick namedtuple or numpy.void row
-        Has fields: bid, ask, time (epoch seconds).
-    instrument : CurrencyPair | Cfd
-        The instrument this tick belongs to (for precision info).
-
-    Returns
-    -------
-    QuoteTick
-    """
-    pp = instrument.price_precision
-
-    # numpy structured array rows (from copy_ticks_range) are numpy.void type
-    # namedtuples and MagicMocks use attribute access
-    if type(symbol_info_tick).__name__ == "void":
-        # numpy structured array row — use key access
-        bid = float(symbol_info_tick["bid"])
-        ask = float(symbol_info_tick["ask"])
-        ts_s = int(symbol_info_tick["time"])
-        if "time_msc" in symbol_info_tick.dtype.names:
-            ts_event = int(symbol_info_tick["time_msc"]) * 1000 * 1000
-        else:
-            ts_event = ts_s * 1_000_000_000
-    else:
-        # namedtuple (live polling) or MagicMock (tests) — use attribute access
-        bid = float(symbol_info_tick.bid)
-        ask = float(symbol_info_tick.ask)
-        ts_s = int(symbol_info_tick.time)
-        if hasattr(symbol_info_tick, "time_msc"):
-            ts_event = int(symbol_info_tick.time_msc) * 1000 * 1000
-        else:
-            ts_event = ts_s * 1_000_000_000
-
+def parse_quote_tick(row, instrument: InstrumentAny) -> QuoteTick:
+    """A history tick row as a QuoteTick stamped at its time_msc: bid and ask as the venue quotes
+    them, and both sizes the instrument's largest order, since the venue publishes no depth."""
     return QuoteTick(
         instrument_id=instrument.id,
-        bid_price=Price(bid, pp),
-        ask_price=Price(ask, pp),
-        bid_size=Quantity(1_000_000, 0),  # MT5 doesn't expose depth
-        ask_size=Quantity(1_000_000, 0),
-        ts_event=ts_event,
+        bid_price=instrument.make_price(row["bid"]),
+        ask_price=instrument.make_price(row["ask"]),
+        bid_size=instrument.max_quantity,
+        ask_size=instrument.max_quantity,
+        ts_event=int(row["time_msc"]) * 1_000_000,
         ts_init=time.time_ns(),
     )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BAR PARSER  (used by MT5DataClient and downloader.py)
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Map MT5 timeframe integers to NautilusTrader BarAggregation + step
 _MT5_TIMEFRAME_MAP: dict[int, tuple[int, BarAggregation]] = {
@@ -362,27 +313,18 @@ def venue_series(bar_type: BarType) -> Series:
     return _VENUE_SERIES[key]
 
 
-def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:
-    """One mt5.copy_rates_range() row of an MT5 timeframe as a Bar stamped at its close, the row's
-    open plus the timeframe's interval; raises ValueError for a timeframe the package does not
-    define, and for MN1, since a month has no fixed interval."""
+def venue_bar_type(instrument: InstrumentAny, timeframe: int) -> BarType:
+    """The venue bar type of an MT5 timeframe's bars of `instrument`, priced as its definition's
+    chart mode states, LAST where it states none; raises ValueError for a timeframe the package does
+    not define, for MN1, since a month has no fixed interval, and for a chart mode the venue
+    lacks."""
     if timeframe not in _MT5_TIMEFRAME_MAP:
         raise ValueError(f"timeframe {timeframe} is unknown")
     step, aggregation = _MT5_TIMEFRAME_MAP[timeframe]
     if aggregation == BarAggregation.MONTH:
         raise ValueError(f"timeframe {timeframe}: a month has no fixed interval")
-    pp = instrument.price_precision
-    bar_spec = BarSpecification(step, aggregation, PriceType.LAST)
-    bar_type = BarType(instrument_id=instrument.id, bar_spec=bar_spec)
-    ts_event = int(mt5_rate["time"]) * 1_000_000_000 + bar_spec.get_interval_ns()
-
-    return Bar(
-        bar_type=bar_type,
-        open=Price(mt5_rate["open"], pp),
-        high=Price(mt5_rate["high"], pp),
-        low=Price(mt5_rate["low"], pp),
-        close=Price(mt5_rate["close"], pp),
-        volume=Quantity(float(mt5_rate["tick_volume"]), 0),
-        ts_event=ts_event,
-        ts_init=ts_event,
-    )
+    charted = ChartMode((instrument.info or {}).get("chart_mode", ChartMode.LAST))
+    if charted == ChartMode.BID:
+        return BarType(instrument.id, BarSpecification(step, aggregation, PriceType.BID))
+    else:
+        return BarType(instrument.id, BarSpecification(step, aggregation, PriceType.LAST))

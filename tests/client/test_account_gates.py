@@ -16,6 +16,7 @@ from nautilus_trader.model.enums import CurrencyType, OmsType
 from nautilus_trader.model.identifiers import AccountId, InstrumentId, PositionId, Symbol, TraderId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
+from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from push_double import PushDouble
 from venue_doubles import account_info, symbol_info, trade_position
@@ -253,6 +254,40 @@ async def test_the_account_id_is_the_venue_and_the_login_the_account_reports(ven
     await client._connect()
     assert client.account_id == AccountId("MT5-7654321")
     await _stop_account_loop(client)
+
+
+# ── The account's currency ───────────────────────────────────────────────────
+
+
+async def test_the_account_keeps_one_balance_in_its_currency(venue):
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TraderId("TESTER-001"), clock=clock)
+    cache = TestComponentStubs.cache()
+    Portfolio(msgbus, cache, clock)
+    states = []
+    msgbus.subscribe(topic="events.account.*", handler=states.append)
+    conn = MagicMock(spec=MT5Connection)
+    conn.get_account_info.return_value = AccountSnapshot.from_mt5(
+        account_info(login=7654321, currency="EUR")
+    )
+    conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    with patch.object(execution, "PushClient", PushDouble):
+        client = MT5LiveExecutionClient(
+            loop=asyncio.get_running_loop(),
+            connection=conn,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=_provider(()),
+            config=_config(),
+        )
+    try:
+        await client._connect()
+        [state] = states
+        assert state.base_currency == Currency.from_str("EUR")
+        assert cache.account(AccountId("MT5-7654321")).base_currency == Currency.from_str("EUR")
+    finally:
+        await _stop_account_loop(client)
 
 
 # ── Currency registration ────────────────────────────────────────────────────

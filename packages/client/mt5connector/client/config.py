@@ -1,5 +1,6 @@
 """`MT5Config`: what the adapter runs with, checked when it is built."""
 
+import math
 from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse
 
@@ -46,10 +47,10 @@ class MT5Config:
         if not self.symbols:
             raise ValueError("MT5Config.symbols cannot be empty.")
 
-        # Preserve exact broker symbol names — do NOT uppercase.
-        # Brokers like Exness use lowercase suffixes (EURUSDm).
-        # We only strip surrounding whitespace.
+        # Broker casing is the symbol (EURUSDm): only surrounding whitespace goes.
         self.symbols = [s.strip() for s in self.symbols]
+        if "" in self.symbols:
+            raise ValueError("MT5Config.symbols holds a blank symbol")
 
         if self.exec_poll_interval_ms < 50:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")
@@ -59,9 +60,30 @@ class MT5Config:
             raise ValueError("account_refresh_seconds must be at least 1.")
         if self.history_lookback_mins <= 0:
             raise ValueError("history_lookback_mins must be positive.")
+        if not (math.isfinite(self.timeout_s) and self.timeout_s > 0):
+            raise ValueError(f"MT5Config.timeout_s {self.timeout_s} is not finite and positive")
+        if self.reconnect_max_attempts < 1:
+            raise ValueError(
+                f"MT5Config.reconnect_max_attempts {self.reconnect_max_attempts} is below 1"
+            )
+        if not (
+            math.isfinite(self.reconnect_initial_delay_s) and self.reconnect_initial_delay_s >= 0
+        ):
+            raise ValueError(
+                f"MT5Config.reconnect_initial_delay_s {self.reconnect_initial_delay_s} is not "
+                "finite and non-negative"
+            )
+        if not (math.isfinite(self.reconnect_max_delay_s) and self.reconnect_max_delay_s >= 0):
+            raise ValueError(
+                f"MT5Config.reconnect_max_delay_s {self.reconnect_max_delay_s} is not finite and "
+                "non-negative"
+            )
 
         if not self.server_url:
             raise MT5ConfigError("MT5Config.server_url cannot be empty.")
+        url = urlparse(self.server_url)
+        if not (url.scheme and url.hostname):
+            raise MT5ConfigError("MT5Config.server_url has no scheme or no host")
         if self.ws_url is None:
             self.ws_url = derive_ws_url(self.server_url)
 
@@ -75,5 +97,4 @@ def derive_ws_url(server_url: str) -> str:
     p = urlparse(server_url)
     if p.scheme == "ws" and p.port == 9000:
         return server_url
-    host = p.hostname or "localhost"
-    return urlunparse(("ws", f"{host}:9000", p.path, "", "", ""))
+    return urlunparse(("ws", f"{p.hostname}:9000", p.path, "", "", ""))

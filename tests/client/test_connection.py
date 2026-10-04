@@ -1,13 +1,22 @@
 """MT5Connection against a patched shim: its states, connect, disconnect and reconnect, the account
-and terminal reads, and the account snapshot."""
+and terminal reads, and the account snapshot. A test observes the connection's state through what
+ensure_connected answers."""
 
 import asyncio
 from unittest.mock import patch
 
 import pytest
 
+from mt5connector.client import connection
 from mt5connector.client.connection import AccountSnapshot, ConnectionState, MT5Connection
-from mt5connector.client.errors import MT5ConnectionError, MT5LoginError
+from mt5connector.client.errors import MT5ConnectionError, MT5LoginError, ServerUnreachable
+
+
+def assert_not_connected(conn, state: str) -> None:
+    """The connection refuses to be used, naming `state`."""
+    with pytest.raises(MT5ConnectionError, match=rf"^MT5 not connected \(state={state}\)$"):
+        conn.ensure_connected()
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. ConnectionState enum
@@ -43,7 +52,7 @@ class TestInitialState:
 
     def test_starts_disconnected(self, config, mock_mt5):
         conn = MT5Connection(config)
-        assert conn.state == ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "DISCONNECTED")
 
     def test_repr_shows_disconnected(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -78,10 +87,10 @@ class TestSuccessfulConnect:
             timeout=5000,
         )
 
-    def test_state_is_connected_after_connect(self, config, mock_mt5):
+    def test_connected_after_connect(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn.connect()
-        assert conn.state == ConnectionState.CONNECTED
+        conn.ensure_connected()
 
     def test_disconnect_calls_mt5_shutdown(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -93,7 +102,7 @@ class TestSuccessfulConnect:
         conn = MT5Connection(config)
         conn.connect()
         conn.disconnect()
-        assert conn.state == ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "DISCONNECTED")
 
     def test_repr_shows_connected(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -124,7 +133,7 @@ class TestInitializeFailure:
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError):
             conn.connect()
-        assert conn.state == ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "DISCONNECTED")
 
     def test_helpful_message_mentions_terminal(self, config, mock_mt5):
         mock_mt5.initialize.return_value = False
@@ -158,7 +167,7 @@ class TestLoginFailure:
         conn = MT5Connection(config)
         with pytest.raises(MT5LoginError):
             conn.connect()
-        assert conn.state == ConnectionState.INITIALIZED
+        assert_not_connected(conn, "INITIALIZED")
 
     def test_login_error_mentions_server(self, config, mock_mt5):
         mock_mt5.login.return_value = False
@@ -228,97 +237,7 @@ class TestEnsureConnected:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. Reconnect (sync) — success path
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-class TestReconnectSync:
-
-    def test_reconnect_succeeds_first_attempt(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn._state = ConnectionState.RECONNECTING
-        result = conn.reconnect()
-        assert result is True
-
-    def test_reconnect_calls_shutdown_then_initialize_then_login(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn._state = ConnectionState.RECONNECTING
-        conn.reconnect()
-        mock_mt5.shutdown.assert_called()
-        mock_mt5.initialize.assert_called()
-        mock_mt5.login.assert_called()
-
-    def test_reconnect_state_is_connected_on_success(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn._state = ConnectionState.RECONNECTING
-        conn.reconnect()
-        assert conn.state == ConnectionState.CONNECTED
-
-    def test_reconnect_resets_attempt_counter_on_success(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn._attempt = 2
-        conn.reconnect()
-        assert conn._attempt == 0
-
-    def test_reconnect_succeeds_after_initial_failures(self, config, mock_mt5):
-        """Fails first 2 attempts, succeeds on 3rd."""
-        call_count = {"n": 0}
-
-        def flaky_init():
-            call_count["n"] += 1
-            return call_count["n"] >= 3  # fail twice, then succeed
-
-        mock_mt5.initialize.side_effect = flaky_init
-
-        conn = MT5Connection(config)
-        result = conn.reconnect()
-        assert result is True
-        assert mock_mt5.initialize.call_count == 3
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 8. Reconnect (sync) — failure / max attempts
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-class TestReconnectSyncFailure:
-
-    def test_reconnect_returns_false_when_max_attempts_exceeded(self, config, mock_mt5):
-        mock_mt5.initialize.return_value = False
-        mock_mt5.last_error.return_value = (5, "IPC timeout")
-        conn = MT5Connection(config)
-        result = conn.reconnect()
-        assert result is False
-
-    def test_state_is_failed_when_max_attempts_exceeded(self, config, mock_mt5):
-        mock_mt5.initialize.return_value = False
-        mock_mt5.last_error.return_value = (5, "IPC timeout")
-        conn = MT5Connection(config)
-        conn.reconnect()
-        assert conn.state == ConnectionState.FAILED
-
-    def test_attempt_count_equals_max_on_failure(self, config, mock_mt5):
-        mock_mt5.initialize.return_value = False
-        mock_mt5.last_error.return_value = (5, "IPC timeout")
-        conn = MT5Connection(config)
-        conn.reconnect()
-        # config.reconnect_max_attempts == 3 in test fixture
-        assert conn._attempt == config.reconnect_max_attempts
-
-    def test_ensure_connected_raises_after_failed_reconnect(self, config, mock_mt5):
-        mock_mt5.initialize.return_value = False
-        mock_mt5.last_error.return_value = (5, "IPC timeout")
-        conn = MT5Connection(config)
-        conn.reconnect()
-        with pytest.raises(MT5ConnectionError) as exc_info:
-            conn.ensure_connected()
-        assert str(exc_info.value) == (
-            f"MT5 connection gave up after {config.reconnect_max_attempts} reconnect attempts"
-        )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 9. Reconnect (async) — success path
+# 7. Reconnect — success path
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -331,10 +250,13 @@ class TestReconnectAsync:
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_async_reconnect_state_is_connected(self, config, mock_mt5):
+    async def test_async_reconnect_connects(self, config, mock_mt5):
         conn = MT5Connection(config)
         await conn.reconnect_async()
-        assert conn.state == ConnectionState.CONNECTED
+        conn.ensure_connected()
+        mock_mt5.shutdown.assert_called()
+        mock_mt5.initialize.assert_called_once()
+        mock_mt5.login.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_async_reconnect_resets_attempt_counter(self, config, mock_mt5):
@@ -359,7 +281,7 @@ class TestReconnectAsync:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 10. Reconnect (async) — failure / max attempts
+# 8. Reconnect — failure / max attempts
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -374,12 +296,17 @@ class TestReconnectAsyncFailure:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_async_reconnect_state_is_failed(self, config, mock_mt5):
+    async def test_a_connection_given_up_on_names_its_attempts(self, config, mock_mt5):
         mock_mt5.initialize.return_value = False
         mock_mt5.last_error.return_value = (5, "IPC timeout")
         conn = MT5Connection(config)
         await conn.reconnect_async()
-        assert conn.state == ConnectionState.FAILED
+        assert mock_mt5.initialize.call_count == config.reconnect_max_attempts
+        with pytest.raises(MT5ConnectionError) as exc_info:
+            conn.ensure_connected()
+        assert str(exc_info.value) == (
+            f"MT5 connection gave up after {config.reconnect_max_attempts} reconnect attempts"
+        )
 
 
 class TestReconnectAsyncSerialised:
@@ -391,7 +318,7 @@ class TestReconnectAsyncSerialised:
         assert (first, second) == (True, True)
         assert mock_mt5.initialize.call_count == 1
         assert mock_mt5.login.call_count == 1
-        assert conn.state == ConnectionState.CONNECTED
+        conn.ensure_connected()
 
     async def test_a_concurrent_second_caller_shares_the_first_ones_failure(self, config, mock_mt5):
         mock_mt5.initialize.return_value = False
@@ -400,11 +327,12 @@ class TestReconnectAsyncSerialised:
         first, second = await asyncio.gather(conn.reconnect_async(), conn.reconnect_async())
         assert (first, second) == (False, False)
         assert mock_mt5.initialize.call_count == config.reconnect_max_attempts
-        assert conn.state == ConnectionState.FAILED
+        with pytest.raises(MT5ConnectionError, match="gave up"):
+            conn.ensure_connected()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 11. get_account_info()
+# 9. get_account_info()
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -451,7 +379,7 @@ class TestGetAccountInfo:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 12. get_terminal_info()
+# 10. get_terminal_info()
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -486,29 +414,7 @@ class TestGetTerminalInfo:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 13. last_error()
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-class TestLastError:
-
-    def test_returns_tuple(self, config, mock_mt5):
-        mock_mt5.last_error.return_value = (0, "No error")
-        conn = MT5Connection(config)
-        result = conn.last_error()
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-
-    def test_safe_before_connect(self, config, mock_mt5):
-        """last_error() must work without any connection."""
-        mock_mt5.last_error.return_value = (0, "No error")
-        conn = MT5Connection(config)
-        code, msg = conn.last_error()
-        assert code == 0
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 14. Context manager
+# 11. Context manager
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -516,12 +422,13 @@ class TestContextManager:
 
     def test_connects_on_enter(self, config, mock_mt5):
         with MT5Connection(config) as conn:
-            assert conn.state == ConnectionState.CONNECTED
+            conn.ensure_connected()
 
     def test_disconnects_on_exit(self, config, mock_mt5):
         with MT5Connection(config) as conn:
             pass
-        assert conn.state == ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "DISCONNECTED")
+        mock_mt5.shutdown.assert_called_once()
 
     def test_disconnects_on_exception(self, config, mock_mt5):
         conn = None
@@ -531,7 +438,7 @@ class TestContextManager:
                 raise ValueError("strategy error")
         except ValueError:
             pass
-        assert conn.state == ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "DISCONNECTED")
 
     def test_does_not_suppress_exceptions(self, config, mock_mt5):
         with pytest.raises(ValueError):
@@ -540,7 +447,7 @@ class TestContextManager:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 15. __repr__
+# 12. __repr__
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -562,81 +469,111 @@ class TestRepr:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 16. Backoff delay calculation
+# 13. Backoff delay calculation
 # ═════════════════════════════════════════════════════════════════════════════
 
 
 class TestBackoffDelays:
 
-    def test_delay_doubles_each_attempt(self, config, mock_mt5):
-        """Verify the exponential backoff math without actually sleeping."""
+    async def test_delay_doubles_each_attempt_up_to_the_max(self, config, mock_mt5):
         mock_mt5.initialize.return_value = False
         mock_mt5.last_error.return_value = (5, "IPC timeout")
-
         delays_seen = []
 
-        with patch("time.sleep", side_effect=lambda d: delays_seen.append(d)):
-            conn = MT5Connection(config)
-            conn.reconnect()
+        async def backoff(delay):
+            delays_seen.append(delay)
 
-        assert len(delays_seen) == config.reconnect_max_attempts
-        # Each delay should be <= the next (exponential growth)
-        for i in range(len(delays_seen) - 1):
-            assert delays_seen[i] <= delays_seen[i + 1]
+        with patch.object(connection.asyncio, "sleep", backoff):
+            await MT5Connection(config).reconnect_async()
 
-    def test_delay_is_capped_at_max(self, config, mock_mt5):
-        """Delays must never exceed reconnect_max_delay_s."""
-        mock_mt5.initialize.return_value = False
-        mock_mt5.last_error.return_value = (5, "IPC timeout")
-
-        delays_seen = []
-        with patch("time.sleep", side_effect=lambda d: delays_seen.append(d)):
-            conn = MT5Connection(config)
-            conn.reconnect()
-
-        for d in delays_seen:
-            assert d <= config.reconnect_max_delay_s
+        assert delays_seen == [0.01, 0.02, 0.04]
+        assert all(delay <= config.reconnect_max_delay_s for delay in delays_seen)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 17. Disconnect idempotency
+# 14. Lifecycle transitions
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-class TestDisconnectIdempotency:
+class TestLifecycleTransitions:
 
-    def test_disconnect_when_already_disconnected_does_not_raise(self, config, mock_mt5):
+    def test_a_disconnect_on_a_connection_never_connected_is_refused_naming_its_state(
+        self, config, mock_mt5
+    ):
         conn = MT5Connection(config)
-        conn.disconnect()  # already DISCONNECTED — must not raise
-        conn.disconnect()  # again — still must not raise
+        with pytest.raises(MT5ConnectionError, match="DISCONNECTED"):
+            conn.disconnect()
+        mock_mt5.shutdown.assert_not_called()
 
-    def test_disconnect_only_calls_shutdown_once(self, config, mock_mt5):
+    def test_a_second_disconnect_is_refused_and_shuts_down_once(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn.connect()
         conn.disconnect()
-        conn.disconnect()  # second call should be a no-op
+        with pytest.raises(MT5ConnectionError, match="DISCONNECTED"):
+            conn.disconnect()
         mock_mt5.shutdown.assert_called_once()
+
+    def test_a_connect_on_a_connected_connection_is_refused_naming_its_state(
+        self, config, mock_mt5
+    ):
+        conn = MT5Connection(config)
+        conn.connect()
+        with pytest.raises(MT5ConnectionError, match="CONNECTED"):
+            conn.connect()
+        mock_mt5.configure.assert_called_once()
+        mock_mt5.initialize.assert_called_once()
+        mock_mt5.login.assert_called_once()
+
+    async def test_a_connect_while_reconnecting_is_refused_naming_its_state(self, config, mock_mt5):
+        mock_mt5.initialize.return_value = False
+        mock_mt5.last_error.return_value = (5, "IPC timeout")
+        conn = MT5Connection(config)
+        refusals = []
+
+        async def backoff(delay):
+            with pytest.raises(MT5ConnectionError) as refused:
+                conn.connect()
+            refusals.append(str(refused.value))
+
+        with patch.object(connection.asyncio, "sleep", backoff):
+            assert await conn.reconnect_async() is False
+
+        assert len(refusals) == config.reconnect_max_attempts
+        assert all("RECONNECTING" in refusal for refusal in refusals)
+        assert mock_mt5.initialize.call_count == config.reconnect_max_attempts
+
+    def test_a_connect_the_server_did_not_answer_can_be_made_again(self, config, mock_mt5):
+        mock_mt5.initialize.side_effect = [ServerUnreachable("initialize: refused"), True]
+        conn = MT5Connection(config)
+        with pytest.raises(ServerUnreachable):
+            conn.connect()
+        conn.connect()
+        conn.ensure_connected()
+
+    def test_a_login_the_server_did_not_answer_can_be_made_again(self, config, mock_mt5):
+        mock_mt5.login.side_effect = [ServerUnreachable("login: refused"), True]
+        conn = MT5Connection(config)
+        with pytest.raises(ServerUnreachable):
+            conn.connect()
+        conn.connect()
+        conn.ensure_connected()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 18. State integrity after login failure
+# 15. State integrity after a failed connect
 # ═════════════════════════════════════════════════════════════════════════════
 
 
 class TestStateIntegrity:
 
     def test_login_failure_leaves_state_initialized_not_disconnected(self, config, mock_mt5):
-        """
-        When login fails, terminal IPC is still alive (INITIALIZED state).
-        State must NOT be DISCONNECTED — that would hide the terminal being open.
-        """
+        """A failed login leaves the terminal initialized: INITIALIZED, never DISCONNECTED."""
         mock_mt5.login.return_value = False
         mock_mt5.last_error.return_value = (65537, "Invalid account")
         conn = MT5Connection(config)
         with pytest.raises(MT5LoginError):
             conn.connect()
-        assert conn.state == ConnectionState.INITIALIZED
-        assert conn.state != ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "INITIALIZED")
 
     def test_initialize_failure_leaves_state_disconnected(self, config, mock_mt5):
         mock_mt5.initialize.return_value = False
@@ -644,11 +581,11 @@ class TestStateIntegrity:
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError):
             conn.connect()
-        assert conn.state == ConnectionState.DISCONNECTED
+        assert_not_connected(conn, "DISCONNECTED")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 19. AccountSnapshot
+# 16. AccountSnapshot
 # ═════════════════════════════════════════════════════════════════════════════
 
 

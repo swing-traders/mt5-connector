@@ -9,15 +9,16 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
-from nautilus_trader.model.identifiers import ClientId, InstrumentId
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.data.messages import DataResponse, RequestInstrument, RequestInstruments
+from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from push_double import PushDouble
 
 from mt5connector.client import data
-from mt5connector.client.connection import ConnectionState
-from mt5connector.client.data import MT5DataClient, _bar_spec_to_mt5_timeframe, _epoch_s
-from mt5connector.client.errors import MT5ConnectionError
+from mt5connector.client.data import MT5DataClient, _epoch_s
+from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import Series
 from mt5connector.wire.push_wire import Stream, Subscription
@@ -92,7 +93,6 @@ def make_config(symbols=None):
 
 def make_conn(connected=True):
     conn = MagicMock()
-    conn.state = ConnectionState.CONNECTED if connected else ConnectionState.DISCONNECTED
     conn.ensure_connected = (
         MagicMock() if connected else MagicMock(side_effect=MT5ConnectionError("not connected"))
     )
@@ -101,11 +101,8 @@ def make_conn(connected=True):
 
 
 def make_provider(instrument=None):
-    """
-    Build a real MT5InstrumentProvider subclass — NautilusTrader's
-    PyCondition.type() rejects MagicMock, so we must use a real subclass.
-    We override the methods to return test data without touching MT5.
-    """
+    """A real MT5InstrumentProvider, whose type NT checks, answering `instrument` without the
+    venue."""
     from mt5connector.client.connection import MT5Connection
     from mt5connector.client.providers import MT5InstrumentProvider
 
@@ -145,8 +142,11 @@ class RecordedDataClient(MT5DataClient):
         return self.recorded_log
 
 
-def make_client(symbols=None, connected=True, instrument=None, client_class=MT5DataClient):
-    """Build a fully wired MT5DataClient with real NautilusTrader components."""
+def make_client(
+    symbols=None, connected=True, instrument=None, client_class=MT5DataClient, nt_handlers=False
+):
+    """Build a fully wired MT5DataClient with real NautilusTrader components, its handlers recorded
+    unless `nt_handlers` keeps NT's own."""
     from nautilus_trader.common.component import LiveClock
     from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
@@ -175,12 +175,12 @@ def make_client(symbols=None, connected=True, instrument=None, client_class=MT5D
             instrument_provider=provider,
             config=config,
         )
-    # Patch internal handler methods so we can track emitted data
-    client._handle_data = MagicMock()
-    client._handle_quote_ticks = MagicMock()
-    client._handle_bars = MagicMock()
-    client._handle_instrument = MagicMock()
-    client._handle_instruments = MagicMock()
+    if not nt_handlers:
+        client._handle_data = MagicMock()
+        client._handle_quote_ticks = MagicMock()
+        client._handle_bars = MagicMock()
+        client._handle_instrument = MagicMock()
+        client._handle_instruments = MagicMock()
 
     return client, conn, provider, loop
 
@@ -211,71 +211,6 @@ class TestEpochS:
 
     def test_a_datetime_becomes_its_epoch_seconds(self):
         assert _epoch_s(datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)) == 1_700_000_000
-
-
-class TestBarSpecToMt5Timeframe:
-
-    def _make_bar_type(self, step, aggregation_name):
-        from nautilus_trader.model.enums import BarAggregation
-
-        bar_spec = MagicMock()
-        bar_spec.step = step
-        bar_spec.aggregation = getattr(BarAggregation, aggregation_name)
-        bar_type = MagicMock()
-        bar_type.spec = bar_spec
-        return bar_type
-
-    def test_m1_returns_1(self):
-        bt = self._make_bar_type(1, "MINUTE")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 1
-
-    def test_m5_returns_5(self):
-        bt = self._make_bar_type(5, "MINUTE")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 5
-
-    def test_m15_returns_15(self):
-        bt = self._make_bar_type(15, "MINUTE")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 15
-
-    def test_h1_returns_16385(self):
-        bt = self._make_bar_type(1, "HOUR")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            mock_mt5.TIMEFRAME_H4 = 16388
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 16385
-
-    def test_h4_returns_16388(self):
-        bt = self._make_bar_type(4, "HOUR")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            mock_mt5.TIMEFRAME_H4 = 16388
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 16388
-
-    def test_d1_returns_correct(self):
-        bt = self._make_bar_type(1, "DAY")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_D1 = 16408
-            mock_mt5.TIMEFRAME_H1 = 16385
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 16408
-
-    def test_unknown_falls_back_to_h1(self):
-        bt = self._make_bar_type(999, "MINUTE")
-        with patch("mt5connector.client.data.mt5") as mock_mt5:
-            mock_mt5.TIMEFRAME_H1 = 16385
-            result = _bar_spec_to_mt5_timeframe(bt)
-        assert result == 16385
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -311,6 +246,29 @@ class TestConnect:
         c, conn, prov, loop = make_client()
         await c._connect()
         prov.get_instrument.assert_called()
+        await c._disconnect()
+
+    @pytest.mark.parametrize("held", [False, True], ids=["loaded-at-connect", "already-held"])
+    @pytest.mark.asyncio
+    async def test_connect_registers_the_settlement_currency_of_each_instrument_it_hands(
+        self, held
+    ):
+        from nautilus_trader.model.enums import CurrencyType
+        from nautilus_trader.model.objects import Currency
+
+        Currency.register(Currency("CLP", 8, 0, "CLP", CurrencyType.FIAT), overwrite=True)
+        clp = Currency("CLP", 0, 0, "CLP", CurrencyType.FIAT)
+        c, conn, prov, loop = make_client(symbols=["USDCLP"], instrument=clp_instrument(clp))
+        if not held:
+            prov.get_instrument.return_value = None
+        precisions = []
+        c._handle_data.side_effect = lambda *_: precisions.append(
+            Currency.from_str("CLP", strict=True).precision
+        )
+
+        await c._connect()
+
+        assert precisions == [0]
         await c._disconnect()
 
     @pytest.mark.asyncio
@@ -459,11 +417,21 @@ class TestRequestQuoteTicks:
         assert "2025-07-15T09:00:00+00:00" in recorded._log.error.call_args[0][0]
 
     @pytest.mark.asyncio
-    async def test_skips_when_instrument_not_found(self, client):
+    async def test_both_sizes_are_the_instruments_largest_order(self, recorded):
+        rows = tick_rows(1_752_570_000_250)
+        with patch("mt5connector.client.history.ticks", return_value=rows):
+            await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
+
+        [tick] = recorded._handle_quote_ticks.call_args[0][1]
+        assert (tick.bid_size, tick.ask_size) == (Quantity(1000, 2), Quantity(1000, 2))
+
+    @pytest.mark.asyncio
+    async def test_raises_naming_a_symbol_not_loaded(self, client):
         client._provider.get_instrument.return_value = None
 
         with patch("mt5connector.client.history.ticks") as ticks:
-            await client._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
+            with pytest.raises(MT5InstrumentError, match="EURUSDm"):
+                await client._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
         ticks.assert_not_called()
 
@@ -533,17 +501,148 @@ class TestRequestBars:
         recorded._handle_bars.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_when_instrument_not_found(self, client):
+    async def test_bars_are_the_bar_type_requested(self, recorded):
+        from nautilus_trader.model.data import BarType
+
+        request = minute_bars_request(1_752_570_060, 1_752_570_120)
+        request.bar_type = BarType.from_str("EURUSDm.MT5-1-MINUTE-BID-EXTERNAL")
+        with patch("mt5connector.client.history.bars", return_value=rate_rows(1_752_570_000)):
+            await recorded._request_bars(request)
+
+        assert recorded._handle_bars.call_args[0][0] == request.bar_type
+        [bar] = recorded._handle_bars.call_args[0][1]
+        assert bar.bar_type == request.bar_type
+
+    @pytest.mark.parametrize("step", ["1-SECOND", "2-DAY", "1-MONTH"])
+    @pytest.mark.asyncio
+    async def test_a_step_the_terminal_has_no_timeframe_for_is_refused(self, recorded, step):
+        from nautilus_trader.model.data import BarType
+
+        request = minute_bars_request(1_752_570_060, 1_752_570_300)
+        request.bar_type = BarType.from_str(f"EURUSDm.MT5-{step}-BID-EXTERNAL")
+        with patch("mt5connector.client.history.bars") as bars:
+            with pytest.raises(ValueError, match="no timeframe"):
+                await recorded._request_bars(request)
+
+        bars.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_naming_a_symbol_not_loaded(self, client):
         client._provider.get_instrument.return_value = None
 
         with patch("mt5connector.client.history.bars") as bars:
-            await client._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
+            with pytest.raises(MT5InstrumentError, match="EURUSDm"):
+                await client._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
 
         bars.assert_not_called()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 9. No-op methods — don't raise
+# 9. Instrument requests
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def responses_of(client) -> list:
+    """What the client sends NT's data engine as responses, recorded."""
+    responses = []
+    client._msgbus.register(endpoint="DataEngine.response", handler=responses.append)
+    return responses
+
+
+def instrument_request(symbol="EURUSDm"):
+    return RequestInstrument(
+        instrument_id=InstrumentId.from_str(f"{symbol}.MT5"),
+        start=None,
+        end=None,
+        client_id=ClientId("MT5"),
+        venue=None,
+        callback=None,
+        request_id=UUID4(),
+        ts_init=0,
+        params=None,
+    )
+
+
+class TestRequestInstruments:
+
+    @pytest.mark.asyncio
+    async def test_an_instrument_request_reaches_the_data_engine_as_its_response(self):
+        client, conn, provider, loop = make_client(nt_handlers=True)
+        responses = responses_of(client)
+        request = instrument_request()
+
+        await client._request_instrument(request)
+
+        [response] = responses
+        assert isinstance(response, DataResponse)
+        assert (response.correlation_id, response.data) == (request.id, [provider.load_symbol()])
+
+    @pytest.mark.asyncio
+    async def test_an_instruments_request_reaches_the_data_engine_as_its_response(self):
+        client, conn, provider, loop = make_client(nt_handlers=True)
+        responses = responses_of(client)
+        request = RequestInstruments(
+            start=None,
+            end=None,
+            client_id=ClientId("MT5"),
+            venue=Venue("MT5"),
+            callback=None,
+            request_id=UUID4(),
+            ts_init=0,
+            params=None,
+        )
+
+        await client._request_instruments(request)
+
+        [response] = responses
+        assert isinstance(response, DataResponse)
+        assert (response.correlation_id, response.venue) == (request.id, Venue("MT5"))
+        assert response.data == provider.list_all()
+
+    @pytest.mark.asyncio
+    async def test_an_instrument_loaded_later_registers_its_settlement_currency_first(self):
+        from nautilus_trader.core import nautilus_pyo3
+        from nautilus_trader.model.enums import CurrencyType
+        from nautilus_trader.model.objects import Currency
+
+        Currency.register(Currency("CLP", 8, 0, "CLP", CurrencyType.FIAT), overwrite=True)
+        clp = Currency("CLP", 0, 0, "CLP", CurrencyType.FIAT)
+        client, conn, provider, loop = make_client(instrument=clp_instrument(clp))
+        precisions = []
+        client._handle_instrument.side_effect = lambda *_: precisions.append(
+            Currency.from_str("CLP", strict=True).precision
+        )
+
+        await client._request_instrument(instrument_request("USDCLP"))
+
+        assert precisions == [0]
+        assert nautilus_pyo3.Currency.from_str("CLP", strict=True).precision == 0
+
+
+def clp_instrument(clp):
+    from nautilus_trader.model.currencies import Currency
+    from nautilus_trader.model.identifiers import Symbol
+
+    return CurrencyPair(
+        instrument_id=InstrumentId.from_str("USDCLP.MT5"),
+        raw_symbol=Symbol("USDCLP"),
+        base_currency=Currency.from_str("USD"),
+        quote_currency=clp,
+        price_precision=2,
+        size_precision=2,
+        price_increment=Price(0.01, 2),
+        size_increment=Quantity(0.01, 2),
+        max_quantity=Quantity(100.0, 2),
+        min_quantity=Quantity(0.01, 2),
+        maker_fee=Decimal("0"),
+        taker_fee=Decimal("0"),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 10. No-op methods — don't raise
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -587,7 +686,7 @@ class TestNoOpMethods:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 10. Properties
+# 11. Properties
 # ═════════════════════════════════════════════════════════════════════════════
 
 

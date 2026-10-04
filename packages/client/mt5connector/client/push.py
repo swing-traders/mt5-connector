@@ -1,7 +1,9 @@
 """A consumer's channel to the hub on NT's WebSocketClient, sending its wanted subscriptions whole
 again on every reconnect: the hub keeps nothing for a consumer that left.
 
-State: the subscriptions wanted, in the order they were first wanted, and the next op id."""
+State: the subscriptions wanted, in the order they were first wanted, and the next op id. A change
+to what is wanted and the resend of the whole set hold one lock across their sends, so the hub
+receives them in the order the set changed."""
 
 from __future__ import annotations
 
@@ -51,6 +53,7 @@ class PushClient:
         self._log = log
         self._ws: WebSocketClient | None = None
         self._wanted: list[Subscription] = []
+        self._wanting = asyncio.Lock()
         self._next_op_id = 1
         self._tasks: set[asyncio.Task] = set()
 
@@ -87,15 +90,17 @@ class PushClient:
 
     async def subscribe(self, subscription: Subscription) -> None:
         """Wants a stream, and subscribes it while connected."""
-        if subscription not in self._wanted:
-            self._wanted.append(subscription)
-            await self._send_op(FrameType.SUBSCRIBE, subscription)
+        async with self._wanting:
+            if subscription not in self._wanted:
+                self._wanted.append(subscription)
+                await self._send_op(FrameType.SUBSCRIBE, subscription)
 
     async def unsubscribe(self, subscription: Subscription) -> None:
         """Stops wanting a stream, and unsubscribes it while connected."""
-        if subscription in self._wanted:
-            self._wanted.remove(subscription)
-            await self._send_op(FrameType.UNSUBSCRIBE, subscription)
+        async with self._wanting:
+            if subscription in self._wanted:
+                self._wanted.remove(subscription)
+                await self._send_op(FrameType.UNSUBSCRIBE, subscription)
 
     async def _send_op(self, frame_type: FrameType, subscription: Subscription) -> None:
         """Sends an op under the next op id while connected; the connect or reconnect sends the
@@ -109,9 +114,10 @@ class PushClient:
         return op_id
 
     async def _send_wanted(self) -> None:
-        await self._send({"v": PROTOCOL_VERSION, "type": FrameType.HELLO, "role": Role.ADAPTER})
-        for subscription in list(self._wanted):
-            await self._send(subscription.op(FrameType.SUBSCRIBE, self._op_id()))
+        async with self._wanting:
+            await self._send({"v": PROTOCOL_VERSION, "type": FrameType.HELLO, "role": Role.ADAPTER})
+            for subscription in self._wanted:
+                await self._send(subscription.op(FrameType.SUBSCRIBE, self._op_id()))
 
     async def _send(self, frame: dict[str, object]) -> None:
         """Sends a frame; one the connection drops is sent again with the whole wanted set when NT's

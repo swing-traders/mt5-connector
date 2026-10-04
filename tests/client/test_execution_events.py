@@ -647,7 +647,12 @@ async def test_the_account_is_reported_on_the_configs_refresh_period(exec_shim):
 
 
 @pytest.mark.parametrize(
-    "failure", [errors.ServerBusy, errors.ServerUnreachable, errors.ResponseLost]
+    "failure",
+    [
+        errors.ServerBusy("account_info: server busy", 5),
+        errors.ServerUnreachable("account_info: unavailable"),
+        errors.ResponseLost("account_info: unavailable"),
+    ],
 )
 async def test_an_account_report_the_server_does_not_answer_stays_owed_and_warns_once(
     exec_shim, failure
@@ -656,7 +661,7 @@ async def test_an_account_report_the_server_does_not_answer_stays_owed_and_warns
     h.place(h.limit(), ticket=9001)
     await h.connect()
     h.deals_added(ours_deal(ticket=7001, order=9001))
-    h.conn.get_account_info.side_effect = failure("account_info: unavailable")
+    h.conn.get_account_info.side_effect = failure
     for _ in range(3):
         h.client._account_turn()
     assert h.names() == ["OrderFilled"]

@@ -7,7 +7,6 @@ the last answered call carried."""
 from __future__ import annotations
 
 import inspect
-import math
 import time
 from collections import namedtuple
 from collections.abc import Callable
@@ -132,7 +131,9 @@ def _call(function: mirror.Function, body: dict[str, object]) -> object:
         reply.status is HTTPStatus.SERVICE_UNAVAILABLE
         and reply.envelope["error"]["code"] is ServerCode.BUSY
     ):
-        raise ServerBusy(f"{function.name}: server busy")
+        raise ServerBusy(
+            f"{function.name}: server busy", retry_after_s(function.name, reply.retry_after)
+        )
     else:
         return mirror.failure_value(function)
 
@@ -145,9 +146,9 @@ def call_route(
     json: dict[str, object] | None = None,
     params: dict[str, str] | None = None,
 ) -> Reply:
-    """Calls one of the server's own routes and sets last_error to the pair its envelope carries.
-    No read timeout bounds it: a cold history read holds the terminal as long as the package's own
-    call takes."""
+    """Calls one of the server's own routes and sets last_error to the pair its envelope carries. No
+    read timeout bounds it: a cold history read holds the terminal as long as the package's own call
+    takes."""
     return _exchange(name, method, path, None, json=json, params=params)
 
 
@@ -220,7 +221,9 @@ def commission_schedule(symbol: str) -> dict:
             and _is_error(envelope)
             and envelope["error"]["code"] == ServerCode.BUSY
         ):
-            raise ServerBusy(f"{name}: server busy")
+            raise ServerBusy(
+                f"{name}: server busy", retry_after_s(name, response.headers.get("Retry-After"))
+            )
         elif (
             response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
             and _is_server_failure(envelope)
@@ -237,14 +240,11 @@ def commission_schedule(symbol: str) -> dict:
             raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
 
 
-def retry_after_s(name: str, retry_after: str | None) -> float:
-    """The delay a deferring answer's Retry-After gives; raises ServerUnreachable for none."""
-    try:
-        seconds = float(retry_after)
-    except (TypeError, ValueError):
-        seconds = math.nan
-    if math.isfinite(seconds) and seconds >= 0:
-        return seconds
+def retry_after_s(name: str, retry_after: str | None) -> int:
+    """The delay in seconds a deferring answer's Retry-After gives, HTTP's whole non-negative
+    seconds; raises ServerUnreachable for none."""
+    if retry_after is not None and retry_after.isascii() and retry_after.isdigit():
+        return int(retry_after)
     else:
         raise ServerUnreachable(f"{name}: a deferring answer's Retry-After is {retry_after!r}")
 

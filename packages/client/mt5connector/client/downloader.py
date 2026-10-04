@@ -9,13 +9,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from nautilus_trader.model.data import BarType
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connector.client import history
 from mt5connector.client import remote_mt5 as mt5
-from mt5connector.client.errors import MT5SymbolNotFoundError
+from mt5connector.client.errors import MT5InstrumentError, MT5SymbolNotFoundError
 from mt5connector.client.history import HistoryRanges
-from mt5connector.client.parsing import parse_bar, parse_quote_tick
+from mt5connector.client.parsing import (
+    InstrumentAny,
+    parse_quote_tick,
+    venue_bar,
+    venue_bar_type,
+)
 from mt5connector.wire.history_wire import BAR_PERIOD_S, SPAN_MARGIN, Series, bar_series
 
 if TYPE_CHECKING:
@@ -85,8 +91,8 @@ class MT5DataDownloader:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def download_ticks(self, symbol: str, start: datetime, end: datetime) -> DownloadResult:
-        """Writes the symbol's quote ticks between start and end, one UTC day per request, each
-        day as it arrives."""
+        """Writes the symbol's quote ticks between start and end, one UTC day per request, each day
+        as it arrives."""
         symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
         start = _ensure_utc(start)
         end = _ensure_utc(end)
@@ -94,32 +100,9 @@ class MT5DataDownloader:
 
         self._conn.ensure_connected()
 
-        # Ensure instrument is loaded
         instrument = self._ensure_instrument(symbol, result)
-        if instrument is None:
-            return result
-
-        ranges = history.ranges(symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {mt5.last_error()}")
-        else:
-            logger.info(f"Downloader: downloading ticks for {symbol} from {start} to {end}")
-            first = int(start.timestamp())
-            windows = []
-            window_end = int(end.timestamp())
-            while window_end >= first:
-                window_start = max(first, window_end - window_end % _DAY_S)
-                windows.append((window_start, window_end))
-                window_end = window_start - 1
-            self._walk_back(
-                result,
-                Series.TICKS,
-                first,
-                windows,
-                _advertised_floor(ranges, Series.TICKS),
-                lambda lo, hi: history.ticks(symbol, lo, hi),
-                lambda rows: [parse_quote_tick(row, instrument) for row in rows],
-            )
+        if instrument is not None:
+            self._walk_ticks(result, instrument, start, end)
         logger.info(f"Downloader: {result}")
         return result
 
@@ -131,47 +114,22 @@ class MT5DataDownloader:
         timeframe: int | None = None,
     ) -> DownloadResult:
         """Writes the symbol's bars of an MT5 timeframe, H1 by default, closing between start and
-        end, stamped at their close; each request spans as many periods as the terminal answers in
-        one read."""
+        end, stamped at their close and typed by the price the venue charts them on; each request
+        spans as many periods as the terminal answers in one read."""
         symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
         start = _ensure_utc(start)
         end = _ensure_utc(end)
-        timeframe = timeframe or mt5.TIMEFRAME_H1
+        if timeframe is None:
+            timeframe = mt5.TIMEFRAME_H1
         series = bar_series(timeframe)
         result = DownloadResult(symbol=symbol, data_type="bars", start=start, end=end)
 
         self._conn.ensure_connected()
 
         instrument = self._ensure_instrument(symbol, result)
-        if instrument is None:
-            return result
-
-        ranges = history.ranges(symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {mt5.last_error()}")
-        else:
-            logger.info(
-                f"Downloader: downloading {series} bars for {symbol} closing from {start} to {end}"
-            )
-            # The range names closes; the server serves bars by their open.
-            period = BAR_PERIOD_S[series]
-            first = int(start.timestamp()) - period
-            span = (ranges.maxbars - SPAN_MARGIN) * period
-            windows = []
-            window_end = int(end.timestamp()) - period
-            while window_end >= first:
-                window_start = max(first, window_end - span)
-                windows.append((window_start, window_end))
-                window_end = window_start - 1
-            self._walk_back(
-                result,
-                series,
-                first,
-                windows,
-                _advertised_floor(ranges, series),
-                lambda lo, hi: history.bars(symbol, series, lo, hi),
-                lambda rows: [parse_bar(row, instrument, timeframe) for row in rows],
-            )
+        if instrument is not None:
+            bar_type = venue_bar_type(instrument, timeframe)
+            self._walk_bars(result, instrument, series, bar_type, start, end)
         logger.info(f"Downloader: {result}")
         return result
 
@@ -184,26 +142,10 @@ class MT5DataDownloader:
         include_bars: bool = True,
         timeframes: list[int] | None = None,
     ) -> dict[str, list[DownloadResult]]:
-        """
-        Download tick and/or bar data for multiple symbols.
-
-        Parameters
-        ----------
-        symbols : list[str]
-        start, end : datetime
-        include_ticks : bool
-            Whether to download tick data.
-        include_bars : bool
-            Whether to download bar data.
-        timeframes : list[int], optional
-            MT5 timeframe constants. Defaults to [H1, D1].
-
-        Returns
-        -------
-        dict[str, list[DownloadResult]]
-            Keyed by symbol, value is list of DownloadResult (one per data type).
-        """
-        timeframes = timeframes or [mt5.TIMEFRAME_H1, mt5.TIMEFRAME_D1]
+        """Downloads each symbol's ticks, then its bars of each MT5 timeframe, H1 and D1 by default;
+        answers each symbol's results in that order."""
+        if timeframes is None:
+            timeframes = [mt5.TIMEFRAME_H1, mt5.TIMEFRAME_D1]
         results: dict[str, list[DownloadResult]] = {}
 
         for symbol in symbols:
@@ -228,6 +170,71 @@ class MT5DataDownloader:
 
     # ── Private ───────────────────────────────────────────────────────────────
 
+    def _walk_ticks(
+        self, result: DownloadResult, instrument: InstrumentAny, start: datetime, end: datetime
+    ) -> None:
+        """Walks the symbol's ticks back from end, a UTC day per window."""
+        ranges = history.ranges(result.symbol)
+        if ranges is None:
+            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+        else:
+            logger.info(f"Downloader: downloading ticks for {result.symbol} from {start} to {end}")
+            first = int(start.timestamp())
+            windows = []
+            window_end = int(end.timestamp())
+            while window_end >= first:
+                window_start = max(first, window_end - window_end % _DAY_S)
+                windows.append((window_start, window_end))
+                window_end = window_start - 1
+            self._walk_back(
+                result,
+                Series.TICKS,
+                first,
+                windows,
+                _advertised_floor(ranges, Series.TICKS),
+                lambda lo, hi: history.ticks(result.symbol, lo, hi),
+                lambda rows: [parse_quote_tick(row, instrument) for row in rows],
+            )
+
+    def _walk_bars(
+        self,
+        result: DownloadResult,
+        instrument: InstrumentAny,
+        series: Series,
+        bar_type: BarType,
+        start: datetime,
+        end: datetime,
+    ) -> None:
+        """Walks the symbol's bars of `series` back from the one closing at end, as many periods per
+        window as the terminal answers in one read."""
+        ranges = history.ranges(result.symbol)
+        if ranges is None:
+            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+        else:
+            logger.info(
+                f"Downloader: downloading {series} bars for {result.symbol} closing from {start} "
+                f"to {end}"
+            )
+            # The range names closes; the server serves bars by their open.
+            period = BAR_PERIOD_S[series]
+            first = int(start.timestamp()) - period
+            span = (ranges.maxbars - SPAN_MARGIN) * period
+            windows = []
+            window_end = int(end.timestamp()) - period
+            while window_end >= first:
+                window_start = max(first, window_end - span)
+                windows.append((window_start, window_end))
+                window_end = window_start - 1
+            self._walk_back(
+                result,
+                series,
+                first,
+                windows,
+                _advertised_floor(ranges, series),
+                lambda lo, hi: history.bars(result.symbol, series, lo, hi),
+                lambda rows: [venue_bar(row, bar_type, instrument) for row in rows],
+            )
+
     def _walk_back(
         self,
         result: DownloadResult,
@@ -239,8 +246,8 @@ class MT5DataDownloader:
         convert: Callable[[np.ndarray], list],
     ) -> None:
         """Requests the windows newest-first, writing the rows each answers, until the next lies
-        wholly before the series' floor, and records the floor when it lies after `first`. The
-        floor is read again after a window answered no rows and once the walk ends, since the server
+        wholly before the series' floor, and records the floor when it lies after `first`. The floor
+        is read again after a window answered no rows and once the walk ends, since the server
         measures one while answering."""
         for lo, hi in windows:
             if floor is not None and hi < floor:
@@ -278,30 +285,16 @@ class MT5DataDownloader:
         else:
             return _advertised_floor(ranges, series)
 
-    def _ensure_instrument(self, symbol: str, result: DownloadResult):
-        """
-        Get the loaded instrument for a symbol.
-        Tries to load it if not already loaded.
-        Returns None and records error in result if it fails.
-        """
+    def _ensure_instrument(self, symbol: str, result: DownloadResult) -> InstrumentAny | None:
+        """The symbol's instrument, loaded when the provider holds none; a definition the venue
+        refuses is recorded as the symbol's error, by its type, and answers None."""
         instrument = self._provider.get_instrument(symbol)
-        if instrument is not None:
-            return instrument
-
-        # Try loading it now
-        try:
-            instrument = self._provider.load_symbol(symbol)
-            return instrument
-        except MT5SymbolNotFoundError:
-            msg = f"Symbol '{symbol}' not found on broker — skipping"
-            logger.error(f"Downloader: {msg}")
-            result.errors.append(msg)
-            return None
-        except Exception as exc:
-            msg = f"Failed to load instrument '{symbol}': {exc}"
-            logger.error(f"Downloader: {msg}")
-            result.errors.append(msg)
-            return None
+        if instrument is None:
+            try:
+                instrument = self._provider.load_symbol(symbol)
+            except (MT5SymbolNotFoundError, MT5InstrumentError) as exc:
+                _record_error(result, f"{type(exc).__name__}: {exc}")
+        return instrument
 
 
 # ─────────────────────────────────────────────────────────────────────────────

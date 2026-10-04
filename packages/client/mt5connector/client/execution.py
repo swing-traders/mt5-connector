@@ -75,7 +75,7 @@ from nautilus_trader.model.identifiers import (
     TraderId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import AccountBalance, Currency, Money, Price, Quantity
+from nautilus_trader.model.objects import AccountBalance, Money, Price, Quantity
 
 from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.connection import MarginMode
@@ -351,13 +351,15 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         instrument_provider: MT5InstrumentProvider,
         config: MT5Config,
     ) -> None:
+        account = connection.get_account_info()
         super().__init__(
             loop=loop,
             client_id=ClientId(MT5_VENUE.value),
             venue=MT5_VENUE,
             oms_type=OmsType.HEDGING,
             account_type=AccountType.MARGIN,
-            base_currency=None,  # MT5 accounts are multi-currency
+            # The account keeps one balance, in its currency; NT takes it only at construction.
+            base_currency=venue_currency(account.currency, account),
             msgbus=msgbus,
             cache=cache,
             clock=clock,
@@ -367,7 +369,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._config = config
         self._provider = instrument_provider
         self._magic = magic_for(self.trader_id)
-        self._account_currency: Currency | None = None
         self._push = PushClient(config, loop, self._on_push_frame, None, self._log)
         self._account_task: asyncio.Task | None = None
         self._client_order_ids: dict[int, ClientOrderId] = {}
@@ -405,8 +406,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             [InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in self._config.symbols]
         )
         # Money mints at its currency's registered precision, which NT may hold at a guess.
-        self._account_currency = venue_currency(account.currency, account)
-        register_venue_currency(self._account_currency)
+        register_venue_currency(self.base_currency)
         for instrument in self._provider.list_all():
             register_venue_currency(instrument.quote_currency)
 
@@ -566,8 +566,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     def _on_request(self, request: dict, result: dict) -> None:
         """Indexes the ticket a completed request of this trader placed when the index lacks it and
-        the request's comment is the digest of an in-flight NT order — the link a lost submit
-        answer leaves undone — and accepts that order while NT holds it submitted."""
+        the request's comment is the digest of an in-flight NT order — the link a lost submit answer
+        leaves undone — and accepts that order while NT holds it submitted."""
         if request["magic"] == self._magic and result["retcode"] in _DONE_RETCODES:
             self._index_by_comment(result["order"], request["comment"])
             order = self._indexed_order(result["order"])
@@ -721,9 +721,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         to the next account turn."""
         self._account_owed = True
         account = self._conn.get_account_info()
-        total = Money(account.balance + account.credit, self._account_currency)
-        locked = Money(account.margin, self._account_currency)
-        free = Money(total.as_decimal() - locked.as_decimal(), self._account_currency)
+        total = Money(account.balance + account.credit, self.base_currency)
+        locked = Money(account.margin, self.base_currency)
+        free = Money(total.as_decimal() - locked.as_decimal(), self.base_currency)
         self.generate_account_state(
             balances=[AccountBalance(total, locked, free)],
             margins=[],
@@ -1896,7 +1896,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """What a deal charged, in the account currency: the venue states a charge negative, so a
         positive commission is a rebate."""
         charge = finite_decimal(deal.commission, "commission") + finite_decimal(deal.fee, "fee")
-        return Money(-charge, self._account_currency)
+        return Money(-charge, self.base_currency)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

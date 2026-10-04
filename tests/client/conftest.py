@@ -37,16 +37,8 @@ def config():
 
 @pytest.fixture
 def mock_mt5():
-    """
-    Patches the shim (mt5connector.client.remote_mt5) used inside mt5connector.client.connection.
-
-    Provides realistic defaults for all common mt5.* calls so tests
-    can focus on adapter logic rather than MT5 plumbing.
-
-    Override in individual tests:
-        mock_mt5.initialize.return_value = False
-        mock_mt5.last_error.return_value = (5, "IPC timeout")
-    """
+    """The shim as mt5connector.client.connection calls it, answering a terminal that initializes,
+    logs in and reports a USD account; a test overrides the answer it needs."""
     with patch("mt5connector.client.connection.mt5") as mock:
         mock.initialize.return_value = True
         mock.shutdown.return_value = None

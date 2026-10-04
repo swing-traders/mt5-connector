@@ -1,8 +1,13 @@
+"""The adapter's connection to the MT5 terminal behind the server, and the account as the terminal
+reports it.
+
+State: where the connection is in its lifecycle, and the reconnect attempts made since it last
+connected."""
+
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum, StrEnum, auto
@@ -34,6 +39,16 @@ class ConnectionState(Enum):
     RECONNECTING = auto()  # lost connection, retrying
     SHUTTING_DOWN = auto()  # mt5.shutdown() called
     FAILED = auto()  # gave up after max attempts
+
+
+_CONNECTED_OR_CONNECTING = frozenset(
+    {
+        ConnectionState.INITIALIZING,
+        ConnectionState.LOGGING_IN,
+        ConnectionState.CONNECTED,
+        ConnectionState.RECONNECTING,
+    }
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,58 +140,35 @@ def _finite(value: float, field: str) -> Decimal:
 
 
 class MT5Connection:
-    """
-    Owns the connection lifecycle to the MT5 terminal behind the server.
-
-    Usage
-    -----
-        conn = MT5Connection(config)
-        conn.connect()                   # initialize + login
-        conn.ensure_connected()          # call before every mt5.* API call
-        info = conn.get_account_info()
-        conn.disconnect()                # clean shutdown
-
-    Context manager
-    ---------------
-        with MT5Connection(config) as conn:
-            info = conn.get_account_info()
-
-    All core methods are synchronous because the shim's calls to the server
-    are synchronous. reconnect_async() is provided for use inside asyncio
-    polling loops.
-    """
+    """The lifecycle of the connection to the MT5 terminal behind the server, shared by the clients
+    of one account."""
 
     def __init__(self, config: MT5Config) -> None:
         self._config = config
         self._state = ConnectionState.DISCONNECTED
         self._attempt = 0
-        self._last_error: tuple[int, str] | None = None
         self._reconnect_lock = asyncio.Lock()
-
-    # ── Public properties ─────────────────────────────────────────────────────
-
-    @property
-    def state(self) -> ConnectionState:
-        return self._state
 
     # ── Core lifecycle ────────────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """
-        Full connection: bind the shim to the configured server, initialize, then login to broker.
-        Raises MT5ConnectionError or MT5LoginError on failure.
-        """
+        """Binds the shim to the configured server, initializes the terminal and logs in to the
+        broker. Raises MT5ConnectionError naming the state on a connection already connected or
+        connecting, and MT5ConnectionError or MT5LoginError for a step that fails."""
+        if self._state in _CONNECTED_OR_CONNECTING:
+            raise MT5ConnectionError(
+                f"MT5 already connected or connecting (state={self._state.name})"
+            )
         mt5.configure(self._config.server_url, self._config.ws_url)
         self._initialize()
         self._login()
-        self._attempt = 0  # reset backoff counter on clean connect
+        self._attempt = 0
 
     def disconnect(self) -> None:
-        """
-        Cleanly shut down. Safe to call even if not connected.
-        """
+        """Shuts the terminal session down; raises MT5ConnectionError naming the state on a
+        connection not connected."""
         if self._state in (ConnectionState.DISCONNECTED, ConnectionState.SHUTTING_DOWN):
-            return
+            raise MT5ConnectionError(f"MT5 not connected (state={self._state.name})")
         logger.info("MT5Connection: shutting down")
         self._state = ConnectionState.SHUTTING_DOWN
         mt5.shutdown()
@@ -198,39 +190,6 @@ class MT5Connection:
         raise MT5ConnectionError(f"MT5 not connected (state={self._state.name})")
 
     # ── Reconnect ─────────────────────────────────────────────────────────────
-
-    def reconnect(self) -> bool:
-        """
-        Synchronous reconnect with exponential backoff.
-        Returns True on success, False when max attempts exceeded.
-        Use reconnect_async() inside asyncio polling loops.
-        """
-        self._state = ConnectionState.RECONNECTING
-        delay = self._config.reconnect_initial_delay_s
-
-        while self._attempt < self._config.reconnect_max_attempts:
-            self._attempt += 1
-            logger.warning(
-                f"MT5 reconnect attempt {self._attempt}/"
-                f"{self._config.reconnect_max_attempts} "
-                f"(waiting {delay:.1f}s)"
-            )
-            time.sleep(delay)
-            delay = min(delay * 2.0, self._config.reconnect_max_delay_s)
-
-            try:
-                mt5.shutdown()  # clean slate before retry
-                self._initialize()
-                self._login()
-                logger.info(f"MT5 reconnected on attempt {self._attempt}")
-                self._attempt = 0
-                return True
-            except (MT5ConnectionError, MT5LoginError) as exc:
-                logger.warning(f"Reconnect attempt {self._attempt} failed: {exc}")
-
-        self._state = ConnectionState.FAILED
-        logger.error(f"MT5 gave up after {self._config.reconnect_max_attempts} attempts")
-        return False
 
     async def reconnect_async(self) -> bool:
         """Reconnects with exponential backoff; True once connected. The clients sharing the
@@ -267,6 +226,8 @@ class MT5Connection:
                 return True
             except (MT5ConnectionError, MT5LoginError) as exc:
                 logger.warning(f"Async reconnect attempt {self._attempt} failed: {exc}")
+                # Between attempts the connection is reconnecting, whatever the failed step left.
+                self._state = ConnectionState.RECONNECTING
 
         self._state = ConnectionState.FAILED
         logger.error(f"MT5 async gave up after {self._config.reconnect_max_attempts} attempts")
@@ -275,10 +236,8 @@ class MT5Connection:
     # ── Data accessors ────────────────────────────────────────────────────────
 
     def get_account_info(self) -> AccountSnapshot:
-        """
-        Return a snapshot of the current account state.
-        Raises MT5ConnectionError if not connected or if call fails.
-        """
+        """The account as the terminal reports it now; raises MT5ConnectionError when not connected
+        or when the read fails."""
         self.ensure_connected()
         info = mt5.account_info()
         if info is None:
@@ -287,10 +246,8 @@ class MT5Connection:
         return AccountSnapshot.from_mt5(info)
 
     def get_terminal_info(self) -> dict:
-        """
-        Return the server's MT5 terminal as `terminal_info()` reports it, its trading permission and
-        connection included. Raises MT5ConnectionError if not connected or if the call fails.
-        """
+        """The server's MT5 terminal as `terminal_info()` reports it, its trading permission and
+        connection included; raises MT5ConnectionError when not connected or when the read fails."""
         self.ensure_connected()
         info = mt5.terminal_info()
         if info is None:
@@ -306,23 +263,19 @@ class MT5Connection:
             "retransmission": info.retransmission,
         }
 
-    def last_error(self) -> tuple[int, str]:
-        """
-        Return the last MT5 error (code, message).
-        Safe to call at any time — does not require connection.
-        """
-        code, msg = mt5.last_error()
-        self._last_error = (code, msg)
-        return code, msg
-
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _initialize(self) -> None:
-        """Ask the server to initialize its MT5 terminal."""
+        """Asks the server to initialize its MT5 terminal; a failure leaves the connection
+        DISCONNECTED."""
         logger.debug("MT5Connection: calling mt5.initialize()")
         self._state = ConnectionState.INITIALIZING
 
-        ok = mt5.initialize()
+        try:
+            ok = mt5.initialize()
+        except MT5ConnectionError:
+            self._state = ConnectionState.DISCONNECTED
+            raise
         if not ok:
             code, msg = mt5.last_error()
             self._state = ConnectionState.DISCONNECTED
@@ -334,16 +287,21 @@ class MT5Connection:
         logger.debug("MT5Connection: server initialized")
 
     def _login(self) -> None:
-        """Authenticate with the broker. Must be called after _initialize()."""
+        """Logs in to the broker on an initialized terminal; a failure leaves the connection
+        INITIALIZED."""
         logger.debug(f"MT5Connection: logging in — server={self._config.server}")
         self._state = ConnectionState.LOGGING_IN
 
-        ok = mt5.login(
-            login=self._config.account,
-            password=self._config.password,
-            server=self._config.server,
-            timeout=int(self._config.timeout_s * 1000),  # mt5 wants milliseconds
-        )
+        try:
+            ok = mt5.login(
+                login=self._config.account,
+                password=self._config.password,
+                server=self._config.server,
+                timeout=int(self._config.timeout_s * 1000),  # mt5 wants milliseconds
+            )
+        except MT5ConnectionError:
+            self._state = ConnectionState.INITIALIZED
+            raise
 
         if not ok:
             code, msg = mt5.last_error()

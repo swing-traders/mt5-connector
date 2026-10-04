@@ -64,3 +64,58 @@ def test_an_execution_setting_out_of_range_is_refused_naming_it(field, value):
 def test_an_execution_setting_at_its_bound_is_kept(field, value):
     c = _base(server_url="http://192.168.1.10:5000", **{field: value})
     assert getattr(c, field) == value
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout_s", 0),
+        ("timeout_s", -1.0),
+        ("timeout_s", float("nan")),
+        ("timeout_s", float("inf")),
+        ("reconnect_max_attempts", 0),
+        ("reconnect_initial_delay_s", -0.5),
+        ("reconnect_initial_delay_s", float("nan")),
+        ("reconnect_initial_delay_s", float("inf")),
+        ("reconnect_max_delay_s", -1.0),
+        ("reconnect_max_delay_s", float("nan")),
+        ("reconnect_max_delay_s", float("inf")),
+    ],
+)
+def test_a_connection_setting_out_of_range_is_refused_naming_it(field, value):
+    with pytest.raises(ValueError, match=field):
+        _base(server_url="http://192.168.1.10:5000", **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout_s", 0.001),
+        ("reconnect_max_attempts", 1),
+        ("reconnect_initial_delay_s", 0),
+        ("reconnect_max_delay_s", 0),
+    ],
+)
+def test_a_connection_setting_at_its_bound_is_kept(field, value):
+    c = _base(server_url="http://192.168.1.10:5000", **{field: value})
+    assert getattr(c, field) == value
+
+
+@pytest.mark.parametrize("symbols", [["EURUSD", "   "], [""], ["\t"]])
+def test_a_blank_symbol_is_refused(symbols):
+    with pytest.raises(ValueError, match="symbols"):
+        MT5Config(
+            account=1,
+            password="p",
+            server="s",
+            symbols=symbols,
+            server_url="http://192.168.1.10:5000",
+        )
+
+
+@pytest.mark.parametrize(
+    "server_url", ["nonsense", "localhost:5000", "http://", "//192.168.1.10:5000"]
+)
+def test_a_server_url_without_a_scheme_and_host_is_refused_naming_it(server_url):
+    with pytest.raises(MT5ConfigError, match="server_url"):
+        _base(server_url=server_url)

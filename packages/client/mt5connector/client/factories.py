@@ -31,31 +31,22 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED CONNECTION REGISTRY
-#
-# Both factories need to share a single MT5Connection and MT5InstrumentProvider instance — one
-# channel to the terminal, one instrument cache. This registry creates them once per account and
-# server and reuses them on subsequent calls.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _connection_registry: dict[int, tuple[MT5Connection, MT5InstrumentProvider]] = {}
 
-# Side-channel registry for MT5Config + factory refs, keyed by venue string.
-# Used by build_mt5_node_config() since NT's config structs are frozen (msgspec)
-# and don't accept arbitrary extra kwargs like `factory` or `custom`.
-_mt5_config_registry: dict[str, dict] = {}
+# The MT5Config of each venue's node config: NT's client configs are frozen msgspec structs that
+# carry no adapter config.
+_mt5_config_registry: dict[str, MT5Config] = {}
 
 
 def _get_or_create_connection(
     config: MT5Config,
     clock: LiveClock,
 ) -> tuple[MT5Connection, MT5InstrumentProvider]:
-    """
-    Return the shared MT5Connection and MT5InstrumentProvider for this config.
-    Creates and connects them on first call; reuses on subsequent calls.
-
-    The registry key is based on account + server to allow multiple adapters
-    (e.g. two brokers) to coexist in the same NautilusTrader node.
-    """
+    """The connection and instrument provider of the config's account and server, created and
+    connected once, so the clients of one account share one terminal session and one instrument
+    cache."""
     registry_key = hash((config.account, config.server))
 
     if registry_key not in _connection_registry:
@@ -84,24 +75,7 @@ def _provider_config(config: MT5Config) -> InstrumentProviderConfig:
 
 
 class MT5LiveDataClientFactory(LiveDataClientFactory):
-    """
-    Factory that builds MT5DataClient instances for NautilusTrader.
-
-    NautilusTrader calls create() once per venue during node startup.
-    The factory grabs (or creates) the shared MT5Connection and provider,
-    then constructs the data client.
-
-    You don't instantiate this class directly — pass it to
-    LiveDataClientConfig or use build_mt5_node_config() for convenience.
-
-    Parameters
-    ----------
-    config : MT5Config
-        Your broker / account configuration.
-    """
-
-    def __init__(self, config: MT5Config) -> None:
-        self._config = config
+    """Builds the MT5 data client of a node."""
 
     @classmethod
     def create(
@@ -113,26 +87,12 @@ class MT5LiveDataClientFactory(LiveDataClientFactory):
         cache: Cache,
         clock: LiveClock,
     ) -> MT5DataClient:
-        """
-        Called by NautilusTrader's engine during node startup.
-
-        Parameters
-        ----------
-        loop    : asyncio event loop
-        name    : client name string (e.g. "MT5")
-        config  : LiveDataClientConfig carrying our MT5Config in .custom
-        msgbus  : NautilusTrader message bus
-        cache   : NautilusTrader cache
-        clock   : NautilusTrader live clock
-
-        Returns
-        -------
-        MT5DataClient
-        """
+        """A data client on the shared connection of the MT5Config the client config carries in its
+        `custom`, else the one the node config was built with."""
         mt5_config: MT5Config = (
             config.custom["mt5_config"]
             if hasattr(config, "custom") and isinstance(getattr(config, "custom", None), dict)
-            else _mt5_config_registry.get(MT5_VENUE.value, {}).get("mt5_config")
+            else _mt5_config_registry.get(MT5_VENUE.value)
         )
         if mt5_config is None:
             raise RuntimeError("MT5LiveDataClientFactory: no MT5Config found.")
@@ -155,20 +115,7 @@ class MT5LiveDataClientFactory(LiveDataClientFactory):
 
 
 class MT5LiveExecClientFactory(LiveExecClientFactory):
-    """
-    Factory that builds MT5LiveExecutionClient instances for NautilusTrader.
-
-    Works identically to MT5LiveDataClientFactory — grabs the shared
-    connection, constructs the execution client.
-
-    Parameters
-    ----------
-    config : MT5Config
-        Your broker / account configuration.
-    """
-
-    def __init__(self, config: MT5Config) -> None:
-        self._config = config
+    """Builds the MT5 execution client of a node."""
 
     @classmethod
     def create(
@@ -180,26 +127,12 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
         cache: Cache,
         clock: LiveClock,
     ) -> MT5LiveExecutionClient:
-        """
-        Called by NautilusTrader's engine during node startup.
-
-        Parameters
-        ----------
-        loop    : asyncio event loop
-        name    : client name string (e.g. "MT5")
-        config  : LiveExecClientConfig carrying our MT5Config in .custom
-        msgbus  : NautilusTrader message bus
-        cache   : NautilusTrader cache
-        clock   : NautilusTrader live clock
-
-        Returns
-        -------
-        MT5LiveExecutionClient
-        """
+        """An execution client on the shared connection of the MT5Config the client config carries
+        in its `custom`, else the one the node config was built with."""
         mt5_config: MT5Config = (
             config.custom["mt5_config"]
             if hasattr(config, "custom") and isinstance(getattr(config, "custom", None), dict)
-            else _mt5_config_registry.get(MT5_VENUE.value, {}).get("mt5_config")
+            else _mt5_config_registry.get(MT5_VENUE.value)
         )
         if mt5_config is None:
             raise RuntimeError("MT5LiveExecClientFactory: no MT5Config found.")
@@ -226,69 +159,22 @@ def build_mt5_node_config(
     risk_engine_config: LiveRiskEngineConfig | None = None,
     logging_config=None,
 ) -> TradingNodeConfig:
-    """
-    Build a complete NautilusTrader TradingNodeConfig for MT5.
+    """The node config of one MT5 venue: its data and execution clients, each the default route and
+    loading the config's symbols, and the MT5Config the factories build them from."""
+    _mt5_config_registry[MT5_VENUE.value] = mt5_config
 
-    This is the highest-level convenience function — it wires up the
-    data engine, execution engine, instrument provider, and factories
-    from a single MT5Config.
-
-    Parameters
-    ----------
-    mt5_config : MT5Config
-        Your broker / account / symbol configuration.
-    risk_engine_config : LiveRiskEngineConfig, optional
-        Custom risk engine config. If None, uses NautilusTrader defaults.
-    logging_config : optional
-        Custom logging config. If None, uses NautilusTrader defaults.
-
-    Returns
-    -------
-    TradingNodeConfig
-        Pass directly to TradingNode(config=...).
-
-    Notes
-    -----
-    NautilusTrader 1.224+ requires strategies to be added via
-    node.trader.add_strategy(instance) AFTER node construction. Do NOT pass
-    (StrategyClass, StrategyConfig) tuples into TradingNodeConfig.
-
-    Examples
-    --------
-        node = TradingNode(config=build_mt5_node_config(mt5_config))
-        node.trader.add_strategy(YourStrategy(config=YourStrategyConfig(...)))
-        node.run()
-    """
-    venue_str = MT5_VENUE.value  # "MT5"
-
-    # ── Side-channel registry (used by factory create() methods) ─────────────
-    _mt5_config_registry[venue_str] = {
-        "mt5_config": mt5_config,
-        "data_factory": MT5LiveDataClientFactory,
-        "exec_factory": MT5LiveExecClientFactory,
-        "load_ids": [f"{s}.{venue_str}" for s in mt5_config.symbols],
-    }
-
-    # ── Client configs — tell NT that an MT5 client exists for this venue ─────
-    # RoutingConfig(default=True) means all unrouted data/orders go to MT5.
-    # The factory classes are registered on the node via
-    # node.add_data_client_factory() / node.add_exec_client_factory()
-    # in live_simple_strategy.py (or wherever the node is constructed).
-    # TradingNodeConfig just needs the client config stubs so build() knows
-    # which names to iterate over.
     data_client_cfg = LiveDataClientConfig(
         instrument_provider=_provider_config(mt5_config),
-        routing=RoutingConfig(default=True, venues=frozenset({venue_str})),
+        routing=RoutingConfig(default=True, venues=frozenset({MT5_VENUE.value})),
     )
     exec_client_cfg = LiveExecClientConfig(
         instrument_provider=_provider_config(mt5_config),
-        routing=RoutingConfig(default=True, venues=frozenset({venue_str})),
+        routing=RoutingConfig(default=True, venues=frozenset({MT5_VENUE.value})),
     )
 
-    # ── Assemble TradingNodeConfig ────────────────────────────────────────────
     kwargs: dict = {
-        "data_clients": {venue_str: data_client_cfg},
-        "exec_clients": {venue_str: exec_client_cfg},
+        "data_clients": {MT5_VENUE.value: data_client_cfg},
+        "exec_clients": {MT5_VENUE.value: exec_client_cfg},
     }
     if risk_engine_config is not None:
         kwargs["risk_engine"] = risk_engine_config

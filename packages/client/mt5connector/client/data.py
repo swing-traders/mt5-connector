@@ -1,5 +1,5 @@
-"""The NT data client of an MT5 terminal: its quote ticks, a mark at the mid of each, and its
-closed venue bars pushed over the hub, and its history read over HTTP.
+"""The NT data client of an MT5 terminal: its quote ticks, a mark at the mid of each, and its closed
+venue bars pushed over the hub, and its history read over HTTP.
 
 State: the symbols whose quotes and whose marks NT subscribes, which share one tick stream; per
 venue bar type, the earliest open the next bar handed to NT may have, and from a reconnect until the
@@ -19,6 +19,8 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.data.messages import (
     RequestBars,
     RequestData,
+    RequestInstrument,
+    RequestInstruments,
     RequestQuoteTicks,
     SubscribeBars,
     SubscribeData,
@@ -36,18 +38,18 @@ from nautilus_trader.model.identifiers import ClientId
 from mt5connector.client import history
 from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.constants import MT5_VENUE
+from mt5connector.client.currencies import register_venue_currency
 from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.parsing import (
     InstrumentAny,
     mark_at_mid,
-    parse_bar,
     parse_quote_tick,
     quote_tick_from_frame,
     venue_bar,
     venue_series,
 )
 from mt5connector.client.push import PushClient
-from mt5connector.wire.history_wire import BAR_PERIOD_S, Series, bar_series
+from mt5connector.wire.history_wire import BAR_PERIOD_S, Series
 from mt5connector.wire.push_wire import FrameType, Stream, Subscription
 
 if TYPE_CHECKING:
@@ -107,6 +109,7 @@ class MT5DataClient(LiveMarketDataClient):
             instrument = self._provider.get_instrument(symbol)
             if instrument is None:
                 instrument = self._provider.load_symbol(symbol)
+            _register_settlement([instrument])
             self._handle_data(instrument)
             self._log.info(f"MT5DataClient: loaded instrument {symbol}")
         await self._push.connect()
@@ -333,23 +336,22 @@ class MT5DataClient(LiveMarketDataClient):
     async def _request(self, request: RequestData) -> None:
         pass
 
-    async def _request_instrument(self, request) -> None:
-        symbol = request.instrument_id.symbol.value
-        instrument = self._provider.load_symbol(symbol)
-        self._handle_instrument(instrument, request.id)
+    async def _request_instrument(self, request: RequestInstrument) -> None:
+        instrument = self._provider.load_symbol(request.instrument_id.symbol.value)
+        _register_settlement([instrument])
+        self._handle_instrument(instrument, request.id, request.start, request.end, request.params)
 
-    async def _request_instruments(self, request) -> None:
+    async def _request_instruments(self, request: RequestInstruments) -> None:
         await self._provider.load_all_async()
         instruments = self._provider.list_all()
-        self._handle_instruments(instruments, MT5_VENUE, request.id)
+        _register_settlement(instruments)
+        self._handle_instruments(
+            MT5_VENUE, instruments, request.id, request.start, request.end, request.params
+        )
 
     async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:
         symbol = request.instrument_id.symbol.value
-        instrument = self._provider.get_instrument(symbol)
-        if instrument is None:
-            self._log.error(f"MT5DataClient: instrument not found for {symbol}")
-            return
-
+        instrument = self._instrument(symbol)
         self._conn.ensure_connected()
         start = _epoch_s(request.start)
         end = self._end_s(request.end)
@@ -367,15 +369,11 @@ class MT5DataClient(LiveMarketDataClient):
             self._log.debug(f"MT5DataClient: delivered {len(ticks):,} ticks for {symbol}")
 
     async def _request_bars(self, request: RequestBars) -> None:
-        bar_type = request.bar_type
-        symbol = bar_type.instrument_id.symbol.value
-        timeframe = _bar_spec_to_mt5_timeframe(bar_type)
-        series = bar_series(timeframe)
-        instrument = self._provider.get_instrument(symbol)
-        if instrument is None:
-            self._log.error(f"MT5DataClient: instrument not found for {symbol}")
-            return
-
+        """Hands NT the venue bars of the bar type requested; raises ValueError for a step the
+        terminal has no timeframe for."""
+        symbol = request.bar_type.instrument_id.symbol.value
+        series = venue_series(request.bar_type)
+        instrument = self._instrument(symbol)
         self._conn.ensure_connected()
         # The request names closes; the server serves bars by their open.
         first_close = _epoch_s(request.start)
@@ -389,13 +387,13 @@ class MT5DataClient(LiveMarketDataClient):
         )
         if rows is None:
             self._log.error(
-                f"MT5DataClient: {bar_type} bars closing {_iso(first_close)}..{_iso(last_close)} "
-                f"failed: {mt5.last_error()}"
+                f"MT5DataClient: {request.bar_type} bars closing "
+                f"{_iso(first_close)}..{_iso(last_close)} failed: {mt5.last_error()}"
             )
         else:
-            bars = [parse_bar(row, instrument, timeframe) for row in rows]
+            bars = [venue_bar(row, request.bar_type, instrument) for row in rows]
             self._handle_bars(
-                bar_type, bars, request.id, request.start, request.end, request.params
+                request.bar_type, bars, request.id, request.start, request.end, request.params
             )
             self._log.debug(f"MT5DataClient: delivered {len(bars):,} bars for {symbol}")
 
@@ -444,34 +442,8 @@ def _iso(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
 
 
-def _bar_spec_to_mt5_timeframe(bar_type) -> int:
-    from nautilus_trader.model.enums import BarAggregation
-
-    spec = bar_type.spec
-    agg = spec.aggregation
-    step = spec.step
-
-    if agg == BarAggregation.MINUTE:
-        tf_map = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 10: 10, 12: 12, 15: 15, 20: 20, 30: 30}
-        return tf_map.get(step, mt5.TIMEFRAME_H1)
-
-    if agg == BarAggregation.HOUR:
-        tf_map = {
-            1: mt5.TIMEFRAME_H1,
-            2: 16386,
-            3: 16387,
-            4: mt5.TIMEFRAME_H4,
-            6: 16390,
-            8: 16392,
-            12: 16396,
-        }
-        return tf_map.get(step, mt5.TIMEFRAME_H1)
-
-    if agg == BarAggregation.DAY:
-        return mt5.TIMEFRAME_D1
-    if agg == BarAggregation.WEEK:
-        return 32769
-    if agg == BarAggregation.MONTH:
-        return 49153
-
-    return mt5.TIMEFRAME_H1
+def _register_settlement(instruments: list[InstrumentAny]) -> None:
+    """Registers each instrument's settlement currency over what NT holds: NT's cache registers it
+    without overwriting, so a precision NT guessed for the code would stand."""
+    for instrument in instruments:
+        register_venue_currency(instrument.quote_currency)

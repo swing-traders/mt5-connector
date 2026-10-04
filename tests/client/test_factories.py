@@ -7,8 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Currency
+from venue_doubles import account_info
 
 from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.data import MT5DataClient
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.factories import (
@@ -67,6 +70,9 @@ def mock_mt5_conn():
         instance.connect = MagicMock()
         instance.disconnect = MagicMock()
         instance.ensure_connected = MagicMock()
+        instance.get_account_info.return_value = AccountSnapshot.from_mt5(
+            account_info(currency="EUR")
+        )
         MockConn.return_value = instance
         yield MockConn, instance
 
@@ -230,6 +236,16 @@ class TestExecClientFactory:
         )
         assert client._conn is conn_inst
 
+    def test_the_client_books_in_the_currency_of_the_account_connected(
+        self, mock_mt5_conn, mock_provider
+    ):
+        loop = asyncio.new_event_loop()
+        msgbus, cache, clock = make_nt_components()
+        client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(make_config()), msgbus, cache, clock
+        )
+        assert client.base_currency == Currency.from_str("EUR")
+
     def test_the_account_id_waits_for_the_accounts_own_login(self, mock_mt5_conn, mock_provider):
         config = make_config(account=55554444)
         loop = asyncio.new_event_loop()
@@ -284,43 +300,12 @@ class TestBuildMt5NodeConfig:
         build_mt5_node_config(make_config())
         assert "MT5" in _mt5_config_registry
 
-    def test_data_factory_stored_in_registry(self):
-        from mt5connector.client.factories import _mt5_config_registry
-
-        build_mt5_node_config(make_config())
-        assert _mt5_config_registry["MT5"]["data_factory"] is MT5LiveDataClientFactory
-
-    def test_exec_factory_stored_in_registry(self):
-        from mt5connector.client.factories import _mt5_config_registry
-
-        build_mt5_node_config(make_config())
-        assert _mt5_config_registry["MT5"]["exec_factory"] is MT5LiveExecClientFactory
-
     def test_mt5_config_stored_in_registry(self):
         from mt5connector.client.factories import _mt5_config_registry
 
         config = make_config()
         build_mt5_node_config(config)
-        assert _mt5_config_registry["MT5"]["mt5_config"] is config
-
-    def test_load_ids_stored_in_registry(self):
-        from mt5connector.client.factories import _mt5_config_registry
-
-        build_mt5_node_config(make_config(symbols=["EURUSD", "XAUUSD"]))
-        assert "EURUSD.MT5" in _mt5_config_registry["MT5"]["load_ids"]
-        assert "XAUUSD.MT5" in _mt5_config_registry["MT5"]["load_ids"]
-
-    def test_load_ids_count_matches_symbols(self):
-        from mt5connector.client.factories import _mt5_config_registry
-
-        build_mt5_node_config(make_config(symbols=["EURUSD", "XAUUSD", "BTCUSD"]))
-        assert len(_mt5_config_registry["MT5"]["load_ids"]) == 3
-
-    def test_single_symbol_load_ids(self):
-        from mt5connector.client.factories import _mt5_config_registry
-
-        build_mt5_node_config(make_config(symbols=["EURUSD"]))
-        assert _mt5_config_registry["MT5"]["load_ids"] == ["EURUSD.MT5"]
+        assert _mt5_config_registry["MT5"] is config
 
     def test_optional_risk_engine_config_is_wired(self):
         from nautilus_trader.config import LiveRiskEngineConfig
@@ -330,14 +315,12 @@ class TestBuildMt5NodeConfig:
         assert result.risk_engine is risk_config
 
     def test_strategies_kwarg_not_accepted(self):
-        # NT 1.224+: strategies must be added via node.trader.add_strategy(instance)
-        # AFTER node construction. build_mt5_node_config never accepts strategies.
+        # A node takes its strategies through node.trader.add_strategy once it is built.
         with pytest.raises(TypeError, match="strategies"):
             build_mt5_node_config(make_config(), strategies=[MagicMock()])
 
     def test_node_config_has_no_strategies_by_default(self):
-        # TradingNodeConfig should carry no strategies —
-        # wired in by caller via node.trader.add_strategy().
+        # The caller adds strategies through node.trader.add_strategy().
         result = build_mt5_node_config(make_config())
         assert not result.strategies
 
@@ -364,7 +347,7 @@ class TestBuildMt5NodeConfig:
         config2 = make_config(account=22222222)
         build_mt5_node_config(config1)
         build_mt5_node_config(config2)
-        assert _mt5_config_registry["MT5"]["mt5_config"] is config2
+        assert _mt5_config_registry["MT5"] is config2
 
 
 class TestInstrumentLoading:

@@ -13,9 +13,13 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
-from mt5connector.client.connection import ConnectionState
 from mt5connector.client.downloader import DownloadResult, MT5DataDownloader, _ensure_utc
-from mt5connector.client.errors import MT5ConnectionError, MT5SymbolNotFoundError
+from mt5connector.client.errors import (
+    MT5ConnectionError,
+    MT5InstrumentError,
+    MT5SymbolNotFoundError,
+    ServerUnreachable,
+)
 from mt5connector.client.history import HistoryRanges, SeriesRange
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import Series
@@ -97,8 +101,8 @@ def serving(server):
         yield
 
 
-def make_eurusd_instrument():
-    """Build a real CurrencyPair instrument for EURUSD."""
+def make_eurusd_instrument(info=None):
+    """Build a real CurrencyPair instrument for EURUSD, its definition's venue facts `info`."""
     from decimal import Decimal
 
     from nautilus_trader.model.currencies import Currency
@@ -125,6 +129,7 @@ def make_eurusd_instrument():
         taker_fee=Decimal("0"),
         ts_event=0,
         ts_init=0,
+        info=info,
     )
 
 
@@ -136,7 +141,6 @@ def from_str_sym(s):
 
 def make_conn(connected=True):
     conn = MagicMock()
-    conn.state = ConnectionState.CONNECTED if connected else ConnectionState.DISCONNECTED
     if connected:
         conn.ensure_connected = MagicMock()  # no-op
     else:
@@ -386,6 +390,31 @@ class TestDownloadBarsWalk:
         with pytest.raises(ValueError, match="49153"):
             downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=49153)
 
+    def test_a_timeframe_of_zero_is_refused_not_defaulted(self, downloader, package):
+        server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
+        with serving(server):
+            with pytest.raises(ValueError, match="^timeframe 0 has no history series$"):
+                downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=0)
+        assert server.asked == []
+
+    @pytest.mark.parametrize(
+        ("info", "price_type"),
+        [({"chart_mode": "BID"}, "BID"), ({"chart_mode": "LAST"}, "LAST"), ({}, "LAST")],
+        ids=["bid-chart", "last-chart", "no-chart-mode"],
+    )
+    def test_bars_are_typed_by_the_price_the_venue_charts_them_on(
+        self, conn, catalog, package, info, price_type
+    ):
+        downloader = MT5DataDownloader(conn, make_provider(make_eurusd_instrument(info)), catalog)
+        server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
+        with serving(server):
+            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+
+        written = catalog.write_data.call_args_list[0][0][0]
+        assert {str(bar.bar_type) for bar in written} == {
+            f"EURUSD.MT5-1-HOUR-{price_type}-EXTERNAL"
+        }
+
     def test_data_type_is_bars(self, downloader, package):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
         with serving(server):
@@ -418,6 +447,16 @@ class TestDownloadTicksWalk:
         assert result.floor == datetime.fromtimestamp(floor, UTC)
         written = catalog.write_data.call_args_list[0][0][0]
         assert all(isinstance(tick, QuoteTick) for tick in written)
+
+    def test_both_sizes_of_a_tick_are_the_instruments_largest_order(
+        self, downloader, catalog, package
+    ):
+        server = Server(Answer.ROWS, floors={Series.TICKS: int(dt(2024, 1, 8).timestamp())})
+        with serving(server):
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+
+        [tick] = catalog.write_data.call_args_list[0][0][0]
+        assert (tick.bid_size, tick.ask_size) == (Quantity(1000, 2), Quantity(1000, 2))
 
     def test_walks_no_further_back_than_start(self, downloader, package):
         server = Server(Answer.ROWS, Answer.ROWS)
@@ -485,6 +524,27 @@ class TestInstruments:
         ticks.assert_not_called()
         bars.assert_not_called()
 
+    def test_a_definition_the_venue_refuses_is_that_symbols_error(self, conn, catalog, package):
+        provider = MagicMock()
+        provider.get_instrument.return_value = None
+        provider.load_symbol.side_effect = MT5InstrumentError("DE40: trade_calc_mode FUTURES")
+        downloader = MT5DataDownloader(conn, provider, catalog)
+
+        with patch("mt5connector.client.history.bars") as bars:
+            result = downloader.download_bars("DE40", dt(2024, 1, 1), dt(2024, 1, 8))
+
+        assert len(result.errors) == 1 and "DE40: trade_calc_mode FUTURES" in result.errors[0]
+        bars.assert_not_called()
+
+    def test_a_load_the_server_does_not_answer_is_raised_not_recorded(self, conn, catalog, package):
+        provider = MagicMock()
+        provider.get_instrument.return_value = None
+        provider.load_symbol.side_effect = ServerUnreachable("symbol_select: refused")
+        downloader = MT5DataDownloader(conn, provider, catalog)
+
+        with pytest.raises(ServerUnreachable, match="symbol_select"):
+            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+
     def test_raises_when_not_connected(self, catalog, provider):
         downloader = MT5DataDownloader(make_conn(connected=False), provider, catalog)
 
@@ -546,6 +606,15 @@ class TestDownloadAll:
             downloader.download_all(["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert [asked[1] for asked in server.asked[1:]] == [Series.H1, Series.D1]
+
+    def test_no_timeframes_downloads_no_bars(self, downloader, package):
+        server = Server(Answer.ROWS, floors=ONE_WINDOW_FLOORS)
+        with serving(server):
+            results = downloader.download_all(
+                ["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8), timeframes=[]
+            )
+
+        assert [r.data_type for r in results["EURUSD"]] == ["ticks"]
 
     def test_skip_ticks_when_include_ticks_false(self, downloader, package):
         server = Server(Answer.ROWS, floors=ONE_WINDOW_FLOORS)

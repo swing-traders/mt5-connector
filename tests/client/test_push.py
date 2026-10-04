@@ -11,7 +11,7 @@ from websockets.exceptions import ConnectionClosed
 from mt5connector.client.config import MT5Config
 from mt5connector.client.push import PushClient
 from mt5connector.wire.history_wire import Series
-from mt5connector.wire.push_wire import Stream, Subscription
+from mt5connector.wire.push_wire import PROTOCOL_VERSION, FrameType, Stream, Subscription
 
 HELLO = {"v": 1, "type": "hello", "role": "adapter"}
 TICK = {
@@ -30,8 +30,8 @@ TICK = {
 
 
 class HubDouble:
-    """A hub on a free loopback port that records what each connection sends, acknowledges every
-    op, and pushes what a test hands it to the latest connection."""
+    """A hub on a free loopback port that records what each connection sends, acknowledges every op,
+    and pushes what a test hands it to the latest connection."""
 
     def __init__(self):
         self.received: list[list[dict]] = []
@@ -45,8 +45,9 @@ class HubDouble:
             async for raw in ws:
                 frame = json.loads(raw)
                 frames.append(frame)
-                if frame["type"] in ("subscribe", "unsubscribe"):
-                    await ws.send(json.dumps({"v": 1, "type": "ack", "id": frame["id"]}))
+                if frame["type"] in (FrameType.SUBSCRIBE, FrameType.UNSUBSCRIBE):
+                    ack = {"v": PROTOCOL_VERSION, "type": FrameType.ACK, "id": frame["id"]}
+                    await ws.send(json.dumps(ack))
         except ConnectionClosed:
             pass
 
@@ -193,6 +194,59 @@ async def test_a_reconnect_resends_the_hello_and_the_whole_wanted_set_after_tell
         },
     ]
     await push.disconnect()
+
+
+class HeldSocket:
+    """NT's WebSocketClient once connected, recording each frame as it is sent and holding the send
+    of the first frame `hold` matches until released."""
+
+    def __init__(self, hold):
+        self.sent = []
+        self.hold = hold
+        self.holding = asyncio.Event()
+        self.released = asyncio.Event()
+
+    def is_active(self):
+        return True
+
+    async def send_text(self, data):
+        frame = json.loads(data)
+        self.sent.append(frame)
+        if self.hold(frame) and not self.holding.is_set():
+            self.holding.set()
+            await self.released.wait()
+
+
+def held_by_the_hub(frames) -> set:
+    """The streams a hub holds after the frames, in order."""
+    held = set()
+    for frame in frames:
+        stream = (frame.get("stream"), frame.get("symbol"), frame.get("timeframe"))
+        if frame["type"] == FrameType.SUBSCRIBE:
+            held.add(stream)
+        elif frame["type"] == FrameType.UNSUBSCRIBE:
+            held.discard(stream)
+    return held
+
+
+async def test_an_unsubscribe_while_the_reconnect_resends_is_not_undone_by_it():
+    owner = Owner()
+    push = PushClient(config(1), asyncio.get_running_loop(), owner.on_frame, None, owner.log)
+    eurusd = Subscription(Stream.TICKS, "EURUSD")
+    gbpusd = Subscription(Stream.TICKS, "GBPUSD")
+    await push.subscribe(eurusd)
+    await push.subscribe(gbpusd)
+    socket = HeldSocket(lambda frame: frame.get("symbol") == "EURUSD")
+    push._ws = socket
+
+    push._on_reconnected()
+    await socket.holding.wait()
+    unsubscribe = asyncio.ensure_future(push.unsubscribe(gbpusd))
+    await asyncio.wait({unsubscribe}, timeout=0.05)
+    socket.released.set()
+    await asyncio.gather(unsubscribe, *push._tasks)
+
+    assert held_by_the_hub(socket.sent) == {("ticks", "EURUSD", None)}
 
 
 async def test_an_error_frame_is_logged_and_not_handed_to_the_owner(hub):

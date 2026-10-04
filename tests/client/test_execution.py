@@ -373,7 +373,7 @@ async def test_a_retcode_the_package_does_not_name_rejects_with_its_number(h):
 
 @pytest.mark.parametrize(
     "failure",
-    [errors.ServerUnreachable("order_send: refused"), errors.ServerBusy("order_send: busy")],
+    [errors.ServerUnreachable("order_send: refused"), errors.ServerBusy("order_send: busy", 5)],
 )
 async def test_a_request_that_never_left_is_rejected_unsent_at_once(h, failure):
     h.venue.order_send.side_effect = failure
