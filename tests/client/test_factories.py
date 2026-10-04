@@ -13,6 +13,7 @@ from venue_doubles import account_info
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.data import MT5DataClient
+from mt5connector.client.errors import MT5ConfigError
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.factories import (
     MT5LiveDataClientFactory,
@@ -28,7 +29,7 @@ def make_config(account=12345678, server="Exness-MT5Trial1", symbols=None):
         account=account,
         password="test_password",
         server=server,
-        symbols=symbols or ["EURUSD"],
+        symbols=["EURUSD"] if symbols is None else symbols,
         server_url="http://127.0.0.1:5000",
     )
 
@@ -358,6 +359,26 @@ class TestInstrumentLoading:
             assert client.instrument_provider.load_ids == frozenset(
                 {InstrumentId.from_str("EURUSD.a.MT5"), InstrumentId.from_str("XAUUSD+.MT5")}
             )
+
+    def test_the_node_config_refuses_a_config_naming_no_symbols(self):
+        with pytest.raises(MT5ConfigError, match="symbols"):
+            build_mt5_node_config(make_config(symbols=[]))
+
+    def test_a_client_factory_refuses_a_config_naming_no_symbols_before_connecting(
+        self, mock_mt5_conn
+    ):
+        _, conn_inst = mock_mt5_conn
+        msgbus, cache, clock = make_nt_components()
+        with pytest.raises(MT5ConfigError, match="symbols"):
+            MT5LiveDataClientFactory.create(
+                asyncio.new_event_loop(),
+                "MT5",
+                make_live_data_config(make_config(symbols=[])),
+                msgbus,
+                cache,
+                clock,
+            )
+        conn_inst.connect.assert_not_called()
 
     def test_the_shared_provider_loads_the_configured_symbols(self, mock_mt5_conn):
         with patch("mt5connector.client.factories.MT5InstrumentProvider") as provider:

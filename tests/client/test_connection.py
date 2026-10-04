@@ -118,6 +118,19 @@ class TestSuccessfulConnect:
         conn.connect()
         assert "CONNECTED" in repr(conn)
 
+    def test_a_config_naming_no_symbols_connects(self, mock_mt5):
+        conn = MT5Connection(
+            MT5Config(
+                account=12345678,
+                password="test_password",
+                server="Exness-MT5Trial1",
+                symbols=[],
+                server_url="http://127.0.0.1:5000",
+            )
+        )
+        conn.connect()
+        conn.ensure_connected()
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. initialize() failure

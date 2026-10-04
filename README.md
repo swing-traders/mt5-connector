@@ -131,7 +131,7 @@ print(info.currency, info.balance)
 
 ## Configuration
 
-All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL. A config is refused when it is built:
+All configuration goes through `MT5Config`. The required fields are your account credentials and the MT5 server's URL. `symbols` is required for a node, whose instrument provider loads them, and optional for a consumer that loads symbols by name through `MT5InstrumentProvider.load_symbol`. A config is refused when it is built:
 
 - without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
 - with a `ws_url` that is not a `ws` or `wss` URL naming a host;
@@ -159,8 +159,10 @@ config = MT5Config(
     account  = 12345678,
     password = "your_password",
     server   = "Exness-MT5Trial9",
-    symbols  = ["EURUSDm", "XAUUSDm"],
     server_url = "http://127.0.0.1:5000",
+
+    # The symbols a node loads: required for a node, optional for a consumer that loads by name
+    symbols  = ["EURUSDm", "XAUUSDm"],   # default: []
 
     # The WebSocket push hub (default: derived from server_url, on port 9000)
     ws_url = "ws://127.0.0.1:9000",

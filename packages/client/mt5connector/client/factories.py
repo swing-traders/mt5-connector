@@ -23,6 +23,7 @@ from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
+from mt5connector.client.errors import MT5ConfigError
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
 
@@ -63,7 +64,10 @@ def _get_or_create_connection(
 
 
 def _provider_config(config: MT5Config) -> InstrumentProviderConfig:
-    """The provider loads exactly the symbols the config names."""
+    """The provider loads exactly the symbols the config names; raises MT5ConfigError when it names
+    none."""
+    if not config.symbols:
+        raise MT5ConfigError("MT5Config.symbols is empty")
     return InstrumentProviderConfig(
         load_ids=frozenset(InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in config.symbols)
     )
@@ -161,14 +165,15 @@ def build_mt5_node_config(
 ) -> TradingNodeConfig:
     """The node config of one MT5 venue: its data and execution clients, each the default route and
     loading the config's symbols, and the MT5Config the factories build them from."""
+    provider_config = _provider_config(mt5_config)
     _mt5_config_registry[MT5_VENUE.value] = mt5_config
 
     data_client_cfg = LiveDataClientConfig(
-        instrument_provider=_provider_config(mt5_config),
+        instrument_provider=provider_config,
         routing=RoutingConfig(default=True, venues=frozenset({MT5_VENUE.value})),
     )
     exec_client_cfg = LiveExecClientConfig(
-        instrument_provider=_provider_config(mt5_config),
+        instrument_provider=provider_config,
         routing=RoutingConfig(default=True, venues=frozenset({MT5_VENUE.value})),
     )
 

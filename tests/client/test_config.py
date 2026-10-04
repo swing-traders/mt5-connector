@@ -99,6 +99,18 @@ def test_a_connection_setting_at_its_bound_is_kept(field, value):
     assert getattr(c, field) == value
 
 
+def test_a_config_without_symbols_names_none():
+    c = MT5Config(account=1, password="p", server="s", server_url="http://192.168.1.10:5000")
+    assert c.symbols == []
+
+
+def test_an_empty_symbol_list_is_kept():
+    c = MT5Config(
+        account=1, password="p", server="s", symbols=[], server_url="http://192.168.1.10:5000"
+    )
+    assert c.symbols == []
+
+
 @pytest.mark.parametrize("symbols", [["EURUSD", "   "], [""], ["\t"]])
 def test_a_blank_symbol_is_refused(symbols):
     with pytest.raises(ValueError, match="symbols"):

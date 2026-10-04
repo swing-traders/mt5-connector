@@ -37,9 +37,10 @@ class MT5Config:
     account: int = field(repr=False)
     password: str = field(repr=False)
     server: str = field(repr=False)
-    symbols: list[str]
 
     # ── Optional / defaults ───────────────────────────────────────────────────
+    # A node's instrument provider loads these; a consumer loading symbols by name needs none.
+    symbols: list[str] = field(default_factory=list)
     exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
     deviation_points: int = 20
     account_refresh_seconds: int = 10
@@ -60,8 +61,6 @@ class MT5Config:
             raise ValueError("MT5Config.password cannot be empty.")
         if not self.server:
             raise ValueError("MT5Config.server cannot be empty.")
-        if not self.symbols:
-            raise ValueError("MT5Config.symbols cannot be empty.")
 
         # Broker casing is the symbol (EURUSDm): only surrounding whitespace goes.
         self.symbols = [s.strip() for s in self.symbols]

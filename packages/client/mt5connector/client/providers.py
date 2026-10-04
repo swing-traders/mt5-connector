@@ -68,7 +68,7 @@ class MT5InstrumentProvider(InstrumentProvider):
 
     async def load_all_async(self, filters: dict | None = None) -> None:
         """Loads every symbol the provider's config names."""
-        if self._config.load_ids is None:
+        if not self._config.load_ids:
             raise MT5ConfigError("instrument provider: no symbols are configured")
         self._load(sorted(instrument_id.symbol.value for instrument_id in self._config.load_ids))
 

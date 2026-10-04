@@ -300,6 +300,11 @@ async def test_a_last_built_symbol_names_its_chart_mode(venue):
 # ── Loading ──────────────────────────────────────────────────────────────────
 
 
+async def test_loading_all_with_no_symbols_configured_is_refused(venue):
+    with pytest.raises(MT5ConfigError, match="no symbols"):
+        await provider_for().load_all_async()
+
+
 async def test_loading_all_loads_exactly_the_symbols_the_config_names(venue):
     venue.add(symbol_info(name="EURUSDm"))
     venue.add(symbol_info(name="GBPUSDm", currency_base="GBP"))
