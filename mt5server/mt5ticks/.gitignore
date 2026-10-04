@@ -1,7 +1,0 @@
-.cache/
-.clangd
-.clang-format
-.vscode/
-.mql-auto-forwards/
-compile_commands.json
-**/*.ex5

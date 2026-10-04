@@ -1,0 +1,67 @@
+# Publishes a PEP 503 simple index on GitHub Pages, regenerated from the repo's releases.
+# Wheels stay as release assets; the index links to them with #sha256= fragments taken
+# from each wheel's published .sha256 sibling, so pip verifies what it downloads. Each
+# wheel is listed on the page of the project its filename names.
+# Called from the release workflow only: the index derives from releases alone, and an
+# independent branch-push publish races the release's own deployment. Re-run the last
+# run to republish after infrastructure-only changes.
+name: publish-index
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Generate simple index from releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          declare -A entries
+          while IFS=$'\t' read -r name url; do
+            case "$name" in
+              *.whl)
+                # A wheel's filename starts with its distribution name; PEP 503 normalizes it
+                # into the project's page name.
+                project=$(printf '%s' "${name%%-*}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g')
+                sha_url="${url}.sha256"
+                sha=$(curl -sfL "$sha_url" | awk '{print $1}') || sha=""
+                if [[ -n "$sha" ]]; then
+                  entries[$project]+="    <a href=\"${url}#sha256=${sha}\">${name}</a><br/>\n"
+                else
+                  entries[$project]+="    <a href=\"${url}\">${name}</a><br/>\n"
+                fi
+                ;;
+            esac
+          done < <(gh api "repos/${REPO}/releases" --paginate \
+                     -q '.[].assets[] | [.name, .browser_download_url] | @tsv')
+          mkdir -p site/simple
+          projects=""
+          for project in $(printf '%s\n' "${!entries[@]}" | sort); do
+            mkdir -p "site/simple/${project}"
+            printf '<!DOCTYPE html>\n<html><head><title>%s</title></head><body>\n' "$project" > "site/simple/${project}/index.html"
+            printf "%b" "${entries[$project]}" >> "site/simple/${project}/index.html"
+            printf '</body></html>\n' >> "site/simple/${project}/index.html"
+            projects+="<a href=\"${project}/\">${project}</a><br/>\n"
+            cat "site/simple/${project}/index.html"
+          done
+          printf '<!DOCTYPE html>\n<html><body>\n%b</body></html>\n' "$projects" > site/simple/index.html
+          printf '<!DOCTYPE html>\n<html><body><a href="simple/">simple index</a></body></html>\n' > site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4

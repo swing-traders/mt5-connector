@@ -22,6 +22,7 @@ ENV/
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 .pytest_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
@@ -51,8 +52,16 @@ logs/
 
 # ── Metatrader  ────────────────────────────────────────────────────────────────
 *.ex5
+.mql-auto-forwards/
+compile_commands.json
 
 
 # ── Secrets  ───────────────────────────────────────────────────────────────────
 
 secrets/
+
+# ── Ad-hoc tooling (never committed) ───────────────────────────────────────────
+/scripts/
+
+# ── GitHub Pages index build ───────────────────────────────────────────────────
+site/

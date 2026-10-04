@@ -1,13 +1,14 @@
 # mt5-connector
 
+This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5-connector). It is maintained independently and does not track upstream.
+
 **Unofficial community MetaTrader 5 adapter for NautilusTrader** — live trading and backtesting on any MT5 broker (Exness, IC Markets, Pepperstone, and more).
 
 > ⚠️ **Disclaimer:** This is an independent community project. It is **not** affiliated with, endorsed by, or supported by [Nautech Systems Pty Ltd](https://nautilustrader.io) or the official [NautilusTrader](https://nautilustrader.io) project.
 
-[![PyPI version](https://badge.fury.io/py/mt5-connector.svg)](https://badge.fury.io/py/mt5-connector)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](https://www.microsoft.com/windows)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
 [![Unofficial](https://img.shields.io/badge/NautilusTrader-unofficial%20community%20adapter-orange.svg)](https://nautilustrader.io)
 
 ---
@@ -17,22 +18,35 @@
 `mt5-connector` is a **data and execution adapter** that connects [NautilusTrader](https://nautilustrader.io) to any MetaTrader 5 broker. Write your strategy once in Python, then run it as a backtest against historical MT5 data  or flip a switch and run it live.
 
 ```
-MT5 Terminal (Windows) ←→ mt5-connector ←→ NautilusTrader
+MT5 server ←→ mt5-connector-client ←→ NautilusTrader
                               ↑
-                    tick polling, order routing,
-                    account state, reconciliation
+                 pushed ticks, bars and transactions,
+                 order routing, account state, reconciliation
 ```
 
 **What you get:**
 
-- Live tick data polled from MT5, aggregated into any bar type NautilusTrader supports
-- Full order lifecycle: market, limit, stop, stop-limit orders with SL/TP
+- Live quote ticks, a mark price at the mid of each, and the venue's own closed bars, pushed from the terminal over WebSocket; the ticks aggregate into any bid, ask or mid bar type NautilusTrader supports
+- Order lifecycle: market, limit, stop and stop-limit entries, their fills booked to the venue's hedging positions, and each position's exits — its stop, its target and its closes — as the venue's own stop loss, take profit and closing deals; every fill, cancel and expiry pushed from the terminal as it happens
 - Account state and position reconciliation on startup and continuously
 - Historical bar data download into a NautilusTrader Parquet catalog for backtesting
 - Automatic reconnection with exponential backoff
 - Works with any MT5 broker — Exness, IC Markets, Pepperstone, OANDA, and more
 
-> **Platform note:** The MetaTrader5 Python library is Windows-only. This adapter runs on Windows. Backtesting with downloaded data works on any platform once the data has been collected.
+> **Platform note:** The adapter talks only to the MT5 server — `mt5-connector-server`, running beside the MT5 terminal (see [The MT5 server](#the-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package. It runs where the NautilusTrader build it pins installs: CPython 3.12 on Linux x86_64.
+
+---
+
+## Distributions
+
+The repository ships two distributions, versioned together: one release builds both wheels onto one index.
+
+| Distribution | Import packages | Installs into | Carries |
+|---|---|---|---|
+| `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the remote backend, the history client and the downloader, and the wire vocabulary |
+| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the push hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
+
+`mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
 
 ---
 
@@ -40,109 +54,100 @@ MT5 Terminal (Windows) ←→ mt5-connector ←→ NautilusTrader
 
 - [mt5-connector](#mt5-connector)
   - [What this is](#what-this-is)
+  - [Distributions](#distributions)
   - [Table of contents](#table-of-contents)
   - [Requirements](#requirements)
   - [Installation](#installation)
   - [Quick start](#quick-start)
   - [Configuration](#configuration)
     - [Symbol naming](#symbol-naming)
-  - [Writing a strategy](#writing-a-strategy)
-  - [Backtesting](#backtesting)
-    - [Step 1 — download historical data](#step-1--download-historical-data)
-    - [Step 2 — run the backtest](#step-2--run-the-backtest)
-  - [Live trading](#live-trading)
-    - [Bar types for live trading](#bar-types-for-live-trading)
-  - [Dockerized server backend](#dockerized-server-backend)
-    - [What it is](#what-it-is)
-    - [Improtant Security Notice](#improtant-security-notice)
-    - [Requirements](#requirements-1)
-      - [Quick start](#quick-start-1)
-    - [Persistence](#persistence)
+  - [Downloading history](#downloading-history)
+  - [Running in a node](#running-in-a-node)
+    - [Bar types](#bar-types)
+  - [The MT5 server](#the-mt5-server)
+  - [Releases](#releases)
   - [Running the full test suite](#running-the-full-test-suite)
   - [Project structure](#project-structure)
   - [Broker compatibility](#broker-compatibility)
   - [Troubleshooting](#troubleshooting)
   - [Safety notes](#safety-notes)
-  - [Changelog](#changelog)
-    - [0.1.0 (2026-06-12)](#010-2026-06-12)
   - [License](#license)
 
 ---
 
 ## Requirements
 
-- Windows 10 or 11 (required by MetaTrader 5)
-- Python 3.10, 3.11, or 3.12
-- MetaTrader 5 terminal installed and open, logged in to your broker account
+- CPython 3.12 on Linux x86_64 where the client runs: the NautilusTrader build it pins exists for that platform alone
+- An MT5 server (`mt5-connector-server`, see [The MT5 server](#the-mt5-server)) running beside a MetaTrader 5 terminal logged in to your broker account
 - An MT5 broker account (demo accounts work perfectly for development)
 
 ---
 
 ## Installation
 
+Releases are published as wheels on the fork's package index. The client pins the NautilusTrader fork's own build, `nautilus_trader==1.231.0+st.22`, which only that fork's index serves. Install the adapter where NautilusTrader runs, from both indexes:
+
 ```bash
-pip install mt5-connector
+pip install \
+  --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
+  --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
+  "mt5-connector-client==0.4.0+st.N"
 ```
 
-Or install from source for development:
+and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
 
 ```bash
-git clone https://github.com/aulekator/mt5-connect
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.4.0+st.N"
+```
+
+For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
+
+```bash
+git clone https://github.com/swing-traders/mt5-connector
 cd mt5-connector
-pip install -e ".[dev]"
+mamba env create -f environment.yml
+mamba env update -f environment.dev.yml
+just lint
+just test
 ```
 
 ---
 
 ## Quick start
 
-**1. Create a `.env` file** in your project root with your broker credentials:
+**1. Run an MT5 server.** The adapter talks to the MT5 terminal through `mt5-connector-server` — [its README](packages/server/mt5connector/server/README.md) states what the terminal and the server need. The server must be up, and the terminal's AutoTrading on, before you run any script; without AutoTrading every order is rejected.
 
-```bash
-# .env — never commit this file
-MT5_ACCOUNT=12345678
-MT5_PASSWORD=your_password
-MT5_SERVER=Exness-MT5Trial9
-MT5_SYMBOLS=EURUSDm,XAUUSDm
-```
-
-Find your server name in MT5 → File → Open Account → search your broker.
-
-**2. Open MT5 and log in.** The adapter connects to the running terminal via Windows IPC — the terminal must be open before you run any script.
-
-**3. Enable AutoTrading** in the MT5 toolbar (the button should show a green dot). Without this, order_send calls will be rejected.
-
-**4. Test the connection:**
+**2. Test the connection:**
 
 ```python
-import MetaTrader5 as mt5
+from mt5connector.client import remote_mt5 as mt5
 
-mt5.initialize()
-mt5.login(12345678, "your_password", "Exness-MT5Trial9")
-print(mt5.account_info())
-mt5.shutdown()
-```
-
-**5. Run the example live strategy:**
-
-```bash
-python examples/live_simple_strategy.py
+mt5.configure("http://127.0.0.1:5000")
+info = mt5.account_info()
+print(info.currency, info.balance)
 ```
 
 ---
 
 ## Configuration
 
-All configuration goes through `MT5Config`. The only required fields are your account credentials and symbols.
+All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL. A config is refused when it is built:
+
+- without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
+- with a `ws_url` that is not a `ws` or `wss` URL naming a host;
+- with either URL malformed, or naming a port outside 1–65535.
+
+Its repr and string name none of the credentials: the login, the password and the broker server's name.
 
 ```python
-from mt5connect.config import MT5Config
+from mt5connector.client.config import MT5Config
 
 config = MT5Config(
-    account  = 12345678,            # MT5 account number
-    password = "your_password",
-    server   = "Exness-MT5Trial9",  # broker server name
-    symbols  = ["EURUSDm", "XAUUSDm"],
+    account    = 12345678,            # MT5 account number
+    password   = "your_password",
+    server     = "Exness-MT5Trial9",  # broker server name
+    symbols    = ["EURUSDm", "XAUUSDm"],
+    server_url = "http://127.0.0.1:5000",  # the MT5 server's HTTP API
 )
 ```
 
@@ -155,15 +160,20 @@ config = MT5Config(
     password = "your_password",
     server   = "Exness-MT5Trial9",
     symbols  = ["EURUSDm", "XAUUSDm"],
+    server_url = "http://127.0.0.1:5000",
 
-    # Polling intervals
-    poll_interval_ms      = 100,   # tick data polling (default: 100ms)
-    exec_poll_interval_ms = 250,   # order/position polling (default: 250ms)
+    # The WebSocket push hub (default: derived from server_url, on port 9000)
+    ws_url = "ws://127.0.0.1:9000",
 
-    # Order tagging — change if running multiple bots simultaneously
-    magic_number = 510,
+    # How often the execution client checks its terminal session and reports an owed account
+    exec_poll_interval_ms = 250,   # default: 250ms
 
-    # Reconnection
+    # Execution
+    deviation_points        = 20,  # the price deviation a market order accepts, in points
+    account_refresh_seconds = 10,  # the longest the account goes unreported between events
+    history_lookback_mins   = 60,  # the venue history read when NT names no window, and at connect
+
+    # Reconnection: the terminal session's, and the push channel's backoff (which never gives up)
     reconnect_initial_delay_s = 1.0,
     reconnect_max_delay_s     = 60.0,
     reconnect_max_attempts    = 20,
@@ -173,21 +183,18 @@ config = MT5Config(
 )
 ```
 
-**Loading from `.env`** (recommended — never hardcode credentials):
+**Loading from the environment** (never hardcode credentials):
 
 ```python
 import os
-from pathlib import Path
-from dotenv import load_dotenv
-from mt5connect.config import MT5Config
-
-load_dotenv(Path(__file__).parent / ".env")
+from mt5connector.client.config import MT5Config
 
 config = MT5Config(
     account  = int(os.environ["MT5_ACCOUNT"]),
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
     symbols  = os.environ["MT5_SYMBOLS"].split(","),
+    server_url = os.environ["MT5_SERVER_URL"],
 )
 ```
 
@@ -202,133 +209,57 @@ Different brokers use different symbol names. Always use the **exact name shown 
 | IC Markets | `EURUSD` | `XAUUSD` | `BTCUSD` |
 | Pepperstone | `EURUSD` | `XAUUSD` | `BTCUSD` |
 
-The adapter handles suffix normalisation internally for instrument classification — you just provide the exact broker symbol name.
+The instrument provider loads exactly these symbols and builds each one from the venue's own definition — nothing is inferred from a symbol's name:
+
+- **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
+- **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
+- **Currencies**:
+  - The base is `currency_base` and the quote — the settlement currency — `currency_profit`.
+  - Each takes NT's precision, else the account's currency digits for the account currency, else its ISO 4217 minor units.
+  - A settlement code none of those covers is refused at load; a base code is built as NT builds a code it does not know.
+  - An instrument's settlement currency is registered with NT before every instrument NT receives.
+  - The account currency, with every loaded settlement currency, is registered before the first account state.
+  - Base-only codes are never registered.
+- **Taker fee** from the commission schedule the server relays for the symbol, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the server has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, a conversion symbol the venue refuses to select, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
+- **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, the session calendar (`session_tz`, `session_day_open`, `session_week_open`) and `bar_volume` (`tick_count`).
+
+The provider also answers what a consumer discovers its settlement currencies by:
+
+- `quoted_pairs() -> dict[tuple[str, str], str]` — the venue symbol quoting each `(base, profit)` currency pair the venue's FOREX symbols cover, as the last load found it: a symbol the run loads, else one fully tradable, else the first that prices once selected, each rung in alphabetical order.
+- `account_currency() -> str` — the account's currency code, as the account reports it at the call.
 
 ---
 
-## Writing a strategy
+## Downloading history
 
-Strategies are plain NautilusTrader `Strategy` subclasses. The adapter handles all the MT5-specific plumbing — your strategy code is identical for both backtesting and live trading.
+`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the MT5 server's [history routes](packages/server/mt5connector/server/README.md#history).
 
-```python
-from decimal import Decimal
-from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.config import StrategyConfig
+The downloader walks back from `end`, one request per window, until `start` or the floor `/history/ranges` advertises for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
 
+- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at its close — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
+- ticks one UTC day at a time, both sizes of each the instrument's largest order.
 
-class SmaCrossConfig(StrategyConfig, frozen=True):
-    instrument_id : str
-    bar_type      : str
-    fast_period   : int     = 10
-    slow_period   : int     = 30
-    trade_size    : Decimal = Decimal("0.01")
-
-
-class SmaCrossStrategy(Strategy):
-
-    def __init__(self, config: SmaCrossConfig) -> None:
-        super().__init__(config)
-        self.instrument_id = InstrumentId.from_str(config.instrument_id)
-        self.bar_type      = BarType.from_str(config.bar_type)
-        self.fast_period   = config.fast_period
-        self.slow_period   = config.slow_period
-        self.trade_size    = config.trade_size
-        self._fast_prices: list[float] = []
-        self._slow_prices: list[float] = []
-        self._position_side = None
-
-    def on_start(self) -> None:
-        self.instrument = self.cache.instrument(self.instrument_id)
-        self.subscribe_bars(self.bar_type)
-
-    def on_bar(self, bar: Bar) -> None:
-        close = float(bar.close)
-        self._fast_prices.append(close)
-        self._slow_prices.append(close)
-        if len(self._fast_prices) > self.fast_period:
-            self._fast_prices.pop(0)
-        if len(self._slow_prices) > self.slow_period:
-            self._slow_prices.pop(0)
-
-        if len(self._fast_prices) < self.fast_period:
-            return
-
-        fast_sma = sum(self._fast_prices) / self.fast_period
-        slow_sma = sum(self._slow_prices) / self.slow_period
-
-        if fast_sma > slow_sma and self._position_side != OrderSide.BUY:
-            self._close_position()
-            self._open_position(OrderSide.BUY)
-        elif fast_sma < slow_sma and self._position_side != OrderSide.SELL:
-            self._close_position()
-            self._open_position(OrderSide.SELL)
-
-    def _open_position(self, side: OrderSide) -> None:
-        quantity = Quantity(float(self.trade_size), self.instrument.size_precision)
-        order = self.order_factory.market(
-            instrument_id=self.instrument_id,
-            order_side=side,
-            quantity=quantity,
-        )
-        self.submit_order(order)
-        self._position_side = side
-
-    def _close_position(self) -> None:
-        if self._position_side is None:
-            return
-        for pos in self.cache.positions_open(instrument_id=self.instrument_id):
-            close_side = OrderSide.SELL if pos.side.name == "LONG" else OrderSide.BUY
-            order = self.order_factory.market(
-                instrument_id=self.instrument_id,
-                order_side=close_side,
-                quantity=pos.quantity,
-            )
-            self.submit_order(order)
-        self._position_side = None
-
-    def on_stop(self) -> None:
-        self._close_position()
-```
-
-The strategy above is identical whether you run it in a backtest or live — the only difference is which engine you wire it into.
-
----
-
-## Backtesting
-
-Backtesting requires two steps: download historical bar data from MT5, then run the backtest engine against it.
-
-### Step 1 — download historical data
-
-```bash
-python examples/download_historical_data.py
-```
-
-This connects to MT5, downloads H1 bars for the configured symbol, and writes them into a NautilusTrader Parquet catalog at `./catalog`.
-
-You can customise the download by editing the script, or call the downloader directly:
+A window the server answers with a failure, or leaves unanswered, is recorded among the result's errors and the walk goes on; any other error reading it raises.
 
 ```python
-from mt5connect.config import MT5Config
-from mt5connect.connection import MT5Connection
-from mt5connect.providers import MT5InstrumentProvider
-from mt5connect.downloader import MT5DataDownloader
+from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import MT5Connection
+from mt5connector.client.providers import MT5InstrumentProvider
+from mt5connector.client.downloader import MT5DataDownloader
+from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from datetime import datetime, timezone
 
 config = MT5Config(
     account=12345678, password="your_password",
     server="Exness-MT5Trial9", symbols=["EURUSDm"],
+    server_url="http://127.0.0.1:5000",
 )
 
 conn     = MT5Connection(config)
 conn.connect()
 
-provider = MT5InstrumentProvider(conn)
+provider = MT5InstrumentProvider(conn, clock=LiveClock())
 catalog  = ParquetDataCatalog("./catalog")
 
 # Write the instrument definition first (required by the backtest engine)
@@ -360,327 +291,105 @@ conn.disconnect()
 | D1  | 16408 |
 | W1  | 32769 |
 
-### Step 2 — run the backtest
-
-```bash
-python examples/backtest_eurusd.py
-```
-
-Or wire it up yourself:
-
-```python
-from decimal import Decimal
-from datetime import datetime, timezone
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType, OmsType
-from nautilus_trader.model.identifiers import Venue, TraderId
-from nautilus_trader.model.objects import Money
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-SYMBOL   = "EURUSDm"
-VENUE    = "MT5"
-CATALOG  = "./catalog"
-
-catalog     = ParquetDataCatalog(CATALOG)
-instruments = catalog.instruments()
-instrument  = next(i for i in instruments if i.id.symbol.value == SYMBOL)
-
-# Load bars from catalog
-bars = catalog.bars([f"{SYMBOL}.{VENUE}"])
-
-engine = BacktestEngine(
-    config=BacktestEngineConfig(
-        trader_id=TraderId("BACKTESTER-001"),
-        logging=LoggingConfig(log_level="WARNING"),
-    )
-)
-
-engine.add_venue(
-    venue             = Venue(VENUE),
-    oms_type          = OmsType.NETTING,
-    account_type      = AccountType.MARGIN,
-    base_currency     = USD,
-    starting_balances = [Money(10_000.0, USD)],
-    fill_model        = FillModel(
-        prob_fill_on_limit=0.95,
-        prob_slippage=0.10,
-        random_seed=42,
-    ),
-)
-engine.add_instrument(instrument)
-engine.add_data(bars)
-
-strategy = SmaCrossStrategy(
-    config=SmaCrossConfig(
-        instrument_id = f"{SYMBOL}.{VENUE}",
-        bar_type      = f"{SYMBOL}.{VENUE}-1-HOUR-LAST-INTERNAL",
-        fast_period   = 10,
-        slow_period   = 30,
-        trade_size    = Decimal("0.10"),
-    )
-)
-engine.add_strategy(strategy)
-engine.run(
-    start = datetime(2024, 1,  1, tzinfo=timezone.utc),
-    end   = datetime(2024, 12, 31, tzinfo=timezone.utc),
-)
-
-# Results
-account = engine.trader.generate_account_report(Venue(VENUE))
-fills   = engine.trader.generate_order_fills_report()
-print(account)
-print(f"Total fills: {len(fills)}")
-engine.dispose()
-```
-
 ---
 
-## Live trading
+## Running in a node
 
-Live trading uses NautilusTrader's `TradingNode` with the MT5 data and execution clients.
+The data and execution clients run in NautilusTrader's `TradingNode`. `build_mt5_node_config` makes them the node's default route, each loading the config's symbols, and the factories, registered before `node.build()`, build them on one connection and one instrument provider per account and server:
 
 ```python
-import os, signal, sys
-from decimal import Decimal
-from pathlib import Path
-from dotenv import load_dotenv
+import os
 from nautilus_trader.live.node import TradingNode
-from mt5connect.config import MT5Config
-from mt5connect.factories import (
+from mt5connector.client.config import MT5Config
+from mt5connector.client.factories import (
     build_mt5_node_config,
     MT5LiveDataClientFactory,
     MT5LiveExecClientFactory,
 )
 
-load_dotenv(Path(__file__).parent / ".env")
-
-# 1. Configure MT5
 mt5_config = MT5Config(
     account  = int(os.environ["MT5_ACCOUNT"]),
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
     symbols  = os.environ["MT5_SYMBOLS"].split(","),
+    server_url = os.environ["MT5_SERVER_URL"],
 )
 
-# 2. Configure strategy
-symbol        = mt5_config.symbols[0]
-instrument_id = f"{symbol}.MT5"
-bar_type      = f"{instrument_id}-1-MINUTE-LAST-INTERNAL"
-
-strategy_config = SmaCrossConfig(
-    instrument_id = instrument_id,
-    bar_type      = bar_type,
-    fast_period   = 10,
-    slow_period   = 30,
-    trade_size    = Decimal("0.01"),
-)
-
-# 3. Build and run the node
-node_config = build_mt5_node_config(mt5_config=mt5_config)
-node        = TradingNode(config=node_config)
-
-# 4. Register factories (must be before node.build())
+node = TradingNode(config=build_mt5_node_config(mt5_config=mt5_config))
 node.add_data_client_factory("MT5", MT5LiveDataClientFactory)
 node.add_exec_client_factory("MT5", MT5LiveExecClientFactory)
-
-# 5. Add strategy
-node.trader.add_strategy(SmaCrossStrategy(config=strategy_config))
-
-# 6. Graceful shutdown on Ctrl+C
-def _shutdown(sig, frame):
-    node.stop()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT,  _shutdown)
-signal.signal(signal.SIGTERM, _shutdown)
-
-# 7. Start
-node.build()  # connects to MT5, loads instruments
-node.run()    # starts polling loops and strategy
+node.build()  # builds the clients, connecting to the MT5 server
+node.run()    # connects the clients: loads the config's symbols and starts the push channels
 ```
 
-The node lifecycle in order — **sequence matters:**
+### Bar types
 
-```
-TradingNode(config)                    # 1. init kernel and engines
-node.add_data_client_factory(...)      # 2. register MT5 data factory
-node.add_exec_client_factory(...)      # 2. register MT5 exec factory
-node.trader.add_strategy(instance)     # 3. register strategy instance
-node.build()                           # 4. connect to MT5, load instruments
-node.run()                             # 5. start tick polling and strategy
-```
+A bar type aggregated `EXTERNAL` is the venue's own bar: the terminal's bar of that timeframe — 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 or 30 minutes, 1, 2, 3, 4, 6, 8 or 12 hours, a day or a week — pushed when it closes and stamped at its close, its prices and tick volume the venue's. Its price type is the one price the terminal builds the symbol's bars from, as its chart mode names it: `BID` or `LAST`. A step the terminal has no timeframe for is refused at subscription and at a history request. `"EURUSDm.MT5-5-MINUTE-BID-EXTERNAL"` is the venue's 5-minute bar of a symbol charted by bid.
 
-### Bar types for live trading
-
-NautilusTrader aggregates ticks into bars internally. The bar type string format is:
+Any other bar type is `INTERNAL`: NautilusTrader aggregates it from the symbol's quote ticks itself, priced `BID`, `ASK` or `MID`, and it never carries the venue's bar type. `LAST` internal bars are not available on this venue: NautilusTrader aggregates them from trade ticks, which MT5 does not provide. The bar type string format is:
 
 ```
 {symbol}.{venue}-{step}-{aggregation}-{price_type}-{aggregation_source}
 ```
 
-Common examples:
-
-```python
-"EURUSDm.MT5-1-MINUTE-LAST-INTERNAL"    # 1-minute bars
-"EURUSDm.MT5-5-MINUTE-LAST-INTERNAL"    # 5-minute bars
-"EURUSDm.MT5-1-HOUR-LAST-INTERNAL"      # 1-hour bars
-"EURUSDm.MT5-100-TICK-LAST-INTERNAL"    # 100-tick bars
-"EURUSDm.MT5-1000-VOLUME-LAST-INTERNAL" # volume bars
-```
-
 ---
 
-## Dockerized server backend
+## The MT5 server
 
-The adapter can run against a **Dockerized MT5 server** instead of a local
-MetaTrader terminal. The server container runs MT5 under Wine, exposes a
-Flask REST API (`mt5server/app`) plus a WebSocket tick hub, and runs a
-small MQL5 EA that publishes live ticks. The adapter then works on any
-machine — including Linux — by selecting `backend="remote"`.
+The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and that EA's source. Its HTTP API, its history protocol, its hub and everything the image running it must provide are in [its README](packages/server/mt5connector/server/README.md).
 
 ```
-┌─ your bot (any OS) ────────────────┐      ┌─ MT5 server container ────────┐
-│  mt5-connector (backend="remote")  │      │  Flask REST  :5000             │
-│   └─ WSStreamClient                │──────│  WS tick hub :9000             │
-│      (subscribe/tick messages)     │      │  MT5 terminal (Wine)           │
+┌─ your bot (Linux) ─────────────────┐      ┌─ beside the MT5 terminal ──────┐
+│  mt5-connector-client              │      │  HTTP API    :5000             │
+│   └─ PushClient                    │──────│  WS push hub :9000             │
+│      (ticks, bars, transactions)   │      │  MT5 terminal                  │
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
-### What it is
+- `MT5Config` requires the server's `server_url`, an `http` or `https` URL, and derives its `ws_url` (WebSocket) from the same host on port 9000 unless one is given; a given `ws_url` must be a `ws` or `wss` URL naming a host, and a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
+- The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
+- A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
+- Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
+  - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. Its history requests answer quote ticks sized the same way, and the venue's bars as the bar type requested. After a reconnect it holds the bars pushed until the first one arrives, then reads back over HTTP, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
+  - The execution client subscribes the account's trade transactions: a `DEAL_ADD` is a fill, read from the venue's history by its ticket; an `ORDER_DELETE` or `HISTORY_ADD` ends the order the venue cancelled, expired or rejected; a `TRADE_TRANSACTION_REQUEST` links the ticket of an order whose submit got no answer through its comment's digest, and accepts it. A transaction naming a ticket the client cannot resolve is left to NautilusTrader's reconciliation, never booked as an external order.
+  - Each symbol's EA publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
+- The execution client polls nothing for events: what the push channel misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop checks the terminal session and reports the account.
+- There is no authentication: the server trusts its network. Its image publishes no host port, loopback included, so the API and the hub are reachable on the container network alone.
 
-- A `backend="remote"` mode on `MT5Config` plus a `server_url` (HTTP) and a
-  derived `ws_url` (WebSocket) — see `mt5connect/config.py`.
-- The Docker image builds MT5 + Wine + the Flask API + the WS hub in one
-  container (`mt5server/Dockerfile`), with the EA provisioned automatically.
-- `set_backend(config)` binds the HTTP/WS client (`mt5connect/remote_mt5.py`,
-  `mt5connect/ws_stream.py`) into the adapter, replacing the local
-  `MetaTrader5` package — no Windows-only dependency needed.
+The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function and carrying the delay the server's `Retry-After` gives as `retry_after_s`, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets the shim's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
 
-### Improtant Security Notice
+`mt5connector.client.history` calls the server's history routes through the shim's session, with no read timeout:
 
-There is no authentication in the dockerized backend. It is intended to be used on the
-same machine only for now. Never expose ports to an insecure network. 
+- `bars()` and `ticks()` answer the rows as the package's arrays, and `ranges()` the advertised floors and `maxbars`.
+- On a 503 — the window not proven yet, or every slot taken — each waits its `Retry-After` and asks again, with no deadline of its own, until the server answers otherwise or the `cancel` event it was handed is set.
+- They answer `None` for a failure, a 400 among them, and for a cancellation, with `last_error()` set to the pair the server last answered.
 
-### Requirements
+---
 
-- Docker on the host.
+## Releases
 
-#### Quick start
-
-***1 . Build and start Container***
-
-With docker compose: 
-
-```bash
-# 0. create an environment file 
-cp .env.example .env   # set MT5_ACCOUNT / MT5_PASSWORD / MT5_SERVER
-
-# 1. Build + start the server (context is the repo root, so mt5ticks/ is copied)
-source .env
-# environment variables need to be exported in order to be picked up by docker compose
-export MT5_ACCOUNT
-export MT5_PASSWORD
-export MT5_SERVER
-export MT5_SYMBOLS
-cd mt5server && docker compose up --build -d
-``` 
-
-Without docker compose
-
-Without docker-compose, build/run directly:
-
-```bash
-cd mt5server 
-docker build -t mt5-server .
-source ../.env
-docker run -d --name mt5-server \
-  -p 127.0.0.1:5000:5000 -p 127.0.0.1:9000:9000 -p 127.0.0.1:3001:3001 \
-  -e MT5_SYMBOLS="${MT5_SYMBOLS}" \
-  -e MT5_SERVER="${MT5_SERVER}" \
-  -e MT5_PASSWORD="${MT5_PASSWORD}" \
-  -e MT5_ACCOUNT="${MT5_ACCOUNT}" \
-  mt5-server
-```
-
-***2. Wait until container is up***
-
-```bash
-
-# 2. Metatrader 5 ist installed and started in a docker container. Give it 1-2 minutes to start
-# if you want to track the installation progress run:
-docker exec -it  mt5server-mt5server-1 tail -f /var/log/mt5_setup.log
-
-# if you need to see the metatrader ui open https://localhost:3001 in a browser
-```
-
-***3. Run remote backend example***
-```bash
-# 3. in a new terminal
-source .env
-source .venv/bin/activate
-python examples/live_remote.py
-```
-If everythng works correctly you shoud see ticks streming in after a few seconds like this:
-
-```
-2026-08-19T12:20:07.454036271Z [INFO] TRADER-001.Portfolio: Updated AccountState(account_id=MT5-917132, account_type=MARGIN, base_currency=None, is_reported=True, balances=[AccountBalance(total=9_999.93 USD, locked=0.00 USD, free=9_999.93 USD)], margins=[], event_id=c24fbca4-15bb-4105-9eaa-4ebaa3bfb873)
-2026-08-19T12:20:07.613214977Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.34 ask=4368.46 @ 1787152807592000000
-2026-08-19T12:20:07.633962622Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.37 ask=4368.49 @ 1787152807612000000
-2026-08-19T12:20:07.685732285Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.37 ask=4368.47 @ 1787152807664000000
-2026-08-19T12:20:07.697749223Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.25 ask=4368.37 @ 1787152807675000000
-2026-08-19T12:20:07.710776389Z [INFO] TRADER-001.TickPrintStrategy: EURUSDp.MT5 bid=1.16074 ask=1.16075 @ 1787152807684000000
-2026-08-19T12:20:07.725422727Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.34 ask=4368.46 @ 1787152807704000000
-2026-08-19T12:20:07.732231519Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.34 ask=4368.43 @ 1787152807713000000
-2026-08-19T12:20:07.746709404Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.31 ask=4368.43 @ 1787152807723000000
-2026-08-19T12:20:07.767988612Z [INFO] TRADER-001.TickPrintStrategy: EURUSDp.MT5 bid=1.16075 ask=1.16076 @ 1787152807745000000
-
-```
-
-
-**Tick streaming setup**
-
-Ticks streamking is set up automatically for every symbol in the environment
-variable  `MT5_SYMBOLS`.
-
-**Security note**
-
-For now the server *does not provide any authentication and authorization*. That means it should be only used  locally
-and never be exposed over an insecure network, as this will *expose the api and your account* to every one who has access
-to the network. On public machines this is the whole internet. 
-
-Account credentials live only in your local gitignored `.env`. They are only passed to the container via environment 
-variables and used during setup. They are also forwarded to the server at runtime via `POST /login` .
-They  and are never baked into the Docker image. The server's `config/` directory (Wine prefix) is a mounted
-volume owned by the container.
-
-### Persistence
-
-The dockerized metatrader instance is configured at startup automatically and not intended to be used via the regular matatrader GUI.
-Therefor it has no volumes for persisting configuration configured. If you need to persist data between container instances, you need
-to mount a volume to the containers `/config` path. For example by additonally passing `-v $PWD/config:/config` to the docker command
-line, or change the `docker-compose.yaml` file accordingly. 
+- `VERSION` holds the one version both distributions carry, `0.4.0+st.N`.
+- A `v0.4.0+st.N` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, attaches all four files to one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
+- Consumers pin a release exactly, by its full local version, from that index; PyPI can never satisfy a `+st` version, so the pin proves provenance.
 
 ---
 
 ## Running the full test suite
 
 ```bash
-pytest tests/ -v
+just test
 ```
 
 All tests mock the MT5 terminal — no live connection required to run tests.
 
 ```
-tests/test_connection.py   — MT5Connection lifecycle, reconnect logic
-tests/test_data.py         — MT5DataClient tick polling and bar publishing
-tests/test_execution.py    — order submission, fills, reconciliation
-tests/test_factories.py    — factory wiring and node config
-tests/test_parsing.py      — symbol info → NautilusTrader instrument conversion
-tests/test_providers.py    — MT5InstrumentProvider loading
+tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the shim, the history client and the downloader
+tests/server/              — the server's routes, lifecycle, WS hub and history protocol, and the shim through them
+tests/conformance/         — the inventory against the pinned MetaTrader5 wheel
+tests/test_distributions.py — the two distributions' shared version and the import boundary between them
 ```
+
+The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`.
 
 ---
 
@@ -688,25 +397,43 @@ tests/test_providers.py    — MT5InstrumentProvider loading
 
 ```
 mt5-connector/
-├── mt5connect/
-│   ├── config.py        # MT5Config — all user-facing configuration
-│   ├── connection.py    # MT5Connection — terminal IPC lifecycle
-│   ├── constants.py     # venue, magic number, symbol sets, normalize_symbol()
-│   ├── data.py          # MT5DataClient — tick polling and bar publishing
-│   ├── downloader.py    # MT5DataDownloader — historical bar download
-│   ├── errors.py        # custom exceptions
-│   ├── execution.py     # MT5LiveExecutionClient — order submission and fills
-│   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
-│   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
-│   └── providers.py     # MT5InstrumentProvider
-├── tests/               # full test suite (no live MT5 required)
-├── examples/
-│   ├── live_simple_strategy.py       # full live trading example
-│   ├── backtest_eurusd.py            # SMA crossover backtest
-│   ├── download_historical_data.py   # download bars from MT5
-│   └── test_place_order.py           # verify execution path end-to-end
-├── .env.example         # credential template — copy to .env and fill in
-└── pyproject.toml
+├── VERSION                       # the one version both distributions carry
+├── packages/
+│   ├── client/                   # mt5-connector-client
+│   │   ├── pyproject.toml
+│   │   └── mt5connector/
+│   │       ├── client/
+│   │       │   ├── commissions.py   # the relayed commission rule and the taker fee it implies
+│   │       │   ├── config.py        # MT5Config — all user-facing configuration
+│   │       │   ├── connection.py    # MT5Connection — server connection lifecycle
+│   │       │   ├── constants.py     # venue, account-loop and reconnect defaults
+│   │       │   ├── currencies.py    # the precision ladder a venue currency code is built by
+│   │       │   ├── data.py          # MT5DataClient — pushed ticks, marks and venue bars, and history requests
+│   │       │   ├── downloader.py    # MT5DataDownloader — historical bar download
+│   │       │   ├── errors.py        # custom exceptions
+│   │       │   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
+│   │       │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
+│   │       │   ├── history.py       # the server's history routes, as a client
+│   │       │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
+│   │       │   ├── providers.py     # MT5InstrumentProvider
+│   │       │   ├── push.py          # the hub's push channel on NT's WebSocketClient
+│   │       │   └── remote_mt5.py    # the HTTP shim generated from the inventory
+│   │       └── wire/
+│   │           ├── mirror.py        # the inventory of the pinned MetaTrader5 package
+│   │           ├── broker_clock.py  # broker wall-clock time ↔ true UTC
+│   │           ├── history_wire.py  # the history routes' paths, series and answer states
+│   │           └── push_wire.py     # the push protocol's version, frames, roles and streams
+│   └── server/                   # mt5-connector-server
+│       ├── pyproject.toml
+│       └── mt5connector/
+│           └── server/
+│               ├── README.md        # the server's API and what its image must provide
+│               ├── app.py           # the HTTP server (mt5-connector-server)
+│               ├── ws_server.py     # the push hub (mt5-connector-hub)
+│               ├── push_frames.py   # the EA's frames, held to their structs and converted to UTC
+│               ├── wire -> ../../../client/mt5connector/wire
+│               └── mql5/            # the EA, its startup script and their includes
+└── tests/                        # full test suite (no live MT5 required)
 ```
 
 ---
@@ -731,15 +458,15 @@ Find your exact server name in MT5 → File → Open Account → search your bro
 
 **`mt5.initialize() failed — error -6: Terminal: Authorization failed`**
 
-The MT5 terminal is not open, or is not logged in. Open MetaTrader 5, log in to your account, wait for the green connection indicator in the bottom-right corner, then run the script again.
+The server's MT5 terminal is not running, or is not logged in. Check the server's log and its terminal (see [The MT5 server](#the-mt5-server)), wait for the green connection indicator in the terminal's bottom-right corner, then run the script again.
 
 **`mt5.login() failed — error -6: Terminal: Authorization failed`**
 
 Wrong account number, password, or server name. Double-check all three against your broker's welcome email or the MT5 terminal itself (the account number is shown in the top-left of the terminal).
 
-**`order_send failed — retcode=10027 comment=AutoTrading disabled by client`**
+**An order rejected with `TRADE_RETCODE_CLIENT_DISABLES_AT: AutoTrading disabled by client`**
 
-AutoTrading is disabled in the MT5 terminal. Click the **AutoTrading** button in the toolbar — it should turn green. This must be enabled for any automated order to be sent.
+AutoTrading is disabled in the server's MT5 terminal. Click the **AutoTrading** button in the toolbar — it should turn green. This must be enabled for any automated order to be sent.
 
 **`Factory was not of type LiveExecClientFactory`**
 
@@ -747,38 +474,31 @@ You are using an old version of `factories.py` where `MT5LiveExecClientFactory` 
 
 **Strategy not placing trades after 30+ minutes**
 
-Check that the bar type string in your strategy config exactly matches the bar type you subscribed to in `on_start`. A mismatch means `on_bar` is never called. Also verify AutoTrading is enabled in the MT5 terminal.
-
-Note: `mt5-connector` only installs successfully on Windows. It cannot be installed on macOS or Linux.
+Check that the bar type string in your strategy config exactly matches the bar type you subscribed to in `on_start`. A mismatch means `on_bar` is never called. Also verify AutoTrading is enabled in the server's MT5 terminal.
 
 ---
 
 ## Safety notes
 
 - Always use a **demo account** until you have verified your strategy behaves correctly.
-- The `magic_number` in `MT5Config` (default: `510`) tags every order placed by the adapter. Orders without this magic number are ignored — safe to have the MT5 terminal open and trade manually alongside the bot.
-- Change `magic_number` if you run multiple bots simultaneously to avoid one bot managing the other's positions.
-- The adapter uses netting mode (one position per symbol) matching how MT5 accounts work by default. Hedging accounts are not currently supported.
+- Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, the stop-loss and take-profit deals of the positions it holds exits for, and the stop-outs of the positions it opened, so manual trading on the same account, or a node with another trader id, is left alone.
+- The adapter runs on hedging accounts only: it declares NT's `HEDGING` position model and refuses to connect to an account whose margin mode is netting or exchange, or to a read-only (investor) session.
+- The execution account id is `MT5-<hash>-<magic>`: the first 8 hex digits of the SHA-256 of the login's decimal string, the login read from the account at connect, and the node's magic. Two trader ids on one login book under two ids that share the hash, and the login appears in neither. The login, the password and the broker server's name appear in no log, repr, string or exception message the client composes.
+- An order's comment at the venue is the first 29 hex digits of its client order id's SHA-256. Venue tickets map to NT orders through NT's own order records, and through that digest for an order whose submit got no answer; a deal or order neither explains is logged and left to NT's reconciliation.
+- Order lists, post-only and trailing orders, and times in force other than GTC and GTD are rejected before anything is sent.
+- A reduce-only order is an exit of the position its submit names (NT's position id, the venue's position identifier), translated into what the venue holds for one, which is one stop loss and one take profit per position:
+  - A stop-market order becomes the position's stop loss and a limit order its take profit. The order's venue order id is synthetic, `<identifier>-SL-<n>` or `<identifier>-TP-<n>`; a later order of the same kind moves the bracket and cancels the order it took the place of.
+  - A cancel clears the bracket, and a modify moves it; the only quantity a modify takes is the order's fills plus the position's volume, which changes nothing at the venue.
+  - The venue answers a request setting a bracket to what it already holds with "no changes" (10025), which confirms the setting: a stop or target sent again to the level the venue holds is accepted like any other.
+  - A market order closes the position by its current ticket. A partial close is refused while a target stands, since the venue's take profit covers the whole position.
+  - A stop loss or take profit that fires is a fill of the order holding that bracket. The order first takes the ticket of the order the venue executed the bracket with as its venue order id, and each fill reports under the ticket of its execution.
+  - A stop-out fills no exit. Its deal and the venue order that executed it are this trader's by the position they close, whatever magic the venue stamps on them; no order of the trader explains them, so both are left to NT's reconciliation. A stop-out that closes the position takes its stop loss and take profit with it, so its exits report canceled and a cancel of one cancels it; one that leaves part of the position leaves the surviving brackets standing, as the client reads them from the venue's position.
+  - A bracket can execute in parts, each part an execution of its own: the order keeps every execution ticket it took, across a restart too, and a later deal of one of them fills that order even after another order took the bracket.
+  - An exit order reports once, under the ticket it took last, however many executions the venue records for it, and always as the exit: its own type, quantity and level. Once its bracket no longer holds it, the report carries the volume its executions filled at their average price, and reads filled when they filled the order, canceled when they did not.
+  - A pending order bound to a position, a reduce-only stop-limit order, and an exit that expires are rejected before anything is sent: the venue ignores a pending order's position, and its fill would open a new one.
+- A submit, modify or cancel the venue may have acted on without the client learning it — `order_send` answering 10031, a read timeout, a connection closed after the request arrived — emits no event and logs a warning; the transactions the venue pushes for it or NT's reconciliation settle the order. A request that never left the client is rejected at once as `not sent`.
+- Fills come from the venue's deals alone, pushed as they happen, once per deal; deals already in the history when the client connects are never emitted, except a stop loss's or take profit's deal no exit order in NT's cache has booked while an exit holds its execution or occupies that bracket. Connect emits those before it returns, and fails naming the deal when it cannot build one, so the next start tries again.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
-
----
-
-## Changelog
-
-### 0.1.0 (2026-06-12)
-
-**Bug fix:** `MT5LiveExecutionClient` no longer replays historical deals from the current day's MT5 history as fills when the node starts up. Previously, restarting the node mid-session caused NautilusTrader to emit `WARN/ERROR` log entries like:
-
-```
-Order with ClientOrderId('MT5-xxxx') not found in the cache to apply OrderFilled(...)
-Cannot apply event to any order: ... not found in cache
-```
-
-because fills from prior sessions were re-emitted into an execution engine that had no record of those orders.
-
-**Root cause:** `_processed_deal_keys` was empty on startup, so the first execution poll replayed every deal since UTC midnight.
-
-**Fix:** `_connect()` now calls `_seed_processed_deals()` before starting the poll loop. This pre-populates `_processed_deal_keys` with all existing deals in the silence window (UTC midnight → now) without emitting them as fills. A secondary guard in `_emit_fill()` also silently skips any deal whose order is not registered with NT in the current session, rather than synthesising a fake `ClientOrderId` and pushing it through `generate_order_filled`.
 
 ---
 

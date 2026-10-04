@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mt5-connector-client"
+dynamic = ["version"]
+description = "NautilusTrader adapter for MetaTrader 5 — live trading and backtesting on any MT5 broker"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [
+    { name = "mt5-connector contributors" },
+]
+keywords = [
+    "algorithmic-trading",
+    "metatrader5",
+    "mt5",
+    "forex",
+    "nautilus-trader",
+    "backtesting",
+    "live-trading",
+    "exness",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# The fork's own NautilusTrader build, served by its index alone, for CPython 3.12 on Linux x86_64.
+dependencies = [
+    "nautilus_trader==1.231.0+st.22",
+    "numpy>=1.26.4",
+    "python-dotenv>=1.0",
+    "requests>=2.32",
+    "urllib3>=2",
+]
+
+[project.urls]
+Homepage   = "https://github.com/swing-traders/mt5-connector"
+Repository = "https://github.com/swing-traders/mt5-connector"
+Issues     = "https://github.com/swing-traders/mt5-connector/issues"
+
+# Both distributions read the one version file at the repository root.
+[tool.hatch.version]
+path = "../../VERSION"
+pattern = "(?P<version>\\S+)"
+
+# `mt5connector` is a namespace package shared with mt5-connector-server: it has no __init__.py.
+[tool.hatch.build.targets.wheel]
+packages = ["mt5connector"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

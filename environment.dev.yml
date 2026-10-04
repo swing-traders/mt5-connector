@@ -1,0 +1,20 @@
+# Development tooling — layer on top of environment.yml (same env name):
+#   mamba env update -f environment.dev.yml
+
+name: mt5-connector
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - ruff>=0.15
+  - black>=26
+  - just>=1.30
+  - pytest>=9.0
+
+  - pip:
+      - pytest-asyncio
+      - pytest-mock
+      # The server, for its tests; its project declares the dependencies they import.
+      - -e packages/server
