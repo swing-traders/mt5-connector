@@ -18,7 +18,7 @@ This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](
 `mt5-connector` is a **data and execution adapter** that connects [NautilusTrader](https://nautilustrader.io) to any MetaTrader 5 broker. Write your strategy once in Python, then run it as a backtest against historical MT5 data  or flip a switch and run it live.
 
 ```
-MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
+MT5 server ←→ mt5-connector-client ←→ NautilusTrader
                               ↑
                     tick stream, order routing,
                     account state, reconciliation
@@ -33,7 +33,20 @@ MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
 - Automatic reconnection with exponential backoff
 - Works with any MT5 broker — Exness, IC Markets, Pepperstone, OANDA, and more
 
-> **Platform note:** The adapter talks only to the MT5 server — the MT5 terminal in a Docker container (see [Dockerized MT5 server](#dockerized-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package and runs on any platform. Backtesting with downloaded data works on any platform once the data has been collected.
+> **Platform note:** The adapter talks only to the MT5 server — `mt5-connector-server`, running beside the MT5 terminal (see [The MT5 server](#the-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package and runs on any platform. Backtesting with downloaded data works on any platform once the data has been collected.
+
+---
+
+## Distributions
+
+The repository ships two distributions, versioned together: one release builds both wheels onto one index.
+
+| Distribution | Import packages | Installs into | Carries |
+|---|---|---|---|
+| `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the remote backend, the history client and the downloader, and the wire vocabulary |
+| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the tick hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
+
+`mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
 
 ---
 
@@ -41,6 +54,7 @@ MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
 
 - [mt5-connector](#mt5-connector)
   - [What this is](#what-this-is)
+  - [Distributions](#distributions)
   - [Table of contents](#table-of-contents)
   - [Requirements](#requirements)
   - [Installation](#installation)
@@ -53,12 +67,8 @@ MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
     - [Step 2 — run the backtest](#step-2--run-the-backtest)
   - [Live trading](#live-trading)
     - [Bar types for live trading](#bar-types-for-live-trading)
-  - [Dockerized MT5 server](#dockerized-mt5-server)
-    - [What it is](#what-it-is)
-    - [Important Security Notice](#important-security-notice)
-    - [Requirements](#requirements-1)
-      - [Quick start](#quick-start-1)
-    - [Persistence](#persistence)
+  - [The MT5 server](#the-mt5-server)
+  - [Releases](#releases)
   - [Running the full test suite](#running-the-full-test-suite)
   - [Project structure](#project-structure)
   - [Broker compatibility](#broker-compatibility)
@@ -71,20 +81,26 @@ MT5 server (Docker) ←→ mt5-connector ←→ NautilusTrader
 ## Requirements
 
 - Python 3.11+
-- The MT5 server under `mt5server/` running in Docker on Linux (see [Dockerized MT5 server](#dockerized-mt5-server)); it runs the MetaTrader 5 terminal and logs it in to your broker account
+- An MT5 server (`mt5-connector-server`, see [The MT5 server](#the-mt5-server)) running beside a MetaTrader 5 terminal logged in to your broker account
 - An MT5 broker account (demo accounts work perfectly for development)
 
 ---
 
 ## Installation
 
-Releases are published as wheels on the fork's package index:
+Releases are published as wheels on the fork's package index. Install the adapter where NautilusTrader runs:
 
 ```bash
-pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector==0.4.0+st.1"
+pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-client==0.4.0+st.N"
 ```
 
-For development, create the environment with mamba and layer the dev tooling on top:
+and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
+
+```bash
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.4.0+st.N"
+```
+
+For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
 
 ```bash
 git clone https://github.com/swing-traders/mt5-connector
@@ -99,34 +115,19 @@ just test
 
 ## Quick start
 
-**1. Create a `.env` file** in your project root with your broker credentials:
+**1. Run an MT5 server.** The adapter talks to the MT5 terminal through `mt5-connector-server` — [its README](packages/server/mt5connector/server/README.md) states what the terminal and the server need. The server must be up, and the terminal's AutoTrading on, before you run any script; without AutoTrading every order is rejected.
 
-```bash
-# .env — never commit this file
-MT5_ACCOUNT=12345678
-MT5_PASSWORD=your_password
-MT5_SERVER=Exness-MT5Trial9
-MT5_SYMBOLS=EURUSDm,XAUUSDm
-MT5_SERVER_URL=http://127.0.0.1:5000
-```
-
-Find your server name in MT5 → File → Open Account → search your broker.
-
-**2. Start the MT5 server.** The adapter talks to the MT5 terminal in the server's container — see [Dockerized MT5 server](#dockerized-mt5-server). The server must be up before you run any script.
-
-**3. Enable AutoTrading** in the container's MT5 terminal (the button should show a green dot). Without this, order_send calls will be rejected.
-
-**4. Test the connection:**
+**2. Test the connection:**
 
 ```python
-from mt5connect import remote_mt5 as mt5
+from mt5connector.client import remote_mt5 as mt5
 
 mt5.configure("http://127.0.0.1:5000")
 info = mt5.account_info()
 print(info.currency, info.balance)
 ```
 
-**5. Run the example live strategy:**
+**3. Run the example live strategy.** The examples read `MT5_ACCOUNT`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_SYMBOLS` and `MT5_SERVER_URL` from the environment. Find your server name in MT5 → File → Open Account → search your broker.
 
 ```bash
 python examples/live_remote.py
@@ -139,7 +140,7 @@ python examples/live_remote.py
 All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL; a config without `server_url` is refused when it is built.
 
 ```python
-from mt5connect.config import MT5Config
+from mt5connector.client.config import MT5Config
 
 config = MT5Config(
     account    = 12345678,            # MT5 account number
@@ -182,15 +183,11 @@ config = MT5Config(
 )
 ```
 
-**Loading from `.env`** (recommended — never hardcode credentials):
+**Loading from the environment** (never hardcode credentials):
 
 ```python
 import os
-from pathlib import Path
-from dotenv import load_dotenv
-from mt5connect.config import MT5Config
-
-load_dotenv(Path(__file__).parent / ".env")
+from mt5connector.client.config import MT5Config
 
 config = MT5Config(
     account  = int(os.environ["MT5_ACCOUNT"]),
@@ -324,7 +321,7 @@ Backtesting requires two steps: download historical bar data from MT5, then run 
 python examples/download_historical_data.py
 ```
 
-This downloads H1 bars for the configured symbol through the MT5 server's [history routes](#history), so it runs against the MT5 server at `MT5_SERVER_URL` (`http://127.0.0.1:5000` by default), and writes them into a NautilusTrader Parquet catalog at `./catalog`.
+This downloads H1 bars for the configured symbol through the MT5 server's [history routes](packages/server/mt5connector/server/README.md#history), so it runs against the MT5 server at `MT5_SERVER_URL` (`http://127.0.0.1:5000` by default), and writes them into a NautilusTrader Parquet catalog at `./catalog`.
 
 The downloader walks back from `end`, one request per window, until `start` or the floor `/history/ranges` advertises for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
 
@@ -334,10 +331,10 @@ The downloader walks back from `end`, one request per window, until `start` or t
 You can customise the download by editing the script, or call the downloader directly:
 
 ```python
-from mt5connect.config import MT5Config
-from mt5connect.connection import MT5Connection
-from mt5connect.providers import MT5InstrumentProvider
-from mt5connect.downloader import MT5DataDownloader
+from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import MT5Connection
+from mt5connector.client.providers import MT5InstrumentProvider
+from mt5connector.client.downloader import MT5DataDownloader
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from datetime import datetime, timezone
 
@@ -467,17 +464,13 @@ Live trading uses NautilusTrader's `TradingNode` with the MT5 data and execution
 ```python
 import os, signal, sys
 from decimal import Decimal
-from pathlib import Path
-from dotenv import load_dotenv
 from nautilus_trader.live.node import TradingNode
-from mt5connect.config import MT5Config
-from mt5connect.factories import (
+from mt5connector.client.config import MT5Config
+from mt5connector.client.factories import (
     build_mt5_node_config,
     MT5LiveDataClientFactory,
     MT5LiveExecClientFactory,
 )
-
-load_dotenv(Path(__file__).parent / ".env")
 
 # 1. Configure MT5
 mt5_config = MT5Config(
@@ -556,225 +549,37 @@ Common examples:
 
 ---
 
-## Dockerized MT5 server
+## The MT5 server
 
-The adapter runs against a **Dockerized MT5 server**. The server container runs MT5 under Wine, exposes an HTTP API mirroring the `MetaTrader5` package (`mt5server/app`) plus a WebSocket tick hub, and runs a small MQL5 EA that publishes live ticks and the trade server's time. The adapter then works on any machine.
+The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries the ticks an EA inside the terminal publishes, and that EA's source. Its HTTP API, its history protocol, its hub and everything the image running it must provide are in [its README](packages/server/mt5connector/server/README.md).
 
 ```
-┌─ your bot (any OS) ────────────────┐      ┌─ MT5 server container ────────┐
-│  mt5-connector                     │      │  HTTP API    :5000             │
+┌─ your bot (any OS) ────────────────┐      ┌─ beside the MT5 terminal ──────┐
+│  mt5-connector-client              │      │  HTTP API    :5000             │
 │   └─ WSStreamClient                │──────│  WS tick hub :9000             │
-│      (subscribe/tick messages)     │      │  MT5 terminal (Wine)           │
+│      (subscribe/tick messages)     │      │  MT5 terminal                  │
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
-### What it is
+- `MT5Config` requires the server's `server_url` (HTTP) and derives its `ws_url` (WebSocket) on port 9000 unless one is given — see `packages/client/mt5connector/client/config.py`.
+- The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`, and streams ticks through `mt5connector.client.ws_stream`.
+- There is no authentication: the server trusts its network, so its ports stay on loopback and are never exposed to an untrusted one.
 
-- A required `server_url` (HTTP) on `MT5Config` and a derived `ws_url` (WebSocket) — see `mt5connect/config.py`.
-- The Docker image builds MT5 + Wine + the HTTP API + the WS hub in one container (`mt5server/Dockerfile`), with the EA provisioned automatically.
-- The adapter calls the server through the shim `mt5connect/remote_mt5.py`, which `MT5Connection.connect()` binds to `server_url`, and streams ticks through `mt5connect/ws_stream.py`.
+The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets the shim's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
 
-### HTTP API
-
-The server mirrors the `MetaTrader5` package (5.0.6231), so code written against `import MetaTrader5 as mt5` runs unchanged against `mt5connect.remote_mt5`. Both are generated from one inventory of the package, `mt5connect/mirror.py`.
-
-- `POST /mt5/<function>` for each of the package's 32 functions, its arguments a JSON object keyed by parameter name; datetimes travel as true-UTC epoch seconds.
-- A package call answers `{"ok": true, "result": ..., "last_error": [code, message]}` or `{"ok": false, "error": {"code": ..., "message": ...}, "last_error": [code, message]}`. `last_error` is the package's `last_error()` read right after the call; a failure's error is that same pair. Structs answer as objects in the package's field order, arrays as lists of objects keyed by the dtype's fields.
-- Every epoch is true UTC in both directions. The terminal keeps time on the broker's clock — a zone's wall time plus a fixed offset, New York plus seven hours by default — and the server converts by the era of each instant:
-  - every epoch field of an answer, `0` (no time) left as `0`, with bars still stamped at their open;
-  - every time window a client sends, and a trade request's `expiration`.
-- An epoch in the zone's repeated autumn hour reads as its first occurrence, and the server logs a warning naming the field. One in its skipped spring hour is a server error (HTTP 500).
-- Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, a time that is not an integer epoch, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
-- `POST /mt5/shutdown` is the one deliberate departure from the package: it answers `None` without calling the package's `shutdown()`. Every client shares the server's terminal session, and the adapter calls `shutdown()` whenever it disconnects, so passing it on would end the session for every client. `initialize` and `login` pass through unchanged.
-- `GET /health` answers the broker clock's latest verification — the relayed sample's chart `symbol`, its `trade_server` and `current` (last quote) times in true UTC, the terminal's own `gmt`, and the `skew_s` from the server's clock and the `offset_s` in effect — beside the server's load: the calls that can reach the terminal `in_flight` now, the `peak_in_flight` and the `refusals` since start, and its `workers`. While the clock is not verified it answers HTTP 503. It never calls the terminal: the server initialized it at start, and the EA's samples say whether it is connected to the trade server.
-- `POST /relay/server_time` takes the `server_time` frame the WS hub relays from the EA and answers `{"ok": true, "result": null}`. It accepts a frame from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the frame's exact shape with HTTP 400 and code -2.
-- `GET /commissions/<symbol>` answers the commission schedule the terminal's EA relayed for the symbol, or code -4 (`RES_E_NOT_FOUND`) while none has been relayed. No package call answers it, so its envelope carries no `last_error`.
-- `POST /history/bars` and `POST /history/ticks` answer a history window the server vouches for (see [History](#history)), and `GET /history/ranges?symbol=<symbol>` the floors it has measured.
-- While the broker clock is not verified, every route but `/health` and `/relay/server_time` answers HTTP 503 with `{"ok": false, "error": {"code": -1, "message": "the broker clock is not verified"}}` and calls nothing.
-- Package calls run one at a time; waitress serves the API with `MT5_API_THREADS` workers, one of them always kept free for `/health` and `/relay/server_time`.
-- Every route that can reach the terminal — `/mt5/<function>` and the three history routes — takes one of `MT5_API_THREADS − 1` slots. A call that finds every slot taken is refused at once, never queued on a worker: HTTP 503 with the failure envelope, code -20002 naming the route, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>`. Each refusal is logged as a warning. The clock check answers first, so while the clock is not verified such a call gets its 503 and takes no slot.
-
-The shim raises `ServerUnreachable` when the server cannot be reached or answers outside this contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets the shim's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
-
-The server reads its settings from the environment once at start, initializes the terminal with them, and exits when that fails:
-
-| Variable | Setting | Default |
-|---|---|---|
-| `MT5_TERMINAL_PATH` | the terminal executable, as Windows names it | set by the image |
-| `MT5_LOGIN` | account number | required |
-| `MT5_PASSWORD` | account password | required |
-| `MT5_SERVER` | trade server name | required |
-| `MT5_LOGIN_TIMEOUT_MS` | initialize timeout | `60000` |
-| `MT5_API_HOST` | bind address | `0.0.0.0` |
-| `MT5_API_PORT` | HTTP port | `5000` |
-| `MT5_API_THREADS` | waitress threads, one of them kept free for `/health` and the relay; at least 2 | `5` |
-| `MT5_CLOCK_CHECK_SECONDS` | interval between re-verifications of the broker's clock | `300` |
-| `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` | how long a relayed server-time sample stays fresh, and how long the terminal must stay connected before a sample verifies the clock | `30` |
-| `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long the server waits at start for the first sample that verifies the clock | `120` |
-| `MT5_BROKER_TZ` | the zone the broker's clock follows, as an IANA name | `America/New_York` |
-| `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
-| `MT5_HISTORY_RETRY_SECONDS` | the `Retry-After` of a history answer the terminal has not proven yet, and of a call refused with every slot taken: how long the client waits before asking again | `5` |
-| `MT5_FLOOR_TTL_SECONDS` | how long a measured history floor is used before it is measured again | `900` |
-
-Once the terminal is initialized, the server verifies the broker's clock against the trade server's time the EA relays through the WS hub, at any hour, market open or closed:
-
-- A sample is fresh while it is younger than `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` and says the terminal is connected to the trade server.
-- A fresh sample verifies the clock only once the terminal has been connected without a break for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, so a terminal back from downtime is not trusted while it re-fetches what it missed. A sample that says the terminal is disconnected, or a gap of `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` between two samples, starts the run again.
-- A fresh sample's trade-server time, converted to true UTC, must sit within 120 s of the server's clock, or the server exits with both times and the offset in its log. The terminal extrapolates the trade server's time from the clock it shares with the server, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the container's clock reads.
-- At start the server waits up to `MT5_CLOCK_BOOTSTRAP_SECONDS` for the first sample that verifies the clock, and exits when none arrives; the window includes the connected run, so with the defaults `/health` first answers 200 at least 30 s after the first connected sample. It then re-verifies the latest sample every `MT5_CLOCK_CHECK_SECONDS`.
-- The moment the latest sample no longer verifies the clock it is unverified, and stays so until a sample verifies it again. Each change is logged once.
-
-### History
-
-The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. The history routes answer a window only once the terminal's answers prove it, so a client never receives emptiness it cannot trust.
-
-- `POST /history/bars` takes `{"symbol", "timeframe", "start", "end"}`, the timeframe by its MT5 name from `M1` to `W1` (a month has no fixed period, so `MN1` is refused), and `start` and `end` the bars' opens in true-UTC epoch seconds, inclusive at both ends.
-- `POST /history/ticks` takes `{"symbol", "start", "end", "flags"}`: the ticks from the start of second `start` through the end of second `end`, true UTC, and `flags` the selection by its `COPY_TICKS_*` name — `ALL`, `INFO` or `TRADE`, `INFO` when absent.
-
-| HTTP | Answer | When |
-|---|---|---|
-| 200 | the mirror's envelope, its `result` the window's rows as the mirror answers them, bars stamped at their open | the terminal's answers prove the rows; an empty list is an answer like any other |
-| 503 | the failure envelope with code -20001, naming the symbol, the series and the window, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | the terminal's answers do not prove the window yet: ask again after the delay |
-| 503 | the failure envelope with code -20002, naming the route, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | every slot for a call that can reach the terminal is taken: ask again after the delay |
-| 400 | the failure envelope with code -2 | a body out of shape, or a window that starts after the terminal's current time: the trade-server time the EA last relayed, plus the time since it arrived |
-
-A 200 carries the failure envelope instead when the terminal cannot select the symbol, or when the rows it answers break the checks below.
-
-How the server proves a window, within the request and without waiting:
-
-- It selects the symbol and reads the terminal's `maxbars`. The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in the fewest equal spans within that.
-- A read the terminal answers with rows and a success `last_error` is proven: the rows are the answer. A read it fails, with no answer or with an error, is a 503.
-- A read that answers no rows is proven empty by any one of these facts, each read from the terminal, and is a 503 without one:
-  - **Before the floor**: the window lies wholly before the series' floor. A window that begins before the floor answers its rows from the floor on.
-  - **The live edge**: the window lies after the second of the symbol's last quote, read with `symbol_info_tick`. A last quote at time zero dates nothing, and a window holding the last quote's second is a 503: that quote is itself a record.
-  - **Bracketed**: the terminal has a row before the window and a record after it. Before it: for bars, the last bar the terminal answers as opened at or before the window's start (`copy_rates_from` for one bar); for ticks, the window's UTC day, then its UTC week. After it: the first bar in the span of one read from the window's end, or the first tick from its last second. An empty span of a long bar window between spans that answered rows is bracketed by them.
-- Every read asks the terminal to sync what it lacks, and a client's retry after a 503 reads the window again.
-- Every bar must lie on its timeframe's grid, or the answer fails with code -1 naming the row. In an answer that begins at the series' floor, a leading run of an intraday series spaced a whole number of days apart, ahead of its first two rows one period apart, is not that timeframe's data: it is dropped and the floor moves past it. An answer that begins anywhere else drops no such run. Ticks must not go back in time.
-- A cold read holds the terminal for as long as the package's own call takes. `/health` never waits on the terminal, so liveness does not see it.
-
-A series' floor is set by the stub — the one bar the terminal answers for a window before any plausible history; for ticks, the first tick from then — or by a coarse prefix at the series' start, at the first row past it. It is used for `MT5_FLOOR_TTL_SECONDS`, then measured again, and sooner when a window read from a kept floor answers no rows, since the terminal's own floor may have moved past it. A stub measured again never moves a floor the coarse prefix set back: it replaces it only with a later row.
-
-`GET /history/ranges?symbol=<symbol>` answers `{"maxbars", "ranges": {"<series>": {"floor", "measured_at", "generation"}}}`: every floor measured for the symbol since the server started, keyed by timeframe name and `ticks`, in true UTC with the time it was measured. A floor's `generation` steps each time its value changes.
-
-`mt5connect.history` calls these routes through the shim's session, with no read timeout:
+`mt5connector.client.history` calls the server's history routes through the shim's session, with no read timeout:
 
 - `bars()` and `ticks()` answer the rows as the package's arrays, and `ranges()` the advertised floors and `maxbars`.
 - On a 503 — the window not proven yet, or every slot taken — each waits its `Retry-After` and asks again, with no deadline of its own, until the server answers otherwise or the `cancel` event it was handed is set.
 - They answer `None` for a failure, a 400 among them, and for a cancellation, with `last_error()` set to the pair the server last answered.
 
-### WebSocket hub
+---
 
-The hub (`mt5server/app/ws_server.py`, port `WS_PORT`) carries these frames:
+## Releases
 
-| Frame | From | What the hub does |
-|---|---|---|
-| `{"type": "hello", "role": "ea"}` or `"role": "adapter"` | EA, adapter | records the connection's role |
-| a tick — `symbol`, `bid`, `ask`, `time_msec`, `flags` and more, as strings, with no `type` | EA | broadcasts it to every adapter when its bid or ask changed |
-| `{"v": 1, "type": "server_time", "symbol", "trade_server", "current", "gmt", "connected"}`, its epochs and `connected` (0 or 1) as integers | EA | POSTs it to the server's `/relay/server_time` on `127.0.0.1:MT5_API_PORT`, never to adapters, and logs a failed post |
-| `{"type": "subscribe", "symbols": [...]}` or `"unsubscribe"` | adapter | records the symbols |
-
-A frame the hub cannot handle closes its connection with a logged warning. The EA sends `server_time` every `RelaySeconds` (5 in the chart template), the terminal's `TimeTradeServer()`, `TimeCurrent()` and `TimeGMT()` with `TERMINAL_CONNECTED`, and reconnects to the hub on the same timer, so both go on while the market is closed. The EA answers the hub's keepalive pings each time it ticks or its timer fires.
-
-### Important Security Notice
-
-There is no authentication in the dockerized server. It is intended to be used on the
-same machine only for now. Never expose ports to an insecure network. 
-
-### Requirements
-
-- Docker on the host.
-
-#### Quick start
-
-***1 . Build and start Container***
-
-With docker compose: 
-
-```bash
-# 0. create an environment file 
-cp .env.example .env   # set MT5_ACCOUNT / MT5_PASSWORD / MT5_SERVER
-
-# 1. Build + start the server (the build context is the repo root; MT5_ACCOUNT becomes MT5_LOGIN)
-source .env
-# environment variables need to be exported in order to be picked up by docker compose
-export MT5_ACCOUNT
-export MT5_PASSWORD
-export MT5_SERVER
-export MT5_SYMBOLS
-cd mt5server && docker compose up --build -d
-``` 
-
-Without docker compose
-
-Without docker-compose, build/run directly:
-
-```bash
-cd mt5server 
-docker build -t mt5-server -f Dockerfile ..
-source ../.env
-docker run -d --name mt5-server \
-  -p 127.0.0.1:5000:5000 -p 127.0.0.1:9000:9000 -p 127.0.0.1:3001:3001 \
-  -e MT5_SYMBOLS="${MT5_SYMBOLS}" \
-  -e MT5_SERVER="${MT5_SERVER}" \
-  -e MT5_PASSWORD="${MT5_PASSWORD}" \
-  -e MT5_LOGIN="${MT5_ACCOUNT}" \
-  mt5-server
-```
-
-***2. Wait until container is up***
-
-```bash
-
-# 2. Metatrader 5 ist installed and started in a docker container. Give it 1-2 minutes to start
-# if you want to track the installation progress run:
-docker exec -it  mt5server-mt5server-1 tail -f /var/log/mt5_setup.log
-
-# if you need to see the metatrader ui open https://localhost:3001 in a browser
-```
-
-***3. Run the live tick example***
-```bash
-# 3. in a new terminal
-source .env
-source .venv/bin/activate
-python examples/live_remote.py
-```
-If everythng works correctly you shoud see ticks streming in after a few seconds like this:
-
-```
-2026-08-19T12:20:07.454036271Z [INFO] TRADER-001.Portfolio: Updated AccountState(account_id=MT5-00000000, account_type=MARGIN, base_currency=None, is_reported=True, balances=[AccountBalance(total=9_999.93 USD, locked=0.00 USD, free=9_999.93 USD)], margins=[], event_id=c24fbca4-15bb-4105-9eaa-4ebaa3bfb873)
-2026-08-19T12:20:07.613214977Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.34 ask=4368.46 @ 1787152807592000000
-2026-08-19T12:20:07.633962622Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.37 ask=4368.49 @ 1787152807612000000
-2026-08-19T12:20:07.685732285Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.37 ask=4368.47 @ 1787152807664000000
-2026-08-19T12:20:07.697749223Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.25 ask=4368.37 @ 1787152807675000000
-2026-08-19T12:20:07.710776389Z [INFO] TRADER-001.TickPrintStrategy: EURUSDp.MT5 bid=1.16074 ask=1.16075 @ 1787152807684000000
-2026-08-19T12:20:07.725422727Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.34 ask=4368.46 @ 1787152807704000000
-2026-08-19T12:20:07.732231519Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.34 ask=4368.43 @ 1787152807713000000
-2026-08-19T12:20:07.746709404Z [INFO] TRADER-001.TickPrintStrategy: XAUUSDp.MT5 bid=4368.31 ask=4368.43 @ 1787152807723000000
-2026-08-19T12:20:07.767988612Z [INFO] TRADER-001.TickPrintStrategy: EURUSDp.MT5 bid=1.16075 ask=1.16076 @ 1787152807745000000
-
-```
-
-
-**Tick streaming setup**
-
-Ticks streamking is set up automatically for every symbol in the environment
-variable  `MT5_SYMBOLS`.
-
-**Security note**
-
-For now the server *does not provide any authentication and authorization*. That means it should be only used  locally
-and never be exposed over an insecure network, as this will *expose the api and your account* to every one who has access
-to the network. On public machines this is the whole internet. 
-
-Account credentials live only in your local gitignored `.env`. They are passed to the container via environment variables, used during setup and by the server's `initialize()` at start, and never baked into the Docker image. The shim's `login()` reaches the server as `POST /mt5/login`. The server's `config/` directory (Wine prefix) is a mounted volume owned by the container.
-
-### Persistence
-
-The dockerized metatrader instance is configured at startup automatically and not intended to be used via the regular matatrader GUI.
-Therefor it has no volumes for persisting configuration configured. If you need to persist data between container instances, you need
-to mount a volume to the containers `/config` path. For example by additonally passing `-v $PWD/config:/config` to the docker command
-line, or change the `docker-compose.yaml` file accordingly. 
+- `VERSION` holds the one version both distributions carry, `0.4.0+st.N`.
+- A `v0.4.0+st.N` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, attaches all four files to one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
+- Consumers pin a release exactly, by its full local version, from that index; PyPI can never satisfy a `+st` version, so the pin proves provenance.
 
 ---
 
@@ -787,18 +592,10 @@ just test
 All tests mock the MT5 terminal — no live connection required to run tests.
 
 ```
-tests/test_connection.py   — MT5Connection lifecycle, reconnect logic
-tests/test_data.py         — MT5DataClient subscriptions and history requests
-tests/test_data_ws.py      — MT5DataClient's WebSocket tick stream
-tests/test_execution.py    — order identity and the submit, modify and cancel boundary
-tests/test_execution_events.py  — the ticket index, the deal stream, ended orders, the account and the poll loop
-tests/test_execution_reports.py — the order, fill and position reports for reconciliation
-tests/test_factories.py    — factory wiring and node config
-tests/test_parsing.py      — symbol info → NautilusTrader instrument conversion
-tests/test_providers.py    — MT5InstrumentProvider loading
-tests/test_remote_mt5.py   — the shim's transport and failure classes
+tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the shim, the history client and the downloader
 tests/server/              — the server's routes, lifecycle, WS hub and history protocol, and the shim through them
 tests/conformance/         — the inventory against the pinned MetaTrader5 wheel
+tests/test_distributions.py — the two distributions' shared version and the import boundary between them
 ```
 
 The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`.
@@ -809,29 +606,46 @@ The conformance suite's static tier downloads the pinned `MetaTrader5` wheel onc
 
 ```
 mt5-connector/
-├── mt5connect/
-│   ├── commissions.py   # the relayed commission rule and the taker fee it implies
-│   ├── config.py        # MT5Config — all user-facing configuration
-│   ├── connection.py    # MT5Connection — server connection lifecycle
-│   ├── constants.py     # venue, polling and reconnect defaults
-│   ├── currencies.py    # the precision ladder a venue currency code is built by
-│   ├── data.py          # MT5DataClient — WebSocket tick stream and history requests
-│   ├── downloader.py    # MT5DataDownloader — historical bar download
-│   ├── errors.py        # custom exceptions
-│   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
-│   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
-│   ├── history.py       # the server's history routes, as a client
-│   ├── history_wire.py  # the history routes' paths, series and answer states
-│   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
-│   └── providers.py     # MT5InstrumentProvider
-├── tests/               # full test suite (no live MT5 required)
-├── examples/
-│   ├── live_simple_strategy.py       # full live trading example
-│   ├── backtest_eurusd.py            # SMA crossover backtest
-│   ├── download_historical_data.py   # download bars from MT5
-│   └── test_place_order.py           # verify execution path end-to-end
-├── .env.example         # credential template — copy to .env and fill in
-└── pyproject.toml
+├── VERSION                       # the one version both distributions carry
+├── packages/
+│   ├── client/                   # mt5-connector-client
+│   │   ├── pyproject.toml
+│   │   └── mt5connector/
+│   │       ├── client/
+│   │       │   ├── commissions.py   # the relayed commission rule and the taker fee it implies
+│   │       │   ├── config.py        # MT5Config — all user-facing configuration
+│   │       │   ├── connection.py    # MT5Connection — server connection lifecycle
+│   │       │   ├── constants.py     # venue, polling and reconnect defaults
+│   │       │   ├── currencies.py    # the precision ladder a venue currency code is built by
+│   │       │   ├── data.py          # MT5DataClient — WebSocket tick stream and history requests
+│   │       │   ├── downloader.py    # MT5DataDownloader — historical bar download
+│   │       │   ├── errors.py        # custom exceptions
+│   │       │   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
+│   │       │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
+│   │       │   ├── history.py       # the server's history routes, as a client
+│   │       │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
+│   │       │   ├── providers.py     # MT5InstrumentProvider
+│   │       │   ├── remote_mt5.py    # the HTTP shim generated from the inventory
+│   │       │   └── ws_stream.py     # the WebSocket tick client
+│   │       └── wire/
+│   │           ├── mirror.py        # the inventory of the pinned MetaTrader5 package
+│   │           ├── broker_clock.py  # broker wall-clock time ↔ true UTC
+│   │           └── history_wire.py  # the history routes' paths, series and answer states
+│   └── server/                   # mt5-connector-server
+│       ├── pyproject.toml
+│       └── mt5connector/
+│           └── server/
+│               ├── README.md        # the server's API and what its image must provide
+│               ├── app.py           # the HTTP server (mt5-connector-server)
+│               ├── ws_server.py     # the tick hub (mt5-connector-hub)
+│               ├── wire -> ../../../client/mt5connector/wire
+│               └── mql5/            # the EA, its startup script and their includes
+├── tests/                        # full test suite (no live MT5 required)
+└── examples/
+    ├── live_remote.py               # stream live ticks through the server
+    ├── backtest_eurusd.py           # SMA crossover backtest
+    ├── download_historical_data.py  # download bars from MT5
+    └── test_place_order.py          # verify execution path end-to-end
 ```
 
 ---
@@ -856,7 +670,7 @@ Find your exact server name in MT5 → File → Open Account → search your bro
 
 **`mt5.initialize() failed — error -6: Terminal: Authorization failed`**
 
-The server's MT5 terminal is not running, or is not logged in. Check the container's log and its terminal UI (see [Dockerized MT5 server](#dockerized-mt5-server)), wait for the green connection indicator in the terminal's bottom-right corner, then run the script again.
+The server's MT5 terminal is not running, or is not logged in. Check the server's log and its terminal (see [The MT5 server](#the-mt5-server)), wait for the green connection indicator in the terminal's bottom-right corner, then run the script again.
 
 **`mt5.login() failed — error -6: Terminal: Authorization failed`**
 

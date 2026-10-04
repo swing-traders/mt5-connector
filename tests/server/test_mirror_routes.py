@@ -13,7 +13,7 @@ from mirror_samples import (
     result_sample,
 )
 
-from mt5connect import mirror
+from mt5connector.server.wire import mirror
 
 FUNCTIONS = list(mirror.FUNCTIONS.values())
 WITH_REQUIRED = [
@@ -89,7 +89,7 @@ def test_failure_carries_its_error_as_the_last_error(client, stub):
 
 
 def test_shutdown_answers_without_ending_the_servers_session(client, stub, caplog):
-    caplog.set_level(logging.INFO, logger="mt5server.app.app")
+    caplog.set_level(logging.INFO, logger="mt5connector.server.app")
     response = client.post("/mt5/shutdown", environ_base={"REMOTE_ADDR": "10.0.0.7"})
     assert response.json == {"ok": True, "result": None, "last_error": [1, "Success"]}
     stub.shutdown.assert_not_called()

@@ -21,8 +21,8 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.strategy import Strategy
 
-from mt5connect.config import MT5Config
-from mt5connect.factories import (
+from mt5connector.client.config import MT5Config
+from mt5connector.client.factories import (
     MT5LiveDataClientFactory,
     MT5LiveExecClientFactory,
     build_mt5_node_config,

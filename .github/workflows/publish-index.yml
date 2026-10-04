@@ -1,6 +1,7 @@
 # Publishes a PEP 503 simple index on GitHub Pages, regenerated from the repo's releases.
 # Wheels stay as release assets; the index links to them with #sha256= fragments taken
-# from each wheel's published .sha256 sibling, so pip verifies what it downloads.
+# from each wheel's published .sha256 sibling, so pip verifies what it downloads. Each
+# wheel is listed on the page of the project its filename names.
 # Called from the release workflow only: the index derives from releases alone, and an
 # independent branch-push publish races the release's own deployment. Re-run the last
 # run to republish after infrastructure-only changes.
@@ -28,28 +29,36 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mkdir -p site/simple/mt5-connector
-          entries=""
+          declare -A entries
           while IFS=$'\t' read -r name url; do
             case "$name" in
               *.whl)
+                # A wheel's filename starts with its distribution name; PEP 503 normalizes it
+                # into the project's page name.
+                project=$(printf '%s' "${name%%-*}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g')
                 sha_url="${url}.sha256"
                 sha=$(curl -sfL "$sha_url" | awk '{print $1}') || sha=""
                 if [[ -n "$sha" ]]; then
-                  entries+="    <a href=\"${url}#sha256=${sha}\">${name}</a><br/>\n"
+                  entries[$project]+="    <a href=\"${url}#sha256=${sha}\">${name}</a><br/>\n"
                 else
-                  entries+="    <a href=\"${url}\">${name}</a><br/>\n"
+                  entries[$project]+="    <a href=\"${url}\">${name}</a><br/>\n"
                 fi
                 ;;
             esac
           done < <(gh api "repos/${REPO}/releases" --paginate \
                      -q '.[].assets[] | [.name, .browser_download_url] | @tsv')
-          printf '<!DOCTYPE html>\n<html><head><title>mt5-connector</title></head><body>\n' > site/simple/mt5-connector/index.html
-          printf "%b" "$entries" >> site/simple/mt5-connector/index.html
-          printf '</body></html>\n' >> site/simple/mt5-connector/index.html
-          printf '<!DOCTYPE html>\n<html><body><a href="mt5-connector/">mt5-connector</a></body></html>\n' > site/simple/index.html
+          mkdir -p site/simple
+          projects=""
+          for project in $(printf '%s\n' "${!entries[@]}" | sort); do
+            mkdir -p "site/simple/${project}"
+            printf '<!DOCTYPE html>\n<html><head><title>%s</title></head><body>\n' "$project" > "site/simple/${project}/index.html"
+            printf "%b" "${entries[$project]}" >> "site/simple/${project}/index.html"
+            printf '</body></html>\n' >> "site/simple/${project}/index.html"
+            projects+="<a href=\"${project}/\">${project}</a><br/>\n"
+            cat "site/simple/${project}/index.html"
+          done
+          printf '<!DOCTYPE html>\n<html><body>\n%b</body></html>\n' "$projects" > site/simple/index.html
           printf '<!DOCTYPE html>\n<html><body><a href="simple/">simple index</a></body></html>\n' > site/index.html
-          cat site/simple/mt5-connector/index.html
 
       - uses: actions/upload-pages-artifact@v3
         with:

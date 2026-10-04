@@ -7,9 +7,9 @@ import time
 import pytest
 from mirror_samples import CLOCK
 
-from mt5server.app.app import create_app
-from mt5server.app.clock_check import ClockCheck
-from mt5server.app.server_time import ServerTimeSample, ServerTimeSink
+from mt5connector.server.app import create_app
+from mt5connector.server.clock_check import ClockCheck
+from mt5connector.server.server_time import ServerTimeSample, ServerTimeSink
 
 FRAME = {
     "v": 1,

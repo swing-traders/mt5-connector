@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from mirror_samples import PACKAGE_TYPES, array_sample, struct_sample
 
-from mt5connect import mirror
+from mt5connector.server.wire import mirror
 
 EPOCH_NAME = re.compile(r"^(time|.*_time|.*time_msc|time_.*|expiration.*|start_time|.*_msc)$")
 # Fields named like epochs that hold none: ENUM_ORDER_TYPE_TIME values and SYMBOL_EXPIRATION_MODE
@@ -297,7 +297,7 @@ def test_the_repeated_hour_answers_its_first_occurrence_with_one_warning(client,
     ticks["time"] = [broker, broker + 1, broker + 2]
     ticks["time_msc"] = [broker * 1000, (broker + 1) * 1000, (broker + 2) * 1000]
     stub.copy_ticks_range.return_value = ticks
-    caplog.set_level(logging.WARNING, logger="mt5server.app.encoding")
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.encoding")
 
     response = client.post(
         "/mt5/copy_ticks_range",

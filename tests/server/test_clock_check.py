@@ -12,10 +12,10 @@ from dataclasses import dataclass
 import pytest
 from mirror_samples import CLOCK
 
-from mt5server.app.app import create_app
-from mt5server.app.clock_check import ClockCheck
-from mt5server.app.history import FloorStore, History
-from mt5server.app.server_time import Received, ServerTimeSample, ServerTimeSink
+from mt5connector.server.app import create_app
+from mt5connector.server.clock_check import ClockCheck
+from mt5connector.server.history import FloorStore, History
+from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
 
 BROKER_EPOCH = 1_752_580_800
 UTC_EPOCH = 1_752_570_000
@@ -108,7 +108,7 @@ def exits(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def check_logs(caplog):
-    caplog.set_level(logging.INFO, logger="mt5server.app.clock_check")
+    caplog.set_level(logging.INFO, logger="mt5connector.server.clock_check")
 
 
 def clock_check(timeline: Timeline) -> ClockCheck:

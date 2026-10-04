@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pytest
 
-from mt5connect import mirror
+from mt5connector.wire import mirror
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("MT5_LIVE_CONFORMANCE") != "1", reason="MT5_LIVE_CONFORMANCE is not 1"

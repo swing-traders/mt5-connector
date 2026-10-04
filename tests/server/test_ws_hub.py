@@ -7,8 +7,8 @@ import pytest
 import websockets
 from websockets.asyncio.server import serve
 
-from mt5server.app.server_time import ServerTimeSample
-from mt5server.app.ws_server import TickHub, post_to
+from mt5connector.server.server_time import ServerTimeSample
+from mt5connector.server.ws_server import TickHub, post_to
 
 SERVER_TIME = {
     "v": 1,
@@ -165,7 +165,7 @@ async def test_server_time_from_a_connection_that_is_not_an_ea_is_not_relayed():
 
 @pytest.mark.asyncio
 async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on(caplog):
-    caplog.set_level(logging.WARNING, logger="mt5server.app.ws_server")
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     hub, server, port, _ = await _run_hub()
     broken = await _connect(port, "ea")
     ea = await _connect(port, "ea")
@@ -202,7 +202,7 @@ def test_the_relay_posts_a_frame_to_the_server_over_loopback(served, server_time
 
 
 def test_a_refused_post_is_logged_and_not_raised(served, server_times, caplog):
-    caplog.set_level(logging.WARNING, logger="mt5server.app.ws_server")
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
 
     post_to(f"{served}/relay/server_time")(SERVER_TIME | {"v": 2})
 
@@ -213,7 +213,7 @@ def test_a_refused_post_is_logged_and_not_raised(served, server_times, caplog):
 
 
 def test_an_unreachable_server_is_logged_and_not_raised(caplog):
-    caplog.set_level(logging.WARNING, logger="mt5server.app.ws_server")
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]

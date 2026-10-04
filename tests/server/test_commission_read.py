@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from mt5connect.errors import ServerUnreachable
-from mt5server.app.commissions import CommissionRule, CommissionSchedule, CommissionTier
+from mt5connector.client.errors import ServerUnreachable
+from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
 
 SCHEDULE = CommissionSchedule(
     ret=1,

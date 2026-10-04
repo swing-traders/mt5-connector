@@ -18,15 +18,15 @@ from mirror_samples import CLOCK, struct_sample
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from saturation import Held, counters, until
 
-import mt5connect.history as history_client
-import mt5connect.history_wire as wire
-from mt5connect import mirror
-from mt5connect.downloader import MT5DataDownloader
-from mt5connect.errors import ServerUnreachable
-from mt5connect.history_wire import Series
-from mt5server.app import history as history_module
-from mt5server.app.history import FloorOrigin
-from mt5server.app.server_time import ServerTimeSample, ServerTimeSink
+import mt5connector.client.history as history_client
+import mt5connector.wire.history_wire as wire
+from mt5connector.client.downloader import MT5DataDownloader
+from mt5connector.client.errors import ServerUnreachable
+from mt5connector.server import history as history_module
+from mt5connector.server.history import FloorOrigin
+from mt5connector.server.server_time import ServerTimeSample, ServerTimeSink
+from mt5connector.server.wire import mirror
+from mt5connector.server.wire.history_wire import Series
 
 RATES = np.dtype(list(mirror.RATES.dtype))
 TICKS = np.dtype(list(mirror.TICKS.dtype))
@@ -1132,7 +1132,7 @@ def test_the_client_answers_a_window_in_the_packages_types(remote, stub, floors)
     stub.rates[H1] = rates(floor, floor + HOUR)
     kept(floors, Series.H1, floor)
 
-    answered = history_client.bars("EURUSD", Series.H1, floor - DAY - EDT, floor + HOUR - EDT)
+    answered = history_client.bars("EURUSD", wire.Series.H1, floor - DAY - EDT, floor + HOUR - EDT)
 
     assert answered.dtype == RATES
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
@@ -1140,8 +1140,8 @@ def test_the_client_answers_a_window_in_the_packages_types(remote, stub, floors)
     assert ranges == history_client.HistoryRanges(
         maxbars=100_000,
         series={
-            Series.H1: history_client.SeriesRange(
-                floor - EDT, ranges.series[Series.H1].measured_at, 1
+            wire.Series.H1: history_client.SeriesRange(
+                floor - EDT, ranges.series[wire.Series.H1].measured_at, 1
             )
         },
     )
@@ -1169,7 +1169,7 @@ def test_the_client_waits_past_the_mirrors_read_timeout(remote, stub, floors, mo
     kept(floors, Series.H1, floor)
     stub.delay_s = 0.3
 
-    answered = history_client.bars("EURUSD", Series.H1, floor - EDT, floor - EDT)
+    answered = history_client.bars("EURUSD", wire.Series.H1, floor - EDT, floor - EDT)
 
     assert len(answered) == 1
 
@@ -1184,7 +1184,7 @@ def test_the_client_asks_again_after_each_syncing_answers_retry_after_until_the_
     kept(floors, Series.H1, floor)
     stub.syncing = lambda: len(stub.windows("symbol_select")) <= 2
 
-    answered = history_client.bars("EURUSD", Series.H1, floor - EDT, floor + HOUR - EDT)
+    answered = history_client.bars("EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT)
 
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
     assert len(stub.windows("symbol_select")) == 3
@@ -1200,7 +1200,9 @@ def test_a_cancellation_between_retries_stops_the_client(remote, stub, floors):
     answered = []
     request = threading.Thread(
         target=lambda: answered.append(
-            history_client.bars("EURUSD", Series.H1, floor - EDT, floor + HOUR - EDT, cancel=cancel)
+            history_client.bars(
+                "EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT, cancel=cancel
+            )
         )
     )
 
@@ -1258,7 +1260,7 @@ def test_the_client_asks_a_window_again_after_a_busy_answers_retry_after(
     asked = asked_routes(remote, monkeypatch)
     slept = releasing_sleep(cold_reads, monkeypatch)
 
-    answered = history_client.bars("EURUSD", Series.H1, floor - EDT, floor + HOUR - EDT)
+    answered = history_client.bars("EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT)
 
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
     assert asked == ["/history/bars", "/history/bars"]
@@ -1285,7 +1287,7 @@ def test_the_client_asks_the_ranges_again_after_a_busy_answers_retry_after(
     answered = history_client.ranges("EURUSD")
 
     assert answered.maxbars == 100_000
-    assert set(answered.series) == {Series.H1}
+    assert set(answered.series) == {wire.Series.H1}
     assert asked == ["/history/ranges", "/history/ranges"]
     assert slept == [5.0]
     assert counters(served)["refusals"] == 1
@@ -1297,7 +1299,7 @@ def test_the_client_asks_the_ranges_again_after_a_busy_answers_retry_after(
         (
             "/history/bars",
             lambda cancel: history_client.bars(
-                "EURUSD", Series.H1, 1_752_570_000, 1_752_573_600, cancel=cancel
+                "EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600, cancel=cancel
             ),
         ),
         ("/history/ranges", lambda cancel: history_client.ranges("EURUSD", cancel=cancel)),
@@ -1354,6 +1356,6 @@ def test_the_client_raises_server_unreachable_while_the_server_is_not_ready(
         ServerUnreachable,
         match="^history/bars: server not ready — the broker clock is not verified$",
     ):
-        history_client.bars("EURUSD", Series.H1, 1_752_570_000, 1_752_573_600)
+        history_client.bars("EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600)
     with pytest.raises(ServerUnreachable, match="^history/ranges: server not ready"):
         history_client.ranges("EURUSD")

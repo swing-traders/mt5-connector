@@ -16,11 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # environment.yml installs packages/client editable; environment.dev.yml packages/server.
       - uses: mamba-org/setup-micromamba@v2
         with:
           environment-file: environment.yml
 
-      - name: Layer the dev tooling
+      - name: Layer the dev tooling and the server
         run: micromamba env update -n mt5-connector -f environment.dev.yml --yes
 
       - name: Lint (black --check + ruff)

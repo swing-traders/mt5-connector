@@ -16,10 +16,10 @@ from dotenv import load_dotenv
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
-from mt5connect.config import MT5Config
-from mt5connect.connection import MT5Connection
-from mt5connect.downloader import MT5DataDownloader
-from mt5connect.providers import MT5InstrumentProvider
+from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import MT5Connection
+from mt5connector.client.downloader import MT5DataDownloader
+from mt5connector.client.providers import MT5InstrumentProvider
 
 # Load credentials from .env in the project root
 load_dotenv(Path(__file__).parent.parent / ".env")

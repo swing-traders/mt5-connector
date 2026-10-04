@@ -5,11 +5,11 @@ from zoneinfo import ZoneInfo
 import pytest
 from mirror_samples import CLOCK
 
-from mt5server.app.app import TerminalStartError, connect_terminal, create_app
-from mt5server.app.commissions import CommissionRule, CommissionSchedule, CommissionTier
-from mt5server.app.history import FloorStore, History
-from mt5server.app.settings import Settings, SettingsError, read_settings
-from mt5server.app.terminal import Terminal
+from mt5connector.server.app import TerminalStartError, connect_terminal, create_app
+from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
+from mt5connector.server.history import FloorStore, History
+from mt5connector.server.settings import Settings, SettingsError, read_settings
+from mt5connector.server.terminal import Terminal
 
 ENVIRONMENT = {
     "MT5_TERMINAL_PATH": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",

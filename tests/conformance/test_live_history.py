@@ -14,11 +14,11 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pytest
 
-from mt5connect import mirror
-from mt5connect.broker_clock import BrokerClock
-from mt5connect.history_wire import Series, TickFlags
-from mt5server.app.history import FloorStore, History, Syncing
-from mt5server.app.terminal import Answered, Failed, Terminal
+from mt5connector.server.history import FloorStore, History, Syncing
+from mt5connector.server.terminal import Answered, Failed, Terminal
+from mt5connector.server.wire import mirror
+from mt5connector.server.wire.broker_clock import BrokerClock
+from mt5connector.server.wire.history_wire import Series, TickFlags
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("MT5_LIVE_CONFORMANCE") != "1", reason="MT5_LIVE_CONFORMANCE is not 1"

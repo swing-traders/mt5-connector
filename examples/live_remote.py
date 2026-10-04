@@ -1,23 +1,21 @@
 """
 examples/live_remote.py
 
-Connect to the MT5 server (the Dockerized MT5 terminal) and stream live
-ticks for the configured symbols.
+Connect to the MT5 server and stream live ticks for the configured symbols.
 
     python examples/live_remote.py
 
 Requirements
 ------------
-- The MT5 server container from ``mt5server/`` is running (see README →
-  "Dockerized MT5 server"), and the container's MT5 terminal has been
-  logged into a broker once (via the desktop on port 3000).
+- An MT5 server (mt5-connector-server, see packages/server/mt5connector/server/README.md) is
+  running, its terminal logged in to a broker.
 - A local ``.env`` with:
       MT5_ACCOUNT=12345678
       MT5_PASSWORD=your_password
       MT5_SERVER=YourBroker-Demo
       MT5_SYMBOLS=EURUSD,GBPUSD
       MT5_SERVER_URL=http://localhost:5000
-- The adapter installed in this venv:  pip install -e .
+- The adapter installed in this env:  pip install -e packages/client
 """
 
 import os
@@ -33,8 +31,8 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from mt5connect.config import MT5Config
-from mt5connect.factories import (
+from mt5connector.client.config import MT5Config
+from mt5connector.client.factories import (
     MT5LiveDataClientFactory,
     MT5LiveExecClientFactory,
     build_mt5_node_config,

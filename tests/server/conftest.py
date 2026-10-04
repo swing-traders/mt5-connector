@@ -5,13 +5,13 @@ import pytest
 import waitress
 from mirror_samples import CLOCK
 
-import mt5connect.remote_mt5 as shim
-from mt5server.app.app import create_app
-from mt5server.app.clock_check import ClockStatus, ClockVerification
-from mt5server.app.commissions import CommissionStore
-from mt5server.app.history import FloorStore, History
-from mt5server.app.server_time import ServerTimeSink
-from mt5server.app.terminal import Terminal
+import mt5connector.client.remote_mt5 as shim
+from mt5connector.server.app import create_app
+from mt5connector.server.clock_check import ClockStatus, ClockVerification
+from mt5connector.server.commissions import CommissionStore
+from mt5connector.server.history import FloorStore, History
+from mt5connector.server.server_time import ServerTimeSink
+from mt5connector.server.terminal import Terminal
 
 
 @pytest.fixture

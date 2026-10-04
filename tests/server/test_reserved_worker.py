@@ -9,8 +9,8 @@ import pytest
 import requests
 from saturation import COUNTERS, Held, counters
 
-from mt5connect.errors import MT5ConnectionError, ServerBusy, ServerUnreachable
-from mt5connect.history_wire import ServerCode
+from mt5connector.client.errors import MT5ConnectionError, ServerBusy, ServerUnreachable
+from mt5connector.wire.history_wire import ServerCode
 
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
 FRAME = {
@@ -90,7 +90,7 @@ def test_a_call_past_the_cap_is_refused_at_once_while_health_and_the_relay_answe
 def test_each_refusal_logs_one_warning_naming_its_route_and_the_calls_in_flight(
     served, stub, held, caplog
 ):
-    caplog.set_level(logging.WARNING, logger="mt5server.app.app")
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.app")
     held.take(2, "/mt5/positions_total")
 
     requests.post(f"{served}/mt5/orders_total", timeout=1)
@@ -99,7 +99,7 @@ def test_each_refusal_logs_one_warning_naming_its_route_and_the_calls_in_flight(
     assert [
         (record.levelno, record.getMessage())
         for record in caplog.records
-        if record.name == "mt5server.app.app"
+        if record.name == "mt5connector.server.app"
     ] == [
         (logging.WARNING, "/mt5/orders_total refused: 2 calls to the terminal in flight"),
         (logging.WARNING, "/history/ranges refused: 2 calls to the terminal in flight"),

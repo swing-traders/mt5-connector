@@ -23,8 +23,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from nautilus_trader.model.identifiers import TraderId
 
-from mt5connect import remote_mt5 as mt5
-from mt5connect.execution import magic_for
+from mt5connector.client import remote_mt5 as mt5
+from mt5connector.client.execution import magic_for
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 

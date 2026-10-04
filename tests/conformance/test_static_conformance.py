@@ -6,8 +6,8 @@ import inspect
 import pytest
 from mt5_wheel import METH_KEYWORDS, METH_NOARGS, METH_VARARGS
 
-import mt5connect.remote_mt5 as shim
-from mt5connect import mirror
+import mt5connector.client.remote_mt5 as shim
+from mt5connector.wire import mirror
 
 # The package's functions as the MQL5 reference indexes them.
 DOCUMENTED_FUNCTIONS = {

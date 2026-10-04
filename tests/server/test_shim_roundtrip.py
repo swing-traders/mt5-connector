@@ -16,8 +16,8 @@ from mirror_samples import (
     struct_sample,
 )
 
-from mt5connect import mirror
-from mt5connect.errors import ServerUnreachable
+from mt5connector.client.errors import ServerUnreachable
+from mt5connector.server.wire import mirror
 
 FUNCTIONS = [
     function

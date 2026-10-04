@@ -29,11 +29,11 @@ from dotenv import load_dotenv
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
-import mt5connect.remote_mt5 as mt5
-from mt5connect.config import MT5Config
-from mt5connect.connection import MT5Connection
-from mt5connect.downloader import MT5DataDownloader
-from mt5connect.providers import MT5InstrumentProvider
+import mt5connector.client.remote_mt5 as mt5
+from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import MT5Connection
+from mt5connector.client.downloader import MT5DataDownloader
+from mt5connector.client.providers import MT5InstrumentProvider
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD CREDENTIALS

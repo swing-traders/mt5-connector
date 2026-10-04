@@ -25,4 +25,4 @@ dependencies:
       - python-dotenv>=1.0
       - requests>=2.32
       - urllib3>=2
-      - -e .
+      - -e packages/client

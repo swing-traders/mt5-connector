@@ -1,63 +1,11 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[project]
-name = "mt5-connector"
-version = "0.4.0+st.1"
-description = "NautilusTrader adapter for MetaTrader 5 — live trading and backtesting on any MT5 broker"
-readme = "README.md"
-license = { file = "LICENSE" }
-requires-python = ">=3.11"
-authors = [
-    { name = "mt5-connector contributors" },
-]
-keywords = [
-    "algorithmic-trading",
-    "metatrader5",
-    "mt5",
-    "forex",
-    "nautilus-trader",
-    "backtesting",
-    "live-trading",
-    "exness",
-]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Financial and Insurance Industry",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Office/Business :: Financial",
-    "Topic :: Office/Business :: Financial :: Investment",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-]
-dependencies = [
-    "nautilus_trader>=1.231.0",
-    "python-dotenv>=1.0",
-    "requests>=2.32",
-    "urllib3>=2",
-    "websockets>=17.0.1",
-]
-
-[project.urls]
-Homepage   = "https://github.com/swing-traders/mt5-connector"
-Repository = "https://github.com/swing-traders/mt5-connector"
-Issues     = "https://github.com/swing-traders/mt5-connector/issues"
-
-[tool.hatch.build.targets.wheel]
-packages = ["mt5connect"]
-
-[tool.hatch.metadata]
-allow-direct-references = true
+# Repository tooling. The distributions are packages/client (mt5-connector-client) and
+# packages/server (mt5-connector-server).
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 extend-exclude = ["scripts"]
+src = [".", "packages/client", "packages/server"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

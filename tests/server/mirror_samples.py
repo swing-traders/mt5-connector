@@ -7,8 +7,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from mt5connect import mirror
-from mt5connect.broker_clock import BrokerClock
+from mt5connector.server.wire import mirror
+from mt5connector.server.wire.broker_clock import BrokerClock
 
 PACKAGE_TYPES = {
     name: namedtuple(name.value, struct.fields) for name, struct in mirror.STRUCTS.items()
