@@ -134,7 +134,7 @@ def test_bar_and_tick_reads_of_a_symbol_no_ea_publishes_are_deferred_without_the
     assert chart_posts.posted == ["USDJPY", "GBPUSD"]
     assert stub.mock_calls == []
     health = client.get("/health").json["result"]
-    assert (health["peak_in_flight"], health["refusals"]) == (0, 0)
+    assert (health["in_flight"], health["peak_in_flight"], health["refusals"]) == (0, 1, 0)
 
 
 def test_the_floors_and_the_mirror_post_nothing_to_the_hub(client, chart_posts, stub):
@@ -325,7 +325,7 @@ def test_samples_from_two_eas_keep_the_latest_and_either_disconnected_one_restar
 # ── The order of the checks ──────────────────────────────────────────────────
 
 
-def test_the_publisher_check_answers_after_the_clock_gate_and_before_the_slot_cap(
+def test_the_publisher_check_answers_after_the_clock_gate_and_inside_a_slot_of_the_cap(
     served, held, chart_posts, clock_status
 ):
     chart_posts.state = ChartState.REQUESTED
@@ -335,6 +335,7 @@ def test_the_publisher_check_answers_after_the_clock_gate_and_before_the_slot_ca
     unpublished = requests.post(
         f"{served}/history/bars", json={"symbol": "USDJPY", "timeframe": "H1"} | WINDOW, timeout=1
     )
+    unpublished_commissions = requests.get(f"{served}/commissions/USDJPY", timeout=1)
     published = requests.post(
         f"{served}/history/bars", json={"symbol": "EURUSD", "timeframe": "H1"} | WINDOW, timeout=1
     )
@@ -343,11 +344,8 @@ def test_the_publisher_check_answers_after_the_clock_gate_and_before_the_slot_ca
     gated = requests.get(f"{served}/commissions/GBPUSD", timeout=1)
     clock_status.set(verification)
 
-    assert (unpublished.status_code, unpublished.json()["error"]["code"]) == (
-        503,
-        ServerCode.SYNCING,
-    )
-    assert (published.status_code, published.json()["error"]["code"]) == (503, ServerCode.BUSY)
+    for response in (unpublished, unpublished_commissions, published):
+        assert (response.status_code, response.json()["error"]["code"]) == (503, ServerCode.BUSY)
     assert (gated.status_code, gated.json()) == (503, UNVERIFIED)
-    assert chart_posts.posted == ["USDJPY"]
-    assert counters(served)["refusals"] == 1
+    assert chart_posts.posted == []
+    assert counters(served)["refusals"] == 3

@@ -1,9 +1,4 @@
-"""
-nautilus_mt5/config.py
-
-User-facing configuration for the nautilus-mt5 adapter.
-This is the only file users need to touch to connect their broker.
-"""
+"""`MT5Config`: what the adapter runs with, checked when it is built."""
 
 from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse

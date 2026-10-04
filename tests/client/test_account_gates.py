@@ -1,6 +1,5 @@
-"""The account the execution client connects to: its snapshot as the connection reads it, the gates
-the client holds it to before anything is reported or sent, the identity it books under, the
-currencies it registers, and the magic that marks its orders."""
+"""The account the execution client connects to: its snapshot, the gates it is held to, the identity
+it books under, the currencies it registers, and the magic that marks its orders."""
 
 import asyncio
 from decimal import Decimal

@@ -1,43 +1,5 @@
-"""
-nautilus_mt5/factories.py
-
-MT5LiveDataClientFactory and MT5LiveExecClientFactory — the glue between
-NautilusTrader's component wiring system and the MT5 adapter clients.
-
-NautilusTrader uses these factories to instantiate data and execution
-clients inside its LiveTradingNode. You register them in your node config
-and NautilusTrader calls them at startup.
-
-Usage (typical)
----------------
-    from mt5connector.client.config   import MT5Config
-    from mt5connector.client.factories import build_mt5_node_config
-
-    config = MT5Config(
-        account=12345678,
-        password="your_password",
-        server="Exness-MT5Trial9",
-        symbols=["EURUSDm", "XAUUSDm"],
-    )
-
-    node_config = build_mt5_node_config(config)  # <-- single call, that's it
-
-    node = TradingNode(config=node_config)
-    node.trader.add_strategy(YourStrategy(config=YourStrategyConfig(...)))
-    node.run()
-
-Advanced (manual wiring)
-------------------------
-    from mt5connector.client.factories import MT5LiveDataClientFactory, MT5LiveExecClientFactory
-
-    data_config = LiveDataEngineConfig(
-        data_client_configs={
-            MT5_VENUE: DataClientConfig(factory=MT5LiveDataClientFactory(...)),
-        }
-    )
-
-See examples/live_simple_strategy.py for a complete runnable example.
-"""
+"""NT's live data and execution client factories for MT5 — sharing one connection and instrument
+provider per account and server for the process's life — and the node config that wires them."""
 
 from __future__ import annotations
 
@@ -118,21 +80,6 @@ def _provider_config(config: MT5Config) -> InstrumentProviderConfig:
     return InstrumentProviderConfig(
         load_ids=frozenset(InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in config.symbols)
     )
-
-
-def clear_connection_registry() -> None:
-    """
-    Remove all cached connections. Useful in tests and when
-    restarting a node without process restart.
-
-    Calls disconnect() on each registered connection before clearing.
-    """
-    for conn, _ in _connection_registry.values():
-        try:
-            conn.disconnect()
-        except Exception:
-            pass
-    _connection_registry.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

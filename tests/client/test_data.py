@@ -92,7 +92,6 @@ def make_config(symbols=None):
 
 def make_conn(connected=True):
     conn = MagicMock()
-    conn.is_connected = connected
     conn.state = ConnectionState.CONNECTED if connected else ConnectionState.DISCONNECTED
     conn.ensure_connected = (
         MagicMock() if connected else MagicMock(side_effect=MT5ConnectionError("not connected"))

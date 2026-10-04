@@ -81,7 +81,7 @@ def publishers(chart_posts):
 
 @pytest.fixture
 def workers():
-    """The server's worker threads: one kept free, so two terminal-bound calls at once."""
+    """The server's worker threads: one kept free, so two slots."""
     return 3
 
 

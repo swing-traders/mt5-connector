@@ -16,8 +16,8 @@ input int RelaySeconds = 5;
 input int PollMilliseconds = 250;
 input bool Spawner = false;
 input string ChartTemplate = "ticks.tpl";
-// The longest the hub takes to drop a dead connection: its ping interval, ping timeout and close
-// timeout together.
+// The whole time from a dead connection's last pong to the hub dropping it, while the hub's writes
+// to it drain: the hub's ping interval, ping timeout and close timeout together.
 input int HubPingTimeoutSec = 50;
 
 #include <MQL5Book/AutoPtr.mqh>
@@ -740,7 +740,8 @@ void OnDuplicate()
     else if (g_firstRefusal == 0)
     {
         // The publisher may be this terminal's own earlier connection, which the hub drops at most
-        // HubPingTimeoutSec after its last pong; the reconnect then says hello again.
+        // HubPingTimeoutSec after its last pong while its writes to it drain; the reconnect then
+        // says hello again.
         g_firstRefusal = now;
         PrintFormat("ticks: another EA publishes '%s'; saying hello again every %d s for %d s",
                     _Symbol, ReconnectIntervalSec, HubPingTimeoutSec);

@@ -1,23 +1,21 @@
 """The NT execution client for an MT5 hedging account: one trader's orders and position exits at the
 venue, the order events the venue confirms, and the reports NT's reconciliation reads.
 
-An exit order is no state of the client's: its synthetic venue order id,
-`{identifier}-{SL|TP}-{generation}`, names the bracket it occupies, and the venue's brackets with
-NT's cache say the rest; each time the bracket executes, the order takes the ticket of the order
-the venue executed it with. The client's state, none of which survives a restart on its own —
-connect rebuilds it from NT's cache and the venue:
+State, none of which survives a restart on its own — connect rebuilds it from NT's cache and the
+venue:
 
-- the ticket index, venue order ticket ↔ client order id: rebuilt at connect from every ticket
-  NT's orders hold or held as their venue order id, extended by each accepted submit, each comment
-  the digest lane matches and each execution an exit takes the ticket of;
+- the ticket index, venue order ticket ↔ client order id: rebuilt at connect from every ticket NT's
+  orders hold or held as their venue order id, extended by each accepted submit, each comment the
+  digest lane matches and each execution an exit takes the ticket of;
 - the deals already seen;
 - the tickets of the orders whose end the client emitted;
 - the tickets no NT order explains, logged once each;
 - whether an account report is owed, when the next one is due, and whether the last one went
   unanswered.
 
-The venue pushes every trade transaction of the account over the hub; NT's own reconciliation heals
-what the push channel misses."""
+An exit order keeps no state here: its synthetic venue order id,
+`{identifier}-{SL|TP}-{generation}`, names the bracket it occupies, and it takes the ticket of each
+order the venue executes that bracket with."""
 
 from __future__ import annotations
 

@@ -34,6 +34,7 @@ from mt5connector.server.wire.broker_clock import BrokerClock
 from mt5connector.server.wire.history_wire import BAR_TIMEFRAME
 from mt5connector.server.wire.push_wire import (
     CHARTS_PATH,
+    CLOSE_TIMEOUT_S,
     MISSED_PONGS,
     PING_INTERVAL_S,
     PROTOCOL_VERSION,
@@ -496,7 +497,9 @@ class Hub:
 
 def serve_hub(hub: Hub, host: str, port: int):
     """The hub served on `host`:`port` with its chart route, pinging every peer at the protocol's
-    interval and dropping one that leaves the protocol's count of pings in a row without a pong."""
+    interval with one ping outstanding, failing a connection whose ping goes the ping timeout
+    without its pong, and dropping it within the close timeout; the ping and the close frame wait
+    on the hub's writes to the peer draining."""
     return serve(
         hub.handler,
         host,
@@ -504,6 +507,7 @@ def serve_hub(hub: Hub, host: str, port: int):
         process_request=hub.process_request,
         ping_interval=PING_INTERVAL_S,
         ping_timeout=PING_INTERVAL_S * MISSED_PONGS,
+        close_timeout=CLOSE_TIMEOUT_S,
     )
 
 

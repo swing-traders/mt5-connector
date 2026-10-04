@@ -1,5 +1,5 @@
-"""Requests held in flight against a served app, each holding a slot of its terminal-bound cap, and
-the counters its /health reports."""
+"""Requests held in flight against a served app, each holding a slot of its cap, and the counters
+its /health reports."""
 
 import threading
 import time

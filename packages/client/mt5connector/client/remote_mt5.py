@@ -1,6 +1,5 @@
-"""The MetaTrader5 package's call surface served by the MT5 server, every epoch in true UTC: its
-functions, structs as namedtuples, arrays as numpy structured arrays, constants and Buy/Sell/Close;
-and the commission schedules the server relays from the terminal.
+"""The MetaTrader5 package's call surface served by the MT5 server, every epoch in true UTC, and the
+commission schedules the server relays from the terminal.
 
 State: the server this module is configured against with its HTTP session, and the last_error() pair
 the last answered call carried."""
@@ -184,7 +183,8 @@ def _exchange(
 def commission_schedule(symbol: str) -> dict:
     """Waits for the symbol's relayed schedule, retrying after the server's advertised delay; raises
     MT5InstrumentError when the server refused the symbol's last relay or the symbol's chart failed
-    to open. Leaves last_error as it was: no package call answers it."""
+    to open, and ServerBusy when it refuses the read with every slot taken. Leaves last_error as it
+    was: no package call answers it."""
     name = "commissions"
     if _session is None:
         raise MT5ConfigError("remote_mt5: no server is configured")
@@ -215,6 +215,12 @@ def commission_schedule(symbol: str) -> dict:
                 raise ServerUnreachable(
                     f"{name}: server not ready — {envelope['error']['message']}"
                 )
+        elif (
+            response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+            and _is_error(envelope)
+            and envelope["error"]["code"] == ServerCode.BUSY
+        ):
+            raise ServerBusy(f"{name}: server busy")
         elif (
             response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
             and _is_server_failure(envelope)

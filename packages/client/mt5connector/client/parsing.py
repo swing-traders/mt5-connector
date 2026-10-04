@@ -1,9 +1,5 @@
-"""
-nautilus_mt5/parsing.py
-
-Converts the terminal's symbol definitions, ticks and bars into NautilusTrader domain objects. A
-definition is typed by its calc mode and filled from the venue's own facts alone.
-"""
+"""Converts the terminal's symbol definitions, ticks and bars into NautilusTrader domain objects. A
+definition is typed by its calc mode and filled from the venue's own facts alone."""
 
 from __future__ import annotations
 
@@ -368,8 +364,11 @@ def venue_series(bar_type: BarType) -> Series:
 
 def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:
     """One mt5.copy_rates_range() row of an MT5 timeframe as a Bar stamped at its close, the row's
-    open plus the timeframe's interval; a month has no fixed interval, so MN1 raises ValueError."""
-    step, aggregation = _MT5_TIMEFRAME_MAP.get(timeframe, (1, BarAggregation.DAY))  # safe fallback
+    open plus the timeframe's interval; raises ValueError for a timeframe the package does not
+    define, and for MN1, since a month has no fixed interval."""
+    if timeframe not in _MT5_TIMEFRAME_MAP:
+        raise ValueError(f"timeframe {timeframe} is unknown")
+    step, aggregation = _MT5_TIMEFRAME_MAP[timeframe]
     if aggregation == BarAggregation.MONTH:
         raise ValueError(f"timeframe {timeframe}: a month has no fixed interval")
     pp = instrument.price_precision

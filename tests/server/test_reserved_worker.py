@@ -1,15 +1,17 @@
-"""The cap on terminal-bound calls under waitress with three workers, so two such calls at once: the
-worker it keeps free for /health and the relay, the calls past it refused at once, and the counters
-/health reports."""
+"""The slot cap under waitress: the worker it keeps free for /health and the relays, the calls past
+it refused at once, and the counters /health reports."""
 
 import logging
+import threading
 import time
 
 import pytest
 import requests
+from chart_posts import ChartPosts
 from saturation import COUNTERS, counters
 
 from mt5connector.client.errors import MT5ConnectionError, ServerBusy, ServerUnreachable
+from mt5connector.server.wire.push_wire import ChartState
 from mt5connector.wire.history_wire import ServerCode
 
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
@@ -61,7 +63,7 @@ def test_a_call_past_the_cap_is_refused_at_once_while_health_and_the_relay_answe
     }
     assert relayed.status_code == 200
     assert (commissions.status_code, commissions.headers["Retry-After"]) == (503, "5")
-    assert commissions.json()["error"]["code"] == ServerCode.SYNCING
+    assert commissions.json() == busy("/commissions/EURUSD")
     assert max(refused_s, health_s, relayed_s) < 1
     stub.orders_total.assert_not_called()
 
@@ -70,7 +72,51 @@ def test_a_call_past_the_cap_is_refused_at_once_while_health_and_the_relay_answe
 
     assert [answer.status_code for answer in held.answers] == [200, 200]
     assert answered.json() == {"ok": True, "result": 3, "last_error": [1, "Success"]}
-    assert counters(served) == {"in_flight": 0, "peak_in_flight": 2, "refusals": 1, "workers": 3}
+    assert counters(served) == {"in_flight": 0, "peak_in_flight": 2, "refusals": 2, "workers": 3}
+
+
+class HungHub(ChartPosts):
+    """The hub's chart route, holding every post until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def __call__(self, symbol: str) -> ChartState:
+        self.posted.append(symbol)
+        self.entered.set()
+        self.released.wait(10)
+        return self.state
+
+
+@pytest.mark.parametrize(("workers", "chart_posts"), [(2, HungHub())])
+def test_a_hub_that_hangs_holds_the_one_slot_and_never_the_free_worker(served, chart_posts):
+    first = []
+    reading = threading.Thread(
+        target=lambda: first.append(requests.get(f"{served}/commissions/USDJPY", timeout=15))
+    )
+    reading.start()
+    try:
+        assert chart_posts.entered.wait(5)
+        second, second_s = timed(lambda: requests.get(f"{served}/commissions/GBPUSD", timeout=3))
+        health, health_s = timed(lambda: requests.get(f"{served}/health", timeout=1))
+    finally:
+        chart_posts.released.set()
+        reading.join(15)
+
+    assert (second.status_code, second.headers["Retry-After"]) == (503, "5")
+    assert second.json() == busy("/commissions/GBPUSD")
+    assert health.status_code == 200
+    assert {name: health.json()["result"][name] for name in COUNTERS} == {
+        "in_flight": 1,
+        "peak_in_flight": 1,
+        "refusals": 1,
+        "workers": 2,
+    }
+    assert max(second_s, health_s) < 1
+    assert chart_posts.posted == ["USDJPY"]
+    assert first[0].json()["error"]["code"] == ServerCode.SYNCING
 
 
 def test_each_refusal_logs_one_warning_naming_its_route_and_the_calls_in_flight(
@@ -87,8 +133,8 @@ def test_each_refusal_logs_one_warning_naming_its_route_and_the_calls_in_flight(
         for record in caplog.records
         if record.name == "mt5connector.server.app"
     ] == [
-        (logging.WARNING, "/mt5/orders_total refused: 2 calls to the terminal in flight"),
-        (logging.WARNING, "/history/ranges refused: 2 calls to the terminal in flight"),
+        (logging.WARNING, "/mt5/orders_total refused: 2 calls in flight"),
+        (logging.WARNING, "/history/ranges refused: 2 calls in flight"),
     ]
 
 

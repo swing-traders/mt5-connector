@@ -1,6 +1,5 @@
-"""The instrument provider against a venue double: what it loads, how it types and fills each
-definition from the venue's own facts, the currencies it builds, the conversion pairs it finds, and
-the taker fee it derives from the relayed commission schedule."""
+"""The instrument provider against a venue double: what it loads and how it builds each definition,
+its currencies, the conversion pairs it finds, and the taker fees it derives."""
 
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -57,6 +56,7 @@ class Venue:
         self.symbols = {}
         self.ticks = {}
         self.schedules = {}
+        self.unselectable = set()
         self.calls = []
 
     def add(self, info, bid=None, ask=None, schedule=None):
@@ -68,7 +68,7 @@ class Venue:
 
     def symbol_select(self, name, enable):
         self.calls.append(("symbol_select", name))
-        return name in self.symbols
+        return name in self.symbols and name not in self.unselectable
 
     def symbol_info(self, name):
         self.calls.append(("symbol_info", name))
@@ -553,6 +553,31 @@ async def test_a_rule_in_a_currency_the_venue_quotes_inversely_is_converted_thro
     assert abs(fee - Decimal(5) / Decimal("1.25") / (Decimal(1) * Decimal(20000))) < Decimal(
         "1e-18"
     )
+
+
+async def test_a_conversion_symbol_the_venue_refuses_to_select_fails_the_load_naming_it(venue):
+    venue.add(symbol_info(name="EURUSD", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL), 1.25, 1.25)
+    venue.add(
+        symbol_info(
+            name="DE40",
+            digits=1,
+            point=0.1,
+            trade_tick_size=0.1,
+            trade_contract_size=1.0,
+            currency_base="EUR",
+            currency_profit="EUR",
+            trade_calc_mode=mirror.SYMBOL_CALC_MODE_CFDINDEX,
+        ),
+        bid=20000.0,
+        ask=20000.0,
+        schedule=schedule(5.0, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+    )
+    venue.unselectable.add("EURUSD")
+    provider = provider_for("DE40")
+    with pytest.raises(MT5InstrumentError, match="EURUSD") as refused:
+        await provider.load_all_async()
+    assert "DE40" in str(refused.value)
+    assert provider.list_all() == []
 
 
 async def test_a_rule_in_a_currency_the_venue_cannot_convert_fails_the_load_naming_it(venue):

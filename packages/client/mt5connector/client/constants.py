@@ -1,9 +1,4 @@
-"""
-nautilus_mt5/constants.py
-
-All fixed values for the nautilus-mt5 adapter.
-No logic here — just constants referenced across all modules.
-"""
+"""The venue's id and the client's defaults for its account loop and its reconnect backoff."""
 
 from nautilus_trader.model.identifiers import Venue
 

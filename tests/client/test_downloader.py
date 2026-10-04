@@ -149,7 +149,6 @@ def from_str_sym(s):
 
 def make_conn(connected=True):
     conn = MagicMock()
-    conn.is_connected = connected
     conn.state = ConnectionState.CONNECTED if connected else ConnectionState.DISCONNECTED
     if connected:
         conn.ensure_connected = MagicMock()  # no-op

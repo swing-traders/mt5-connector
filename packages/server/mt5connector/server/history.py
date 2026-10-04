@@ -177,7 +177,8 @@ class History:
         self, symbol: str, series: Series, start: int, end: int
     ) -> Answered | Failed | Syncing:
         """The bars opened in [start, end], true-UTC epochs inclusive at both ends, once the
-        terminal's answers prove them."""
+        terminal's answers prove them. Selects the symbol in Market Watch, and measures and stores
+        the series' floor on the way."""
         calls = _Calls(self._terminal)
         try:
             rows = self._bars(calls, symbol, series, start, end)
@@ -193,7 +194,8 @@ class History:
         self, symbol: str, start: int, end: int, flags: TickFlags
     ) -> Answered | Failed | Syncing:
         """The ticks from the start of second `start` through the end of second `end`, true UTC,
-        once the terminal's answers prove them."""
+        once the terminal's answers prove them. Selects the symbol in Market Watch, and measures and
+        stores the ticks' floor on the way."""
         calls = _Calls(self._terminal)
         try:
             rows = self._ticks(calls, symbol, start, end, flags)

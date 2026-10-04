@@ -1,10 +1,5 @@
-"""
-tests/client/test_factories.py
-
-Tests for MT5LiveDataClientFactory, MT5LiveExecClientFactory,
-_get_or_create_connection, clear_connection_registry, and
-build_mt5_node_config.
-"""
+"""The data and execution client factories, the connection and provider they share, and the node
+config that wires them."""
 
 import asyncio
 from unittest.mock import MagicMock, patch
@@ -22,7 +17,6 @@ from mt5connector.client.factories import (
     _connection_registry,
     _get_or_create_connection,
     build_mt5_node_config,
-    clear_connection_registry,
 )
 
 
@@ -59,10 +53,10 @@ def make_live_exec_config(mt5_config):
 def clean_registry():
     from mt5connector.client.factories import _mt5_config_registry
 
-    clear_connection_registry()
+    _connection_registry.clear()
     _mt5_config_registry.clear()
     yield
-    clear_connection_registry()
+    _connection_registry.clear()
     _mt5_config_registry.clear()
 
 
@@ -72,7 +66,6 @@ def mock_mt5_conn():
         instance = MagicMock()
         instance.connect = MagicMock()
         instance.disconnect = MagicMock()
-        instance.is_connected = True
         instance.ensure_connected = MagicMock()
         MockConn.return_value = instance
         yield MockConn, instance
@@ -163,46 +156,6 @@ class TestConnectionRegistryIsolation:
         _get_or_create_connection(make_config(account=10000002), clock)
         _get_or_create_connection(make_config(account=10000003), clock)
         assert len(_connection_registry) == 3
-
-
-class TestClearConnectionRegistry:
-    def test_clears_all_entries(self, mock_mt5_conn, mock_provider):
-        config = make_config()
-        clock = LiveClock()
-        _get_or_create_connection(config, clock)
-        assert len(_connection_registry) == 1
-        clear_connection_registry()
-        assert len(_connection_registry) == 0
-
-    def test_calls_disconnect_on_each_connection(self, mock_mt5_conn, mock_provider):
-        _, conn_inst = mock_mt5_conn
-        config = make_config()
-        clock = LiveClock()
-        _get_or_create_connection(config, clock)
-        clear_connection_registry()
-        conn_inst.disconnect.assert_called_once()
-
-    def test_safe_to_call_when_already_empty(self):
-        clear_connection_registry()
-        clear_connection_registry()
-
-    def test_disconnect_exception_does_not_prevent_clear(self, mock_mt5_conn, mock_provider):
-        _, conn_inst = mock_mt5_conn
-        conn_inst.disconnect.side_effect = RuntimeError("oops")
-        config = make_config()
-        clock = LiveClock()
-        _get_or_create_connection(config, clock)
-        clear_connection_registry()
-        assert len(_connection_registry) == 0
-
-    def test_new_connection_created_after_clear(self, mock_mt5_conn, mock_provider):
-        MockConn, _ = mock_mt5_conn
-        config = make_config()
-        clock = LiveClock()
-        _get_or_create_connection(config, clock)
-        clear_connection_registry()
-        _get_or_create_connection(config, clock)
-        assert MockConn.call_count == 2
 
 
 class TestDataClientFactory:

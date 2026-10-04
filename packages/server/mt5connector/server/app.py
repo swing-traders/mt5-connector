@@ -1,9 +1,8 @@
-"""The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, the
-history windows it vouches for, its liveness, and what the terminal's EAs relay — the trade-server
-time and each symbol's commission schedule.
+"""The MT5 server: the MetaTrader5 package mirrored over HTTP in true UTC, the history windows it
+vouches for, its liveness, and the trade-server time and commission schedules the EAs relay.
 
-State: the calls that can reach the terminal in flight now, the most in flight at once and the calls
-refused since start; nothing is persisted."""
+State: the calls holding a slot of the cap now, the most at once and the calls refused since start;
+nothing is persisted."""
 
 import dataclasses
 import logging
@@ -97,8 +96,8 @@ class _Unserved:
 
 
 class _Concurrency:
-    """The cap on calls that can reach the terminal, one below the server's workers so one is always
-    free for /health and the relay, and its counters."""
+    """The cap on calls that can hold a worker on the terminal or the hub, one below the server's
+    workers so one is always free for /health and the relays, and its counters."""
 
     def __init__(self, workers: int) -> None:
         self._workers = workers
@@ -120,7 +119,7 @@ class _Concurrency:
             with self._lock:
                 self._refusals += 1
                 in_flight = self._in_flight
-            logger.warning("%s refused: %d calls to the terminal in flight", route, in_flight)
+            logger.warning("%s refused: %d calls in flight", route, in_flight)
             return False
 
     def leave(self) -> None:
@@ -153,8 +152,9 @@ def create_app(
     retry_s: int,
 ) -> Flask:
     """The server's routes — the package mirror, /health, the commission read, the relays and the
-    history routes — behind the clock gate, the publisher check and the cap of `workers` − 1
-    terminal-bound calls; `retry_s` is the Retry-After of every deferring answer."""
+    history routes — behind the clock gate, then the cap of `workers` − 1 calls that can hold a
+    worker on the terminal or the hub, and inside it the publisher check; `retry_s` is the
+    Retry-After of every deferring answer."""
     concurrency = _Concurrency(workers)
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
@@ -175,7 +175,9 @@ def create_app(
     app.add_url_rule(
         "/commissions/<symbol>",
         endpoint=_Endpoint.COMMISSIONS.value,
-        view_func=_commissions_view(commissions, publishers, retry_s),
+        view_func=_capped(
+            concurrency, retry_s, _commissions_view(commissions, publishers, retry_s)
+        ),
         methods=["GET"],
     )
     app.add_url_rule(
@@ -193,20 +195,20 @@ def create_app(
     app.add_url_rule(
         BARS_PATH,
         endpoint=_Endpoint.HISTORY_BARS.value,
-        view_func=_charted(
-            publishers,
+        view_func=_capped(
+            concurrency,
             retry_s,
-            _capped(concurrency, retry_s, _history_bars_view(history, server_times, clock)),
+            _charted(publishers, retry_s, _history_bars_view(history, server_times, clock)),
         ),
         methods=["POST"],
     )
     app.add_url_rule(
         TICKS_PATH,
         endpoint=_Endpoint.HISTORY_TICKS.value,
-        view_func=_charted(
-            publishers,
+        view_func=_capped(
+            concurrency,
             retry_s,
-            _capped(concurrency, retry_s, _history_ticks_view(history, server_times, clock)),
+            _charted(publishers, retry_s, _history_ticks_view(history, server_times, clock)),
         ),
         methods=["POST"],
     )
@@ -222,7 +224,7 @@ def create_app(
 def _clock_gate(clock_status: ClockStatus) -> Callable:
     def gate():
         if request.endpoint not in _UNGATED and clock_status.read() is None:
-            return _clock_unverified(), 503
+            return _clock_unverified(), HTTPStatus.SERVICE_UNAVAILABLE
 
     return gate
 
@@ -276,11 +278,11 @@ def _capped(concurrency: _Concurrency, retry_s: int, view: Callable) -> Callable
     """The view run in a slot of the cap, or refused at once when none is free: a call never waits
     on a worker for one."""
 
-    def capped():
+    def capped(**path_arguments):
         if concurrency.enter(request.path):
             try:
                 # Built in the slot, so serializing a large answer counts against the cap.
-                return make_response(view())
+                return make_response(view(**path_arguments))
             finally:
                 concurrency.leave()
         else:
@@ -296,23 +298,26 @@ def _mirror_view(terminal: Terminal, function: mirror.Function, clock: BrokerClo
         arguments = _body_arguments()
         refusal = _refusal(function, arguments)
         if refusal is not None:
-            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), 400
+            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), HTTPStatus.BAD_REQUEST
         elif function.server_session:
             # Every client shares the server's terminal session; one client's shutdown() ending it
             # would end it for all of them.
             logger.info("%s from %s keeps the server's session", function.name, request.remote_addr)
-            return _answer(None, mirror.SUCCESS), 200
+            return _answer(None, mirror.SUCCESS), HTTPStatus.OK
         else:
             outcome = terminal.call(function, package_arguments(function, arguments, clock))
             if isinstance(outcome, Failed):
                 # terminal_info() failing is the terminal's IPC being down.
                 if function.name is mirror.FunctionName.TERMINAL_INFO:
-                    status = 503
+                    status = HTTPStatus.SERVICE_UNAVAILABLE
                 else:
-                    status = 200
+                    status = HTTPStatus.OK
                 return _failure(*outcome.last_error), status
             else:
-                return _answer(encode(function, outcome.value, clock), outcome.last_error), 200
+                return (
+                    _answer(encode(function, outcome.value, clock), outcome.last_error),
+                    HTTPStatus.OK,
+                )
 
     return view
 
@@ -323,12 +328,12 @@ def _health_view(clock_status: ClockStatus, concurrency: _Concurrency) -> Callab
     def view():
         verification = clock_status.read()
         if verification is None:
-            return _clock_unverified(), 503
+            return _clock_unverified(), HTTPStatus.SERVICE_UNAVAILABLE
         else:
             return {
                 "ok": True,
                 "result": dataclasses.asdict(verification) | concurrency.read(),
-            }, 200
+            }, HTTPStatus.OK
 
     return view
 
@@ -356,7 +361,7 @@ def _commissions_view(
             error = {"code": ServerCode.RELAY_REFUSED, "message": message}
             return {"ok": False, "error": error}, HTTPStatus.UNPROCESSABLE_ENTITY
         else:
-            return {"ok": True, "result": dataclasses.asdict(relay)}, 200
+            return {"ok": True, "result": dataclasses.asdict(relay)}, HTTPStatus.OK
 
     return view
 
@@ -370,12 +375,12 @@ def _server_time_relay_view(server_times: ServerTimeSink, publishers: Publishers
             return _not_loopback()
         elif refusal is not None:
             error = {"code": mirror.RES_E_INVALID_PARAMS, "message": refusal}
-            return {"ok": False, "error": error}, 400
+            return {"ok": False, "error": error}, HTTPStatus.BAD_REQUEST
         else:
             sample = server_time_sample(frame)
             server_times.write(sample)
             publishers.saw(sample.symbol)
-            return {"ok": True, "result": None}, 200
+            return {"ok": True, "result": None}, HTTPStatus.OK
 
     return view
 
@@ -390,18 +395,19 @@ def _commissions_relay_view(commissions: CommissionStore) -> Callable:
         elif refusal is not None:
             commissions.write(symbol, RelayRefusal(refusal))
             error = {"code": mirror.RES_E_INVALID_PARAMS, "message": refusal}
-            return {"ok": False, "error": error}, 400
+            return {"ok": False, "error": error}, HTTPStatus.BAD_REQUEST
         else:
             commissions.write(symbol, commission_schedule(frame))
-            return {"ok": True, "result": None}, 200
+            return {"ok": True, "result": None}, HTTPStatus.OK
 
     return view
 
 
-def _not_loopback() -> tuple[dict[str, object], int]:
+def _not_loopback() -> tuple[dict[str, object], HTTPStatus]:
     """The answer to a relayed frame that did not arrive over loopback."""
     message = f"{request.remote_addr} is not loopback"
-    return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}, 403
+    error = {"code": mirror.RES_E_FAIL, "message": message}
+    return {"ok": False, "error": error}, HTTPStatus.FORBIDDEN
 
 
 def _history_bars_view(
@@ -411,7 +417,7 @@ def _history_bars_view(
         body = _body_arguments()
         refusal = bars_refusal(body, _terminal_time(server_times, clock))
         if refusal is not None:
-            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), 400
+            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), HTTPStatus.BAD_REQUEST
         else:
             return _outcome(
                 history.bars(body["symbol"], Series(body["timeframe"]), body["start"], body["end"])
@@ -427,7 +433,7 @@ def _history_ticks_view(
         body = _body_arguments()
         refusal = ticks_refusal(body, _terminal_time(server_times, clock))
         if refusal is not None:
-            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), 400
+            return _failure(mirror.RES_E_INVALID_PARAMS, refusal), HTTPStatus.BAD_REQUEST
         else:
             flags = TickFlags(body.get("flags", TickFlags.INFO))
             return _outcome(history.ticks(body["symbol"], body["start"], body["end"], flags))
@@ -439,7 +445,10 @@ def _history_ranges_view(history: History) -> Callable:
     def view():
         symbol = request.args.get("symbol", "")
         if not symbol:
-            return _failure(mirror.RES_E_INVALID_PARAMS, "missing parameter: symbol"), 400
+            return (
+                _failure(mirror.RES_E_INVALID_PARAMS, "missing parameter: symbol"),
+                HTTPStatus.BAD_REQUEST,
+            )
         else:
             return _outcome(history.ranges(symbol))
 
@@ -500,11 +509,15 @@ def _outcome(outcome: Answered | Failed | Syncing) -> tuple:
     """The response to an answer the server composed from package calls: one it cannot give yet is
     HTTP 503, its Retry-After the delay before the client asks again."""
     if isinstance(outcome, Syncing):
-        return _failure(*outcome.last_error), 503, {"Retry-After": str(outcome.retry_after_s)}
+        return (
+            _failure(*outcome.last_error),
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {"Retry-After": str(outcome.retry_after_s)},
+        )
     elif isinstance(outcome, Failed):
-        return _failure(*outcome.last_error), 200
+        return _failure(*outcome.last_error), HTTPStatus.OK
     else:
-        return _answer(outcome.value, outcome.last_error), 200
+        return _answer(outcome.value, outcome.last_error), HTTPStatus.OK
 
 
 def _failure(code: int, message: str) -> dict[str, object]:

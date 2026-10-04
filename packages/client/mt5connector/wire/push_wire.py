@@ -9,10 +9,12 @@ from .history_wire import Series
 
 PROTOCOL_VERSION = 1
 
-# The hub pings every peer at this interval, and drops one that leaves this many pings in a row
-# without a pong.
+# The hub pings every peer at this interval, one ping outstanding at a time; a ping that goes this
+# many intervals without its pong fails the connection, dropped within the close timeout. Both wait
+# on the hub's writes to the peer draining, so a peer that stops reading delays them.
 PING_INTERVAL_S = 10
 MISSED_PONGS = 3
+CLOSE_TIMEOUT_S = 10
 
 # The hub's loopback route the server posts a symbol it serves a read of to.
 CHARTS_PATH = "/charts"

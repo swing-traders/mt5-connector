@@ -842,13 +842,17 @@ async def test_a_consumer_with_10_001_queued_frames_is_closed_with_4008_and_the_
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
 
 
-async def test_the_hub_pings_every_10_s_and_drops_a_peer_after_3_missed_pongs():
+async def test_the_hub_serves_a_10_s_ping_interval_a_30_s_ping_timeout_and_a_10_s_close_timeout():
     hub, server, port, _ = await _run_hub()
     adapter = await _adapter(port)
     await asyncio.sleep(0.05)
 
     (connection,) = server.connections
-    assert (connection.ping_interval, connection.ping_timeout) == (10, 30)
+    assert (connection.ping_interval, connection.ping_timeout, connection.close_timeout) == (
+        10,
+        30,
+        10,
+    )
     await _close(server, adapter)
 
 

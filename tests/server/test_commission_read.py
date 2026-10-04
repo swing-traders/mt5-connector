@@ -11,7 +11,7 @@ from mirror_samples import struct_sample
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.identifiers import InstrumentId
 
-from mt5connector.client.errors import MT5InstrumentError, ServerUnreachable
+from mt5connector.client.errors import MT5InstrumentError, ServerBusy, ServerUnreachable
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
 from mt5connector.server.wire import mirror
@@ -134,6 +134,19 @@ def test_a_read_while_the_clock_is_not_verified_raises_server_unreachable(remote
     clock_status.clear()
     with pytest.raises(ServerUnreachable):
         remote.commission_schedule("EURUSD+")
+
+
+@pytest.mark.parametrize("workers", [2])
+def test_a_read_the_server_is_busy_for_raises_server_busy_and_leaves_last_error(
+    remote, commissions, held
+):
+    commissions.write("EURUSD+", SCHEDULE)
+    held.take(1, "/mt5/positions_total")
+    before = remote.last_error()
+
+    with pytest.raises(ServerBusy, match="^commissions: server busy$"):
+        remote.commission_schedule("EURUSD+")
+    assert remote.last_error() == before
 
 
 @pytest.fixture

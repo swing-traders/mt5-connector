@@ -35,8 +35,8 @@ class ResponseLost(ServerUnreachable):
 
 
 class ServerBusy(MT5ConnectionError):
-    """Raised when the remote MT5 server refuses a call because every slot for a call that can reach
-    the terminal is taken; the server is up, so the caller decides whether to ask again."""
+    """Raised when the remote MT5 server refuses a call because every slot of its cap is taken; the
+    server is up, so the caller decides whether to ask again."""
 
 
 class MT5LoginError(MT5Error):

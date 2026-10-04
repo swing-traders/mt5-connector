@@ -1,13 +1,8 @@
-"""
-nautilus_mt5/providers.py
-
-MT5InstrumentProvider — loads the symbols a run names into NautilusTrader's instrument cache, each
-typed and filled from the venue's own definition, and finds the venue symbol that quotes each
-currency pair.
+"""MT5InstrumentProvider: loads the symbols a run names into NT's instrument cache, each built from
+the venue's own definition, and finds the venue symbol that quotes each currency pair.
 
 State: the loaded instruments, and the quoting symbol per currency pair the last load found; a load
-replaces both together, or neither when it fails.
-"""
+replaces both together, or neither when it fails."""
 
 from __future__ import annotations
 
@@ -126,11 +121,13 @@ class MT5InstrumentProvider(InstrumentProvider):
     def _load_definition(self, info, account: AccountSnapshot, pairs: _Pairs, ts: int):
         """Builds the instrument a selected symbol's definition describes, its taker fee from the
         commission rule the server relays, selecting first the symbol that converts a money rule's
-        currency into the quote currency."""
+        currency into the quote currency; raises MT5InstrumentError when the venue refuses that
+        selection."""
         rule = parse_schedule(mt5.commission_schedule(info.name))
         if rule is not None and rule.mode in MONEY_MODES and rule.currency != info.currency_profit:
             converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
-            mt5.symbol_select(converter, True)
+            if not mt5.symbol_select(converter, True):
+                raise MT5InstrumentError(f"{converter} cannot be selected")
         return parse_symbol_info(info, account, _taker_fee(info, rule, pairs), ts)
 
     # ── Conversion pairs ──────────────────────────────────────────────────────

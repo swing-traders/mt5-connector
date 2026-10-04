@@ -1,6 +1,5 @@
-"""The history routes' vocabulary, shared by the server and its client: their paths, the series they
-serve with each bar series' period, the tick selections, and the codes the server answers with
-beside the package's own."""
+"""The history routes' vocabulary, shared by the server and its client: their paths, the series and
+their periods, the tick selections, and the codes the server answers beside the package's own."""
 
 from enum import IntEnum, StrEnum
 
@@ -54,7 +53,7 @@ class ServerCode(IntEnum):
     # HTTP 503 with Retry-After: a history window is unproven, a schedule has not been relayed, or
     # no EA publishes the symbol yet.
     SYNCING = -20_001
-    # HTTP 503 with Retry-After: every slot for a call that can reach the terminal is taken.
+    # HTTP 503 with Retry-After: every slot of the server's cap on calls is taken.
     BUSY = -20_002
     # HTTP 422: the last commission relay for the symbol was refused.
     RELAY_REFUSED = -20_003

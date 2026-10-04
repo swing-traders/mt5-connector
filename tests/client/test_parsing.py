@@ -22,6 +22,7 @@ from mt5connector.client.parsing import (
     parse_quote_tick,
     parse_symbol_info,
 )
+from mt5connector.wire import mirror
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -256,10 +257,40 @@ class TestParseBar:
         assert result.bar_type.spec.aggregation == BarAggregation.DAY
         assert result.bar_type.spec.step == 1
 
-    def test_unknown_timeframe_falls_back_to_d1(self, eurusd):
-        rate = make_rate()
-        result = parse_bar(rate, eurusd, timeframe=99999)
-        assert result.bar_type.spec.aggregation == BarAggregation.DAY
+    def test_an_unknown_timeframe_raises_naming_it(self, eurusd):
+        with pytest.raises(ValueError, match="99999"):
+            parse_bar(make_rate(), eurusd, timeframe=99999)
+
+    @pytest.mark.parametrize(
+        ("timeframe", "step", "aggregation"),
+        [
+            (mirror.TIMEFRAME_M1, 1, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M2, 2, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M3, 3, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M4, 4, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M5, 5, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M6, 6, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M10, 10, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M12, 12, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M15, 15, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M20, 20, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_M30, 30, BarAggregation.MINUTE),
+            (mirror.TIMEFRAME_H1, 1, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_H2, 2, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_H3, 3, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_H4, 4, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_H6, 6, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_H8, 8, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_H12, 12, BarAggregation.HOUR),
+            (mirror.TIMEFRAME_D1, 1, BarAggregation.DAY),
+            (mirror.TIMEFRAME_W1, 1, BarAggregation.WEEK),
+        ],
+    )
+    def test_each_timeframe_with_a_fixed_period_is_its_step_and_aggregation(
+        self, eurusd, timeframe, step, aggregation
+    ):
+        spec = parse_bar(make_rate(), eurusd, timeframe=timeframe).bar_type.spec
+        assert (spec.step, spec.aggregation) == (step, aggregation)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

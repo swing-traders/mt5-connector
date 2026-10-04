@@ -151,7 +151,6 @@ class MT5Connection:
         self._state = ConnectionState.DISCONNECTED
         self._attempt = 0
         self._last_error: tuple[int, str] | None = None
-        self._connected_at: float | None = None
         self._reconnect_lock = asyncio.Lock()
 
     # ── Public properties ─────────────────────────────────────────────────────
@@ -159,10 +158,6 @@ class MT5Connection:
     @property
     def state(self) -> ConnectionState:
         return self._state
-
-    @property
-    def is_connected(self) -> bool:
-        return self._state == ConnectionState.CONNECTED
 
     # ── Core lifecycle ────────────────────────────────────────────────────────
 
@@ -186,7 +181,6 @@ class MT5Connection:
         self._state = ConnectionState.SHUTTING_DOWN
         mt5.shutdown()
         self._state = ConnectionState.DISCONNECTED
-        self._connected_at = None
         logger.info("MT5Connection: disconnected")
 
     def ensure_connected(self) -> None:
@@ -202,15 +196,11 @@ class MT5Connection:
 
         if self._state == ConnectionState.FAILED:
             raise MT5ConnectionError(
-                f"MT5 connection permanently failed after "
-                f"{self._config.reconnect_max_attempts} attempts. "
-                "Restart the trading node to try again."
+                f"MT5 connection gave up after {self._config.reconnect_max_attempts} reconnect "
+                "attempts"
             )
 
-        raise MT5ConnectionError(
-            f"MT5 not connected (state={self._state.name}). "
-            "Call connect() first or wait for reconnect to complete."
-        )
+        raise MT5ConnectionError(f"MT5 not connected (state={self._state.name})")
 
     # ── Reconnect ─────────────────────────────────────────────────────────────
 
@@ -330,12 +320,6 @@ class MT5Connection:
         self._last_error = (code, msg)
         return code, msg
 
-    def uptime_seconds(self) -> float | None:
-        """How long this connection has been alive. None if not connected."""
-        if self._connected_at is None:
-            return None
-        return time.time() - self._connected_at
-
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _initialize(self) -> None:
@@ -374,7 +358,6 @@ class MT5Connection:
             )
 
         self._state = ConnectionState.CONNECTED
-        self._connected_at = time.time()
 
         info = mt5.account_info()
         if info:

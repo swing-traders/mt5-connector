@@ -1,33 +1,5 @@
-"""
-tests/client/test_connection.py
-
-Comprehensive tests for MT5Connection.
-
-Every behaviour of connection.py is tested here WITHOUT a real MT5 terminal.
-The mock_mt5 fixture patches the mt5 module entirely.
-
-Test groups:
-  1.  ConnectionState enum
-  2.  Initial state
-  3.  Successful connect / disconnect
-  4.  initialize() failure
-  5.  login() failure
-  6.  ensure_connected() all states
-  7.  Reconnect (sync) — success path
-  8.  Reconnect (sync) — failure / max attempts
-  9.  Reconnect (async) — success path
-  10. Reconnect (async) — failure / max attempts
-  11. get_account_info() — success and failure
-  12. get_terminal_info()
-  13. last_error()
-  14. uptime_seconds()
-  15. Context manager (__enter__ / __exit__)
-  16. __repr__
-  17. Backoff delay calculation
-  18. Disconnect when already disconnected (idempotent)
-  19. State after login failure stays INITIALIZED (not DISCONNECTED)
-  20. reconnect() resets attempt counter on success
-"""
+"""MT5Connection against a patched shim: its states, connect, disconnect and reconnect, the account
+and terminal reads, and the account snapshot."""
 
 import asyncio
 from unittest.mock import patch
@@ -73,14 +45,6 @@ class TestInitialState:
         conn = MT5Connection(config)
         assert conn.state == ConnectionState.DISCONNECTED
 
-    def test_not_connected_initially(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        assert conn.is_connected is False
-
-    def test_uptime_is_none_before_connect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        assert conn.uptime_seconds() is None
-
     def test_repr_shows_disconnected(self, config, mock_mt5):
         conn = MT5Connection(config)
         r = repr(conn)
@@ -119,18 +83,6 @@ class TestSuccessfulConnect:
         conn.connect()
         assert conn.state == ConnectionState.CONNECTED
 
-    def test_is_connected_true_after_connect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn.connect()
-        assert conn.is_connected is True
-
-    def test_uptime_positive_after_connect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn.connect()
-        uptime = conn.uptime_seconds()
-        assert uptime is not None
-        assert uptime >= 0.0
-
     def test_disconnect_calls_mt5_shutdown(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn.connect()
@@ -142,12 +94,6 @@ class TestSuccessfulConnect:
         conn.connect()
         conn.disconnect()
         assert conn.state == ConnectionState.DISCONNECTED
-
-    def test_uptime_is_none_after_disconnect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn.connect()
-        conn.disconnect()
-        assert conn.uptime_seconds() is None
 
     def test_repr_shows_connected(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -247,15 +193,16 @@ class TestEnsureConnected:
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError) as exc_info:
             conn.ensure_connected()
-        assert "DISCONNECTED" in str(exc_info.value)
+        assert str(exc_info.value) == "MT5 not connected (state=DISCONNECTED)"
 
     def test_raises_when_failed(self, config, mock_mt5):
         conn = MT5Connection(config)
         conn._state = ConnectionState.FAILED
         with pytest.raises(MT5ConnectionError) as exc_info:
             conn.ensure_connected()
-        assert "permanently failed" in str(exc_info.value)
-        assert str(config.reconnect_max_attempts) in str(exc_info.value)
+        assert str(exc_info.value) == (
+            f"MT5 connection gave up after {config.reconnect_max_attempts} reconnect attempts"
+        )
 
     def test_raises_when_initializing(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -365,7 +312,9 @@ class TestReconnectSyncFailure:
         conn.reconnect()
         with pytest.raises(MT5ConnectionError) as exc_info:
             conn.ensure_connected()
-        assert "permanently failed" in str(exc_info.value)
+        assert str(exc_info.value) == (
+            f"MT5 connection gave up after {config.reconnect_max_attempts} reconnect attempts"
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -559,30 +508,7 @@ class TestLastError:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 14. uptime_seconds()
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-class TestUptime:
-
-    def test_none_before_connect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        assert conn.uptime_seconds() is None
-
-    def test_positive_after_connect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn.connect()
-        assert conn.uptime_seconds() >= 0.0
-
-    def test_none_after_disconnect(self, config, mock_mt5):
-        conn = MT5Connection(config)
-        conn.connect()
-        conn.disconnect()
-        assert conn.uptime_seconds() is None
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 15. Context manager
+# 14. Context manager
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -590,7 +516,7 @@ class TestContextManager:
 
     def test_connects_on_enter(self, config, mock_mt5):
         with MT5Connection(config) as conn:
-            assert conn.is_connected is True
+            assert conn.state == ConnectionState.CONNECTED
 
     def test_disconnects_on_exit(self, config, mock_mt5):
         with MT5Connection(config) as conn:
@@ -614,7 +540,7 @@ class TestContextManager:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 16. __repr__
+# 15. __repr__
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -636,7 +562,7 @@ class TestRepr:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 17. Backoff delay calculation
+# 16. Backoff delay calculation
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -673,7 +599,7 @@ class TestBackoffDelays:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 18. Disconnect idempotency
+# 17. Disconnect idempotency
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -693,7 +619,7 @@ class TestDisconnectIdempotency:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 19. State integrity after login failure
+# 18. State integrity after login failure
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -722,7 +648,7 @@ class TestStateIntegrity:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 20. AccountSnapshot
+# 19. AccountSnapshot
 # ═════════════════════════════════════════════════════════════════════════════
 
 
