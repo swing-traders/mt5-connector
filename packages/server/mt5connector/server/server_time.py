@@ -1,4 +1,4 @@
-"""The trade-server time the terminal's EA relays through the hub, and the latest sample of it.
+"""The trade-server time the terminal's EAs relay through the hub, and the latest sample of it.
 
 State: the latest sample, the monotonic time it arrived, and when the terminal's current unbroken
 run of connected samples began; a disconnected sample, or a gap of the maximum age between two
@@ -8,9 +8,8 @@ import threading
 import time
 from dataclasses import dataclass
 
-from mt5connector.server.ws_server import FrameType
+from mt5connector.server.wire.push_wire import PROTOCOL_VERSION, FrameType
 
-_FRAME_VERSION = 1
 _FIELDS = ("v", "type", "symbol", "trade_server", "current", "gmt", "connected")
 _EPOCH_FIELDS = ("trade_server", "current", "gmt")
 
@@ -82,7 +81,7 @@ def server_time_refusal(frame: object) -> str | None:
         return f"missing field: {', '.join(missing)}"
     elif unknown:
         return f"unknown field: {', '.join(unknown)}"
-    elif not (_is_integer(frame["v"]) and frame["v"] == _FRAME_VERSION):
+    elif not (_is_integer(frame["v"]) and frame["v"] == PROTOCOL_VERSION):
         return f"unsupported frame version: {frame['v']!r}"
     elif frame["type"] != FrameType.SERVER_TIME:
         return f"not a {FrameType.SERVER_TIME} frame: {frame['type']!r}"

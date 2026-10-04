@@ -39,7 +39,6 @@ dependencies = [
     "python-dotenv>=1.0",
     "requests>=2.32",
     "urllib3>=2",
-    "websockets>=17.0.1",
 ]
 
 [project.urls]

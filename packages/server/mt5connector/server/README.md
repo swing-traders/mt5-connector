@@ -1,6 +1,6 @@
 # mt5-connector-server
 
-The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5` package with every epoch in true UTC, the WebSocket hub that carries the terminal's ticks, and the source of the EA and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
+The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5` package with every epoch in true UTC, the WebSocket hub that pushes the terminal's ticks, closed bars and trade transactions, and the source of the EA and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
 
 Releases are wheels on the fork's package index, versioned together with the client's:
 
@@ -11,7 +11,7 @@ python -m pip install --extra-index-url https://swing-traders.github.io/mt5-conn
 | Part | What it is |
 |---|---|
 | `mt5connector.server.app` | the HTTP server, started as `mt5-connector-server` |
-| `mt5connector.server.ws_server` | the tick hub, started as `mt5-connector-hub` |
+| `mt5connector.server.ws_server` | the push hub, started as `mt5-connector-hub` |
 | `mt5connector/server/mql5/` | the EA (`Expert/ticks.mq5`), its startup script (`Scripts/ticks_setup.mq5`) and the MQL5 libraries they include (`Include/`) |
 | `mt5connector.server.wire` | the wire vocabulary, copied from the client's `mt5connector.wire` when the wheel is built |
 
@@ -29,17 +29,32 @@ The server mirrors the `MetaTrader5` package (5.0.6231), so code written against
 - An epoch in the zone's repeated autumn hour reads as its first occurrence, and the server logs a warning naming the field. One in its skipped spring hour is a server error (HTTP 500).
 - Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, a time that is not an integer epoch, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
 - `POST /mt5/shutdown` is the one deliberate departure from the package: it answers `None` without calling the package's `shutdown()`. Every client shares the server's terminal session, and the adapter calls `shutdown()` whenever it disconnects, so passing it on would end the session for every client. `initialize` and `login` pass through unchanged.
-- `GET /health` answers the broker clock's latest verification — the relayed sample's chart `symbol`, its `trade_server` and `current` (last quote) times in true UTC, the terminal's own `gmt`, and the `skew_s` from the server's clock and the `offset_s` in effect — beside the server's load: the calls that can reach the terminal `in_flight` now, the `peak_in_flight` and the `refusals` since start, and its `workers`. While the clock is not verified it answers HTTP 503. It never calls the terminal: the server initialized it at start, and the EA's samples say whether it is connected to the trade server.
-- `POST /relay/server_time` takes the `server_time` frame the WS hub relays from the EA and answers `{"ok": true, "result": null}`. It accepts a frame from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the frame's exact shape with HTTP 400 and code -2.
-- `GET /commissions/<symbol>` answers the commission schedule the terminal's EA relayed for the symbol, or code -4 (`RES_E_NOT_FOUND`) while none has been relayed. No package call answers it, so its envelope carries no `last_error`.
+- `GET /health` answers the broker clock's latest verification — the relayed sample's chart `symbol`, its `trade_server` and `current` (last quote) times in true UTC, the terminal's own `gmt`, and the `skew_s` from the server's clock and the `offset_s` in effect — beside the server's load: the calls that can reach the terminal `in_flight` now, the `peak_in_flight` and the `refusals` since start, and its `workers`. While the clock is not verified it answers HTTP 503. It never calls the terminal: the server initialized it at start, and the EAs' samples say whether it is connected to the trade server.
+- `POST /relay/server_time` and `POST /relay/commissions/<symbol>` take the `server_time` and `commissions` frames the WS hub relays from the EAs, the commission frame under the symbol of the EA that sent it, and answer `{"ok": true, "result": null}`. Each accepts a frame from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the frame's exact shape — for a commission frame, naming the path's symbol — with HTTP 400 and code -2. A refused commission frame is kept against the path's symbol until a later frame for it is accepted.
+- `GET /commissions/<symbol>` answers the commission schedule the symbol's EA last relayed — `ret` and `last_error` of its `SymbolInfoCommissions` call and its `rules`, every enum field by the name `EnumToString` gives it:
+
+  | HTTP | When |
+  |---|---|
+  | 200 | the last relay was accepted; a schedule with no rule answers an empty `rules` list |
+  | 503 with code -20001 (`SYNCING`) and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | nothing was relayed for the symbol yet |
+  | 422 with code -20003 (`RELAY_REFUSED`) | the last relay was refused; the message names the symbol and why |
+
+  No package call answers it, so its envelope carries no `last_error`.
+- `GET /commissions/<symbol>`, `POST /history/bars` and `POST /history/ticks` read a symbol, and first check that an EA publishes it. The server knows the symbols the EAs publish from their server-time samples, each naming its EA's chart symbol, fresh for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`:
+  - For a symbol no EA publishes, the server posts the symbol to the hub's chart route (`POST http://127.0.0.1:<MT5_HUB_PORT>/charts/<symbol>`), which has the spawner open its chart, and answers HTTP 503 with code -20001, `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` and the message `no publisher for <symbol>; chart requested` until the chart's EA relays.
+  - While the hub's last answer for a symbol is `requested`, the server posts it again at most once per `MT5_HISTORY_RETRY_SECONDS`, so a client's next retry meets a failure to open its chart; the hub sends the spawner one `open_chart` for it however often it is posted.
+  - The server posts any other symbol at most once per half `MT5_CHART_IDLE_SECONDS`, the start of an EA's samples counting as a post. For a symbol an EA publishes, the post tells the hub the symbol is in use, which keeps its chart open.
+  - For a symbol whose chart the spawner failed to open, the hub answers the post with the spawner's reason, and the server answers HTTP 400 with code -20004 (`CHART_FAILED`) and the message `the chart of <symbol> failed to open: <reason>`. Such a symbol is posted again on its next read, so a read after its chart opens is served.
+  - A post the hub does not answer is HTTP 503 with code -1 naming the failure; the next read posts again.
+  - The check runs after the clock gate and before the slot cap: it takes no slot. `/history/ranges` and the mirror routes check nothing.
 - `POST /history/bars` and `POST /history/ticks` answer a history window the server vouches for (see [History](#history)), and `GET /history/ranges?symbol=<symbol>` the floors it has measured.
-- While the broker clock is not verified, every route but `/health` and `/relay/server_time` answers HTTP 503 with `{"ok": false, "error": {"code": -1, "message": "the broker clock is not verified"}}` and calls nothing.
-- Package calls run one at a time; waitress serves the API with `MT5_API_THREADS` workers, one of them always kept free for `/health` and `/relay/server_time`.
+- While the broker clock is not verified, every route but `/health` and the two relays answers HTTP 503 with `{"ok": false, "error": {"code": -1, "message": "the broker clock is not verified"}}` and calls nothing.
+- Package calls run one at a time; waitress serves the API with `MT5_API_THREADS` workers, one of them always kept free for `/health` and the relays.
 - Every route that can reach the terminal — `/mt5/<function>` and the three history routes — takes one of `MT5_API_THREADS − 1` slots. A call that finds every slot taken is refused at once, never queued on a worker: HTTP 503 with the failure envelope, code -20002 naming the route, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>`. Each refusal is logged as a warning. The clock check answers first, so while the clock is not verified such a call gets its 503 and takes no slot.
 
 ### The broker clock
 
-Once the terminal is initialized, the server verifies the broker's clock against the trade server's time the EA relays through the WS hub, at any hour, market open or closed:
+Once the terminal is initialized, the server verifies the broker's clock against the trade server's time the EAs relay through the WS hub, at any hour, market open or closed:
 
 - A sample is fresh while it is younger than `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` and says the terminal is connected to the trade server.
 - A fresh sample verifies the clock only once the terminal has been connected without a break for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, so a terminal back from downtime is not trusted while it re-fetches what it missed. A sample that says the terminal is disconnected, or a gap of `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` between two samples, starts the run again.
@@ -59,7 +74,7 @@ The terminal answers a history request with whatever it has synced, substitutes 
 | 200 | the mirror's envelope, its `result` the window's rows as the mirror answers them, bars stamped at their open | the terminal's answers prove the rows; an empty list is an answer like any other |
 | 503 | the failure envelope with code -20001, naming the symbol, the series and the window, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | the terminal's answers do not prove the window yet: ask again after the delay |
 | 503 | the failure envelope with code -20002, naming the route, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | every slot for a call that can reach the terminal is taken: ask again after the delay |
-| 400 | the failure envelope with code -2 | a body out of shape, or a window that starts after the terminal's current time: the trade-server time the EA last relayed, plus the time since it arrived |
+| 400 | the failure envelope with code -2 | a body out of shape, or a window that starts after the terminal's current time: the trade-server time an EA last relayed, plus the time since it arrived |
 
 A 200 carries the failure envelope instead when the terminal cannot select the symbol, or when the rows it answers break the checks below.
 
@@ -81,16 +96,57 @@ A series' floor is set by the stub — the one bar the terminal answers for a wi
 
 ## WebSocket hub
 
-The hub (`mt5connector.server.ws_server`, port `WS_PORT`) carries these frames:
+The hub (`mt5connector.server.ws_server`, port `MT5_HUB_PORT`) carries every push: one EA per symbol, each on its own chart inside the terminal, publishes, and each consumer — the client's data and execution clients — receives the streams it subscribes to. Commands, reconciliation reports, history and account state travel over HTTP; nothing else travels over the hub.
 
-| Frame | From | What the hub does |
+- One endpoint. Every frame is a JSON text frame carrying `"v": 1`; a frame of another version is answered with an `error` frame and the connection closed with code 1002. A frame the hub cannot handle — not JSON, out of its kind's shape, or of a kind the connection's role does not send — is answered the same way and logged as a warning; a frame of an unknown kind is logged and skipped.
+- A connection's first frame is its `hello`, declaring its role: `ea` publishes, `adapter` consumes. An EA's hello also names its chart's `symbol` and whether it is the `spawner`.
+- The hub keeps no event store and replays nothing: a consumer that reconnects subscribes again and receives what is published from then on.
+
+| Frame | From → to | Fields |
 |---|---|---|
-| `{"type": "hello", "role": "ea"}` or `"role": "adapter"` | EA, adapter | records the connection's role |
-| a tick — `symbol`, `bid`, `ask`, `time_msec`, `flags` and more, as strings, with no `type` | EA | broadcasts it to every adapter when its bid or ask changed |
-| `{"v": 1, "type": "server_time", "symbol", "trade_server", "current", "gmt", "connected"}`, its epochs and `connected` (0 or 1) as integers | EA | POSTs it to the server's `/relay/server_time` on `127.0.0.1:MT5_API_PORT`, never to adapters, and logs a failed post |
-| `{"type": "subscribe", "symbols": [...]}` or `"unsubscribe"` | adapter | records the symbols |
+| `hello` | EA, adapter → hub | `role`: `ea` or `adapter`; an EA's also `symbol`, its chart's, and `spawner`, a boolean |
+| `subscribe`, `unsubscribe` | adapter → hub | `id`, an integer its `ack` carries; `stream`: `ticks` with a `symbol`, `bars` with a `symbol` and a `timeframe` from `M1` to `W1`, or `trade_transactions` |
+| `ack` | hub → adapter | the `id` of the op it acknowledges, queued ahead of every frame the op routes to the adapter |
+| `error` | hub → EA, adapter | `message`: what the hub could not handle; the connection closes after it |
+| `wanted` | hub → the EA of `symbol` | `symbol`; `ticks`, whether some adapter subscribes to its ticks; and `timeframes`, those of its bars some adapter subscribes to, as MQL5's `ENUM_TIMEFRAMES` values. Sent on every change to that symbol's part and in answer to the EA's hello |
+| `duplicate` | hub → an EA | `symbol`: another EA publishes the EA's symbol; the connection closes after it |
+| `open_chart`, `close_chart` | hub → the spawner | `symbol`: the chart to open, or the chart of a symbol out of use to close |
+| `chart_opened` | the spawner → hub | `symbol`, answering its `open_chart`: a chart of the symbol is open |
+| `chart_failed` | the spawner → hub | `symbol` and `reason`, answering its `open_chart`: no chart of the symbol opened, and the call that failed with its error |
+| `chart_kept` | the spawner → hub | `symbol` and `reason`, answering its `close_chart`: the chart stays open, and the open positions and pending orders the account holds on the symbol |
+| `tick` | EA → the adapters subscribed to the symbol's ticks | `symbol` and the `MqlTick` fields verbatim: `time`, `bid`, `ask`, `last`, `volume`, `time_msc`, `flags`, `volume_real` |
+| `bar` | EA → the adapters subscribed to the symbol's bars of the timeframe | `symbol`, `timeframe` — the `ENUM_TIMEFRAMES` value from the EA, the series name to adapters — and the `MqlRates` fields verbatim, stamped at the bar's open: `time`, `open`, `high`, `low`, `close`, `tick_volume`, `spread`, `real_volume`; published once the bar has closed |
+| `trade_transaction` | EA → the adapters subscribed to `trade_transactions` | `transaction`, `request` and `result`: the three structs `OnTradeTransaction` receives, under their MQL5 field names, every enum as its MQL5 integer |
+| `server_time` | EA → the server's `/relay/server_time` | `symbol`, the EA's, `trade_server`, `current`, `gmt` and `connected` (0 or 1), as integers |
+| `commissions` | EA → the server's `/relay/commissions/<symbol>`, under the EA's symbol | `symbol`, `ret` and `last_error` of its `SymbolInfoCommissions` call, and `rules`: each rule's `currency`, its enum fields by name and its `tiers`, each with its enum fields by name, its values and its `currency` |
 
-A frame the hub cannot handle closes its connection with a logged warning. The EA sends `server_time` every `RelaySeconds` (5 in the chart template), the terminal's `TimeTradeServer()`, `TimeCurrent()` and `TimeGMT()` with `TERMINAL_CONNECTED`, and reconnects to the hub on the same timer, so both go on while the market is closed. The EA answers the hub's keepalive pings each time it ticks or its timer fires.
+- Every epoch of a `tick`, a `bar` and a `trade_transaction` reaches the adapters in true UTC: the EA sends the broker's clock, and the hub converts through the broker clock `MT5_BROKER_TZ` and `MT5_BROKER_OFFSET_HOURS` set, as the HTTP server does. An epoch in the broker's repeated hour reads as its first occurrence, with one warning per repeated hour.
+- An adapter's frames wait in a queue of at most 10,000; the frame that finds it full closes that adapter with code 4008, and the rest are served on.
+- The hub pings every connection every 10 s, and drops one that leaves three pings in a row without a pong.
+- The hub hands `server_time` and `commissions` frames to the server's relay routes on `127.0.0.1:MT5_API_PORT` off its event loop, so a slow server never holds back a stream, never sends them to an adapter, and logs a failed post.
+
+One EA publishes each symbol, and nothing is elected:
+
+- A symbol's first EA to say hello publishes it. The hub answers a later EA for that symbol with `duplicate`, closes it, and logs a warning naming the symbol; the publisher is untouched.
+- The hub drops, with a warning, a frame an EA may not send: a tick, a bar, a transaction or a server-time sample of a symbol other than its own. A transaction's symbol is its request's for a `TRADE_TRANSACTION_REQUEST`, its own otherwise; the spawner alone may send one that names no symbol. A commission frame is posted under the EA's symbol whatever it names, so the server refuses a mismatch against that symbol.
+- The spawner is the EA whose hello says so, the latest one to say hello when two do, with a warning naming both. It publishes its own symbol like any EA.
+
+The hub has the spawner open and close charts:
+
+- **Requests.** A consumer subscribing to the ticks or bars of a symbol no EA publishes, the server posting such a symbol, and a publishing EA going away while its symbol is in use each request the symbol's chart. A request is held until the symbol's EA says hello, and sent to the spawner as `open_chart` once per spawner connection; one made while no spawner is connected is sent on the spawner's hello.
+- **Failed charts.** The spawner answers every `open_chart` with `chart_opened` or `chart_failed`. The hub keeps a failure, with its reason and a warning naming the symbol, until the spawner answers `chart_opened` for the symbol or its EA says hello. A chart answer from an EA other than the current spawner is dropped with a warning.
+- **The chart route.** `POST /charts/<symbol>` on the hub's port, from `127.0.0.1` alone and with no body, marks the symbol in use and answers `{"ok": true, "result": "published"}` while an EA publishes it, `{"ok": true, "result": "failed", "reason": "<the spawner's reason>"}` while its chart's failure stands, and otherwise requests its chart and answers `{"ok": true, "result": "requested"}`. Another method answers 405, a path naming no symbol 404, another host 403. Any other request goes on to the WebSocket handshake.
+- **Idle charts.** A symbol is in use while a consumer subscribes to its ticks or bars, and for `MT5_CHART_IDLE_SECONDS` after its last use: a post naming it, a subscription to it starting or ending, its EA's hello, the spawner's `chart_kept`. The hub tells the spawner to close the chart of a symbol out of use for that long, as `close_chart`, once per spawner connection, and again once the symbol is out of use for another period after a `chart_kept`; the spawner's own chart never closes. A later use requests the chart again.
+
+The EA, `ticks.mq5`, one per symbol on its own chart:
+
+- It publishes one `trade_transaction` frame per `OnTradeTransaction` call whose symbol is its own, in the order the calls arrive, whatever the magic; the spawner also each one that names no symbol, such as a pending order's delete or modify sent without one. Every EA receives the account's whole transaction stream, so the filter publishes each transaction once; a transaction of a symbol no chart publishes, naming one, reaches the hub zero times.
+- While the hub wants its ticks it publishes them from its tick database — `COPY_TICKS_INFO`, the ticks that change the bid or the ask — from the moment they are wanted, read at every tick and again on its timer, since the terminal queues no tick event while one is queued or handled. It publishes the bar that closed for each wanted timeframe, found on its timer and its ticks when the forming bar's open moves.
+- Every `RelaySeconds` it sends `server_time` and its symbol's commission schedule.
+- It reads the hub on its timer and on every tick, so the vendored library answers the hub's pings and acknowledges a close. While disconnected it reconnects every `ReconnectIntervalSec` on `TimeLocal()`, and it publishes no ticks or bars until the reconnected hub wants them again.
+- On `duplicate` it closes its own chart, which unloads it. The spawner instead keeps its chart and says hello again on each reconnect, since the publisher may be its own terminal's earlier connection, which the hub drops at most 50 s after its last pong; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
+- The spawner, on `open_chart`, selects the symbol and opens an M1 chart of it with the template `ChartTemplate`, unless a chart of the symbol already runs this EA or a chart it opened for the symbol is still open — the template's EA loads only once the chart has processed the template. It answers `chart_opened`, or `chart_failed` naming the call that failed — `SymbolSelect`, `ChartOpen` or `ChartApplyTemplate` — and its error.
+- The spawner, on `close_chart`, first counts the account's open positions and pending orders on the symbol: while it holds any, the chart stays and the spawner answers `chart_kept`. Otherwise it closes the chart it opened for the symbol, then takes the symbol out of Market Watch. The terminal refuses that while a chart of the symbol is open or it has open positions, so a refused deselect is tried again on each timer tick until it succeeds or the symbol's chart opens again, and only every 15 minutes, logged once, while positions or orders hold the symbol.
 
 ---
 
@@ -111,21 +167,26 @@ The HTTP server reads its settings from the environment once at start; a missing
 | `MT5_LOGIN_TIMEOUT_MS` | initialize timeout | `60000` |
 | `MT5_API_HOST` | bind address | `0.0.0.0` |
 | `MT5_API_PORT` | HTTP port | `5000` |
-| `MT5_API_THREADS` | waitress threads, one of them kept free for `/health` and the relay; at least 2 | `5` |
+| `MT5_API_THREADS` | waitress threads, one of them kept free for `/health` and the relays; at least 2 | `5` |
 | `MT5_CLOCK_CHECK_SECONDS` | interval between re-verifications of the broker's clock | `300` |
 | `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` | how long a relayed server-time sample stays fresh, and how long the terminal must stay connected before a sample verifies the clock | `30` |
 | `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long the server waits at start for the first sample that verifies the clock | `120` |
 | `MT5_BROKER_TZ` | the zone the broker's clock follows, as an IANA name | `America/New_York` |
 | `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
-| `MT5_HISTORY_RETRY_SECONDS` | the `Retry-After` of a history answer the terminal has not proven yet, and of a call refused with every slot taken: how long the client waits before asking again | `5` |
+| `MT5_HISTORY_RETRY_SECONDS` | the `Retry-After` of an unproven history answer, a read of a symbol whose chart is requested, a commission schedule not yet relayed, or a call refused with every slot taken: how long the client waits before asking again. The server posts a symbol whose chart is requested to the hub again at most this often | `5` |
 | `MT5_FLOOR_TTL_SECONDS` | how long a measured history floor is used before it is measured again | `900` |
+| `MT5_HUB_PORT` | the hub's port, which the server posts the symbols it reads to on `127.0.0.1` | `9000` |
+| `MT5_CHART_IDLE_SECONDS` | how long a symbol stays in use after its last use; the server posts a symbol it reads at most once per half of it, unless the hub's last answer requested its chart | `900` |
 
-The hub reads two:
+The hub reads five, and stops naming the first that is malformed:
 
 | Variable | Setting | Default |
 |---|---|---|
-| `WS_PORT` | the hub's port, bound on all interfaces | `9000` |
-| `MT5_API_PORT` | the HTTP server's port, which the hub posts each relayed server time to on `127.0.0.1` | `5000` |
+| `MT5_HUB_PORT` | the hub's port, bound on all interfaces, as the HTTP server reads it | `9000` |
+| `MT5_API_PORT` | the HTTP server's port, which the hub posts each relayed server time and commission schedule to on `127.0.0.1` | `5000` |
+| `MT5_BROKER_TZ` | the zone the broker's clock follows, as the HTTP server reads it | `America/New_York` |
+| `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone, as the HTTP server reads it | `7` |
+| `MT5_CHART_IDLE_SECONDS` | how long a symbol out of use keeps its chart open, as the HTTP server reads it | `900` |
 
 The credentials reach the processes as environment variables at start; the image never carries them.
 
@@ -137,9 +198,9 @@ The credentials reach the processes as environment variables at start; the image
 | the hub | the image's Linux Python | `mt5-connector-hub`, or `python -m mt5connector.server.ws_server` |
 
 - Both Pythons install `mt5-connector-server` from the index. Its dependencies pin `MetaTrader5` on Windows alone, `numpy` at 2.2.1 because later releases crash under Wine, and `tzdata` because the Windows Python has no zone database. The hub imports none of these, but installing the distribution brings them all, and numpy 2.2.1 publishes wheels for CPython 3.10 to 3.13 only.
-- The hub posts every relayed server time to `127.0.0.1`, and the server accepts that route from `127.0.0.1` alone: the two share a loopback.
+- The hub posts every relayed server time and commission schedule to `127.0.0.1`, the server posts the symbols it reads to the hub's chart route on `127.0.0.1`, and each accepts those routes from `127.0.0.1` alone: the two share a loopback.
 - At start the server initializes the terminal named by `MT5_TERMINAL_PATH` with the account's login, password and server, and exits non-zero when that fails.
-- It then answers HTTP 503 on every route but `/health` and the relay until a server-time sample from the EA verifies the broker clock, and exits non-zero when none does within `MT5_CLOCK_BOOTSTRAP_SECONDS`, or when any sample it measures, then or later, puts the trade server more than 120 s from the server's clock. The terminal, its EA and the hub must therefore be up within that window of the server's start; whatever starts the server decides whether to start it again.
+- It then answers HTTP 503 on every route but `/health` and the relays until a server-time sample from an EA verifies the broker clock, and exits non-zero when none does within `MT5_CLOCK_BOOTSTRAP_SECONDS`, or when any sample it measures, then or later, puts the trade server more than 120 s from the server's clock. The terminal, the spawner's EA and the hub must therefore be up within that window of the server's start; whatever starts the server decides whether to start it again.
 - `/health` answers HTTP 200 once the clock is verified, and 503 whenever it is not.
 
 ### The terminal
@@ -158,7 +219,7 @@ The terminal is started as `terminal64.exe /config:<setup.ini> /portable`, so it
 | | `Enabled` | `1`: algorithmic trading on, without which the terminal refuses every order the adapter sends |
 | | `WebRequest` | `1` |
 | `[StartUp]` | `Script` | `ticks_setup` |
-| | `Symbol`, `Period` | the chart the script runs on, `EURUSD` and `M1`; the script closes it when done |
+| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol and closes its own when done. The deployment sets the symbol: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
 
 The terminal must know the trade server `MT5_SERVER` names — its `Config\servers.dat` lists it — before the login can succeed: a server a fresh install does not know is added by searching for its name once (File → Open an Account), or by copying in a `servers.dat` that lists it.
 
@@ -180,21 +241,18 @@ Both sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `
 - It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5`, with the `Include\` tree beside it — and the `.ex5` copied into place.
 - A clean compile writes `0 errors, 0 warnings` to its `/log:` file; a missing `.ex5` is a failed compile.
 
-On each terminal start `ticks_setup` opens an M1 chart for every symbol in `symbols.txt` and applies the template `ticks.tpl`, which attaches the EA. A symbol whose chart already runs the EA is left as it is, and an open chart without it gets the template again.
+On each terminal start `ticks_setup` closes every chart the terminal restored from its last profile but the spawner's — the chart of the symbol it runs on that runs the EA — and, when there is none, opens an M1 chart of that symbol and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
 
-#### symbols.txt
-
-`MQL5\Files\symbols.txt` lists the symbols to stream:
-
-- one symbol per line, read as ANSI, its surrounding whitespace trimmed;
-- blank lines and lines starting with `#` skipped;
-- a symbol the terminal does not know skipped, with a line in the terminal's log.
-
-Only a listed symbol streams ticks: each needs its own chart running the EA, so a symbol the adapter subscribes to that is not listed produces none.
+- The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's included.
+- A chart that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
+- The spawner refused as a duplicate keeps its chart and says hello again every `ReconnectIntervalSec`; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
+- A chart closes once its symbol has been out of use for `MT5_CHART_IDLE_SECONDS`: the spawner closes it and takes the symbol out of Market Watch, where the terminal would keep processing its ticks.
+- A symbol with open positions or pending orders never closes idle: the spawner keeps its chart and the hub counts it in use for another `MT5_CHART_IDLE_SECONDS`.
+- A deselect the terminal refuses after the close is tried again on the spawner's timer until it succeeds or the chart reopens, less often while positions or orders hold the symbol.
 
 #### The chart template
 
-`ticks.tpl` goes in `MQL5\Profiles\Templates\` and in `Profiles\Templates\`, the two places a template applied by bare name is looked for. It must be in the form the terminal saves templates in:
+Two templates attach the EA: `ticks_spawner.tpl`, with `Spawner=true`, and `ticks.tpl`, with `Spawner=false`. Each goes in `MQL5\Profiles\Templates\` and in `Profiles\Templates\`, the two places a template applied by bare name is looked for, and must be in the form the terminal saves templates in:
 
 - UTF-16LE with a byte-order mark (`FF FE`), and CRLF line ends;
 - a root `<chart>` section — its symbol and period are ignored, the chart keeps its own;
@@ -209,15 +267,23 @@ expertmode=5
 Server=ws://127.0.0.1:9000
 ReconnectIntervalSec=3
 RelaySeconds=5
+PollMilliseconds=250
+Spawner=false
+ChartTemplate=ticks.tpl
+HubPingTimeoutSec=50
 </inputs>
 </expert>
 ```
 
 | EA input | Meaning |
 |---|---|
-| `Server` | the hub's URL, `ws://127.0.0.1:<WS_PORT>` |
+| `Server` | the hub's URL, `ws://127.0.0.1:<MT5_HUB_PORT>` |
 | `ReconnectIntervalSec` | the fewest seconds between two attempts to reach the hub while the EA is not connected |
-| `RelaySeconds` | the EA's timer: the interval between server-time frames, and between checks of the connection. It must stay below `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, or the clock never verifies |
+| `RelaySeconds` | the interval between server-time frames and the symbol's commission schedule. It must stay below `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, or the clock never verifies |
+| `PollMilliseconds` | the EA's timer: the interval between reads of the hub, of the symbol's ticks and closed bars, and of the connection; the terminal fires it no faster than every 10–16 ms |
+| `Spawner` | `true` in `ticks_spawner.tpl`, `false` in `ticks.tpl`: whether the EA opens and closes the charts the hub asks for |
+| `ChartTemplate` | the template the spawner applies to a chart it opens, `ticks.tpl` |
+| `HubPingTimeoutSec` | how long after its first refusal the spawner, answered `duplicate`, says hello again before it closes its chart: the longest the hub takes to drop a dead connection, `50` s — its 10 s ping interval, its 30 s ping timeout and the 10 s close timeout of its WebSocket server |
 
 <details>
 <summary>A complete template, before its UTF-16LE encoding</summary>
@@ -294,6 +360,10 @@ expertmode=5
 Server=ws://127.0.0.1:9000
 ReconnectIntervalSec=3
 RelaySeconds=5
+PollMilliseconds=250
+Spawner=false
+ChartTemplate=ticks.tpl
+HubPingTimeoutSec=50
 </inputs>
 </expert>
 
@@ -325,13 +395,13 @@ fixed_height=-1
 
 #### The allowlist
 
-The EA's socket reaches only a host on the terminal's allowlist — Tools → Options → Expert Advisors → "Allow WebRequest for listed URL", checked, with `127.0.0.1` on its list:
+Each EA's socket reaches only a host on the terminal's allowlist — Tools → Options → Expert Advisors → "Allow WebRequest for listed URL", checked, with `127.0.0.1` on its list:
 
-- The list lives in memory, and every terminal start empties it: the host is added again after each start, until then the EA cannot reach the hub.
+- The list lives in memory, and every terminal start empties it: the host is added again after each start, until then no EA can reach the hub.
 - `setup.ini` cannot set it: MT5 ignores the `WebRequestUrl` key, which is MT4's.
 - Confirming the dialog re-initialises every attached EA, which then connects again.
 
 ### Network
 
-- The adapter needs two ports: the HTTP server's `MT5_API_PORT` and the hub's `WS_PORT`. It derives the hub's URL from `server_url` on port 9000 unless its config names `ws_url`.
+- The adapter needs two ports: the HTTP server's `MT5_API_PORT` and the hub's `MT5_HUB_PORT`. It derives the hub's URL from `server_url` on port 9000 unless its config names `ws_url`.
 - There is no authentication: the API trusts its network. Both ports are published on loopback alone; exposing either is a design change.

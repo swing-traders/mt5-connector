@@ -31,17 +31,18 @@ FAILURE_ANSWERS = {mirror.Failure.NONE: None, mirror.Failure.FALSE: False}
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
 
 
-def test_the_server_routes_the_mirror_health_commissions_the_relay_and_the_history(app):
+def test_the_server_routes_the_mirror_health_commissions_the_relays_and_the_history(app):
     routes = {
         (rule.rule, method)
         for rule in app.url_map.iter_rules()
         for method in rule.methods - {"HEAD", "OPTIONS"}
     }
-    assert len(routes) == 32 + 3 + 3
+    assert len(routes) == 32 + 4 + 3
     assert routes == {(f"/mt5/{function.name}", "POST") for function in FUNCTIONS} | {
         ("/health", "GET"),
         ("/commissions/<symbol>", "GET"),
         ("/relay/server_time", "POST"),
+        ("/relay/commissions/<symbol>", "POST"),
         ("/history/bars", "POST"),
         ("/history/ticks", "POST"),
         ("/history/ranges", "GET"),
@@ -66,6 +67,7 @@ def test_commissions_are_unavailable_while_the_clock_is_not_verified(client, clo
     response = client.get("/commissions/EURUSD")
 
     assert (response.status_code, response.json) == (503, UNVERIFIED)
+    assert "Retry-After" not in response.headers
 
 
 def test_answer_carries_the_last_error_read_after_the_call(client, stub):

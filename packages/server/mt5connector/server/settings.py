@@ -1,8 +1,14 @@
-"""The server's settings, read once from the environment at start."""
+"""The HTTP server's and the hub's settings, each read once from the environment at start."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+_API_PORT = "5000"
+_HUB_PORT = "9000"
+_CHART_IDLE_SECONDS = "900"
+_BROKER_TZ = "America/New_York"
+_BROKER_OFFSET_HOURS = "7"
 
 
 class SettingsError(Exception):
@@ -26,6 +32,8 @@ class Settings:
     clock_bootstrap_seconds: int
     history_retry_seconds: int
     floor_ttl_seconds: int
+    hub_port: int
+    chart_idle_seconds: int
 
     def __post_init__(self) -> None:
         if self.login_timeout_ms <= 0:
@@ -51,6 +59,10 @@ class Settings:
             )
         elif self.floor_ttl_seconds < 1:
             raise SettingsError(f"floor_ttl_seconds {self.floor_ttl_seconds} is not positive")
+        elif not 1 <= self.hub_port <= 65535:
+            raise SettingsError(f"hub_port {self.hub_port} is not a TCP port")
+        elif self.chart_idle_seconds < 1:
+            raise SettingsError(f"chart_idle_seconds {self.chart_idle_seconds} is not positive")
 
 
 def read_settings(environ: Mapping[str, str]) -> Settings:
@@ -64,11 +76,11 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
             "MT5_LOGIN_TIMEOUT_MS", environ.get("MT5_LOGIN_TIMEOUT_MS", "60000")
         ),
         api_host=environ.get("MT5_API_HOST", "0.0.0.0"),
-        api_port=_integer("MT5_API_PORT", environ.get("MT5_API_PORT", "5000")),
+        api_port=_integer("MT5_API_PORT", environ.get("MT5_API_PORT", _API_PORT)),
         api_threads=_integer("MT5_API_THREADS", environ.get("MT5_API_THREADS", "5")),
-        broker_tz=_zone("MT5_BROKER_TZ", environ.get("MT5_BROKER_TZ", "America/New_York")),
+        broker_tz=_zone("MT5_BROKER_TZ", environ.get("MT5_BROKER_TZ", _BROKER_TZ)),
         broker_offset_hours=_integer(
-            "MT5_BROKER_OFFSET_HOURS", environ.get("MT5_BROKER_OFFSET_HOURS", "7")
+            "MT5_BROKER_OFFSET_HOURS", environ.get("MT5_BROKER_OFFSET_HOURS", _BROKER_OFFSET_HOURS)
         ),
         clock_check_seconds=_integer(
             "MT5_CLOCK_CHECK_SECONDS", environ.get("MT5_CLOCK_CHECK_SECONDS", "300")
@@ -85,6 +97,43 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         ),
         floor_ttl_seconds=_integer(
             "MT5_FLOOR_TTL_SECONDS", environ.get("MT5_FLOOR_TTL_SECONDS", "900")
+        ),
+        hub_port=_integer("MT5_HUB_PORT", environ.get("MT5_HUB_PORT", _HUB_PORT)),
+        chart_idle_seconds=_integer(
+            "MT5_CHART_IDLE_SECONDS", environ.get("MT5_CHART_IDLE_SECONDS", _CHART_IDLE_SECONDS)
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class HubSettings:
+    hub_port: int
+    api_port: int
+    broker_tz: ZoneInfo
+    broker_offset_hours: int
+    chart_idle_seconds: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.hub_port <= 65535:
+            raise SettingsError(f"hub_port {self.hub_port} is not a TCP port")
+        elif not 1 <= self.api_port <= 65535:
+            raise SettingsError(f"api_port {self.api_port} is not a TCP port")
+        elif self.chart_idle_seconds < 1:
+            raise SettingsError(f"chart_idle_seconds {self.chart_idle_seconds} is not positive")
+
+
+def read_hub_settings(environ: Mapping[str, str]) -> HubSettings:
+    """The hub's settings the environment carries; raises SettingsError naming the first bad
+    setting."""
+    return HubSettings(
+        hub_port=_integer("MT5_HUB_PORT", environ.get("MT5_HUB_PORT", _HUB_PORT)),
+        api_port=_integer("MT5_API_PORT", environ.get("MT5_API_PORT", _API_PORT)),
+        broker_tz=_zone("MT5_BROKER_TZ", environ.get("MT5_BROKER_TZ", _BROKER_TZ)),
+        broker_offset_hours=_integer(
+            "MT5_BROKER_OFFSET_HOURS", environ.get("MT5_BROKER_OFFSET_HOURS", _BROKER_OFFSET_HOURS)
+        ),
+        chart_idle_seconds=_integer(
+            "MT5_CHART_IDLE_SECONDS", environ.get("MT5_CHART_IDLE_SECONDS", _CHART_IDLE_SECONDS)
         ),
     )
 

@@ -1,4 +1,4 @@
-"""The broker clock's verification against the trade-server time the terminal's EA relays.
+"""The broker clock's verification against the trade-server time the terminal's EAs relay.
 
 State: `status`, the latest verification, held while the latest relayed sample is fresh and the
 terminal has been connected without a break for the maximum age, and cleared while it is not; the

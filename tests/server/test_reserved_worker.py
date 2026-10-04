@@ -7,7 +7,7 @@ import time
 
 import pytest
 import requests
-from saturation import COUNTERS, Held, counters
+from saturation import COUNTERS, counters
 
 from mt5connector.client.errors import MT5ConnectionError, ServerBusy, ServerUnreachable
 from mt5connector.wire.history_wire import ServerCode
@@ -37,21 +37,6 @@ def timed(request) -> tuple[requests.Response, float]:
     return response, time.monotonic() - started
 
 
-@pytest.fixture
-def held(served, stub):
-    """positions_total calls held in the package until released, the first in it and the rest
-    waiting on the terminal behind it."""
-    held = Held(served)
-
-    def blocked():
-        held.released.wait(5)
-        return 0
-
-    stub.positions_total.side_effect = blocked
-    yield held
-    held.release()
-
-
 def test_a_call_past_the_cap_is_refused_at_once_while_health_and_the_relay_answer(
     served, stub, held
 ):
@@ -75,7 +60,8 @@ def test_a_call_past_the_cap_is_refused_at_once_while_health_and_the_relay_answe
         "workers": 3,
     }
     assert relayed.status_code == 200
-    assert commissions.status_code == 200
+    assert (commissions.status_code, commissions.headers["Retry-After"]) == (503, "5")
+    assert commissions.json()["error"]["code"] == ServerCode.SYNCING
     assert max(refused_s, health_s, relayed_s) < 1
     stub.orders_total.assert_not_called()
 

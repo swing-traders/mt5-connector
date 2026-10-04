@@ -51,10 +51,15 @@ class TickFlags(StrEnum):
 class ServerCode(IntEnum):
     """The error codes the server answers beside the package's own, outside their range."""
 
-    # HTTP 503 with Retry-After: the terminal's answers do not prove the window yet.
+    # HTTP 503 with Retry-After: a history window is unproven, a schedule has not been relayed, or
+    # no EA publishes the symbol yet.
     SYNCING = -20_001
     # HTTP 503 with Retry-After: every slot for a call that can reach the terminal is taken.
     BUSY = -20_002
+    # HTTP 422: the last commission relay for the symbol was refused.
+    RELAY_REFUSED = -20_003
+    # HTTP 400: the spawner failed to open the symbol's chart.
+    CHART_FAILED = -20_004
 
 
 # Each bar series' period and the package's timeframe for it. MN1 has no fixed period, so no series

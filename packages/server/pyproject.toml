@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mt5-connector-server"
 dynamic = ["version"]
-description = "The MT5 server: the MetaTrader5 package mirrored over HTTP, its tick hub, and the terminal's EA"
+description = "The MT5 server: the MetaTrader5 package mirrored over HTTP, its push hub, and the terminal's EA"
 readme = "mt5connector/server/README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

@@ -8,6 +8,8 @@ the last answered call carried."""
 from __future__ import annotations
 
 import inspect
+import math
+import time
 from collections import namedtuple
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,7 +21,13 @@ import numpy as np
 import requests
 from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
 
-from mt5connector.client.errors import MT5ConfigError, ResponseLost, ServerBusy, ServerUnreachable
+from mt5connector.client.errors import (
+    MT5ConfigError,
+    MT5InstrumentError,
+    ResponseLost,
+    ServerBusy,
+    ServerUnreachable,
+)
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import ServerCode
 
@@ -173,35 +181,66 @@ def _exchange(
     return Reply(HTTPStatus(response.status_code), envelope, response.headers.get("Retry-After"))
 
 
-def commission_schedule(symbol: str) -> dict | None:
-    """The commission schedule the terminal's EA relayed for a symbol, as the server keeps it; None
-    while none has been relayed. Leaves last_error as it was: no package call answers it."""
+def commission_schedule(symbol: str) -> dict:
+    """Waits for the symbol's relayed schedule, retrying after the server's advertised delay; raises
+    MT5InstrumentError when the server refused the symbol's last relay or the symbol's chart failed
+    to open. Leaves last_error as it was: no package call answers it."""
     name = "commissions"
     if _session is None:
         raise MT5ConfigError("remote_mt5: no server is configured")
+    while True:
+        try:
+            response = _session.get(
+                f"{_server_url}/commissions/{quote(symbol, safe='')}",
+                timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
+            )
+        except requests.RequestException as exc:
+            raise _unanswered(name, exc) from exc
+        try:
+            envelope = response.json()
+        except requests.JSONDecodeError as exc:
+            raise ResponseLost(f"{name}: HTTP {response.status_code} body is not JSON") from exc
+        if (
+            response.status_code == HTTPStatus.OK
+            and _is_relayed(envelope)
+            and isinstance(envelope["result"], dict)
+        ):
+            return envelope["result"]
+        elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(
+            envelope
+        ):
+            if envelope["error"]["code"] == ServerCode.SYNCING:
+                time.sleep(retry_after_s(name, response.headers.get("Retry-After")))
+            else:
+                raise ServerUnreachable(
+                    f"{name}: server not ready — {envelope['error']['message']}"
+                )
+        elif (
+            response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+            and _is_server_failure(envelope)
+            and envelope["error"]["code"] == ServerCode.RELAY_REFUSED
+        ):
+            raise MT5InstrumentError(f"{name}: {envelope['error']['message']}")
+        elif (
+            response.status_code == HTTPStatus.BAD_REQUEST
+            and _is_server_failure(envelope)
+            and envelope["error"]["code"] == ServerCode.CHART_FAILED
+        ):
+            raise MT5InstrumentError(f"{name}: {envelope['error']['message']}")
+        else:
+            raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
+
+
+def retry_after_s(name: str, retry_after: str | None) -> float:
+    """The delay a deferring answer's Retry-After gives; raises ServerUnreachable for none."""
     try:
-        response = _session.get(
-            f"{_server_url}/commissions/{quote(symbol, safe='')}",
-            timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
-        )
-    except requests.RequestException as exc:
-        raise _unanswered(name, exc) from exc
-    try:
-        envelope = response.json()
-    except requests.JSONDecodeError as exc:
-        raise ResponseLost(f"{name}: HTTP {response.status_code} body is not JSON") from exc
-    if response.status_code == HTTPStatus.OK and _is_relayed(envelope):
-        return envelope["result"]
-    elif (
-        response.status_code == HTTPStatus.OK
-        and _is_server_failure(envelope)
-        and envelope["error"]["code"] == mirror.RES_E_NOT_FOUND
-    ):
-        return None
-    elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(envelope):
-        raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
+        seconds = float(retry_after)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if math.isfinite(seconds) and seconds >= 0:
+        return seconds
     else:
-        raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
+        raise ServerUnreachable(f"{name}: a deferring answer's Retry-After is {retry_after!r}")
 
 
 def _unanswered(name: str, exc: requests.RequestException) -> ServerUnreachable:
@@ -477,23 +516,3 @@ def _market_order(order_type, symbol, volume, price, comment, ticket):
     if ticket is not None:
         request["position"] = ticket
     return _MIRRORED[mirror.FunctionName.ORDER_SEND](request)
-
-
-def tick_from_ws(payload: dict) -> tuple:
-    """Convert an EA WebSocket tick message (all-string JSON) to a Tick.
-
-    The EA message has no ``type`` key, stringifies all numerics, and names the epoch millisecond
-    field ``time_msec``. The formatted ``time`` string is ignored; epoch seconds are derived from
-    ``time_msec``.
-    """
-    time_msc = int(payload.get("time_msec", "0"))
-    return STRUCT_TYPES[mirror.StructName.TICK](
-        time=time_msc // 1000,
-        bid=float(payload.get("bid", "0.0")),
-        ask=float(payload.get("ask", "0.0")),
-        last=float(payload.get("last", "0.0")),
-        volume=int(float(payload.get("volume", "0"))),
-        time_msc=time_msc,
-        flags=int(payload.get("flags", "0")),
-        volume_real=float(payload.get("volume_real", "0.0")),
-    )

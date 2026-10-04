@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import pytest
+from chart_posts import ChartPosts, publishers_on
 from mirror_samples import CLOCK
 
 from mt5connector.server.app import create_app
@@ -124,6 +125,7 @@ def routes(terminal, commissions, check: ClockCheck):
         ServerTimeSink(max_age_s=MAX_AGE_S),
         check.status,
         history,
+        publishers_on(ChartPosts()),
         workers=3,
         retry_s=5,
     ).test_client()

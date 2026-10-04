@@ -5,6 +5,7 @@ import threading
 import time
 
 import pytest
+from chart_posts import ChartPosts, publishers_on
 from mirror_samples import CLOCK
 
 from mt5connector.server.app import create_app
@@ -170,7 +171,15 @@ def test_a_frame_relayed_through_the_route_verifies_the_clock(
     server_times = _SinkEndingTheCheck()
     check = ClockCheck(server_times, CLOCK, max_age_s=30, check_s=300, bootstrap_s=60)
     client = create_app(
-        terminal, commissions, CLOCK, server_times, check.status, history, workers=3, retry_s=5
+        terminal,
+        commissions,
+        CLOCK,
+        server_times,
+        check.status,
+        history,
+        publishers_on(ChartPosts()),
+        workers=3,
+        retry_s=5,
     ).test_client()
 
     def run_until_ended():

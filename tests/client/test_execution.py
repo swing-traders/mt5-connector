@@ -416,7 +416,11 @@ async def test_an_accepted_orders_ticket_is_what_a_later_cancel_removes(h):
     h.venue.orders_get.side_effect = resting(ours_order(ticket=5003))
     h.venue.order_send.return_value = send_result()
     await h.client._cancel_order(cancel_command(order))
-    assert sent_requests(h)[-1] == {"action": mirror.TRADE_ACTION_REMOVE, "order": 5003}
+    assert sent_requests(h)[-1] == {
+        "action": mirror.TRADE_ACTION_REMOVE,
+        "symbol": "EURUSD",
+        "order": 5003,
+    }
 
 
 # ── Modify ───────────────────────────────────────────────────────────────────
@@ -429,6 +433,7 @@ async def test_a_price_modify_of_a_resting_limit_updates_it(h):
     assert sent_requests(h) == [
         {
             "action": mirror.TRADE_ACTION_MODIFY,
+            "symbol": "EURUSD",
             "order": 5002,
             "price": 1.07,
             "sl": 0.0,
@@ -521,7 +526,9 @@ async def test_a_cancel_of_a_resting_order_removes_it_and_cancels_at_the_acknowl
     order = h.place(h.limit(), ticket=5001)
     h.venue.orders_get.side_effect = resting(ours_order(ticket=5001))
     await h.client._cancel_order(cancel_command(order))
-    assert sent_requests(h) == [{"action": mirror.TRADE_ACTION_REMOVE, "order": 5001}]
+    assert sent_requests(h) == [
+        {"action": mirror.TRADE_ACTION_REMOVE, "symbol": "EURUSD", "order": 5001}
+    ]
     assert h.names() == ["OrderCanceled", "AccountState"]
     assert h.events[0].venue_order_id == VenueOrderId("5001")
     h.venue.positions_get.assert_not_called()

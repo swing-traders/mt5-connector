@@ -3,7 +3,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import waitress
+from chart_posts import ChartPosts, publishers_on
 from mirror_samples import CLOCK
+from saturation import Held
 
 import mt5connector.client.remote_mt5 as shim
 from mt5connector.server.app import create_app
@@ -67,13 +69,24 @@ def history(terminal, floors):
 
 
 @pytest.fixture
+def chart_posts():
+    """The hub's chart route, answering that an EA publishes every symbol posted."""
+    return ChartPosts()
+
+
+@pytest.fixture
+def publishers(chart_posts):
+    return publishers_on(chart_posts)
+
+
+@pytest.fixture
 def workers():
     """The server's worker threads: one kept free, so two terminal-bound calls at once."""
     return 3
 
 
 @pytest.fixture
-def app(terminal, commissions, server_times, clock_status, history, workers):
+def app(terminal, commissions, server_times, clock_status, history, publishers, workers):
     """The app with the broker clock verified, refusing a call past its cap with Retry-After 5."""
     return create_app(
         terminal,
@@ -82,6 +95,7 @@ def app(terminal, commissions, server_times, clock_status, history, workers):
         server_times,
         clock_status,
         history,
+        publishers,
         workers=workers,
         retry_s=5,
     )
@@ -113,3 +127,18 @@ def remote(served, monkeypatch):
     shim.configure(served)
     yield shim
     shim._session.close()
+
+
+@pytest.fixture
+def held(served, stub):
+    """positions_total calls held in the package until released, the first in it and the rest
+    waiting on the terminal behind it."""
+    held = Held(served)
+
+    def blocked():
+        held.released.wait(5)
+        return 0
+
+    stub.positions_total.side_effect = blocked
+    yield held
+    held.release()

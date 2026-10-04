@@ -25,11 +25,15 @@ from mt5connector.wire import mirror
 
 NOW_NS = 1_760_000_000_000_000_000
 
-# The tier and entry integers the terminal assigns MONEY_DEPOSIT, MONEY_SPECIFIED, INOUT and IN.
-MONEY_DEPOSIT = 0
-MONEY_SPECIFIED = 6
-ENTRY_INOUT = 0
-ENTRY_IN = 1
+# The names EnumToString gives the commission enumerations' members, as the EA relays them.
+MONEY_DEPOSIT = "SYMBOL_COMMISSION_MONEY_DEPOSIT"
+MONEY_SPECIFIED = "SYMBOL_COMMISSION_MONEY_SPECIFIED"
+PERCENT = "SYMBOL_COMMISSION_PERCENT"
+POINTS = "SYMBOL_COMMISSION_PIPS"
+PERCENT_PROFIT = "SYMBOL_COMMISSION_PERCENT_PROFIT"
+ENTRY_INOUT = "SYMBOL_COMMISSION_ENTRY_INOUT"
+ENTRY_IN = "SYMBOL_COMMISSION_ENTRY_IN"
+ENTRY_OUT = "SYMBOL_COMMISSION_ENTRY_OUT"
 
 TRADED_MODES = {
     mirror.SYMBOL_CALC_MODE_FOREX: CurrencyPair,
@@ -80,7 +84,7 @@ class Venue:
             return tick(0.0, 0.0, time=0)
 
     def commission_schedule(self, name):
-        return self.schedules.get(name)
+        return self.schedules.get(name, {"ret": 0, "last_error": 0, "rules": []})
 
 
 def schedule(value, currency, mode=MONEY_DEPOSIT, entry=ENTRY_INOUT):
@@ -91,15 +95,15 @@ def schedule(value, currency, mode=MONEY_DEPOSIT, entry=ENTRY_INOUT):
         "rules": [
             {
                 "currency": currency,
-                "mode_range": 0,
-                "mode_charge": 2,
+                "mode_range": "SYMBOL_COMMISSION_RANGE_VOLUME",
+                "mode_charge": "SYMBOL_COMMISSION_CHARGE_INSTANT",
                 "mode_entry": entry,
-                "mode_direction": 0,
-                "mode_profit": 0,
+                "mode_direction": "SYMBOL_COMMISSION_DIRECTION_BOTH",
+                "mode_profit": "SYMBOL_COMMISSION_PROFIT_ALL",
                 "tiers": [
                     {
                         "mode": mode,
-                        "volume_type": 1,
+                        "volume_type": "SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
                         "value": value,
                         "min_value": 0.0,
                         "max_value": 0.0,
@@ -453,7 +457,7 @@ def test_the_account_currency_is_the_accounts():
 # ── Fees ─────────────────────────────────────────────────────────────────────
 
 
-async def test_no_relayed_rule_is_a_zero_taker_fee(venue):
+async def test_a_relayed_schedule_without_a_rule_is_a_zero_taker_fee(venue):
     instrument = await loaded(venue, symbol_info(name="DE40.a"))
     assert instrument.taker_fee == Decimal(0)
 
@@ -564,16 +568,85 @@ async def test_a_rule_in_a_currency_the_venue_cannot_convert_fails_the_load_nami
     assert "GBP" in str(refused.value)
 
 
-async def test_a_commission_mode_without_a_known_value_fails_the_load_naming_it(venue):
+async def test_a_percent_rule_charged_on_both_legs_is_its_percentage_of_the_notional(venue):
+    venue.add(
+        symbol_info(name="EURUSD.a"),
+        bid=1.08490,
+        ask=1.08510,
+        schedule=schedule(0.002, "", mode=PERCENT, entry=ENTRY_INOUT),
+    )
+    provider = provider_for("EURUSD.a")
+    await provider.load_all_async()
+    fee = provider.get_instrument("EURUSD.a").taker_fee
+    pct = Decimal("0.002")
+    assert fee == pct / 100
+
+
+async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
     venue.add(
         symbol_info(name="EURUSD.a"),
         bid=1.085,
         ask=1.085,
-        schedule=schedule(0.001, "USD", mode=5, entry=ENTRY_INOUT),
+        schedule=schedule(0.004, "", mode=PERCENT, entry=ENTRY_IN),
     )
     provider = provider_for("EURUSD.a")
-    with pytest.raises(MT5InstrumentError, match="EURUSD.a"):
+    await provider.load_all_async()
+    fee = provider.get_instrument("EURUSD.a").taker_fee
+    pct = Decimal("0.004")
+    assert fee == pct / 100 / 2
+
+
+async def test_a_points_rule_is_its_points_in_price_over_the_price(venue):
+    venue.add(
+        symbol_info(name="EURUSD.a", point=0.00001),
+        bid=1.08490,
+        ask=1.08510,
+        schedule=schedule(30.0, "", mode=POINTS, entry=ENTRY_INOUT),
+    )
+    provider = provider_for("EURUSD.a")
+    await provider.load_all_async()
+    fee = provider.get_instrument("EURUSD.a").taker_fee
+    pts, point, price = Decimal(30), Decimal("0.00001"), Decimal("1.08500")
+    assert abs(fee - pts * point / price) < Decimal("1e-18")
+    assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0002765")
+
+
+async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
+    venue.add(
+        symbol_info(name="EURUSD.a", point=0.00001),
+        bid=1.085,
+        ask=1.085,
+        schedule=schedule(30.0, "", mode=POINTS, entry=ENTRY_IN),
+    )
+    provider = provider_for("EURUSD.a")
+    await provider.load_all_async()
+    fee = provider.get_instrument("EURUSD.a").taker_fee
+    assert abs(fee - Decimal(30) * Decimal("0.00001") / Decimal("1.085") / 2) < Decimal("1e-18")
+
+
+@pytest.mark.parametrize(
+    ("mode", "entry", "named"),
+    [
+        ("SYMBOL_COMMISSION_BOGUS", ENTRY_INOUT, "SYMBOL_COMMISSION_BOGUS"),
+        (PERCENT_PROFIT, ENTRY_INOUT, PERCENT_PROFIT),
+        (MONEY_DEPOSIT, ENTRY_OUT, ENTRY_OUT),
+        (MONEY_DEPOSIT, "SYMBOL_COMMISSION_ENTRY_BOGUS", "SYMBOL_COMMISSION_ENTRY_BOGUS"),
+    ],
+    ids=["unknown-mode", "mode-without-derivation", "exit-only", "unknown-entry"],
+)
+async def test_a_commission_rule_without_a_fee_derivation_fails_the_load_naming_it(
+    venue, mode, entry, named
+):
+    venue.add(
+        symbol_info(name="EURUSD.a"),
+        bid=1.085,
+        ask=1.085,
+        schedule=schedule(0.001, "USD", mode=mode, entry=entry),
+    )
+    provider = provider_for("EURUSD.a")
+    with pytest.raises(MT5InstrumentError, match="EURUSD.a") as refused:
         await provider.load_all_async()
+    assert named in str(refused.value)
 
 
 async def test_a_non_finite_commission_value_fails_the_load_naming_the_symbol(venue):

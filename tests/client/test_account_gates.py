@@ -18,6 +18,7 @@ from nautilus_trader.model.identifiers import AccountId, InstrumentId, PositionI
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+from push_double import PushDouble
 from venue_doubles import account_info, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
@@ -78,15 +79,16 @@ def _client(
         "trade_allowed": terminal_trade_allowed,
     }
     clock = LiveClock()
-    client = MT5LiveExecutionClient(
-        loop=loop,
-        connection=conn,
-        msgbus=MessageBus(trader_id=TraderId(trader_id), clock=clock),
-        cache=TestComponentStubs.cache(),
-        clock=clock,
-        instrument_provider=_provider(instruments),
-        config=_config(),
-    )
+    with patch.object(execution, "PushClient", PushDouble):
+        client = MT5LiveExecutionClient(
+            loop=loop,
+            connection=conn,
+            msgbus=MessageBus(trader_id=TraderId(trader_id), clock=clock),
+            cache=TestComponentStubs.cache(),
+            clock=clock,
+            instrument_provider=_provider(instruments),
+            config=_config(),
+        )
     client.generate_account_state = MagicMock()
     return client
 
@@ -100,11 +102,11 @@ def venue():
         yield package
 
 
-async def _stop_polling(client):
-    if client._exec_poll_task is not None:
-        client._exec_poll_task.cancel()
+async def _stop_account_loop(client):
+    if client._account_task is not None:
+        client._account_task.cancel()
         try:
-            await client._exec_poll_task
+            await client._account_task
         except asyncio.CancelledError:
             pass
 
@@ -208,15 +210,17 @@ async def test_a_non_hedging_account_fails_the_connect_naming_both_modes_before_
     venue.orders_get.assert_not_called()
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
-    assert client._exec_poll_task is None
+    assert client._account_task is None
+    assert not client._push.connected
 
 
 async def test_a_hedging_account_connects(venue):
     client = _client(account_info(margin_mode=mirror.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING))
     await client._connect()
     client.generate_account_state.assert_called_once()
-    assert not client._exec_poll_task.done()
-    await _stop_polling(client)
+    assert not client._account_task.done()
+    assert client._push.connected
+    await _stop_account_loop(client)
 
 
 # ── The investor gate ────────────────────────────────────────────────────────
@@ -230,14 +234,16 @@ async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue)
     venue.orders_get.assert_not_called()
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
-    assert client._exec_poll_task is None
+    assert client._account_task is None
+    assert not client._push.connected
 
 
 async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(venue):
     client = _client(account_info(trade_allowed=True), terminal_trade_allowed=True)
     await client._connect()
-    assert not client._exec_poll_task.done()
-    await _stop_polling(client)
+    assert not client._account_task.done()
+    assert client._push.connected
+    await _stop_account_loop(client)
 
 
 # ── The account id ───────────────────────────────────────────────────────────
@@ -247,7 +253,7 @@ async def test_the_account_id_is_the_venue_and_the_login_the_account_reports(ven
     client = _client(account_info(login=7654321))
     await client._connect()
     assert client.account_id == AccountId("MT5-7654321")
-    await _stop_polling(client)
+    await _stop_account_loop(client)
 
 
 # ── Currency registration ────────────────────────────────────────────────────
@@ -260,7 +266,7 @@ async def test_a_pre_minted_account_currency_is_re_registered_at_the_accounts_di
     assert Currency.from_str("UST", strict=True).precision == 2
     assert nautilus_pyo3.Currency.from_str("UST", strict=True).precision == 2
     client.generate_account_state.assert_called_once()
-    await _stop_polling(client)
+    await _stop_account_loop(client)
 
 
 async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(venue):
@@ -270,13 +276,13 @@ async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(v
     await client._connect()
     assert Currency.from_str("CLP", strict=True).precision == 0
     assert Currency.from_internal_map("BHD") is None
-    await _stop_polling(client)
+    await _stop_account_loop(client)
 
 
 @pytest.fixture
 def settlement_venue(venue):
     venue.symbol_select.return_value = True
-    venue.commission_schedule.return_value = None
+    venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
     venue.symbol_info.return_value = symbol_info(
         currency_base="XPT", currency_profit="UST", currency_margin="BHD"
     )
@@ -305,7 +311,7 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
             )
             assert instrument.base_currency.precision == 2
         finally:
-            await _stop_polling(client)
+            await _stop_account_loop(client)
     assert seen == [(8, 8, 8, 8, 8), (2, 2, 2, 2, 2)]
 
 
@@ -317,7 +323,7 @@ async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
     try:
         await first._connect()
     finally:
-        await _stop_polling(first)
+        await _stop_account_loop(first)
 
     settlement_venue.symbol_info.return_value = symbol_info(currency_profit=code)
     later = _client(account_info(currency="USD"))
@@ -334,7 +340,7 @@ async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
             assert Currency.from_str(code, strict=True).precision == precision
             assert nautilus_pyo3.Currency.from_str(code, strict=True).precision == precision
     finally:
-        await _stop_polling(later)
+        await _stop_account_loop(later)
 
 
 # ── The magic ────────────────────────────────────────────────────────────────
@@ -362,7 +368,7 @@ async def test_the_client_owns_exactly_the_positions_its_trader_ids_magic_marks(
     client = _client(account_info(), instruments=[instrument], trader_id="TRADER-001")
     client._provider.get_instrument.side_effect = {"EURUSD": instrument}.get
     await client._connect()
-    await _stop_polling(client)
+    await _stop_account_loop(client)
     venue.positions_get.return_value = (
         trade_position(identifier=1, magic=3181061856910866440),
         trade_position(identifier=2, magic=2268196824564769654),
@@ -384,7 +390,7 @@ async def test_the_currencies_register_before_the_first_account_state(venue):
     )
     await client._connect()
     assert seen == [2]
-    await _stop_polling(client)
+    await _stop_account_loop(client)
 
 
 async def test_each_client_loads_its_own_configs_symbols_from_a_shared_provider(venue):
@@ -396,7 +402,7 @@ async def test_each_client_loads_its_own_configs_symbols_from_a_shared_provider(
     package.symbol_select.return_value = True
     package.symbol_info.side_effect = definitions.get
     package.symbols_get.return_value = tuple(definitions.values())
-    package.commission_schedule.return_value = None
+    package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
     conn = MagicMock(spec=MT5Connection)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
@@ -413,20 +419,21 @@ async def test_each_client_loads_its_own_configs_symbols_from_a_shared_provider(
         symbols=["GBPUSD"],
         server_url="http://127.0.0.1:5000",
     )
-    client = MT5LiveExecutionClient(
-        loop=asyncio.get_running_loop(),
-        connection=conn,
-        msgbus=MessageBus(trader_id=TraderId("TESTER-001"), clock=clock),
-        cache=TestComponentStubs.cache(),
-        clock=clock,
-        instrument_provider=provider,
-        config=config,
-    )
+    with patch.object(execution, "PushClient", PushDouble):
+        client = MT5LiveExecutionClient(
+            loop=asyncio.get_running_loop(),
+            connection=conn,
+            msgbus=MessageBus(trader_id=TraderId("TESTER-001"), clock=clock),
+            cache=TestComponentStubs.cache(),
+            clock=clock,
+            instrument_provider=provider,
+            config=config,
+        )
     client.generate_account_state = MagicMock()
     with patch("mt5connector.client.providers.mt5", package):
         await client._connect()
     assert provider.get_instrument("GBPUSD") is not None
-    await _stop_polling(client)
+    await _stop_account_loop(client)
 
 
 # ── The lifecycle ────────────────────────────────────────────────────────────
@@ -439,7 +446,7 @@ async def test_a_connect_on_a_connected_client_is_refused(venue):
         with pytest.raises(RuntimeError, match="already connected"):
             await client._connect()
     finally:
-        await _stop_polling(client)
+        await _stop_account_loop(client)
 
 
 async def test_a_disconnect_on_a_client_never_connected_is_refused(venue):

@@ -1,6 +1,6 @@
 """The MT5 server: the MetaTrader5 package mirrored over HTTP with every epoch in true UTC, the
-history windows it vouches for, its liveness, and what the terminal's EA relays — its trade-server
-time and its commission schedules.
+history windows it vouches for, its liveness, and what the terminal's EAs relay — the trade-server
+time and each symbol's commission schedule.
 
 State: the calls that can reach the terminal in flight now, the most in flight at once and the calls
 refused since start; nothing is persisted."""
@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 from http import HTTPStatus
@@ -18,8 +19,14 @@ from http import HTTPStatus
 import waitress
 from flask import Flask, make_response, request
 
+from mt5connector.server.charts import ChartFailed, HubError, Publishers, hub_charts
 from mt5connector.server.clock_check import ClockCheck, ClockStatus
-from mt5connector.server.commissions import CommissionStore
+from mt5connector.server.commissions import (
+    CommissionStore,
+    RelayRefusal,
+    commission_schedule,
+    commissions_refusal,
+)
 from mt5connector.server.encoding import encode, non_epochs, package_arguments
 from mt5connector.server.history import FloorStore, History, Syncing, bars_refusal, ticks_refusal
 from mt5connector.server.server_time import ServerTimeSink, server_time_refusal, server_time_sample
@@ -35,7 +42,8 @@ from mt5connector.server.wire.history_wire import (
     ServerCode,
     TickFlags,
 )
-from mt5connector.server.ws_server import SERVER_TIME_RELAY_PATH
+from mt5connector.server.wire.push_wire import ChartState
+from mt5connector.server.ws_server import COMMISSIONS_RELAY_PATH, SERVER_TIME_RELAY_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +54,15 @@ class _Endpoint(StrEnum):
     HEALTH = "health"
     COMMISSIONS = "commissions"
     SERVER_TIME_RELAY = "server_time_relay"
+    COMMISSIONS_RELAY = "commissions_relay"
     HISTORY_BARS = "history_bars"
     HISTORY_TICKS = "history_ticks"
     HISTORY_RANGES = "history_ranges"
 
 
-# The routes that answer while the broker clock is not verified: the liveness, and the relay that
-# verifies it.
-_UNGATED = frozenset({_Endpoint.HEALTH, _Endpoint.SERVER_TIME_RELAY})
+# The routes that answer while the broker clock is not verified: the liveness, the relay that
+# verifies it, and the commission relay, which carries no time.
+_UNGATED = frozenset({_Endpoint.HEALTH, _Endpoint.SERVER_TIME_RELAY, _Endpoint.COMMISSIONS_RELAY})
 
 
 class TerminalStartError(Exception):
@@ -74,6 +83,17 @@ def connect_terminal(terminal: Terminal, settings: Settings) -> None:
     )
     if isinstance(outcome, Failed):
         raise TerminalStartError(f"initialize failed: {outcome.last_error}")
+
+
+@dataclass(frozen=True)
+class _Unserved:
+    """Why a read of a symbol is not served: no EA publishes it yet, the hub did not take the post,
+    or the spawner failed to open the symbol's chart."""
+
+    status: HTTPStatus
+    code: int
+    message: str
+    headers: dict[str, str]
 
 
 class _Concurrency:
@@ -127,15 +147,14 @@ def create_app(
     server_times: ServerTimeSink,
     clock_status: ClockStatus,
     history: History,
+    publishers: Publishers,
     *,
     workers: int,
     retry_s: int,
 ) -> Flask:
-    """The server's routes: POST /mt5/<function> for every package function, GET /health, GET
-    /commissions/<symbol>, POST /relay/server_time, POST /history/bars and /history/ticks, and GET
-    /history/ranges. Every route but /health and the relay answers 503 while `clock_status` holds no
-    verification. A route that can reach the terminal answers 503 with Retry-After `retry_s` when
-    `workers` − 1 such calls are already in flight."""
+    """The server's routes — the package mirror, /health, the commission read, the relays and the
+    history routes — behind the clock gate, the publisher check and the cap of `workers` − 1
+    terminal-bound calls; `retry_s` is the Retry-After of every deferring answer."""
     concurrency = _Concurrency(workers)
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
@@ -156,25 +175,39 @@ def create_app(
     app.add_url_rule(
         "/commissions/<symbol>",
         endpoint=_Endpoint.COMMISSIONS.value,
-        view_func=_commissions_view(commissions),
+        view_func=_commissions_view(commissions, publishers, retry_s),
         methods=["GET"],
     )
     app.add_url_rule(
         SERVER_TIME_RELAY_PATH,
         endpoint=_Endpoint.SERVER_TIME_RELAY.value,
-        view_func=_server_time_relay_view(server_times),
+        view_func=_server_time_relay_view(server_times, publishers),
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        f"{COMMISSIONS_RELAY_PATH}/<symbol>",
+        endpoint=_Endpoint.COMMISSIONS_RELAY.value,
+        view_func=_commissions_relay_view(commissions),
         methods=["POST"],
     )
     app.add_url_rule(
         BARS_PATH,
         endpoint=_Endpoint.HISTORY_BARS.value,
-        view_func=_capped(concurrency, retry_s, _history_bars_view(history, server_times, clock)),
+        view_func=_charted(
+            publishers,
+            retry_s,
+            _capped(concurrency, retry_s, _history_bars_view(history, server_times, clock)),
+        ),
         methods=["POST"],
     )
     app.add_url_rule(
         TICKS_PATH,
         endpoint=_Endpoint.HISTORY_TICKS.value,
-        view_func=_capped(concurrency, retry_s, _history_ticks_view(history, server_times, clock)),
+        view_func=_charted(
+            publishers,
+            retry_s,
+            _capped(concurrency, retry_s, _history_ticks_view(history, server_times, clock)),
+        ),
         methods=["POST"],
     )
     app.add_url_rule(
@@ -192,6 +225,51 @@ def _clock_gate(clock_status: ClockStatus) -> Callable:
             return _clock_unverified(), 503
 
     return gate
+
+
+def _charted(publishers: Publishers, retry_s: int, view: Callable) -> Callable:
+    """The view behind the publisher check: a read naming a symbol no EA publishes yet is deferred
+    while its chart is requested, and refused once the spawner failed to open it."""
+
+    def charted():
+        symbol = _named_symbol(_body_arguments())
+        if symbol is None:
+            return view()
+        else:
+            unserved = _ensure_published(publishers, symbol, retry_s)
+            if unserved is None:
+                return view()
+            else:
+                failure = _failure(unserved.code, unserved.message)
+                return failure, unserved.status, unserved.headers
+
+    return charted
+
+
+def _ensure_published(publishers: Publishers, symbol: str, retry_s: int) -> _Unserved | None:
+    """None once an EA publishes the symbol, else why its read is not served; posts the symbol to
+    the hub when due."""
+    try:
+        state = publishers.ensure_chart(symbol)
+    except HubError as failure:
+        return _Unserved(HTTPStatus.SERVICE_UNAVAILABLE, mirror.RES_E_FAIL, str(failure), {})
+    except ChartFailed as failure:
+        message = f"the chart of {symbol} failed to open: {failure}"
+        return _Unserved(HTTPStatus.BAD_REQUEST, ServerCode.CHART_FAILED, message, {})
+    if state == ChartState.PUBLISHED:
+        return None
+    else:
+        message = f"no publisher for {symbol}; chart requested"
+        headers = {"Retry-After": str(retry_s)}
+        return _Unserved(HTTPStatus.SERVICE_UNAVAILABLE, ServerCode.SYNCING, message, headers)
+
+
+def _named_symbol(body: object) -> str | None:
+    """The symbol a read's body names, or None for a body that names none."""
+    if isinstance(body, dict) and isinstance(body.get("symbol"), str) and body["symbol"]:
+        return body["symbol"]
+    else:
+        return None
 
 
 def _capped(concurrency: _Concurrency, retry_s: int, view: Callable) -> Callable:
@@ -255,35 +333,75 @@ def _health_view(clock_status: ClockStatus, concurrency: _Concurrency) -> Callab
     return view
 
 
-def _commissions_view(commissions: CommissionStore) -> Callable:
+def _commissions_view(
+    commissions: CommissionStore, publishers: Publishers, retry_s: int
+) -> Callable:
     # No package call answers a relayed schedule, so these envelopes carry no last_error.
     def view(symbol: str):
-        schedule = commissions.read(symbol)
-        if schedule is None:
+        unserved = _ensure_published(publishers, symbol, retry_s)
+        relay = commissions.read(symbol)
+        if unserved is not None:
+            error = {"code": unserved.code, "message": unserved.message}
+            return {"ok": False, "error": error}, unserved.status, unserved.headers
+        elif relay is None:
             message = f"no commission schedule relayed for {symbol}"
-            return {"ok": False, "error": {"code": mirror.RES_E_NOT_FOUND, "message": message}}, 200
+            error = {"code": ServerCode.SYNCING, "message": message}
+            return (
+                {"ok": False, "error": error},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"Retry-After": str(retry_s)},
+            )
+        elif isinstance(relay, RelayRefusal):
+            message = f"the commission relay for {symbol} was refused: {relay.reason}"
+            error = {"code": ServerCode.RELAY_REFUSED, "message": message}
+            return {"ok": False, "error": error}, HTTPStatus.UNPROCESSABLE_ENTITY
         else:
-            return {"ok": True, "result": dataclasses.asdict(schedule)}, 200
+            return {"ok": True, "result": dataclasses.asdict(relay)}, 200
 
     return view
 
 
-def _server_time_relay_view(server_times: ServerTimeSink) -> Callable:
+def _server_time_relay_view(server_times: ServerTimeSink, publishers: Publishers) -> Callable:
     # No package call answers a relayed frame, so these envelopes carry no last_error.
     def view():
         frame = _body_arguments()
         refusal = server_time_refusal(frame)
         if request.remote_addr != _LOOPBACK:
-            message = f"{request.remote_addr} is not loopback"
-            return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}, 403
+            return _not_loopback()
         elif refusal is not None:
             error = {"code": mirror.RES_E_INVALID_PARAMS, "message": refusal}
             return {"ok": False, "error": error}, 400
         else:
-            server_times.write(server_time_sample(frame))
+            sample = server_time_sample(frame)
+            server_times.write(sample)
+            publishers.saw(sample.symbol)
             return {"ok": True, "result": None}, 200
 
     return view
+
+
+def _commissions_relay_view(commissions: CommissionStore) -> Callable:
+    # No package call answers a relayed frame, so these envelopes carry no last_error.
+    def view(symbol: str):
+        frame = _body_arguments()
+        refusal = commissions_refusal(frame, symbol)
+        if request.remote_addr != _LOOPBACK:
+            return _not_loopback()
+        elif refusal is not None:
+            commissions.write(symbol, RelayRefusal(refusal))
+            error = {"code": mirror.RES_E_INVALID_PARAMS, "message": refusal}
+            return {"ok": False, "error": error}, 400
+        else:
+            commissions.write(symbol, commission_schedule(frame))
+            return {"ok": True, "result": None}, 200
+
+    return view
+
+
+def _not_loopback() -> tuple[dict[str, object], int]:
+    """The answer to a relayed frame that did not arrive over loopback."""
+    message = f"{request.remote_addr} is not loopback"
+    return {"ok": False, "error": {"code": mirror.RES_E_FAIL, "message": message}}, 403
 
 
 def _history_bars_view(
@@ -427,6 +545,12 @@ def main() -> None:
         retry_s=settings.history_retry_seconds,
         floor_ttl_s=settings.floor_ttl_seconds,
     )
+    publishers = Publishers(
+        hub_charts(f"http://127.0.0.1:{settings.hub_port}"),
+        fresh_s=settings.clock_sample_max_age_seconds,
+        touch_s=settings.chart_idle_seconds / 2,
+        retry_s=settings.history_retry_seconds,
+    )
     app = create_app(
         terminal,
         CommissionStore(),
@@ -434,6 +558,7 @@ def main() -> None:
         server_times,
         clock_check.status,
         history,
+        publishers,
         workers=settings.api_threads,
         retry_s=settings.history_retry_seconds,
     )

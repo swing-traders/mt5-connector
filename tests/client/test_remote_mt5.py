@@ -356,29 +356,3 @@ def test_tick_struct_attribute_access():
     )
     assert t.bid == 1.0 and t.ask == 1.1 and t.time_msc == 123000
     assert t._asdict()["bid"] == 1.0
-
-
-def test_tick_from_ws_converts_new_format():
-    tick = rmt5.tick_from_ws(
-        {
-            "symbol": "EURUSD",
-            "time": "2024.06.01 10:00:00",
-            "ask": "1.0854",
-            "bid": "1.0852",
-            "volume": "0",
-            "last": "0.0",
-            "time_msec": "1712345678123",
-            "flags": "2",
-        }
-    )
-    assert tick.time == 1712345678  # time_msec // 1000
-    assert tick.time_msc == 1712345678123
-    assert tick.bid == 1.0852 and tick.ask == 1.0854
-    assert tick.last == 0.0 and tick.volume == 0 and tick.flags == 2
-
-
-def test_tick_from_ws_missing_fields_default():
-    tick = rmt5.tick_from_ws({"bid": "1.1"})
-    assert tick.bid == 1.1 and tick.ask == 0.0
-    assert tick.time == 0 and tick.time_msc == 0
-    assert tick.volume == 0 and tick.flags == 0 and tick.volume_real == 0.0

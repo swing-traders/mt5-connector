@@ -13,7 +13,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick
+from nautilus_trader.model.data import Bar, BarSpecification, BarType, MarkPriceUpdate, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
@@ -23,6 +23,7 @@ from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.currencies import base_currency, venue_currency
 from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.wire import mirror
+from mt5connector.wire.history_wire import Series, bar_series
 
 if TYPE_CHECKING:
     from mt5connector.client.connection import AccountSnapshot
@@ -306,6 +307,63 @@ _MT5_TIMEFRAME_MAP: dict[int, tuple[int, BarAggregation]] = {
     32769: (1, BarAggregation.WEEK),  # W1
     49153: (1, BarAggregation.MONTH),  # MN1
 }
+# The terminal's series of each (step, aggregation) it has a timeframe of; a month has no fixed
+# period.
+_VENUE_SERIES: dict[tuple[int, BarAggregation], Series] = {
+    step_and_aggregation: bar_series(timeframe)
+    for timeframe, step_and_aggregation in _MT5_TIMEFRAME_MAP.items()
+    if step_and_aggregation[1] != BarAggregation.MONTH
+}
+
+
+def quote_tick_from_frame(frame: dict, instrument: InstrumentAny, ts_init: int) -> QuoteTick:
+    """A pushed tick as a QuoteTick stamped at its time_msc: bid and ask as the venue quotes them,
+    and both sizes the instrument's largest order, since the venue publishes no depth."""
+    return QuoteTick(
+        instrument_id=instrument.id,
+        bid_price=instrument.make_price(frame["bid"]),
+        ask_price=instrument.make_price(frame["ask"]),
+        bid_size=instrument.max_quantity,
+        ask_size=instrument.max_quantity,
+        ts_event=frame["time_msc"] * 1_000_000,
+        ts_init=ts_init,
+    )
+
+
+def mark_at_mid(quote: QuoteTick) -> MarkPriceUpdate:
+    """The mark at a quote's mid, one decimal finer than the quote so every mid is exact."""
+    mid = (quote.bid_price.as_decimal() + quote.ask_price.as_decimal()) / 2
+    return MarkPriceUpdate(
+        quote.instrument_id,
+        Price(mid, quote.bid_price.precision + 1),
+        quote.ts_event,
+        quote.ts_init,
+    )
+
+
+def venue_bar(rates, bar_type: BarType, instrument: InstrumentAny) -> Bar:
+    """A venue bar of `bar_type` from an MqlRates row stamped at its open, stamped at its close:
+    the open plus the bar's interval, its prices and tick volume as the venue counts them."""
+    ts_event = int(rates["time"]) * 1_000_000_000 + bar_type.spec.get_interval_ns()
+    return Bar(
+        bar_type=bar_type,
+        open=instrument.make_price(rates["open"]),
+        high=instrument.make_price(rates["high"]),
+        low=instrument.make_price(rates["low"]),
+        close=instrument.make_price(rates["close"]),
+        volume=Quantity(int(rates["tick_volume"]), 0),
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+def venue_series(bar_type: BarType) -> Series:
+    """The terminal's series of a venue bar type; raises ValueError for a step and aggregation the
+    terminal has no timeframe for."""
+    key = (bar_type.spec.step, bar_type.spec.aggregation)
+    if key not in _VENUE_SERIES:
+        raise ValueError(f"{bar_type}: the terminal has no timeframe of its step")
+    return _VENUE_SERIES[key]
 
 
 def parse_bar(mt5_rate, instrument: InstrumentAny, timeframe: int) -> Bar:

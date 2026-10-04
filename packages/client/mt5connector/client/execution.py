@@ -10,18 +10,19 @@ connect rebuilds it from NT's cache and the venue:
 - the ticket index, venue order ticket ↔ client order id: rebuilt at connect from every ticket
   NT's orders hold or held as their venue order id, extended by each accepted submit, each comment
   the digest lane matches and each execution an exit takes the ticket of;
-- the deals already seen, and the time the next deal read starts from;
-- the tickets of this trader's orders resting at the venue at the last poll, and those that left it
-  with no final state in the venue's history yet;
+- the deals already seen;
+- the tickets of the orders whose end the client emitted;
 - the tickets no NT order explains, logged once each;
-- the poll steps awaiting recovery;
-- whether an account report is owed, and when the next one is due."""
+- whether an account report is owed, when the next one is due, and whether the last one went
+  unanswered.
+
+The venue pushes every trade transaction of the account over the hub; NT's own reconciliation heals
+what the push channel misses."""
 
 from __future__ import annotations
 
 import asyncio
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -90,7 +91,9 @@ from mt5connector.client.errors import (
     ResponseLost,
 )
 from mt5connector.client.parsing import InstrumentAny, finite_decimal
+from mt5connector.client.push import PushClient
 from mt5connector.wire import mirror
+from mt5connector.wire.push_wire import FrameType, Stream, Subscription, TransactionType
 
 if TYPE_CHECKING:
     from nautilus_trader.model.orders import Order
@@ -186,13 +189,6 @@ class Reason(StrEnum):
     ROLLOVER = "ROLLOVER"
     VMARGIN = "VMARGIN"
     SPLIT = "SPLIT"
-
-
-class PollStep(StrEnum):
-    """The independently retried steps of an execution poll."""
-
-    VENUE_READ = "venue read"
-    ACCOUNT_REPORT = "account report"
 
 
 class Slot(StrEnum):
@@ -374,29 +370,26 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._provider = instrument_provider
         self._magic = magic_for(self.trader_id)
         self._account_currency: Currency | None = None
-        self._exec_poll_task: asyncio.Task | None = None
+        self._push = PushClient(config, loop, self._on_push_frame, None, self._log)
+        self._account_task: asyncio.Task | None = None
         self._client_order_ids: dict[int, ClientOrderId] = {}
         self._tickets: dict[ClientOrderId, int] = {}
         self._seen_deals: set[int] = set()
-        self._deals_since_ms = 0
-        self._resting: set[int] = set()
-        self._vanished: set[int] = set()
+        self._ended: set[int] = set()
         self._unresolved: set[int] = set()
         self._account_owed = False
         self._account_due_ns = 0
-        self._outages: set[PollStep] = set()
+        self._account_unanswered = False
 
     # ── Connect / disconnect ──────────────────────────────────────────────────
 
     async def _connect(self) -> None:
-        """Holds the account to a hedging, tradable session before anything is reported or sent,
-        books under the account's login, loads the config's symbols and registers the currencies the
-        account and the loaded instruments book in; then indexes NT's orders, takes in what the
-        venue already holds, emits the bracket fills NT has yet to book, reports the account and
-        starts polling. Raises MT5ConfigError for an account that books another way or a read-only
-        session, MT5OrderError naming a deal whose owed fill cannot be built, RuntimeError on a
-        connected client."""
-        if self._exec_poll_task is not None:
+        """Connects for this trader: refuses an account that is not a tradable hedging session
+        before anything is reported or sent, then takes in what the venue holds — emitting the
+        bracket fills NT has yet to book — reports the account and subscribes its trade
+        transactions. Raises MT5ConfigError for such an account, MT5OrderError naming a deal whose
+        owed fill cannot be built, RuntimeError on a connected client."""
+        if self._account_task is not None:
             raise RuntimeError("execution client: already connected")
         self._conn.ensure_connected()
         account = self._conn.get_account_info()
@@ -428,29 +421,31 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     f"deal {deal.ticket}: cannot emit owed bracket fill: {exc}"
                 ) from exc
         self._refresh_account()
-        self._outages.clear()
-        self._exec_poll_task = self._loop.create_task(
-            self._exec_poll_loop(),
-            name="MT5LiveExecutionClient._exec_poll_loop",
+        self._account_unanswered = False
+        await self._push.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+        await self._push.connect()
+        self._account_task = self._loop.create_task(
+            self._account_loop(),
+            name="MT5LiveExecutionClient._account_loop",
         )
-        self._log.info(f"connected, polling every {self._config.exec_poll_interval_ms}ms")
+        self._log.info(f"connected, the push channel at {self._config.ws_url}")
 
     async def _disconnect(self) -> None:
-        """Stops polling and drops the client's view of the venue; raises RuntimeError on a client
-        never connected."""
-        if self._exec_poll_task is None:
+        """Stops the account loop and the push channel and drops the client's view of the venue;
+        raises RuntimeError on a client never connected."""
+        if self._account_task is None:
             raise RuntimeError("execution client: not connected")
-        self._exec_poll_task.cancel()
+        self._account_task.cancel()
         try:
-            await self._exec_poll_task
+            await self._account_task
         except asyncio.CancelledError:
             pass
-        self._exec_poll_task = None
+        self._account_task = None
+        await self._push.disconnect()
         self._client_order_ids.clear()
         self._tickets.clear()
         self._seen_deals.clear()
-        self._resting.clear()
-        self._vanished.clear()
+        self._ended.clear()
         self._unresolved.clear()
         self._log.info("disconnected")
 
@@ -478,25 +473,20 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _take_in_venue(self) -> list:
         """Marks every deal in the history over the lookback as seen, so none present at connect is
         emitted — but a bracket's deal NT has not booked to the exit bound to its ticket or
-        occupying its bracket, which it returns in the venue's order. Takes this trader's resting
-        orders as the ones the poll watches."""
+        occupying its bracket, which it returns in the venue's order."""
         now = self._clock.utc_now()
         since = now - timedelta(minutes=self._config.history_lookback_mins)
         deals = _answer("history_deals_get", mt5.history_deals_get(since, now))
         owed = [deal for deal in deals if self._owed_bracket_fill(deal)]
         self._seen_deals = {deal.ticket for deal in deals} - {deal.ticket for deal in owed}
-        self._deals_since_ms = max(
-            (deal.time_msc for deal in deals), default=since.value // 1_000_000
-        )
-        self._resting = {order.ticket for order in self._resting_orders()}
-        self._vanished = set()
+        self._ended = set()
         self._unresolved = set()
         return sorted(owed, key=attrgetter("time_msc", "ticket"))
 
-    # ── The poll ──────────────────────────────────────────────────────────────
+    # ── The account ───────────────────────────────────────────────────────────
 
-    async def _exec_poll_loop(self) -> None:
-        """Polls the venue every poll interval, reconnecting a terminal session the connection
+    async def _account_loop(self) -> None:
+        """Takes an account turn every poll interval, reconnecting a terminal session the connection
         reports lost; ends when a reconnect gives up."""
         while True:
             try:
@@ -505,7 +495,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 if not await self._reconnect(exc):
                     return
             else:
-                self._poll_turn()
+                self._account_turn()
             await asyncio.sleep(self._config.exec_poll_interval_s)
 
     async def _reconnect(self, cause: MT5ConnectionError) -> bool:
@@ -514,51 +504,84 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if reconnected:
             self._log.info("terminal session reconnected")
         else:
-            self._log.error("reconnect gave up: execution polling stops")
+            self._log.error("reconnect gave up: the account loop stops")
         return reconnected
 
-    def _poll_turn(self) -> None:
-        """Reads the venue once and emits what it confirms, then reports the account when a report
-        is owed or the refresh period is up, whether or not the read completed."""
-        with self._poll_step(PollStep.VENUE_READ):
-            self._poll_venue()
+    def _account_turn(self) -> None:
+        """Reports the account when an event owes a report or the refresh period is up. A report the
+        server does not answer stays owed and is logged once until one is answered, any other
+        failure with its stack."""
         if self._account_owed or self._clock.timestamp_ns() >= self._account_due_ns:
-            with self._poll_step(PollStep.ACCOUNT_REPORT):
+            try:
                 self._refresh_account()
+            except MT5ConnectionError as exc:
+                if not self._account_unanswered:
+                    self._log.warning(f"account report: {exc}")
+                self._account_unanswered = True
+            except Exception as exc:
+                self._log.exception("account report failed", exc)
+            else:
+                if self._account_unanswered:
+                    self._account_unanswered = False
+                    self._log.info("account report: the server answers again")
 
-    @contextmanager
-    def _poll_step(self, step: PollStep):
-        """Runs one step of a poll turn, which the next turn retries when it fails: a step the
-        server does not answer is logged once per outage, any other failure with its stack."""
-        try:
-            yield
-        except MT5ConnectionError as exc:
-            if step not in self._outages:
-                self._log.warning(f"execution poll {step}: {exc}")
-            self._outages.add(step)
-        except Exception as exc:
-            self._log.exception(f"execution poll {step} failed", exc)
+    # ── The push channel ──────────────────────────────────────────────────────
+
+    def _on_push_frame(self, frame: dict) -> None:
+        """Feeds a pushed trade transaction to the entry point its type names, as it arrives."""
+        kind = FrameType(frame["type"])
+        if kind == FrameType.TRADE_TRANSACTION:
+            self._on_transaction(frame["transaction"], frame["request"], frame["result"])
         else:
-            if step in self._outages:
-                self._outages.remove(step)
-                self._log.info(f"execution poll {step}: the server answers again")
+            raise ValueError(f"a {kind} frame on the execution channel")
 
-    def _poll_venue(self) -> None:
-        """Emits the fills of the deals since the last one seen, accepts the resting orders the
-        index learns, and ends the pending orders the venue ended. The deal read opens a second
-        before the last deal, so one stamped in the same second as it is never missed."""
-        since = datetime.fromtimestamp((self._deals_since_ms - 1_000) / 1_000, tz=UTC)
-        deals = _answer("history_deals_get", mt5.history_deals_get(since, self._clock.utc_now()))
-        for deal in sorted(deals, key=attrgetter("time_msc", "ticket")):
-            self._on_deal(deal)
-        resting = self._resting_orders()
-        for venue_order in resting:
-            self._on_resting(venue_order)
-        tickets = {venue_order.ticket for venue_order in resting}
-        self._vanished |= self._resting - tickets
-        self._resting = tickets
-        for ticket in sorted(self._vanished):
-            self._on_vanished(ticket)
+    def _on_transaction(self, transaction: dict, request: dict, result: dict) -> None:
+        """A deal the venue added fills its order, an order the venue deleted or moved to its
+        history ends, and a request the venue completed links the ticket it placed; no other
+        transaction carries an event."""
+        kind = TransactionType(transaction["type"])
+        if kind == TransactionType.DEAL_ADD:
+            self._on_deal_added(transaction["deal"])
+        elif kind in (TransactionType.ORDER_DELETE, TransactionType.HISTORY_ADD):
+            self._on_order_left(transaction["order"])
+        elif kind == TransactionType.REQUEST:
+            self._on_request(request, result)
+
+    def _on_deal_added(self, ticket: int) -> None:
+        """Emits the fill of a deal the venue added, read from its history by the ticket: the
+        transaction carries none of the deal's time, magic, entry, reason or charges. A deal the
+        history does not hold yet is left to reconciliation."""
+        deals = _answer("history_deals_get", mt5.history_deals_get(ticket=ticket))
+        if deals:
+            self._on_deal(deals[0])
+        else:
+            self._log.info(f"deal {ticket}: not in the venue's history, left to reconciliation")
+
+    def _on_order_left(self, ticket: int) -> None:
+        """Ends, once, the NT order behind an order of this trader the venue ended other than
+        filled, read from its history by the ticket; an order the history does not hold yet ends on
+        the transaction that adds it there."""
+        if ticket not in self._ended:
+            historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+            if historical and historical[0].magic == self._magic:
+                self._emit_end(historical[0])
+
+    def _on_request(self, request: dict, result: dict) -> None:
+        """Indexes the ticket a completed request of this trader placed when the index lacks it and
+        the request's comment is the digest of an in-flight NT order — the link a lost submit
+        answer leaves undone — and accepts that order while NT holds it submitted."""
+        if request["magic"] == self._magic and result["retcode"] in _DONE_RETCODES:
+            self._index_by_comment(result["order"], request["comment"])
+            order = self._indexed_order(result["order"])
+            if order is not None and order.status == OrderStatus.SUBMITTED:
+                self._accept_placed(order, result["order"])
+
+    def _accept_placed(self, order: Order, ticket: int) -> None:
+        """Accepts an order under the ticket the venue placed it as, when the venue set it up; one
+        the venue holds no record of yet is reconciliation's to accept."""
+        venue_order = self._venue_order(ticket)
+        if venue_order is not None:
+            self._accept(order, venue_order)
 
     def _on_deal(self, deal) -> None:
         """Emits the fill a deal carries, once per deal ticket, under the venue order the deal
@@ -566,7 +589,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         order occupying the bracket, whatever magic the venue stamped on it, and any other deal of
         this trader the order its ticket or comment names. A deal of this trader no order of NT's
         explains is logged and left to NT's reconciliation; one whose fill cannot be built raises
-        before it counts as seen, so a later turn emits it."""
+        before it counts as seen, so a later delivery of it or NT's reconciliation emits it."""
         if deal.ticket in self._seen_deals:
             return
         slot = _bracket_slot(deal)
@@ -584,7 +607,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if order is not None:
             fields = self._fill_fields(order, execution, deal)
         self._seen_deals.add(deal.ticket)
-        self._deals_since_ms = max(self._deals_since_ms, deal.time_msc)
         if fields is not None:
             if slot is not None and self._cache.venue_order_id(order.client_order_id) != execution:
                 self._bind_to_execution(order, execution, deal.time_msc * 1_000_000)
@@ -613,32 +635,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             venue_order_id_modified=True,
         )
 
-    def _on_resting(self, venue_order) -> None:
-        """Indexes a resting order of this trader the index lacks when its comment is the digest of
-        an in-flight NT order, and accepts that order under its ticket while NT holds it submitted.
-        One matching nothing is logged once."""
-        if venue_order.ticket in self._client_order_ids:
-            return
-        self._index_by_comment(venue_order.ticket, venue_order.comment)
-        order = self._indexed_order(venue_order.ticket)
-        if order is None:
-            self._log_unresolved(venue_order.ticket)
-        elif order.status == OrderStatus.SUBMITTED:
-            self._accept(order, venue_order)
-
     def _log_unresolved(self, ticket: int) -> None:
         if ticket not in self._unresolved:
             self._unresolved.add(ticket)
             self._log.info(f"order {ticket}: no order of this trader matches it")
-
-    def _on_vanished(self, ticket: int) -> None:
-        """Emits the end of a pending order that left the venue's resting orders once the venue's
-        history states it — cancelled, expired or rejected; a fill's end is its deal's. Until the
-        history holds the order, the next turn asks again."""
-        historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
-        if historical:
-            self._vanished.discard(ticket)
-            self._emit_end(historical[0])
 
     def _emit_end(self, venue_order) -> None:
         """Ends the NT order behind a venue order its history ended other than filled, through the
@@ -664,6 +664,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._account_owed = True
 
     def _end(self, order: Order, venue_order, state: OrderState) -> None:
+        self._ended.add(venue_order.ticket)
         # The venue placed the order before ending it, and NT expires only an accepted order.
         if order.status == OrderStatus.SUBMITTED and state != OrderState.REJECTED:
             self._accept(order, venue_order)
@@ -719,7 +720,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _refresh_account(self) -> None:
         """Reports the account: its balance and credit in total, its margin locked and the rest
         free; NT's portfolio adds the open positions' unrealised P&L. A report that fails stays owed
-        to the next poll turn."""
+        to the next account turn."""
         self._account_owed = True
         account = self._conn.get_account_info()
         total = Money(account.balance + account.credit, self._account_currency)
@@ -779,8 +780,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _on_new_order_sent(self, order: Order, sent: _Sent) -> None:
         if sent.outcome == SendOutcome.DONE:
             self._index(sent.result.order, order.client_order_id)
-            if order.order_type != OrderType.MARKET:
-                self._resting.add(sent.result.order)
             self.generate_order_accepted(
                 order.strategy_id,
                 order.instrument_id,
@@ -1136,8 +1135,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             if refusal is None:
                 price = _stated(command.price, _limit_price(order))
                 trigger = _stated(command.trigger_price, _trigger_price(order))
+                # The symbol routes the request's transaction through that symbol's EA.
                 request = {
                     "action": mirror.TRADE_ACTION_MODIFY,
+                    "symbol": order.instrument_id.symbol.value,
                     "order": ticket,
                     "sl": 0.0,
                     "tp": 0.0,
@@ -1226,7 +1227,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._cancel_rejected(order, _venue_order_id(ticket), f"not sent: {exc}")
         else:
             if refusal is None:
-                request = {"action": mirror.TRADE_ACTION_REMOVE, "order": ticket}
+                # The symbol routes the request's transaction through that symbol's EA.
+                request = {
+                    "action": mirror.TRADE_ACTION_REMOVE,
+                    "symbol": order.instrument_id.symbol.value,
+                    "order": ticket,
+                }
                 self._on_remove_sent(order, ticket, _send(request))
             else:
                 self._cancel_rejected(order, _venue_order_id(ticket), refusal)
@@ -1234,9 +1240,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     def _on_remove_sent(self, order: Order, ticket: int, sent: _Sent) -> None:
         if sent.outcome == SendOutcome.DONE:
-            # The poll would otherwise cancel it a second time once it leaves the resting orders.
-            self._resting.discard(ticket)
-            self._vanished.discard(ticket)
+            # Its ORDER_DELETE and HISTORY_ADD follow; the end is emitted once.
+            self._ended.add(ticket)
             self.generate_order_canceled(
                 order.strategy_id,
                 order.instrument_id,
@@ -1838,11 +1843,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             return self._tickets.get(order.client_order_id)
 
     # ── Venue reads ───────────────────────────────────────────────────────────
-
-    def _resting_orders(self) -> list:
-        """This trader's orders resting at the venue."""
-        resting = _answer("orders_get", mt5.orders_get())
-        return [order for order in resting if order.magic == self._magic]
 
     def _venue_order(self, ticket: int):
         """The venue's order under a ticket — resting, else in its history — or None when it holds

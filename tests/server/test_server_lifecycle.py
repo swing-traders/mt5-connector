@@ -1,14 +1,21 @@
-"""The server's settings, start, liveness and relayed commission schedules."""
+"""The server's and the hub's settings, the server's start, liveness and relayed commission
+schedules."""
 
 from zoneinfo import ZoneInfo
 
 import pytest
+from chart_posts import ChartPosts, publishers_on
 from mirror_samples import CLOCK
 
 from mt5connector.server.app import TerminalStartError, connect_terminal, create_app
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
 from mt5connector.server.history import FloorStore, History
-from mt5connector.server.settings import Settings, SettingsError, read_settings
+from mt5connector.server.settings import (
+    Settings,
+    SettingsError,
+    read_hub_settings,
+    read_settings,
+)
 from mt5connector.server.terminal import Terminal
 
 ENVIRONMENT = {
@@ -36,6 +43,8 @@ def test_settings_read_the_environment_with_defaults():
     assert settings.clock_bootstrap_seconds == 120
     assert settings.history_retry_seconds == 5
     assert settings.floor_ttl_seconds == 900
+    assert settings.hub_port == 9000
+    assert settings.chart_idle_seconds == 900
 
 
 def test_settings_take_overrides():
@@ -53,6 +62,8 @@ def test_settings_take_overrides():
             "MT5_CLOCK_BOOTSTRAP_SECONDS": "600",
             "MT5_HISTORY_RETRY_SECONDS": "2",
             "MT5_FLOOR_TTL_SECONDS": "60",
+            "MT5_HUB_PORT": "9100",
+            "MT5_CHART_IDLE_SECONDS": "60",
         }
     )
     assert (settings.login_timeout_ms, settings.api_host, settings.api_port) == (
@@ -68,6 +79,7 @@ def test_settings_take_overrides():
     assert settings.clock_bootstrap_seconds == 600
     assert settings.history_retry_seconds == 2
     assert settings.floor_ttl_seconds == 60
+    assert (settings.hub_port, settings.chart_idle_seconds) == (9100, 60)
 
 
 @pytest.mark.parametrize("name", ["MT5_TERMINAL_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"])
@@ -96,6 +108,10 @@ def test_settings_refuse_a_missing_variable(name):
         ("MT5_HISTORY_RETRY_SECONDS", "-1", "history_retry_seconds"),
         ("MT5_FLOOR_TTL_SECONDS", "0", "floor_ttl_seconds"),
         ("MT5_FLOOR_TTL_SECONDS", "-1", "floor_ttl_seconds"),
+        ("MT5_HUB_PORT", "0", "hub_port"),
+        ("MT5_HUB_PORT", "65536", "hub_port"),
+        ("MT5_CHART_IDLE_SECONDS", "0", "chart_idle_seconds"),
+        ("MT5_CHART_IDLE_SECONDS", "-1", "chart_idle_seconds"),
     ],
 )
 def test_settings_refuse_an_out_of_range_value(variable, value, field):
@@ -125,6 +141,8 @@ def test_settings_built_directly_refuse_an_out_of_range_value():
             clock_bootstrap_seconds=120,
             history_retry_seconds=5,
             floor_ttl_seconds=900,
+            hub_port=9000,
+            chart_idle_seconds=900,
         )
 
 
@@ -169,6 +187,53 @@ def test_settings_repr_carries_no_login_values():
     assert "example-server" not in text
 
 
+def test_hub_settings_read_the_environment_with_defaults():
+    settings = read_hub_settings({})
+    assert (settings.hub_port, settings.api_port) == (9000, 5000)
+    assert settings.broker_tz == ZoneInfo("America/New_York")
+    assert settings.broker_offset_hours == 7
+    assert settings.chart_idle_seconds == 900
+
+
+def test_hub_settings_take_overrides():
+    settings = read_hub_settings(
+        {
+            "MT5_HUB_PORT": "9100",
+            "MT5_API_PORT": "5100",
+            "MT5_BROKER_TZ": "Europe/Helsinki",
+            "MT5_BROKER_OFFSET_HOURS": "0",
+            "MT5_CHART_IDLE_SECONDS": "60",
+        }
+    )
+    assert (settings.hub_port, settings.api_port) == (9100, 5100)
+    assert (settings.broker_tz, settings.broker_offset_hours) == (ZoneInfo("Europe/Helsinki"), 0)
+    assert settings.chart_idle_seconds == 60
+
+
+def test_the_server_and_the_hub_read_the_hubs_port_and_idle_period_from_one_variable_each():
+    environment = ENVIRONMENT | {"MT5_HUB_PORT": "9100", "MT5_CHART_IDLE_SECONDS": "60"}
+    server = read_settings(environment)
+    hub = read_hub_settings(environment)
+    assert (server.hub_port, server.chart_idle_seconds) == (hub.hub_port, hub.chart_idle_seconds)
+    assert (hub.hub_port, hub.chart_idle_seconds) == (9100, 60)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    [
+        ("MT5_HUB_PORT", "0", "hub_port"),
+        ("MT5_API_PORT", "65536", "api_port"),
+        ("MT5_HUB_PORT", "nine", "MT5_HUB_PORT is not an integer"),
+        ("MT5_CHART_IDLE_SECONDS", "0", "chart_idle_seconds"),
+        ("MT5_BROKER_OFFSET_HOURS", "7.5", "MT5_BROKER_OFFSET_HOURS is not an integer"),
+        ("MT5_BROKER_TZ", "Mars/Olympus", "MT5_BROKER_TZ"),
+    ],
+)
+def test_hub_settings_refuse_a_bad_value(variable, value, message):
+    with pytest.raises(SettingsError, match=message):
+        read_hub_settings({variable: value})
+
+
 def test_start_initializes_the_configured_terminal_once(
     stub, commissions, server_times, clock_status
 ):
@@ -180,7 +245,15 @@ def test_start_initializes_the_configured_terminal_once(
 
     connect_terminal(terminal, read_settings(ENVIRONMENT))
     client = create_app(
-        terminal, commissions, CLOCK, server_times, clock_status, history, workers=3, retry_s=5
+        terminal,
+        commissions,
+        CLOCK,
+        server_times,
+        clock_status,
+        history,
+        publishers_on(ChartPosts()),
+        workers=3,
+        retry_s=5,
     ).test_client()
     for _ in range(3):
         assert client.get("/health").status_code == 200
@@ -239,12 +312,12 @@ def test_health_is_unavailable_while_the_clock_is_not_verified(client, stub, clo
     assert stub.mock_calls == []
 
 
-def test_commissions_without_a_relayed_schedule_answer_not_found(client):
+def test_commissions_without_a_relayed_schedule_defer_the_read(client):
     response = client.get("/commissions/EURUSD.a")
-    assert response.status_code == 200
+    assert (response.status_code, response.headers["Retry-After"]) == (503, "5")
     assert response.json == {
         "ok": False,
-        "error": {"code": -4, "message": "no commission schedule relayed for EURUSD.a"},
+        "error": {"code": -20001, "message": "no commission schedule relayed for EURUSD.a"},
     }
 
 
@@ -257,15 +330,15 @@ def test_commissions_answer_the_relayed_schedule(client, commissions):
             rules=(
                 CommissionRule(
                     currency="USD",
-                    mode_range=0,
-                    mode_charge=2,
-                    mode_entry=0,
-                    mode_direction=0,
-                    mode_profit=0,
+                    mode_range="SYMBOL_COMMISSION_RANGE_VOLUME",
+                    mode_charge="SYMBOL_COMMISSION_CHARGE_INSTANT",
+                    mode_entry="SYMBOL_COMMISSION_ENTRY_INOUT",
+                    mode_direction="SYMBOL_COMMISSION_DIRECTION_BOTH",
+                    mode_profit="SYMBOL_COMMISSION_PROFIT_ALL",
                     tiers=(
                         CommissionTier(
-                            mode=0,
-                            volume_type=1,
+                            mode="SYMBOL_COMMISSION_MONEY_DEPOSIT",
+                            volume_type="SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
                             value=3.5,
                             min_value=0.0,
                             max_value=0.0,
@@ -289,15 +362,15 @@ def test_commissions_answer_the_relayed_schedule(client, commissions):
             "rules": [
                 {
                     "currency": "USD",
-                    "mode_range": 0,
-                    "mode_charge": 2,
-                    "mode_entry": 0,
-                    "mode_direction": 0,
-                    "mode_profit": 0,
+                    "mode_range": "SYMBOL_COMMISSION_RANGE_VOLUME",
+                    "mode_charge": "SYMBOL_COMMISSION_CHARGE_INSTANT",
+                    "mode_entry": "SYMBOL_COMMISSION_ENTRY_INOUT",
+                    "mode_direction": "SYMBOL_COMMISSION_DIRECTION_BOTH",
+                    "mode_profit": "SYMBOL_COMMISSION_PROFIT_ALL",
                     "tiers": [
                         {
-                            "mode": 0,
-                            "volume_type": 1,
+                            "mode": "SYMBOL_COMMISSION_MONEY_DEPOSIT",
+                            "volume_type": "SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
                             "value": 3.5,
                             "min_value": 0,
                             "max_value": 0,

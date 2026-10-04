@@ -1,11 +1,10 @@
-"""An execution client wired to real NT components over a double of the shim: it records the events
-the client emits and the lines it logs, and places NT orders in the cache at the status a test
-needs."""
+"""An execution client wired to real NT components over doubles of the shim and of its push channel,
+recording what the client emits and logs."""
 
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -26,6 +25,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from push_double import PushDouble, deal_added
 from venue_doubles import account_info, trade_deal, trade_order, trade_position
 
 from mt5connector.client import execution
@@ -114,6 +114,7 @@ class Harness:
     """One client under test, with what it emitted."""
 
     client: RecordedExecClient
+    push: PushDouble
     venue: MagicMock
     conn: MagicMock
     cache: object
@@ -135,16 +136,32 @@ class Harness:
         return [call.args[0] for call in calls]
 
     async def connect(self) -> None:
-        """Connects the client and stops its poll loop, so a test drives each turn itself."""
-        await self.client._connect()
-        self.client._exec_poll_task.cancel()
-        try:
-            await self.client._exec_poll_task
-        except asyncio.CancelledError:
-            pass
+        """Connects the client and stops its account loop, so a test drives each turn itself, then
+        forgets what connecting emitted and read."""
+        await self.connect_keeping_events()
         self.ledger.clear()
         self.venue.reset_mock()
         self.conn.get_account_info.reset_mock()
+
+    async def connect_keeping_events(self) -> None:
+        """Connects the client and stops its account loop, keeping what connecting emitted."""
+        await self.client._connect()
+        self.client._account_task.cancel()
+        try:
+            await self.client._account_task
+        except asyncio.CancelledError:
+            pass
+
+    def deals_added(self, *deals) -> None:
+        """The venue adding each deal to its history and pushing its DEAL_ADD, in turn; its history
+        answers every other read as it did."""
+        previous = self.venue.history_deals_get.side_effect
+        try:
+            for deal in deals:
+                self.venue.history_deals_get.side_effect = _history_holding(deal, self.venue)
+                self.push.deliver(deal_added(deal))
+        finally:
+            self.venue.history_deals_get.side_effect = previous
 
     def place(self, order, status: OrderStatus = OrderStatus.ACCEPTED, ticket=None):
         """Adds an NT order to the cache, advanced to SUBMITTED, ACCEPTED under `ticket`, or FILLED
@@ -222,14 +239,31 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
     provider.list_all.return_value = list(loaded.values())
     provider.get_instrument.side_effect = loaded.get
 
-    client = RecordedExecClient(
-        loop=asyncio.get_running_loop(),
-        connection=conn,
-        msgbus=msgbus,
-        cache=cache,
-        clock=clock,
-        instrument_provider=provider,
-        config=config(**settings),
-    )
+    with patch.object(execution, "PushClient", PushDouble):
+        client = RecordedExecClient(
+            loop=asyncio.get_running_loop(),
+            connection=conn,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=provider,
+            config=config(**settings),
+        )
     factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
-    return Harness(client, venue, conn, cache, factory, ledger, loaded)
+    return Harness(client, client._push, venue, conn, cache, factory, ledger, loaded)
+
+
+def _history_holding(deal, venue):
+    """The venue's history_deals_get, answering the deal under its ticket as well."""
+    previous = venue.history_deals_get.side_effect
+    answer = venue.history_deals_get.return_value
+
+    def history_deals_get(*args, ticket=None, **kwargs):
+        if ticket == deal.ticket:
+            return (deal,)
+        elif previous is not None:
+            return previous(*args, ticket=ticket, **kwargs)
+        else:
+            return answer
+
+    return history_deals_get

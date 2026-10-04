@@ -1,7 +1,6 @@
 """The MT5 server's history routes, called through the shim's session (`remote_mt5`): the rows of a
 bar or tick window once the server vouches for them, and the floors it advertises."""
 
-import math
 import threading
 import time
 from dataclasses import dataclass
@@ -111,7 +110,9 @@ def _reply(
     slot taken — after the delay that answer gives, until it answers otherwise or `cancel` is
     set."""
     reply = remote_mt5.call_route(name, method, path, json=json, params=params)
-    while _is_deferred(reply) and _waits_out(_retry_after_s(name, reply), cancel):
+    while _is_deferred(reply) and _waits_out(
+        remote_mt5.retry_after_s(name, reply.retry_after), cancel
+    ):
         reply = remote_mt5.call_route(name, method, path, json=json, params=params)
     return reply
 
@@ -121,20 +122,6 @@ def _is_deferred(reply: remote_mt5.Reply) -> bool:
         ServerCode.SYNCING,
         ServerCode.BUSY,
     )
-
-
-def _retry_after_s(name: str, reply: remote_mt5.Reply) -> float:
-    """The delay a deferring answer's Retry-After gives; raises ServerUnreachable for none."""
-    try:
-        seconds = float(reply.retry_after)
-    except (TypeError, ValueError):
-        seconds = math.nan
-    if math.isfinite(seconds) and seconds >= 0:
-        return seconds
-    else:
-        raise ServerUnreachable(
-            f"{name}: a deferring answer's Retry-After is {reply.retry_after!r}"
-        )
 
 
 def _waits_out(seconds: float, cancel: threading.Event | None) -> bool:

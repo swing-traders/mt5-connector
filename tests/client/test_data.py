@@ -1,20 +1,5 @@
-"""
-tests/client/test_data.py
-
-Exhaustive tests for MT5DataClient.
-
-Tests are split into:
-  1.  Helpers (_epoch_s, _bar_spec_to_mt5_timeframe)
-  2.  Initial state
-  3.  _connect() — instrument loading
-  4.  _disconnect() — state cleanup
-  5.  _subscribe_quote_ticks() / _unsubscribe_quote_ticks()
-  6.  _subscribe_bars() / _unsubscribe_bars()
-  7.  _request_quote_ticks() — historical ticks through the server's history routes
-  8.  _request_bars() — historical bars through the server's history routes
-  9.  No-op methods — don't raise
-  10. Properties — subscribed_quote_ticks
-"""
+"""The data client's connection, its subscriptions and its history requests; its pushed frames are
+tests/client/test_data_push.py's."""
 
 import asyncio
 import threading
@@ -27,12 +12,15 @@ import pytest
 from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
+from push_double import PushDouble
 
+from mt5connector.client import data
 from mt5connector.client.connection import ConnectionState
 from mt5connector.client.data import MT5DataClient, _bar_spec_to_mt5_timeframe, _epoch_s
 from mt5connector.client.errors import MT5ConnectionError
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import Series
+from mt5connector.wire.push_wire import Stream, Subscription
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -146,15 +134,6 @@ def make_provider(instrument=None):
     return provider
 
 
-def make_stream():
-    """A stand-in for the WebSocket tick stream the client starts on connect."""
-    stream = MagicMock()
-    stream.start = AsyncMock()
-    stream.stop = AsyncMock()
-    stream.send = AsyncMock()
-    return stream
-
-
 class RecordedDataClient(MT5DataClient):
     """The data client with its log calls recorded."""
 
@@ -187,15 +166,16 @@ def make_client(symbols=None, connected=True, instrument=None, client_class=MT5D
     cache = TestComponentStubs.cache()
     clock = LiveClock()
 
-    client = client_class(
-        loop=loop,
-        connection=conn,
-        msgbus=msgbus,
-        cache=cache,
-        clock=clock,
-        instrument_provider=provider,
-        config=config,
-    )
+    with patch.object(data, "PushClient", PushDouble):
+        client = client_class(
+            loop=loop,
+            connection=conn,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=provider,
+            config=config,
+        )
     # Patch internal handler methods so we can track emitted data
     client._handle_data = MagicMock()
     client._handle_quote_ticks = MagicMock()
@@ -323,25 +303,23 @@ class TestConnect:
     @pytest.mark.asyncio
     async def test_connect_checks_connection(self):
         c, conn, prov, loop = make_client()
-        with patch("mt5connector.client.ws_stream.WSStreamClient", return_value=make_stream()):
-            await c._connect()
+        await c._connect()
         conn.ensure_connected.assert_called()
         await c._disconnect()
 
     @pytest.mark.asyncio
     async def test_connect_loads_instruments(self):
         c, conn, prov, loop = make_client()
-        with patch("mt5connector.client.ws_stream.WSStreamClient", return_value=make_stream()):
-            await c._connect()
+        await c._connect()
         prov.get_instrument.assert_called()
         await c._disconnect()
 
     @pytest.mark.asyncio
     async def test_connect_emits_instruments(self):
         c, conn, prov, loop = make_client()
-        with patch("mt5connector.client.ws_stream.WSStreamClient", return_value=make_stream()):
-            await c._connect()
+        await c._connect()
         c._handle_data.assert_called()
+        assert c._push.connected
         await c._disconnect()
 
 
@@ -353,13 +331,15 @@ class TestConnect:
 class TestDisconnect:
 
     @pytest.mark.asyncio
-    async def test_disconnect_clears_subscriptions(self):
+    async def test_disconnect_closes_the_push_channel_and_keeps_what_is_wanted(self):
         c, conn, prov, loop = make_client()
-        with patch("mt5connector.client.ws_stream.WSStreamClient", return_value=make_stream()):
-            await c._connect()
-        c._subscribed_symbols.add("EURUSDm")
+        await c._connect()
+        cmd = MagicMock()
+        cmd.instrument_id.symbol.value = "EURUSDm"
+        await c._subscribe_quote_ticks(cmd)
         await c._disconnect()
-        assert c._subscribed_symbols == set()
+        assert not c._push.connected
+        assert c._push.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -370,68 +350,35 @@ class TestDisconnect:
 class TestSubscribeQuoteTicks:
 
     @pytest.mark.asyncio
-    async def test_subscribe_adds_symbol(self, client):
-        client._is_connected = True
+    async def test_subscribe_wants_the_symbols_ticks(self, client):
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
-        assert "EURUSDm" in client._subscribed_symbols
+        assert client._push.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_symbols(self, client):
-        client._is_connected = True
         for sym in ["EURUSDm", "XAUUSDm", "BTCUSDm"]:
             cmd = MagicMock()
             cmd.instrument_id.symbol.value = sym
             await client._subscribe_quote_ticks(cmd)
-        assert client._subscribed_symbols == {"EURUSDm", "XAUUSDm", "BTCUSDm"}
+        assert client._push.wanted == [
+            Subscription(Stream.TICKS, sym) for sym in ["EURUSDm", "XAUUSDm", "BTCUSDm"]
+        ]
 
     @pytest.mark.asyncio
-    async def test_unsubscribe_removes_symbol(self, client):
-        client._subscribed_symbols.add("EURUSDm")
+    async def test_unsubscribe_stops_wanting_the_symbols_ticks(self, client):
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "EURUSDm"
+        await client._subscribe_quote_ticks(cmd)
         await client._unsubscribe_quote_ticks(cmd)
-        assert "EURUSDm" not in client._subscribed_symbols
+        assert client._push.wanted == []
 
     @pytest.mark.asyncio
     async def test_unsubscribe_non_subscribed_does_not_raise(self, client):
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "FAKESYM"
         await client._unsubscribe_quote_ticks(cmd)  # must not raise
-
-    @pytest.mark.asyncio
-    async def test_subscribed_quote_ticks_sorted(self, client):
-        client._is_connected = True
-        for sym in ["ZZZUSDm", "AAAUSDm", "MMMusd"]:
-            cmd = MagicMock()
-            cmd.instrument_id.symbol.value = sym
-            await client._subscribe_quote_ticks(cmd)
-        result = client.subscribed_quote_ticks()
-        assert result == sorted(result)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. Subscribe / unsubscribe bars
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-class TestSubscribeBars:
-
-    @pytest.mark.asyncio
-    async def test_subscribe_bars_adds_to_set(self, client):
-        cmd = MagicMock()
-        cmd.bar_type.__str__ = lambda self: "EURUSDm.MT5-1-HOUR-MID-EXTERNAL"
-        await client._subscribe_bars(cmd)
-        assert "EURUSDm.MT5-1-HOUR-MID-EXTERNAL" in client._subscribed_bar_types
-
-    @pytest.mark.asyncio
-    async def test_unsubscribe_bars_removes_from_set(self, client):
-        client._subscribed_bar_types.add("EURUSDm.MT5-1-HOUR-MID-EXTERNAL")
-        cmd = MagicMock()
-        cmd.bar_type.__str__ = lambda self: "EURUSDm.MT5-1-HOUR-MID-EXTERNAL"
-        await client._unsubscribe_bars(cmd)
-        assert "EURUSDm.MT5-1-HOUR-MID-EXTERNAL" not in client._subscribed_bar_types
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -649,11 +596,3 @@ class TestProperties:
 
     def test_subscribed_quote_ticks_empty_initially(self, client):
         assert client.subscribed_quote_ticks() == []
-
-    @pytest.mark.asyncio
-    async def test_subscribed_quote_ticks_after_subscribe(self, client):
-        client._is_connected = True
-        cmd = MagicMock()
-        cmd.instrument_id.symbol.value = "EURUSDm"
-        await client._subscribe_quote_ticks(cmd)
-        assert InstrumentId.from_str("EURUSDm.MT5") in client.subscribed_quote_ticks()

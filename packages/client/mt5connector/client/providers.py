@@ -20,7 +20,12 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
 from mt5connector.client import remote_mt5 as mt5
-from mt5connector.client.commissions import CommissionRule, parse_schedule, taker_fee
+from mt5connector.client.commissions import (
+    MONEY_MODES,
+    CommissionRule,
+    parse_schedule,
+    taker_fee,
+)
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import (
     MT5ConfigError,
@@ -120,10 +125,10 @@ class MT5InstrumentProvider(InstrumentProvider):
 
     def _load_definition(self, info, account: AccountSnapshot, pairs: _Pairs, ts: int):
         """Builds the instrument a selected symbol's definition describes, its taker fee from the
-        commission rule the server relays, selecting the symbol that converts the rule's currency
-        into the quote currency first."""
+        commission rule the server relays, selecting first the symbol that converts a money rule's
+        currency into the quote currency."""
         rule = parse_schedule(mt5.commission_schedule(info.name))
-        if rule is not None and rule.currency != info.currency_profit:
+        if rule is not None and rule.mode in MONEY_MODES and rule.currency != info.currency_profit:
             converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
             mt5.symbol_select(converter, True)
         return parse_symbol_info(info, account, _taker_fee(info, rule, pairs), ts)
@@ -193,9 +198,13 @@ def _taker_fee(info, rule: CommissionRule | None, pairs: _Pairs) -> Decimal:
     if rule is None:
         return Decimal(0)
     else:
-        rate = _rate(rule.currency, info.currency_profit, pairs)
-        contract_size = finite_decimal(info.trade_contract_size, "trade_contract_size")
-        return taker_fee(rule, rate, contract_size, _mid(info.name))
+        return taker_fee(
+            rule,
+            price=_mid(info.name),
+            contract_size=finite_decimal(info.trade_contract_size, "trade_contract_size"),
+            point=finite_decimal(info.point, "point"),
+            rate=lambda currency: _rate(currency, info.currency_profit, pairs),
+        )
 
 
 def _rate(source: str, target: str, pairs: _Pairs) -> Decimal:

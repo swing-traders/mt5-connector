@@ -18,7 +18,7 @@ MT5_VENUE = Venue("MT5")
 # POLLING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Interval (milliseconds) between the execution client's polls of the venue.
+# Interval (milliseconds) between the execution client's account turns.
 DEFAULT_EXEC_POLL_INTERVAL_MS: int = 250
 
 

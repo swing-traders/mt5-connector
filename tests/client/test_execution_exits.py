@@ -1,7 +1,6 @@
 """The execution client's exits: a position's stop, target and closes as the venue's brackets and
 closing deals, and the fills and reports those answer for."""
 
-import asyncio
 from decimal import Decimal
 
 import pytest
@@ -49,13 +48,8 @@ async def connected(exec_shim, **settings):
 
 
 async def connect_with_events(h):
-    """Connects without discarding the events emitted before the poll starts."""
-    await h.client._connect()
-    h.client._exec_poll_task.cancel()
-    try:
-        await h.client._exec_poll_task
-    except asyncio.CancelledError:
-        pass
+    """Connects without discarding the events connecting emitted."""
+    await h.connect_keeping_events()
 
 
 def long_position(**fields):
@@ -90,11 +84,14 @@ def holding(*positions):
 
 
 def history(deals, position_deals=()):
-    """A history_deals_get answering `deals` over any window and `position_deals` for a position."""
+    """A history_deals_get answering `deals` over any window and under each one's ticket, and
+    `position_deals` for a position."""
 
     def history_deals_get(date_from=None, date_to=None, group=None, ticket=None, position=None):
         if position is not None:
             return tuple(deal for deal in position_deals if deal.position_id == position)
+        elif ticket is not None:
+            return tuple(deal for deal in deals if deal.ticket == ticket)
         else:
             return tuple(deals)
 
@@ -263,10 +260,18 @@ def no_changes():
 
 
 def turn(h, deals=None):
+    """The venue pushing the DEAL_ADD of each of `deals`, which its history then answers over any
+    window — or, without `deals`, of every deal its history holds — then the client's account
+    turn."""
     if deals is not None:
         h.venue.history_deals_get.side_effect = None
         h.venue.history_deals_get.return_value = tuple(deals)
-    h.client._poll_turn()
+    if h.venue.history_deals_get.side_effect is not None:
+        held = h.venue.history_deals_get.side_effect(None, None)
+    else:
+        held = h.venue.history_deals_get.return_value
+    h.deals_added(*held)
+    h.client._account_turn()
 
 
 def fills(h) -> list:
@@ -835,7 +840,7 @@ async def test_the_second_deal_of_a_close_fills_the_stop_once_the_first_is_booke
     ]
 
 
-async def test_a_deal_nt_booked_to_a_displaced_stop_is_not_filled_again_by_the_poll(exec_shim):
+async def test_a_deal_nt_booked_to_a_displaced_stop_is_not_filled_again_when_pushed(exec_shim):
     h = build_client(exec_shim)
     first = h.place(stop(h, trigger="1.07900"), ticket=f"{POSITION}-SL-1")
     await h.connect()
@@ -935,7 +940,7 @@ async def test_a_deal_of_a_type_the_package_lacks_fails_the_turn_unconsumed(exec
     assert deal.ticket not in h.client._seen_deals
 
 
-@pytest.mark.parametrize("bound", [False, True], ids=["before-the-poll", "after-the-poll"])
+@pytest.mark.parametrize("bound", [False, True], ids=["before-its-push", "after-its-push"])
 @pytest.mark.parametrize(
     "named",
     [None, f"{POSITION}-SL-1", "9901"],
@@ -1339,7 +1344,7 @@ def closed_by_its_stop(h):
     h.venue.history_deals_get.side_effect = history(deals, position_deals=deals)
 
 
-async def test_a_stop_its_bracket_closed_reports_its_own_level_until_the_poll_binds_it(exec_shim):
+async def test_a_stop_its_bracket_closed_reports_its_own_level_until_its_deal_binds_it(exec_shim):
     h, stop_order, _ = await occupied(exec_shim)
     closed_by_its_stop(h)
     report = await one_report(h, stop_order)
@@ -1360,7 +1365,7 @@ async def test_a_stop_its_bracket_closed_reports_its_own_level_until_the_poll_bi
     ]
 
 
-async def test_a_stop_the_poll_bound_and_filled_reports_filled_under_its_execution(exec_shim):
+async def test_a_stop_its_deal_bound_and_filled_reports_filled_under_its_execution(exec_shim):
     h, stop_order, _ = await occupied(exec_shim)
     closed_by_its_stop(h)
     turn(h)

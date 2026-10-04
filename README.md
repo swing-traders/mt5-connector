@@ -20,14 +20,14 @@ This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](
 ```
 MT5 server ←→ mt5-connector-client ←→ NautilusTrader
                               ↑
-                    tick stream, order routing,
-                    account state, reconciliation
+                 pushed ticks, bars and transactions,
+                 order routing, account state, reconciliation
 ```
 
 **What you get:**
 
-- Live tick data streamed from the MT5 server over WebSocket, aggregated into any bar type NautilusTrader supports
-- Order lifecycle: market, limit, stop and stop-limit entries, their fills booked to the venue's hedging positions, and each position's exits — its stop, its target and its closes — as the venue's own stop loss, take profit and closing deals
+- Live quote ticks, a mark price at the mid of each, and the venue's own closed bars, pushed from the terminal over WebSocket; the ticks aggregate into any bar type NautilusTrader supports
+- Order lifecycle: market, limit, stop and stop-limit entries, their fills booked to the venue's hedging positions, and each position's exits — its stop, its target and its closes — as the venue's own stop loss, take profit and closing deals; every fill, cancel and expiry pushed from the terminal as it happens
 - Account state and position reconciliation on startup and continuously
 - Historical bar data download into a NautilusTrader Parquet catalog for backtesting
 - Automatic reconnection with exponential backoff
@@ -44,7 +44,7 @@ The repository ships two distributions, versioned together: one release builds b
 | Distribution | Import packages | Installs into | Carries |
 |---|---|---|---|
 | `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the remote backend, the history client and the downloader, and the wire vocabulary |
-| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the tick hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
+| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the push hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
 
 `mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
 
@@ -162,10 +162,10 @@ config = MT5Config(
     symbols  = ["EURUSDm", "XAUUSDm"],
     server_url = "http://127.0.0.1:5000",
 
-    # The WebSocket tick hub (default: derived from server_url, on port 9000)
+    # The WebSocket push hub (default: derived from server_url, on port 9000)
     ws_url = "ws://127.0.0.1:9000",
 
-    # Order/position polling interval
+    # How often the execution client checks its terminal session and reports an owed account
     exec_poll_interval_ms = 250,   # default: 250ms
 
     # Execution
@@ -173,7 +173,7 @@ config = MT5Config(
     account_refresh_seconds = 10,  # the longest the account goes unreported between events
     history_lookback_mins   = 60,  # the venue history read when NT names no window, and at connect
 
-    # Reconnection
+    # Reconnection: the terminal session's, and the push channel's backoff (which never gives up)
     reconnect_initial_delay_s = 1.0,
     reconnect_max_delay_s     = 60.0,
     reconnect_max_attempts    = 20,
@@ -214,7 +214,7 @@ The instrument provider loads exactly these symbols and builds each one from the
 - **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
 - **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
 - **Currencies**: the base is `currency_base` and the quote — the settlement currency — `currency_profit`, each at NT's precision, else the account's currency digits for the account currency, else its ISO 4217 minor units. A settlement code none of those covers is refused at load; a base code is built as NT builds a code it does not know. The account currency and every settlement currency are registered with NT before the first account state; base-only codes never are.
-- **Taker fee** from the commission schedule the server relays for the symbol: a money rule per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote and halved when charged on entry alone. With none relayed it is zero; a rule of any other mode is refused at load.
+- **Taker fee** from the commission schedule the server relays for the symbol, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the server has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
 - **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, the session calendar (`session_tz`, `session_day_open`, `session_week_open`) and `bar_volume` (`tick_count`).
 
 ---
@@ -515,7 +515,7 @@ signal.signal(signal.SIGTERM, _shutdown)
 
 # 7. Start
 node.build()  # connects to MT5, loads instruments
-node.run()    # starts the tick stream, execution polling and strategy
+node.run()    # starts the push channel and the strategy
 ```
 
 The node lifecycle in order — **sequence matters:**
@@ -526,12 +526,14 @@ node.add_data_client_factory(...)      # 2. register MT5 data factory
 node.add_exec_client_factory(...)      # 2. register MT5 exec factory
 node.trader.add_strategy(instance)     # 3. register strategy instance
 node.build()                           # 4. connect to MT5, load instruments
-node.run()                             # 5. start the tick stream and strategy
+node.run()                             # 5. start the push channel and strategy
 ```
 
 ### Bar types for live trading
 
-NautilusTrader aggregates ticks into bars internally. The bar type string format is:
+A bar type aggregated `EXTERNAL` is the venue's own bar: the terminal's bar of that timeframe — 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 or 30 minutes, 1, 2, 3, 4, 6, 8 or 12 hours, a day or a week — pushed when it closes and stamped at its close, its prices and tick volume the venue's. A step the terminal has no timeframe for is refused at subscription. `"EURUSDm.MT5-5-MINUTE-BID-EXTERNAL"` is the venue's 5-minute bar.
+
+Any other bar type NautilusTrader aggregates from the ticks itself, and never carries the venue's bar type. The bar type string format is:
 
 ```
 {symbol}.{venue}-{step}-{aggregation}-{price_type}-{aggregation_source}
@@ -551,18 +553,23 @@ Common examples:
 
 ## The MT5 server
 
-The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries the ticks an EA inside the terminal publishes, and that EA's source. Its HTTP API, its history protocol, its hub and everything the image running it must provide are in [its README](packages/server/mt5connector/server/README.md).
+The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and that EA's source. Its HTTP API, its history protocol, its hub and everything the image running it must provide are in [its README](packages/server/mt5connector/server/README.md).
 
 ```
 ┌─ your bot (any OS) ────────────────┐      ┌─ beside the MT5 terminal ──────┐
 │  mt5-connector-client              │      │  HTTP API    :5000             │
-│   └─ WSStreamClient                │──────│  WS tick hub :9000             │
-│      (subscribe/tick messages)     │      │  MT5 terminal                  │
+│   └─ PushClient                    │──────│  WS push hub :9000             │
+│      (ticks, bars, transactions)   │      │  MT5 terminal                  │
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
 - `MT5Config` requires the server's `server_url` (HTTP) and derives its `ws_url` (WebSocket) on port 9000 unless one is given — see `packages/client/mt5connector/client/config.py`.
-- The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`, and streams ticks through `mt5connector.client.ws_stream`.
+- The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`.
+- Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client subscribes everything it wants again.
+  - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. After a reconnect it holds the bars pushed until the first one arrives, then reads back over HTTP, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
+  - The execution client subscribes the account's trade transactions: a `DEAL_ADD` is a fill, read from the venue's history by its ticket; an `ORDER_DELETE` or `HISTORY_ADD` ends the order the venue cancelled, expired or rejected; a `TRADE_TRANSACTION_REQUEST` links the ticket of an order whose submit got no answer through its comment's digest, and accepts it. A transaction naming a ticket the client cannot resolve is left to NautilusTrader's reconciliation, never booked as an external order.
+  - Each symbol's EA publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
+- The execution client polls nothing for events: what the push channel misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop checks the terminal session and reports the account.
 - There is no authentication: the server trusts its network, so its ports stay on loopback and are never exposed to an untrusted one.
 
 The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets the shim's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
@@ -615,9 +622,9 @@ mt5-connector/
 │   │       │   ├── commissions.py   # the relayed commission rule and the taker fee it implies
 │   │       │   ├── config.py        # MT5Config — all user-facing configuration
 │   │       │   ├── connection.py    # MT5Connection — server connection lifecycle
-│   │       │   ├── constants.py     # venue, polling and reconnect defaults
+│   │       │   ├── constants.py     # venue, account-loop and reconnect defaults
 │   │       │   ├── currencies.py    # the precision ladder a venue currency code is built by
-│   │       │   ├── data.py          # MT5DataClient — WebSocket tick stream and history requests
+│   │       │   ├── data.py          # MT5DataClient — pushed ticks, marks and venue bars, and history requests
 │   │       │   ├── downloader.py    # MT5DataDownloader — historical bar download
 │   │       │   ├── errors.py        # custom exceptions
 │   │       │   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
@@ -625,19 +632,21 @@ mt5-connector/
 │   │       │   ├── history.py       # the server's history routes, as a client
 │   │       │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
 │   │       │   ├── providers.py     # MT5InstrumentProvider
-│   │       │   ├── remote_mt5.py    # the HTTP shim generated from the inventory
-│   │       │   └── ws_stream.py     # the WebSocket tick client
+│   │       │   ├── push.py          # the hub's push channel on NT's WebSocketClient
+│   │       │   └── remote_mt5.py    # the HTTP shim generated from the inventory
 │   │       └── wire/
 │   │           ├── mirror.py        # the inventory of the pinned MetaTrader5 package
 │   │           ├── broker_clock.py  # broker wall-clock time ↔ true UTC
-│   │           └── history_wire.py  # the history routes' paths, series and answer states
+│   │           ├── history_wire.py  # the history routes' paths, series and answer states
+│   │           └── push_wire.py     # the push protocol's version, frames, roles and streams
 │   └── server/                   # mt5-connector-server
 │       ├── pyproject.toml
 │       └── mt5connector/
 │           └── server/
 │               ├── README.md        # the server's API and what its image must provide
 │               ├── app.py           # the HTTP server (mt5-connector-server)
-│               ├── ws_server.py     # the tick hub (mt5-connector-hub)
+│               ├── ws_server.py     # the push hub (mt5-connector-hub)
+│               ├── push_frames.py   # the EA's frames, held to their structs and converted to UTC
 │               ├── wire -> ../../../client/mt5connector/wire
 │               └── mql5/            # the EA, its startup script and their includes
 ├── tests/                        # full test suite (no live MT5 required)
@@ -707,8 +716,8 @@ Check that the bar type string in your strategy config exactly matches the bar t
   - A bracket can execute in parts, each part an execution of its own: the order keeps every execution ticket it took, across a restart too, and a later deal of one of them fills that order even after another order took the bracket.
   - An exit order reports once, under the ticket it took last, however many executions the venue records for it, and always as the exit: its own type, quantity and level. Once its bracket no longer holds it, the report carries the volume its executions filled at their average price, and reads filled when they filled the order, canceled when they did not.
   - A pending order bound to a position, a reduce-only stop-limit order, and an exit that expires are rejected before anything is sent: the venue ignores a pending order's position, and its fill would open a new one.
-- A submit, modify or cancel the venue may have acted on without the client learning it — `order_send` answering 10031, a read timeout, a connection closed after the request arrived — emits no event and logs a warning; the poll or NT's reconciliation settles the order. A request that never left the client is rejected at once as `not sent`.
-- Fills come from the venue's deals alone, once per deal; deals already in the history when the client connects are never emitted, except a stop loss's or take profit's deal no exit order in NT's cache has booked while an exit holds its execution or occupies that bracket. Connect emits those before it returns, and fails naming the deal when it cannot build one, so the next start tries again.
+- A submit, modify or cancel the venue may have acted on without the client learning it — `order_send` answering 10031, a read timeout, a connection closed after the request arrived — emits no event and logs a warning; the transactions the venue pushes for it or NT's reconciliation settle the order. A request that never left the client is rejected at once as `not sent`.
+- Fills come from the venue's deals alone, pushed as they happen, once per deal; deals already in the history when the client connects are never emitted, except a stop loss's or take profit's deal no exit order in NT's cache has booked while an exit holds its execution or occupies that bracket. Connect emits those before it returns, and fails naming the deal when it cannot build one, so the next start tries again.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
 
 ---

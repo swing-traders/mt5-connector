@@ -15,8 +15,8 @@ An owned hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5
 It ships code, never infrastructure: two distributions in one `mt5connector` namespace package (no `__init__.py` at `mt5connector/`), each its own hatchling project.
 
 - **`mt5-connector-client`** (`packages/client/`) — `mt5connector.client`: NT data and execution clients, the instrument provider, the factories, the remote backend (an HTTP shim generated from the inventory), the history client and the downloader.
-- **Wire vocabulary** (`packages/client/mt5connector/wire/`: `mirror.py`, `broker_clock.py`, `history_wire.py`) — the inventory of the pinned `MetaTrader5` package, the broker-clock conversion and the history protocol's names. It lives once, in the client's tree, and ships in both wheels.
-- **`mt5-connector-server`** (`packages/server/`) — `mt5connector.server`: the Flask app the remote backend talks to (entry point `mt5-connector-server`), the tick hub (`mt5-connector-hub`), the EA and its startup script with their vendored MQL5 libraries as package data (`mql5/`), and its README — the API and the contract the image that runs it builds to.
+- **Wire vocabulary** (`packages/client/mt5connector/wire/`: `mirror.py`, `broker_clock.py`, `history_wire.py`, `push_wire.py`) — the inventory of the pinned `MetaTrader5` package, the broker-clock conversion, and the history and push protocols' names. It lives once, in the client's tree, and ships in both wheels.
+- **`mt5-connector-server`** (`packages/server/`) — `mt5connector.server`: the Flask app the remote backend talks to (entry point `mt5-connector-server`), the push hub (`mt5-connector-hub`), the EA and its startup script with their vendored MQL5 libraries as package data (`mql5/`), and its README — the API and the contract the image that runs it builds to.
 
 **This repository is public.** Nothing in it names a private repository, a deployment, an account, a login number, a server name that identifies an account, or a credential — not in code, tests, docs, commit messages, PR text or review files. A commit here stands on its own: it is written for a reader who has never seen the consumer that pins this fork. Credentials reach the server as environment variables, never baked into an image or committed in an `.env`, and a settings error never echoes a credential.
 
@@ -269,7 +269,7 @@ This file is rules of engagement: guidelines, hard requirements, and non-obvious
 NT TradingNode ──> mt5connector.client (data + exec clients, provider, factories, history client)
                       │
                       ├── remote_mt5 (the HTTP shim generated from the inventory)
-                      └── ws_stream (the WebSocket client)
+                      └── push (the hub's push channel, on NT's WebSocketClient)
                                  │                       │
                                  ▼                       ▼
                      mt5connector.server.app     mt5connector.server.ws_server (hub, a
@@ -293,8 +293,8 @@ The design documents itself in-repo: `packages/server/mt5connector/server/` modu
 - **One lock, one read.** Every package call runs through `Terminal.call`, which holds the one lock around the call and its `last_error()` read, so an answer's error is always its own. Nothing calls the package around it, nothing reads a terminal flag for synchronisation, and nothing waits while holding the lock.
 - **The envelope is the contract.** `{ok, result | error, last_error}` on every mirror route. A failure is `ok: false` carrying the package's `last_error` pair, never a success with an empty result. A mirror route passes the package's own answer through, so its `[]` is as ambiguous as the package's; the history routes are what prove emptiness. `shutdown` keeps the server's session: every client shares one terminal connection. Unknown, missing or non-epoch parameters, and a history query in none of its call forms, are refused with HTTP 400 before the package is asked.
 - **UTC on the wire, broker time only inside the package.** The server converts every epoch field it answers and every window it is asked through `BrokerClock` at the era of the timestamp itself; a consumer never does clock math — it adds a bar's interval for NT's close stamp and subtracts it for a query. A skipped wall-clock hour is a server error; a repeated hour reads as its first occurrence with one warning. A zero epoch stays zero.
-- **The bootstrap gate.** While the clock is not verified against a fresh server-time sample the EA relayed from a terminal connected without a break for one sample max-age, every route but `/health` and the server-time relay answers 503 with the failure envelope, and `/health` answers 503 itself; health reads that verification state and never calls the terminal. The relay route accepts loopback callers only. A missed bootstrap window or a verified mismatch exits the server process.
-- **One worker is always free.** Every call that can reach the terminal — the mirror routes and the three history routes — takes a slot from a pool one smaller than the worker count (`MT5_API_THREADS`, at least 2), without waiting; a call that finds none is refused at once with the busy code and `Retry-After`, never queued on a worker. `/health`, the relay and the commission read take no slot. The worker count is set from the peak `/health` reports, with a margin, so normal operation never refuses.
+- **The bootstrap gate.** While the clock is not verified against a fresh server-time sample the EA relayed from a terminal connected without a break for one sample max-age, every route but `/health` and the two relays — the server time's and the commission schedules' — answers 503 with the failure envelope, and `/health` answers 503 itself; health reads that verification state and never calls the terminal. The relay routes accept loopback callers only. A missed bootstrap window or a verified mismatch exits the server process.
+- **One worker is always free.** Every call that can reach the terminal — the mirror routes and the three history routes — takes a slot from a pool one smaller than the worker count (`MT5_API_THREADS`, at least 2), without waiting; a call that finds none is refused at once with the busy code and `Retry-After`, never queued on a worker. `/health`, the relays and the commission read take no slot. The worker count is set from the peak `/health` reports, with a margin, so normal operation never refuses.
 - **No authentication.** The API trusts its network. The image publishes its ports on loopback alone; exposing one is a design change.
 - **Two Pythons, one distribution.** The Flask app runs under Wine's Windows Python (the terminal's package is Windows-only) and the hub under a Linux Python; both install `mt5-connector-server`, whose `pyproject.toml` declares every server dependency: `MetaTrader5` under the Windows marker, `numpy` held at 2.2.1, `tzdata` pinned because the Windows Python has no system zone database.
 - **The image contract lives in the server's README.** A change to a setting, an entry point, the EA's inputs or what the terminal needs updates its "What the image must provide" section in the same change.
@@ -319,8 +319,18 @@ The terminal substitutes nearest-available data, serves only what it has synced 
 
 ## The EA and the hub — rules of engagement
 
-- The EA (`ticks.mq5`) and its startup script (`ticks_setup.mq5`, which opens a chart per symbol and attaches the EA) are the only code inside the terminal. The EA publishes ticks, relays `TimeTradeServer` every `RelaySeconds`, and drains its socket on its timer and on every tick, so the vendored library answers the hub's keepalive pings and acknowledges a hub close. It reconnects on `TimeLocal()`, because the last-quote time stands still while the market is closed.
-- The hub broadcasts ticks to adapters, hands the EA's `server_time` frame to the server's relay off the event loop so a slow server never holds back ticks, and never broadcasts the relay. The `type` of an EA frame is a `FrameType` member. A frame the hub cannot handle closes its connection with a warning; a frame of an unknown kind is logged and skipped.
+The EA (`ticks.mq5`) and its startup script (`ticks_setup.mq5`) are the only code inside the terminal. The server README documents what the EA publishes and the push protocol, and `ws_server.py` the hub. The rules:
+
+- **One EA per symbol, each on its own chart; nothing is elected.**
+  - Every EA receives the account's whole transaction stream, so each publishes only its own symbol's — a request transaction's by its request's symbol — and the spawner also those that name none. Nothing downstream deduplicates.
+  - A symbol's first EA publishes it; a later one is answered `duplicate`.
+  - The spawner, an input its template sets, alone opens and closes charts, on the hub's request; it publishes its own symbol like any EA, and its chart never closes idle. The startup script closes every restored chart but the spawner's.
+  - Every trade request the adapter sends names its symbol, cancels and modifies included, so its transaction travels through that symbol's EA.
+- **The EA reads its socket and its tick cursor on its timer and on every tick**, so the vendored library answers the hub's keepalive pings and acknowledges a close, and a tick whose event the terminal never queued is still published. It reconnects on `TimeLocal()`, because the last-quote time stands still while the market is closed.
+- **The hub converts every epoch the EA publishes to true UTC** through the one `BrokerClock` rule; a consumer does no clock math.
+- **Nothing is stored or replayed.** A consumer's queue is bounded and overflow closes it; a gap heals through NT's reconciliation and the data client's one bar read-back.
+- **The protocol's closed sets are `push_wire.py` members on both sides.** A frame the hub cannot handle is answered with an error frame and closes its connection with a warning; a frame of an unknown kind is logged and skipped.
+- **An MQL5 enum whose values the reference does not publish travels by its `EnumToString` name**, or, where the protocol carries integers, as the value the image's compiler assigns, pinned in `push_wire.py`; a duplicate `case` label compiled against the terminal's build proves a value.
 - The EA and its script ship as source; whoever builds the image compiles them, and the compile holds only under these requirements: `MetaEditor64.exe` by that exact name (the Wine prefix's volume is case-sensitive), one source per invocation (MetaEditor honours only the last `/compile` argument), from a path without spaces (it truncates one that has them). The chart template that attaches the EA must be UTF-16LE with a BOM and CRLF.
 - Nothing in the test suite runs the EA. A change to it is proven by the compile (`0 errors, 0 warnings`) and by a running server whose `/health` stays 200, which takes a fresh server time relayed by the EA; a claim beyond those is unverified.
 
@@ -328,7 +338,7 @@ The terminal substitutes nearest-available data, serves only what it has synced 
 
 ## MT5 pitfalls (the long list)
 
-Measured on IC Markets and Bybit MT5 terminals; none of it is in the vendor's documentation. Internalize them.
+Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's documentation, except where a bullet names the MQL5 reference. Internalize them.
 
 ### The broker clock
 
@@ -366,7 +376,17 @@ Measured on IC Markets and Bybit MT5 terminals; none of it is in the vendor's do
 - **The filling mode is per symbol**, a bitmask on `symbol_info().filling_mode`; a wrong mode is retcode 10030.
 - **`order_send` can report "no connection" (10031) for a trade the server executed.** The order exists; the reply does not say so.
 - **`account_info.trade_allowed == false` under `terminal_info.trade_allowed == true` marks an investor (read-only) session** — a configuration error to fail at startup, not a refusal to discover on the first order.
-- **`OnTradeTransaction` is account-scoped and complete through one EA**: two EAs receive byte-identical streams. `DEAL_ADD` alone carries the fill; `order_state` on it is a meaningless default; fill ordering against `ORDER_DELETE`/`HISTORY_ADD` is not guaranteed; `TRADE_TRANSACTION_REQUEST` trails the lifecycle events with the full request and result.
+- **`OnTradeTransaction` is account-scoped and complete through one EA**: two EAs receive byte-identical streams. `DEAL_ADD` alone carries the fill; `order_state` on it is a meaningless default; fill ordering against `ORDER_DELETE`/`HISTORY_ADD` is not guaranteed; `TRADE_TRANSACTION_REQUEST` trails the lifecycle events with the full request and result, and the MQL5 reference fills only its type — its symbol is the request's, which a delete or modify of a pending order may leave empty.
+
+### Charts
+
+- **At most `CHARTS_MAX` (100) charts are open at once** (MQL5 reference), the spawner's included; `ChartOpen` past it returns 0. The symbols in use at once stay below it.
+- **A chart that does not open is reported, never waited on**: the spawner answers every `open_chart` with `chart_opened` or `chart_failed` and the failing call's error, and a read of the symbol the server posts to the hub fails naming it until a chart of it opens or its EA says hello.
+- **An EA answered `duplicate` closes its own chart; the spawner first outlasts a stale connection**: it says hello again every `ReconnectIntervalSec` and closes its chart only when still refused `HubPingTimeoutSec`, the longest the hub takes to drop a dead connection, after its first refusal.
+- **A symbol leaves Market Watch only with no chart of it open and no open position** (MQL5 reference, `SymbolSelect`), so the idle close closes the chart first, then deselects. A chart closes once its symbol is out of use for `MT5_CHART_IDLE_SECONDS`, and the spawner, which opened it, closes it.
+- **The deselect right after `ChartClose` may be refused while the close completes**, so the spawner retries it on its timer until it succeeds or the chart reopens, slowly while positions or orders hold the symbol.
+- **A symbol with open positions or pending orders never closes idle**: the spawner answers `close_chart` with `chart_kept` and the hub re-arms its idle period, so its transactions keep flowing.
+- **`ChartApplyTemplate` only queues the template** (MQL5 reference): the template's EA loads after the call returns, so the spawner remembers the charts it opened to keep an open idempotent.
 
 ### The terminal under Wine
 
