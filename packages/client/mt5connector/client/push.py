@@ -1,9 +1,11 @@
 """A consumer's channel to the hub on NT's WebSocketClient, sending its wanted subscriptions whole
 again on every reconnect: the hub keeps nothing for a consumer that left.
 
-State: the subscriptions wanted, in the order they were first wanted, and the next op id. A change
-to what is wanted and the resend of the whole set hold one lock across their sends, so the hub
-receives them in the order the set changed."""
+State: the subscriptions wanted, in the order they were first wanted; the next op id; the reconnects
+NT's client has made, and the one the last hello greeted. An op waits for its connection's hello,
+which the hub needs before any other frame: until then a change only changes the set, which the
+resend carries. A change and the resend hold one lock across their sends, so the hub receives them
+in the order the set changed."""
 
 from __future__ import annotations
 
@@ -55,6 +57,8 @@ class PushClient:
         self._wanted: list[Subscription] = []
         self._wanting = asyncio.Lock()
         self._next_op_id = 1
+        self._reconnects = 0
+        self._greeted: int | None = None
         self._tasks: set[asyncio.Task] = set()
 
     async def connect(self) -> None:
@@ -87,6 +91,7 @@ class PushClient:
             task.cancel()
         await self._ws.disconnect()
         self._ws = None
+        self._greeted = None
 
     async def subscribe(self, subscription: Subscription) -> None:
         """Wants a stream, and subscribes it while connected."""
@@ -103,9 +108,9 @@ class PushClient:
                 await self._send_op(FrameType.UNSUBSCRIBE, subscription)
 
     async def _send_op(self, frame_type: FrameType, subscription: Subscription) -> None:
-        """Sends an op under the next op id while connected; the connect or reconnect sends the
-        wanted set otherwise."""
-        if self._ws is not None and self._ws.is_active():
+        """Sends an op under the next op id once the connection it rides has had its hello; the
+        connect or reconnect sends the wanted set otherwise."""
+        if self._greeted == self._reconnects and self._ws.is_active():
             await self._send(subscription.op(frame_type, self._op_id()))
 
     def _op_id(self) -> int:
@@ -115,13 +120,17 @@ class PushClient:
 
     async def _send_wanted(self) -> None:
         async with self._wanting:
+            reconnects = self._reconnects
             await self._send({"v": PROTOCOL_VERSION, "type": FrameType.HELLO, "role": Role.ADAPTER})
             for subscription in self._wanted:
                 await self._send(subscription.op(FrameType.SUBSCRIBE, self._op_id()))
+            self._greeted = reconnects
 
     async def _send(self, frame: dict[str, object]) -> None:
         """Sends a frame; one the connection drops is sent again with the whole wanted set when NT's
-        client reconnects."""
+        client reconnects. NT's client turns a reconnected socket active before it calls back, and
+        sends a frame it held through the outage at once, so that frame can precede the hello: the
+        hub refuses it and closes, and the reconnect that follows resends the whole set."""
         try:
             await self._ws.send_text(json.dumps(frame).encode())
         except (WebSocketClientError, RuntimeError) as exc:
@@ -150,7 +159,9 @@ class PushClient:
         self._loop.call_soon_threadsafe(self._on_reconnected)
 
     def _on_reconnected(self) -> None:
-        """Tells the owner, then sends the hello and the whole wanted set again."""
+        """Holds back every op until the new connection's hello, tells the owner, then sends the
+        hello and the whole wanted set again."""
+        self._reconnects += 1
         self._log.info("push: reconnected, subscribing again what is wanted")
         if self._on_reconnect is not None:
             self._on_reconnect()

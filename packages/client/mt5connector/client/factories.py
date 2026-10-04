@@ -50,7 +50,7 @@ def _get_or_create_connection(
     registry_key = hash((config.account, config.server))
 
     if registry_key not in _connection_registry:
-        logger.info(f"MT5 factories: creating connection for server={config.server}")
+        logger.info("MT5 factories: creating the account's connection")
         conn = MT5Connection(config)
         provider = MT5InstrumentProvider(conn, clock=clock, config=_provider_config(config))
 

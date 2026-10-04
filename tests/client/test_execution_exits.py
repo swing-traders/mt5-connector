@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 from exec_harness import (
     ACCOUNT_ID,
+    MAGIC,
     TRADER_ID,
     build,
     gtd,
@@ -894,19 +895,155 @@ async def test_a_take_profit_deal_fills_the_target(exec_shim):
     )
 
 
-async def test_a_stop_out_fills_the_stop(exec_shim):
-    h, stop_order, _ = await occupied(exec_shim)
-    turn(h, deals=[bracket_deal(reason=mirror.DEAL_REASON_SO)])
-    assert [fill.client_order_id for fill in fills(h)] == [stop_order.client_order_id]
+# ── A stop-out: the venue closes the position, which takes its brackets with it ──
 
 
-async def test_a_stop_out_with_no_stop_standing_defers_with_one_info(exec_shim):
-    h = await connected(exec_shim)
-    deal = bracket_deal(reason=mirror.DEAL_REASON_SO)
+def stop_out_deal(**fields):
+    """The deal by which the venue's stop-out closed position 8133477, under `fields`."""
+    return bracket_deal(**({"reason": mirror.DEAL_REASON_SO} | fields))
+
+
+def stop_out_order(**fields):
+    """The order the venue placed to execute the stop-out of position 8133477, as its history holds
+    it filled, under `fields`."""
+    return execution_order(
+        **({"reason": mirror.ORDER_REASON_SO, "comment": "[so 45.00%]"} | fields)
+    )
+
+
+def opening_order(**fields):
+    """The order that opened position 8133477 under this trader's magic, its ticket the position's
+    identifier, as the venue's history holds it filled, under `fields`."""
+    return execution_order(
+        **(
+            {
+                "ticket": POSITION,
+                "type": mirror.ORDER_TYPE_BUY,
+                "reason": mirror.ORDER_REASON_EXPERT,
+                "comment": "",
+                "time_setup_msc": 1_760_000_000_000,
+                "time_done_msc": 1_760_000_000_000,
+            }
+            | fields
+        )
+    )
+
+
+# The venue may stamp a stop-out with no magic: the position it closes makes it this trader's.
+STOP_OUT_MAGICS = pytest.mark.parametrize("magic", [MAGIC, 0], ids=["ours", "none"])
+
+
+@STOP_OUT_MAGICS
+async def test_a_stop_out_fills_no_exit_and_is_left_to_reconciliation_with_one_info(
+    exec_shim, magic
+):
+    h, stop_order, target_order = await occupied(exec_shim)
+    h.venue.history_orders_get.side_effect = order_history(
+        opening_order(), stop_out_order(magic=magic)
+    )
+    deal = stop_out_deal(magic=magic)
     turn(h, deals=[deal])
     turn(h, deals=[deal])
     assert h.names() == []
     assert len([line for line in h.logged(LogLevel.INFO) if "7101" in line]) == 1
+    assert (stop_order.status, target_order.status) == (OrderStatus.ACCEPTED, OrderStatus.ACCEPTED)
+
+
+@STOP_OUT_MAGICS
+async def test_a_stop_outs_reduce_reports_as_an_order_and_a_fill_no_exit_explains(exec_shim, magic):
+    h, stop_order, target_order = await occupied(exec_shim)
+    deal = stop_out_deal(magic=magic)
+    h.venue.history_orders_get.side_effect = order_history(
+        opening_order(), stop_out_order(magic=magic)
+    )
+    turn(h, deals=[deal])
+    settle(h)
+    h.venue.positions_get.side_effect = holding()
+    h.venue.history_deals_get.side_effect = history([deal], position_deals=[opening_deal(), deal])
+
+    (fill,) = await fill_reports(h)
+    assert (
+        fill.client_order_id,
+        fill.venue_order_id,
+        fill.trade_id,
+        fill.venue_position_id,
+        fill.order_side,
+        fill.last_qty,
+    ) == (
+        None,
+        VenueOrderId("9901"),
+        TradeId("7101"),
+        PositionId(str(POSITION)),
+        OrderSide.SELL,
+        Quantity.from_str("0.010"),
+    )
+    reports = {report.venue_order_id: report for report in await order_reports(h)}
+    execution = reports[VenueOrderId("9901")]
+    assert (
+        execution.client_order_id,
+        execution.order_side,
+        execution.order_type,
+        execution.order_status,
+        execution.filled_qty,
+    ) == (None, OrderSide.SELL, OrderType.MARKET, OrderStatus.FILLED, Quantity.from_str("0.010"))
+    assert [reports[order.venue_order_id].order_status for order in (stop_order, target_order)] == [
+        OrderStatus.CANCELED,
+        OrderStatus.CANCELED,
+    ]
+    single = await report_by_venue_order_id(h, "9901")
+    assert (single.client_order_id, single.order_status) == (None, OrderStatus.FILLED)
+
+
+async def test_a_stop_out_of_a_position_another_trader_opened_is_not_this_traders(exec_shim):
+    h = await connected(exec_shim)
+    other = 8133999
+    deal = stop_out_deal(magic=0, position_id=other)
+    h.venue.history_orders_get.side_effect = order_history(
+        opening_order(ticket=other, position_id=other, magic=0),
+        stop_out_order(magic=0, position_id=other),
+    )
+    turn(h, deals=[deal])
+    assert h.names() == []
+    assert [line for line in h.logged(LogLevel.INFO) if "7101" in line] == []
+    assert await fill_reports(h) == []
+    assert VenueOrderId("9901") not in {report.venue_order_id for report in await order_reports(h)}
+
+
+async def test_a_stop_out_that_leaves_part_of_the_position_leaves_its_brackets_standing(exec_shim):
+    h, stop_order, target_order = await occupied(exec_shim)
+    turn(h, deals=[stop_out_deal(volume=0.004)])
+    h.venue.positions_get.side_effect = holding(long_position(sl=1.08, tp=1.1, volume=0.006))
+    reports = {report.client_order_id: report for report in await order_reports(h)}
+    standing = reports[stop_order.client_order_id], reports[target_order.client_order_id]
+    assert [(report.order_status, report.trigger_price, report.price) for report in standing] == [
+        (OrderStatus.ACCEPTED, Price.from_str("1.08000"), None),
+        (OrderStatus.ACCEPTED, None, Price.from_str("1.10000")),
+    ]
+
+
+async def test_a_cancel_of_the_stop_once_a_stop_out_closed_its_position_cancels_it(exec_shim):
+    h, stop_order, _ = await occupied(exec_shim)
+    h.venue.positions_get.side_effect = holding()
+    h.venue.history_deals_get.side_effect = history(
+        [], position_deals=[opening_deal(), stop_out_deal(time_msc=1_760_000_009_000)]
+    )
+    await cancel(h, stop_order)
+    assert h.names() == ["OrderCanceled", "AccountState"]
+    assert h.events[0].ts_event == 1_760_000_009_000_000_000
+    h.venue.order_send.assert_not_called()
+
+
+async def test_a_position_a_stop_out_closed_while_down_emits_nothing_and_cancels_its_stops(
+    exec_shim,
+):
+    deals = [opening_deal(), stop_out_deal()]
+    h, first, second = await two_stops(exec_shim, deals=deals, position_deals=deals)
+    assert h.names() == ["AccountState"]
+    reports = await exit_reports(h)
+    assert [reports[order.client_order_id].order_status for order in (first, second)] == [
+        OrderStatus.CANCELED,
+        OrderStatus.CANCELED,
+    ]
 
 
 async def test_a_bracket_deal_fills_the_occupant_whatever_magic_it_carries(exec_shim):

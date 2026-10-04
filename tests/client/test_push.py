@@ -249,6 +249,32 @@ async def test_an_unsubscribe_while_the_reconnect_resends_is_not_undone_by_it():
     assert held_by_the_hub(socket.sent) == {("ticks", "EURUSD", None)}
 
 
+async def test_after_a_reconnect_a_subscribe_waits_for_the_hello_and_rides_the_resend():
+    owner = Owner()
+    push = PushClient(config(1), asyncio.get_running_loop(), owner.on_frame, None, owner.log)
+    await push.subscribe(Subscription(Stream.TICKS, "EURUSD"))
+    socket = HeldSocket(lambda frame: False)
+    push._ws = socket
+
+    push._on_reconnected()
+    await push.subscribe(Subscription(Stream.TICKS, "GBPUSD"))
+    await push.unsubscribe(Subscription(Stream.TICKS, "EURUSD"))
+    await asyncio.gather(*push._tasks)
+
+    assert socket.sent == [
+        HELLO,
+        {"v": 1, "type": "subscribe", "id": 1, "stream": "ticks", "symbol": "GBPUSD"},
+    ]
+    await push.subscribe(Subscription(Stream.TICKS, "USDJPY"))
+    assert socket.sent[-1] == {
+        "v": 1,
+        "type": "subscribe",
+        "id": 2,
+        "stream": "ticks",
+        "symbol": "USDJPY",
+    }
+
+
 async def test_an_error_frame_is_logged_and_not_handed_to_the_owner(hub):
     owner = Owner()
     push = channel(hub, owner)

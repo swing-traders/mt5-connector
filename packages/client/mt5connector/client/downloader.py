@@ -14,7 +14,11 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connector.client import history
 from mt5connector.client import remote_mt5 as mt5
-from mt5connector.client.errors import MT5InstrumentError, MT5SymbolNotFoundError
+from mt5connector.client.errors import (
+    MT5InstrumentError,
+    MT5SymbolNotFoundError,
+    ServerUnreachable,
+)
 from mt5connector.client.history import HistoryRanges
 from mt5connector.client.parsing import (
     InstrumentAny,
@@ -246,8 +250,9 @@ class MT5DataDownloader:
         convert: Callable[[np.ndarray], list],
     ) -> None:
         """Requests the windows newest-first, writing the rows each answers, until the next lies
-        wholly before the series' floor, and records the floor when it lies after `first`. The floor
-        is read again after a window answered no rows and once the walk ends, since the server
+        wholly before the series' floor, and records the floor when it lies after `first`. A window
+        the server fails or leaves unanswered is recorded as an error and the walk goes on. The
+        floor is read again after a window answered no rows and once the walk ends, since the server
         measures one while answering."""
         for lo, hi in windows:
             if floor is not None and hi < floor:
@@ -256,7 +261,7 @@ class MT5DataDownloader:
             label = f"{_iso(lo)}..{_iso(hi)}"
             try:
                 rows = read(lo, hi)
-            except Exception as exc:
+            except ServerUnreachable as exc:
                 _record_error(result, f"Window {label} failed: {exc}")
                 continue
             if rows is None:

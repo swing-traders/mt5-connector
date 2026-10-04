@@ -6,9 +6,9 @@ This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](
 
 > ⚠️ **Disclaimer:** This is an independent community project. It is **not** affiliated with, endorsed by, or supported by [Nautech Systems Pty Ltd](https://nautilustrader.io) or the official [NautilusTrader](https://nautilustrader.io) project.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Linux | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#requirements)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
 [![Unofficial](https://img.shields.io/badge/NautilusTrader-unofficial%20community%20adapter-orange.svg)](https://nautilustrader.io)
 
 ---
@@ -33,7 +33,7 @@ MT5 server ←→ mt5-connector-client ←→ NautilusTrader
 - Automatic reconnection with exponential backoff
 - Works with any MT5 broker — Exness, IC Markets, Pepperstone, OANDA, and more
 
-> **Platform note:** The adapter talks only to the MT5 server — `mt5-connector-server`, running beside the MT5 terminal (see [The MT5 server](#the-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package and runs on any platform. Backtesting with downloaded data works on any platform once the data has been collected.
+> **Platform note:** The adapter talks only to the MT5 server — `mt5-connector-server`, running beside the MT5 terminal (see [The MT5 server](#the-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package. It runs where the NautilusTrader build it pins installs: CPython 3.12 on Linux x86_64.
 
 ---
 
@@ -61,12 +61,9 @@ The repository ships two distributions, versioned together: one release builds b
   - [Quick start](#quick-start)
   - [Configuration](#configuration)
     - [Symbol naming](#symbol-naming)
-  - [Writing a strategy](#writing-a-strategy)
-  - [Backtesting](#backtesting)
-    - [Step 1 — download historical data](#step-1--download-historical-data)
-    - [Step 2 — run the backtest](#step-2--run-the-backtest)
-  - [Live trading](#live-trading)
-    - [Bar types for live trading](#bar-types-for-live-trading)
+  - [Downloading history](#downloading-history)
+  - [Running in a node](#running-in-a-node)
+    - [Bar types](#bar-types)
   - [The MT5 server](#the-mt5-server)
   - [Releases](#releases)
   - [Running the full test suite](#running-the-full-test-suite)
@@ -80,7 +77,7 @@ The repository ships two distributions, versioned together: one release builds b
 
 ## Requirements
 
-- Python 3.11+
+- CPython 3.12 on Linux x86_64 where the client runs: the NautilusTrader build it pins exists for that platform alone
 - An MT5 server (`mt5-connector-server`, see [The MT5 server](#the-mt5-server)) running beside a MetaTrader 5 terminal logged in to your broker account
 - An MT5 broker account (demo accounts work perfectly for development)
 
@@ -88,10 +85,13 @@ The repository ships two distributions, versioned together: one release builds b
 
 ## Installation
 
-Releases are published as wheels on the fork's package index. Install the adapter where NautilusTrader runs:
+Releases are published as wheels on the fork's package index. The client pins the NautilusTrader fork's own build, `nautilus_trader==1.231.0+st.22`, which only that fork's index serves. Install the adapter where NautilusTrader runs, from both indexes:
 
 ```bash
-pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-client==0.4.0+st.N"
+pip install \
+  --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
+  --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
+  "mt5-connector-client==0.4.0+st.N"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
@@ -127,17 +127,11 @@ info = mt5.account_info()
 print(info.currency, info.balance)
 ```
 
-**3. Run the example live strategy.** The examples read `MT5_ACCOUNT`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_SYMBOLS` and `MT5_SERVER_URL` from the environment. Find your server name in MT5 → File → Open Account → search your broker.
-
-```bash
-python examples/live_remote.py
-```
-
 ---
 
 ## Configuration
 
-All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL; a config without `server_url` is refused when it is built.
+All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL. A config is refused when it is built without a `server_url`, with a `server_url` that names no scheme or no host, or with a `ws_url` that is not a well-formed `ws` or `wss` URL naming a host. Its repr and string name none of the credentials: the login, the password and the broker server's name.
 
 ```python
 from mt5connector.client.config import MT5Config
@@ -213,7 +207,13 @@ The instrument provider loads exactly these symbols and builds each one from the
 
 - **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
 - **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
-- **Currencies**: the base is `currency_base` and the quote — the settlement currency — `currency_profit`, each at NT's precision, else the account's currency digits for the account currency, else its ISO 4217 minor units. A settlement code none of those covers is refused at load; a base code is built as NT builds a code it does not know. The account currency and every settlement currency are registered with NT before the first account state; base-only codes never are.
+- **Currencies**:
+  - The base is `currency_base` and the quote — the settlement currency — `currency_profit`.
+  - Each takes NT's precision, else the account's currency digits for the account currency, else its ISO 4217 minor units.
+  - A settlement code none of those covers is refused at load; a base code is built as NT builds a code it does not know.
+  - An instrument's settlement currency is registered with NT before every instrument NT receives.
+  - The account currency, with every loaded settlement currency, is registered before the first account state.
+  - Base-only codes are never registered.
 - **Taker fee** from the commission schedule the server relays for the symbol, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the server has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, a conversion symbol the venue refuses to select, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
 - **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, the session calendar (`session_tz`, `session_day_open`, `session_week_open`) and `bar_volume` (`tick_count`).
 
@@ -224,122 +224,23 @@ The provider also answers what a consumer discovers its settlement currencies by
 
 ---
 
-## Writing a strategy
+## Downloading history
 
-Strategies are plain NautilusTrader `Strategy` subclasses. The adapter handles all the MT5-specific plumbing — your strategy code is identical for both backtesting and live trading.
-
-```python
-from decimal import Decimal
-from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.config import StrategyConfig
-
-
-class SmaCrossConfig(StrategyConfig, frozen=True):
-    instrument_id : str
-    bar_type      : str
-    fast_period   : int     = 10
-    slow_period   : int     = 30
-    trade_size    : Decimal = Decimal("0.01")
-
-
-class SmaCrossStrategy(Strategy):
-
-    def __init__(self, config: SmaCrossConfig) -> None:
-        super().__init__(config)
-        self.instrument_id = InstrumentId.from_str(config.instrument_id)
-        self.bar_type      = BarType.from_str(config.bar_type)
-        self.fast_period   = config.fast_period
-        self.slow_period   = config.slow_period
-        self.trade_size    = config.trade_size
-        self._fast_prices: list[float] = []
-        self._slow_prices: list[float] = []
-        self._position_side = None
-
-    def on_start(self) -> None:
-        self.instrument = self.cache.instrument(self.instrument_id)
-        self.subscribe_bars(self.bar_type)
-
-    def on_bar(self, bar: Bar) -> None:
-        close = float(bar.close)
-        self._fast_prices.append(close)
-        self._slow_prices.append(close)
-        if len(self._fast_prices) > self.fast_period:
-            self._fast_prices.pop(0)
-        if len(self._slow_prices) > self.slow_period:
-            self._slow_prices.pop(0)
-
-        if len(self._fast_prices) < self.fast_period:
-            return
-
-        fast_sma = sum(self._fast_prices) / self.fast_period
-        slow_sma = sum(self._slow_prices) / self.slow_period
-
-        if fast_sma > slow_sma and self._position_side != OrderSide.BUY:
-            self._close_position()
-            self._open_position(OrderSide.BUY)
-        elif fast_sma < slow_sma and self._position_side != OrderSide.SELL:
-            self._close_position()
-            self._open_position(OrderSide.SELL)
-
-    def _open_position(self, side: OrderSide) -> None:
-        quantity = Quantity(float(self.trade_size), self.instrument.size_precision)
-        order = self.order_factory.market(
-            instrument_id=self.instrument_id,
-            order_side=side,
-            quantity=quantity,
-        )
-        self.submit_order(order)
-        self._position_side = side
-
-    def _close_position(self) -> None:
-        if self._position_side is None:
-            return
-        for pos in self.cache.positions_open(instrument_id=self.instrument_id):
-            close_side = OrderSide.SELL if pos.side.name == "LONG" else OrderSide.BUY
-            order = self.order_factory.market(
-                instrument_id=self.instrument_id,
-                order_side=close_side,
-                quantity=pos.quantity,
-            )
-            self.submit_order(order)
-        self._position_side = None
-
-    def on_stop(self) -> None:
-        self._close_position()
-```
-
-The strategy above is identical whether you run it in a backtest or live — the only difference is which engine you wire it into.
-
----
-
-## Backtesting
-
-Backtesting requires two steps: download historical bar data from MT5, then run the backtest engine against it.
-
-### Step 1 — download historical data
-
-```bash
-python examples/download_historical_data.py
-```
-
-This downloads H1 bars for the configured symbol through the MT5 server's [history routes](packages/server/mt5connector/server/README.md#history), so it runs against the MT5 server at `MT5_SERVER_URL` (`http://127.0.0.1:5000` by default), and writes them into a NautilusTrader Parquet catalog at `./catalog`.
+`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the MT5 server's [history routes](packages/server/mt5connector/server/README.md#history).
 
 The downloader walks back from `end`, one request per window, until `start` or the floor `/history/ranges` advertises for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
 
 - bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at its close — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
 - ticks one UTC day at a time, both sizes of each the instrument's largest order.
 
-You can customise the download by editing the script, or call the downloader directly:
+A window the server answers with a failure, or leaves unanswered, is recorded among the result's errors and the walk goes on; any other error reading it raises.
 
 ```python
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import MT5Connection
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.client.downloader import MT5DataDownloader
+from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from datetime import datetime, timezone
 
@@ -352,7 +253,7 @@ config = MT5Config(
 conn     = MT5Connection(config)
 conn.connect()
 
-provider = MT5InstrumentProvider(conn)
+provider = MT5InstrumentProvider(conn, clock=LiveClock())
 catalog  = ParquetDataCatalog("./catalog")
 
 # Write the instrument definition first (required by the backtest engine)
@@ -384,91 +285,14 @@ conn.disconnect()
 | D1  | 16408 |
 | W1  | 32769 |
 
-### Step 2 — run the backtest
-
-```bash
-python examples/backtest_eurusd.py
-```
-
-Or wire it up yourself:
-
-```python
-from decimal import Decimal
-from datetime import datetime, timezone
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType, OmsType
-from nautilus_trader.model.identifiers import Venue, TraderId
-from nautilus_trader.model.objects import Money
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-SYMBOL   = "EURUSDm"
-VENUE    = "MT5"
-CATALOG  = "./catalog"
-
-catalog     = ParquetDataCatalog(CATALOG)
-instruments = catalog.instruments()
-instrument  = next(i for i in instruments if i.id.symbol.value == SYMBOL)
-
-# Load bars from catalog
-bars = catalog.bars([f"{SYMBOL}.{VENUE}"])
-
-engine = BacktestEngine(
-    config=BacktestEngineConfig(
-        trader_id=TraderId("BACKTESTER-001"),
-        logging=LoggingConfig(log_level="WARNING"),
-    )
-)
-
-engine.add_venue(
-    venue             = Venue(VENUE),
-    oms_type          = OmsType.NETTING,
-    account_type      = AccountType.MARGIN,
-    base_currency     = USD,
-    starting_balances = [Money(10_000.0, USD)],
-    fill_model        = FillModel(
-        prob_fill_on_limit=0.95,
-        prob_slippage=0.10,
-        random_seed=42,
-    ),
-)
-engine.add_instrument(instrument)
-engine.add_data(bars)
-
-strategy = SmaCrossStrategy(
-    config=SmaCrossConfig(
-        instrument_id = f"{SYMBOL}.{VENUE}",
-        bar_type      = f"{SYMBOL}.{VENUE}-1-HOUR-LAST-INTERNAL",
-        fast_period   = 10,
-        slow_period   = 30,
-        trade_size    = Decimal("0.10"),
-    )
-)
-engine.add_strategy(strategy)
-engine.run(
-    start = datetime(2024, 1,  1, tzinfo=timezone.utc),
-    end   = datetime(2024, 12, 31, tzinfo=timezone.utc),
-)
-
-# Results
-account = engine.trader.generate_account_report(Venue(VENUE))
-fills   = engine.trader.generate_order_fills_report()
-print(account)
-print(f"Total fills: {len(fills)}")
-engine.dispose()
-```
-
 ---
 
-## Live trading
+## Running in a node
 
-Live trading uses NautilusTrader's `TradingNode` with the MT5 data and execution clients.
+The data and execution clients run in NautilusTrader's `TradingNode`. `build_mt5_node_config` makes them the node's default route, each loading the config's symbols, and the factories, registered before `node.build()`, build them on one connection and one instrument provider per account and server:
 
 ```python
-import os, signal, sys
-from decimal import Decimal
+import os
 from nautilus_trader.live.node import TradingNode
 from mt5connector.client.config import MT5Config
 from mt5connector.client.factories import (
@@ -477,7 +301,6 @@ from mt5connector.client.factories import (
     MT5LiveExecClientFactory,
 )
 
-# 1. Configure MT5
 mt5_config = MT5Config(
     account  = int(os.environ["MT5_ACCOUNT"]),
     password = os.environ["MT5_PASSWORD"],
@@ -486,55 +309,14 @@ mt5_config = MT5Config(
     server_url = os.environ["MT5_SERVER_URL"],
 )
 
-# 2. Configure strategy
-symbol        = mt5_config.symbols[0]
-instrument_id = f"{symbol}.MT5"
-bar_type      = f"{instrument_id}-1-MINUTE-LAST-INTERNAL"
-
-strategy_config = SmaCrossConfig(
-    instrument_id = instrument_id,
-    bar_type      = bar_type,
-    fast_period   = 10,
-    slow_period   = 30,
-    trade_size    = Decimal("0.01"),
-)
-
-# 3. Build and run the node
-node_config = build_mt5_node_config(mt5_config=mt5_config)
-node        = TradingNode(config=node_config)
-
-# 4. Register factories (must be before node.build())
+node = TradingNode(config=build_mt5_node_config(mt5_config=mt5_config))
 node.add_data_client_factory("MT5", MT5LiveDataClientFactory)
 node.add_exec_client_factory("MT5", MT5LiveExecClientFactory)
-
-# 5. Add strategy
-node.trader.add_strategy(SmaCrossStrategy(config=strategy_config))
-
-# 6. Graceful shutdown on Ctrl+C
-def _shutdown(sig, frame):
-    node.stop()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT,  _shutdown)
-signal.signal(signal.SIGTERM, _shutdown)
-
-# 7. Start
-node.build()  # connects to MT5, loads instruments
-node.run()    # starts the push channel and the strategy
+node.build()  # builds the clients, connecting to the MT5 server
+node.run()    # connects the clients: loads the config's symbols and starts the push channels
 ```
 
-The node lifecycle in order — **sequence matters:**
-
-```
-TradingNode(config)                    # 1. init kernel and engines
-node.add_data_client_factory(...)      # 2. register MT5 data factory
-node.add_exec_client_factory(...)      # 2. register MT5 exec factory
-node.trader.add_strategy(instance)     # 3. register strategy instance
-node.build()                           # 4. connect to MT5, load instruments
-node.run()                             # 5. start the push channel and strategy
-```
-
-### Bar types for live trading
+### Bar types
 
 A bar type aggregated `EXTERNAL` is the venue's own bar: the terminal's bar of that timeframe — 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 or 30 minutes, 1, 2, 3, 4, 6, 8 or 12 hours, a day or a week — pushed when it closes and stamped at its close, its prices and tick volume the venue's. A step the terminal has no timeframe for is refused at subscription and at a history request. `"EURUSDm.MT5-5-MINUTE-BID-EXTERNAL"` is the venue's 5-minute bar.
 
@@ -561,16 +343,17 @@ Common examples:
 The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and that EA's source. Its HTTP API, its history protocol, its hub and everything the image running it must provide are in [its README](packages/server/mt5connector/server/README.md).
 
 ```
-┌─ your bot (any OS) ────────────────┐      ┌─ beside the MT5 terminal ──────┐
+┌─ your bot (Linux) ─────────────────┐      ┌─ beside the MT5 terminal ──────┐
 │  mt5-connector-client              │      │  HTTP API    :5000             │
 │   └─ PushClient                    │──────│  WS push hub :9000             │
 │      (ticks, bars, transactions)   │      │  MT5 terminal                  │
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
-- `MT5Config` requires the server's `server_url` (HTTP) and derives its `ws_url` (WebSocket) on port 9000 unless one is given — see `packages/client/mt5connector/client/config.py`.
+- `MT5Config` requires the server's `server_url` (HTTP) and derives its `ws_url` (WebSocket) from the same host on port 9000 unless one is given; a given `ws_url` must be a `ws` or `wss` URL naming a host — see `packages/client/mt5connector/client/config.py`.
 - The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
-- Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client subscribes everything it wants again.
+- A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
+- Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
   - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. Its history requests answer quote ticks sized the same way, and the venue's bars as the bar type requested. After a reconnect it holds the bars pushed until the first one arrives, then reads back over HTTP, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
   - The execution client subscribes the account's trade transactions: a `DEAL_ADD` is a fill, read from the venue's history by its ticket; an `ORDER_DELETE` or `HISTORY_ADD` ends the order the venue cancelled, expired or rejected; a `TRADE_TRANSACTION_REQUEST` links the ticket of an order whose submit got no answer through its comment's digest, and accepts it. A transaction naming a ticket the client cannot resolve is left to NautilusTrader's reconciliation, never booked as an external order.
   - Each symbol's EA publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
@@ -654,12 +437,7 @@ mt5-connector/
 │               ├── push_frames.py   # the EA's frames, held to their structs and converted to UTC
 │               ├── wire -> ../../../client/mt5connector/wire
 │               └── mql5/            # the EA, its startup script and their includes
-├── tests/                        # full test suite (no live MT5 required)
-└── examples/
-    ├── live_remote.py               # stream live ticks through the server
-    ├── backtest_eurusd.py           # SMA crossover backtest
-    ├── download_historical_data.py  # download bars from MT5
-    └── test_place_order.py          # verify execution path end-to-end
+└── tests/                        # full test suite (no live MT5 required)
 ```
 
 ---
@@ -707,9 +485,9 @@ Check that the bar type string in your strategy config exactly matches the bar t
 ## Safety notes
 
 - Always use a **demo account** until you have verified your strategy behaves correctly.
-- Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, and the stop-loss and take-profit deals of the positions it holds exits for, so manual trading on the same account, or a node with another trader id, is left alone.
+- Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, the stop-loss and take-profit deals of the positions it holds exits for, and the stop-outs of the positions it opened, so manual trading on the same account, or a node with another trader id, is left alone.
 - The adapter runs on hedging accounts only: it declares NT's `HEDGING` position model and refuses to connect to an account whose margin mode is netting or exchange, or to a read-only (investor) session.
-- The execution account id is `MT5-<login>`, the login read from the account at connect.
+- The execution account id is `MT5-<hash>-<magic>`: the first 8 hex digits of the SHA-256 of the login's decimal string, the login read from the account at connect, and the node's magic. Two trader ids on one login book under two ids that share the hash, and the login appears in neither. The login, the password and the broker server's name appear in no log, repr, string or exception message the client composes.
 - An order's comment at the venue is the first 29 hex digits of its client order id's SHA-256. Venue tickets map to NT orders through NT's own order records, and through that digest for an order whose submit got no answer; a deal or order neither explains is logged and left to NT's reconciliation.
 - Order lists, post-only and trailing orders, and times in force other than GTC and GTD are rejected before anything is sent.
 - A reduce-only order is an exit of the position its submit names (NT's position id, the venue's position identifier), translated into what the venue holds for one, which is one stop loss and one take profit per position:
@@ -717,7 +495,8 @@ Check that the bar type string in your strategy config exactly matches the bar t
   - A cancel clears the bracket, and a modify moves it; the only quantity a modify takes is the order's fills plus the position's volume, which changes nothing at the venue.
   - The venue answers a request setting a bracket to what it already holds with "no changes" (10025), which confirms the setting: a stop or target sent again to the level the venue holds is accepted like any other.
   - A market order closes the position by its current ticket. A partial close is refused while a target stands, since the venue's take profit covers the whole position.
-  - A stop loss or take profit that fires is a fill of the order holding that bracket, and a stop-out a fill of the stop. The order first takes the ticket of the order the venue executed the bracket with as its venue order id, and each fill reports under the ticket of its execution.
+  - A stop loss or take profit that fires is a fill of the order holding that bracket. The order first takes the ticket of the order the venue executed the bracket with as its venue order id, and each fill reports under the ticket of its execution.
+  - A stop-out fills no exit. Its deal and the venue order that executed it are this trader's by the position they close, whatever magic the venue stamps on them; no order of the trader explains them, so both are left to NT's reconciliation. A stop-out that closes the position takes its stop loss and take profit with it, so its exits report canceled and a cancel of one cancels it; one that leaves part of the position leaves the surviving brackets standing, as the client reads them from the venue's position.
   - A bracket can execute in parts, each part an execution of its own: the order keeps every execution ticket it took, across a restart too, and a later deal of one of them fills that order even after another order took the bracket.
   - An exit order reports once, under the ticket it took last, however many executions the venue records for it, and always as the exit: its own type, quantity and level. Once its bracket no longer holds it, the report carries the volume its executions filled at their average price, and reads filled when they filled the order, canceled when they did not.
   - A pending order bound to a position, a reduce-only stop-limit order, and an exit that expires are rejected before anything is sent: the venue ignores a pending order's position, and its fill would open a new one.

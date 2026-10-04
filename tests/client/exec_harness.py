@@ -4,6 +4,7 @@ recording what the client emits and logs."""
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
+from hashlib import sha256
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
@@ -34,9 +35,20 @@ from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
 
+
+def account_id_of(login: int, trader_id: str) -> AccountId:
+    """The account id a trader books under on an account: MT5, the first 8 hex digits of the SHA-256
+    of the login's decimal string, and the trader's magic — the first 8 bytes of the SHA-256 of its
+    id, masked to 63 bits."""
+    login_hash = sha256(str(login).encode("utf-8")).hexdigest()[:8]
+    digest = sha256(trader_id.encode("utf-8")).digest()
+    magic = int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+    return AccountId(f"MT5-{login_hash}-{magic}")
+
+
 TRADER_ID = TraderId("TESTER-001")
 STRATEGY_ID = StrategyId("S-001")
-ACCOUNT_ID = AccountId("MT5-12345678")
+ACCOUNT_ID = account_id_of(12345678, TRADER_ID.value)
 MAGIC = execution.magic_for(TRADER_ID)
 EURUSD = InstrumentId.from_str("EURUSD.MT5")
 

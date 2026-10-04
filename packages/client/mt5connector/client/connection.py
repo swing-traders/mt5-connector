@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum, StrEnum, auto
 from typing import TYPE_CHECKING
 
 from mt5connector.client import remote_mt5 as mt5
-from mt5connector.client.errors import MT5ConnectionError, MT5LoginError
+from mt5connector.client.errors import MT5ConnectionError, MT5LoginError, ServerBusy
 from mt5connector.wire import mirror
 
 if TYPE_CHECKING:
@@ -75,8 +76,9 @@ _MARGIN_MODES = {
 class AccountSnapshot:
     """The account as `account_info()` reports it, its money in `Decimal`."""
 
-    login: int
-    server: str
+    # Credentials: the broker server's name identifies the account as the login does.
+    login: int = field(repr=False)
+    server: str = field(repr=False)
     balance: Decimal
     equity: Decimal
     margin: Decimal
@@ -119,8 +121,7 @@ class AccountSnapshot:
 
     def __str__(self) -> str:
         return (
-            f"Account | {self.server} | "
-            f"Balance: {self.balance:.2f} {self.currency} | "
+            f"Account | Balance: {self.balance:.2f} {self.currency} | "
             f"Equity: {self.equity:.2f} | "
             f"Free Margin: {self.margin_free:.2f} | "
             f"Leverage: 1:{self.leverage}"
@@ -162,6 +163,7 @@ class MT5Connection:
         mt5.configure(self._config.server_url, self._config.ws_url)
         self._initialize()
         self._login()
+        self._log_connected()
         self._attempt = 0
 
     def disconnect(self) -> None:
@@ -192,9 +194,10 @@ class MT5Connection:
     # ── Reconnect ─────────────────────────────────────────────────────────────
 
     async def reconnect_async(self) -> bool:
-        """Reconnects with exponential backoff; True once connected. The clients sharing the
-        connection reconnect it one at a time, so a caller that finds it already reconnected, or
-        given up on, takes that outcome rather than running the sequence again."""
+        """Reconnects with exponential backoff, waiting out a busy server at no attempt's cost; True
+        once connected. The clients sharing the connection reconnect it one at a time, so a caller
+        that finds it already reconnected, or given up on, takes that outcome rather than running
+        the sequence again."""
         async with self._reconnect_lock:
             if self._state == ConnectionState.CONNECTED:
                 return True
@@ -218,9 +221,10 @@ class MT5Connection:
             delay = min(delay * 2.0, self._config.reconnect_max_delay_s)
 
             try:
-                mt5.shutdown()
-                self._initialize()
-                self._login()
+                await self._served(mt5.shutdown)
+                await self._served(self._initialize)
+                await self._served(self._login)
+                await self._served(self._log_connected)
                 logger.info(f"MT5 async reconnected on attempt {self._attempt}")
                 self._attempt = 0
                 return True
@@ -232,6 +236,21 @@ class MT5Connection:
         self._state = ConnectionState.FAILED
         logger.error(f"MT5 async gave up after {self._config.reconnect_max_attempts} attempts")
         return False
+
+    async def _served(self, call: Callable[[], object]) -> None:
+        """Makes a call, asking it again after the delay each busy answer gives: a busy server is
+        up, so its refusal is no failed step. Short of the login the connection is reconnecting
+        through the wait; once logged in it stays connected."""
+        while True:
+            try:
+                call()
+            except ServerBusy as exc:
+                if self._state != ConnectionState.CONNECTED:
+                    self._state = ConnectionState.RECONNECTING
+                logger.warning(f"MT5 async reconnect: {exc}, asking again in {exc.retry_after_s}s")
+                await asyncio.sleep(exc.retry_after_s)
+            else:
+                return
 
     # ── Data accessors ────────────────────────────────────────────────────────
 
@@ -289,7 +308,7 @@ class MT5Connection:
     def _login(self) -> None:
         """Logs in to the broker on an initialized terminal; a failure leaves the connection
         INITIALIZED."""
-        logger.debug(f"MT5Connection: logging in — server={self._config.server}")
+        logger.debug("MT5Connection: logging in")
         self._state = ConnectionState.LOGGING_IN
 
         try:
@@ -306,17 +325,16 @@ class MT5Connection:
         if not ok:
             code, msg = mt5.last_error()
             self._state = ConnectionState.INITIALIZED
-            raise MT5LoginError(
-                f"mt5.login() failed on {self._config.server} — error {code}: {msg}"
-            )
+            raise MT5LoginError(f"mt5.login() failed — error {code}: {msg}")
 
         self._state = ConnectionState.CONNECTED
 
+    def _log_connected(self) -> None:
         info = mt5.account_info()
         if info:
             logger.info(f"MT5Connection: connected — {AccountSnapshot.from_mt5(info)}")
         else:
-            logger.info(f"MT5Connection: connected to {self._config.server}")
+            logger.info("MT5Connection: connected")
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -329,4 +347,4 @@ class MT5Connection:
         return False  # never suppress exceptions
 
     def __repr__(self) -> str:
-        return f"MT5Connection(server={self._config.server!r}, state={self._state.name})"
+        return f"MT5Connection(state={self._state.name})"

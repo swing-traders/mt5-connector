@@ -119,3 +119,31 @@ def test_a_blank_symbol_is_refused(symbols):
 def test_a_server_url_without_a_scheme_and_host_is_refused_naming_it(server_url):
     with pytest.raises(MT5ConfigError, match="server_url"):
         _base(server_url=server_url)
+
+
+@pytest.mark.parametrize(
+    "ws_url",
+    [
+        "",
+        "nonsense",
+        "localhost:9000",
+        "ws://",
+        "//192.168.1.10:9000",
+        "http://192.168.1.10:9000",
+        "ftp://192.168.1.10:1",
+        "ws://[::1",
+    ],
+)
+def test_a_ws_url_that_is_no_websocket_url_with_a_host_is_refused_naming_it(ws_url):
+    with pytest.raises(MT5ConfigError, match="ws_url"):
+        _base(server_url="http://192.168.1.10:5000", ws_url=ws_url)
+
+
+@pytest.mark.parametrize("ws_url", ["ws://192.168.1.10:9001", "wss://hub.example.com/push"])
+def test_a_ws_or_wss_url_with_a_host_is_kept(ws_url):
+    assert _base(server_url="http://192.168.1.10:5000", ws_url=ws_url).ws_url == ws_url
+
+
+def test_a_bracketed_ipv6_host_keeps_its_brackets_in_the_derived_ws_url():
+    assert derive_ws_url("http://[::1]:5000") == "ws://[::1]:9000"
+    assert _base(server_url="http://[fe80::1]:5000/api").ws_url == "ws://[fe80::1]:9000/api"

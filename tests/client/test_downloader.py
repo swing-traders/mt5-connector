@@ -15,9 +15,11 @@ from nautilus_trader.model.objects import Price, Quantity
 
 from mt5connector.client.downloader import DownloadResult, MT5DataDownloader, _ensure_utc
 from mt5connector.client.errors import (
+    MT5ConfigError,
     MT5ConnectionError,
     MT5InstrumentError,
     MT5SymbolNotFoundError,
+    ResponseLost,
     ServerUnreachable,
 )
 from mt5connector.client.history import HistoryRanges, SeriesRange
@@ -358,14 +360,43 @@ class TestDownloadBarsWalk:
         ]
         assert catalog.write_data.call_count == 1
 
-    def test_a_window_raising_is_an_error_and_the_walk_goes_on(self, downloader, package):
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ServerUnreachable("history/bars: connection refused"),
+            ResponseLost("history/bars: connection reset"),
+        ],
+        ids=["unreachable", "lost"],
+    )
+    def test_a_window_the_server_does_not_answer_is_an_error_and_the_walk_goes_on(
+        self, downloader, package, failure
+    ):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN - SPAN - 50 * HOUR})
-        failures = [RuntimeError("connection reset"), rate_rows(LAST_OPEN - SPAN - HOUR)]
+        failures = [failure, rate_rows(LAST_OPEN - SPAN - HOUR)]
         with serving(server), patch("mt5connector.client.history.bars", side_effect=failures):
             result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert (result.chunks_processed, result.total_written) == (2, 1)
-        assert "connection reset" in result.errors[0]
+        assert str(failure) in result.errors[0]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [RuntimeError("a defect"), MT5ConfigError("remote_mt5: no server is configured")],
+        ids=["defect", "unconfigured"],
+    )
+    def test_a_window_failing_any_other_way_raises_and_ends_the_walk(
+        self, downloader, catalog, package, failure
+    ):
+        server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN - SPAN - 50 * HOUR})
+        with (
+            serving(server),
+            patch("mt5connector.client.history.bars", side_effect=[failure]) as bars,
+        ):
+            with pytest.raises(type(failure), match=str(failure)):
+                downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+
+        assert bars.call_count == 1
+        catalog.write_data.assert_not_called()
 
     def test_failed_ranges_are_an_error_and_nothing_is_walked(self, downloader, package):
         with (

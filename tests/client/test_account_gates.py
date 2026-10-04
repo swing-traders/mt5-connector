@@ -6,6 +6,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from exec_harness import account_id_of
 from nautilus_trader.cache.transformers import transform_instrument_to_pyo3
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
@@ -13,7 +14,7 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.model.enums import CurrencyType, OmsType
-from nautilus_trader.model.identifiers import AccountId, InstrumentId, PositionId, Symbol, TraderId
+from nautilus_trader.model.identifiers import InstrumentId, PositionId, Symbol, TraderId
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
@@ -249,11 +250,22 @@ async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(v
 # ── The account id ───────────────────────────────────────────────────────────
 
 
-async def test_the_account_id_is_the_venue_and_the_login_the_account_reports(venue):
-    client = _client(account_info(login=7654321))
-    await client._connect()
-    assert client.account_id == AccountId("MT5-7654321")
-    await _stop_account_loop(client)
+async def test_two_traders_on_one_login_book_under_two_ids_sharing_the_logins_hash(venue):
+    first = _client(account_info(login=7654321), trader_id="TESTER-001")
+    second = _client(account_info(login=7654321), trader_id="TESTER-002")
+    try:
+        await first._connect()
+        await second._connect()
+    finally:
+        await _stop_account_loop(first)
+        await _stop_account_loop(second)
+    assert (first.account_id, second.account_id) == (
+        account_id_of(7654321, "TESTER-001"),
+        account_id_of(7654321, "TESTER-002"),
+    )
+    assert first.account_id != second.account_id
+    assert first.account_id.value.split("-")[:2] == second.account_id.value.split("-")[:2]
+    assert "7654321" not in first.account_id.value + second.account_id.value
 
 
 # ── The account's currency ───────────────────────────────────────────────────
@@ -285,7 +297,8 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
         await client._connect()
         [state] = states
         assert state.base_currency == Currency.from_str("EUR")
-        assert cache.account(AccountId("MT5-7654321")).base_currency == Currency.from_str("EUR")
+        account_id = account_id_of(7654321, "TESTER-001")
+        assert cache.account(account_id).base_currency == Currency.from_str("EUR")
     finally:
         await _stop_account_loop(client)
 

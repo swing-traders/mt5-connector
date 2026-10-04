@@ -1,7 +1,8 @@
 """`MT5Config`: what the adapter runs with, checked when it is built."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from urllib.parse import urlparse, urlunparse
 
 from mt5connector.client.constants import (
@@ -13,14 +14,22 @@ from mt5connector.client.constants import (
 from mt5connector.client.errors import MT5ConfigError
 
 
+class WebSocketScheme(StrEnum):
+    """The schemes the push hub's URL may name."""
+
+    WS = "ws"
+    WSS = "wss"
+
+
 @dataclass
 class MT5Config:
     """What the adapter runs with; README.md's configuration reference documents each field."""
 
     # ── Required ──────────────────────────────────────────────────────────────
-    account: int
-    password: str
-    server: str
+    # Credentials: the broker server's name identifies the account as the login does.
+    account: int = field(repr=False)
+    password: str = field(repr=False)
+    server: str = field(repr=False)
     symbols: list[str]
 
     # ── Optional / defaults ───────────────────────────────────────────────────
@@ -86,6 +95,13 @@ class MT5Config:
             raise MT5ConfigError("MT5Config.server_url has no scheme or no host")
         if self.ws_url is None:
             self.ws_url = derive_ws_url(self.server_url)
+        else:
+            try:
+                ws = urlparse(self.ws_url)
+            except ValueError as exc:
+                raise MT5ConfigError(f"MT5Config.ws_url is malformed: {exc}") from exc
+            if ws.scheme not in set(WebSocketScheme) or not ws.hostname:
+                raise MT5ConfigError("MT5Config.ws_url is no ws or wss URL with a host")
 
     @property
     def exec_poll_interval_s(self) -> float:
@@ -95,6 +111,12 @@ class MT5Config:
 def derive_ws_url(server_url: str) -> str:
     """Derive the WebSocket hub URL from the REST server URL (port 9000)."""
     p = urlparse(server_url)
-    if p.scheme == "ws" and p.port == 9000:
+    if p.scheme == WebSocketScheme.WS and p.port == 9000:
         return server_url
-    return urlunparse(("ws", f"{p.hostname}:9000", p.path, "", "", ""))
+    # The netloc's host keeps an IPv6 address's brackets, which `hostname` strips.
+    host = p.netloc.rpartition("@")[2]
+    if host.startswith("["):
+        host = host[: host.index("]") + 1]
+    else:
+        host = host.partition(":")[0]
+    return urlunparse((WebSocketScheme.WS, f"{host}:9000", p.path, "", "", ""))

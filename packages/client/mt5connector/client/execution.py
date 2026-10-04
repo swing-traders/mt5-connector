@@ -108,6 +108,14 @@ def magic_for(trader_id: TraderId) -> int:
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
+def _account_id_of(login: int, magic: int) -> AccountId:
+    """The account id a trader books under: the venue, the first 8 hex digits of the SHA-256 of the
+    login's decimal string, so the login reaches no log, and the trader's magic, so the traders of
+    one login book apart."""
+    login_hash = sha256(str(login).encode("utf-8")).hexdigest()[:8]
+    return AccountId(f"{MT5_VENUE}-{login_hash}-{magic}")
+
+
 # The venue refuses a comment of 30 characters or more.
 _COMMENT_LENGTH = 29
 
@@ -334,8 +342,8 @@ _DEAL_REASONS = {
     mirror.DEAL_REASON_VMARGIN: Reason.VMARGIN,
     mirror.DEAL_REASON_SPLIT: Reason.SPLIT,
 }
-# A stop-out closes a position where its stop loss would have.
-_BRACKET_SLOTS = {Reason.SL: Slot.SL, Reason.SO: Slot.SL, Reason.TP: Slot.TP}
+# A stop-out is the venue closing the position itself, never its stop loss executing.
+_BRACKET_SLOTS = {Reason.SL: Slot.SL, Reason.TP: Slot.TP}
 
 
 class MT5LiveExecutionClient(LiveExecutionClient):
@@ -401,7 +409,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         elif terminal["trade_allowed"] and not account.trade_allowed:
             raise MT5ConfigError("read-only (investor) session: the account does not allow trading")
 
-        self._set_account_id(AccountId(f"{MT5_VENUE}-{account.login}"))
+        self._set_account_id(_account_id_of(account.login, self._magic))
         await self._provider.load_ids_async(
             [InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in self._config.symbols]
         )
@@ -591,6 +599,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if deal.ticket in self._seen_deals:
             return
         slot = _bracket_slot(deal)
+        fill = self._is_fill(deal)
         execution = VenueOrderId(str(deal.order))
         booked = None
         order = None
@@ -598,7 +607,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             booked = _booked(self._cache.orders(venue=self.venue), deal, slot)
             if booked is None:
                 order = self._bracket_owner(deal)
-        elif self._is_fill(deal):
+        elif fill:
             self._learn_ticket(deal.order)
             order = self._indexed_order(deal.order)
         fields = None
@@ -610,7 +619,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 self._bind_to_execution(order, execution, deal.time_msc * 1_000_000)
             self.generate_order_filled(**fields)
             self._account_owed = True
-        elif booked is None and self._is_fill(deal):
+        elif booked is None and fill:
             self._log.info(
                 f"deal {deal.ticket} of order {deal.order}: no order of this trader matches it, "
                 "left to reconciliation"
@@ -1321,7 +1330,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             date_from, date_to = self._window(command)
             historical = _answer("history_orders_get", mt5.history_orders_get(date_from, date_to))
             for order in historical:
-                if order.magic == self._magic and _in_scope(order.symbol, command.instrument_id):
+                if self._is_ours(order) and _in_scope(order.symbol, command.instrument_id):
                     venue_orders.setdefault(order.ticket, order)
         reports = []
         executed = {}
@@ -1388,7 +1397,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             venue_order = self._venue_order_by_comment(order_comment(command.client_order_id))
         if venue_order is None:
             return None
-        elif venue_order.magic != self._magic:
+        elif not self._is_ours(venue_order):
             raise MT5OrderError(f"order {venue_order.ticket} carries another trader's magic")
         else:
             return self._order_report(venue_order)
@@ -1881,8 +1890,24 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             return _answer("positions_get", mt5.positions_get(symbol=instrument_id.symbol.value))
 
     def _is_fill(self, deal) -> bool:
-        """Whether a deal is a fill of this trader's."""
-        return deal.magic == self._magic and _is_trade(deal)
+        """Whether a deal is a fill of this trader's: a trade carrying its magic, or a stop-out of a
+        position it opened, whatever magic the venue stamps on the stop-out."""
+        return _is_trade(deal) and (
+            deal.magic == self._magic or (_is_stop_out(deal) and self._opened(deal.position_id))
+        )
+
+    def _is_ours(self, venue_order) -> bool:
+        """Whether a venue order is this trader's: it carries its magic, or it executed the stop-out
+        of a position this trader opened, whatever magic the venue stamps on it."""
+        return venue_order.magic == self._magic or (
+            venue_order.reason == mirror.ORDER_REASON_SO and self._opened(venue_order.position_id)
+        )
+
+    def _opened(self, identifier: int) -> bool:
+        """Whether this trader opened a position: the order the position's identifier is the ticket
+        of carries its magic."""
+        opening = self._venue_order(identifier)
+        return opening is not None and opening.magic == self._magic
 
     def _instrument(self, symbol: str) -> InstrumentAny:
         """The loaded instrument of a venue symbol; raises MT5InstrumentError for one the provider
@@ -2138,10 +2163,16 @@ def _is_trade(deal) -> bool:
     return _deal_type(deal) in (DealType.BUY, DealType.SELL) and deal.volume > 0
 
 
+def _is_stop_out(deal) -> bool:
+    """Whether a trade is the venue's stop-out of its position; raises MT5OrderError for a trade
+    whose entry or reason the package does not name."""
+    return _deal_entry(deal) == DealEntry.OUT and _deal_reason(deal) == Reason.SO
+
+
 def _bracket_slot(deal) -> Slot | None:
-    """The bracket a deal executes — a trade out of a position by its stop loss, a stop-out or its
-    take profit — or None for any other deal; raises MT5OrderError for a trade whose entry or reason
-    the package does not name."""
+    """The bracket a deal executes — a trade out of a position by its stop loss or its take profit —
+    or None for any other deal; raises MT5OrderError for a trade whose entry or reason the package
+    does not name."""
     slot = None
     if _is_trade(deal) and _deal_entry(deal) == DealEntry.OUT:
         slot = _BRACKET_SLOTS.get(_deal_reason(deal))

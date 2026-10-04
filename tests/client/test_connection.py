@@ -1,15 +1,26 @@
 """MT5Connection against a patched shim: its states, connect, disconnect and reconnect, the account
-and terminal reads, and the account snapshot. A test observes the connection's state through what
-ensure_connected answers."""
+and terminal reads, the account snapshot, and the credentials none of them shows. A test observes
+the connection's state through what ensure_connected answers."""
 
 import asyncio
+import logging
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
+from nautilus_trader.common.component import LiveClock
+from venue_doubles import account_info
 
 from mt5connector.client import connection
+from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot, ConnectionState, MT5Connection
-from mt5connector.client.errors import MT5ConnectionError, MT5LoginError, ServerUnreachable
+from mt5connector.client.errors import (
+    MT5ConnectionError,
+    MT5LoginError,
+    ServerBusy,
+    ServerUnreachable,
+)
+from mt5connector.client.factories import _connection_registry, _get_or_create_connection
 
 
 def assert_not_connected(conn, state: str) -> None:
@@ -56,9 +67,7 @@ class TestInitialState:
 
     def test_repr_shows_disconnected(self, config, mock_mt5):
         conn = MT5Connection(config)
-        r = repr(conn)
-        assert "DISCONNECTED" in r
-        assert "Exness-MT5Trial1" in r
+        assert "DISCONNECTED" in repr(conn)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -169,13 +178,14 @@ class TestLoginFailure:
             conn.connect()
         assert_not_connected(conn, "INITIALIZED")
 
-    def test_login_error_mentions_server(self, config, mock_mt5):
+    def test_login_error_names_the_terminals_error(self, config, mock_mt5):
         mock_mt5.login.return_value = False
         mock_mt5.last_error.return_value = (65537, "Invalid account")
         conn = MT5Connection(config)
         with pytest.raises(MT5LoginError) as exc_info:
             conn.connect()
-        assert "Exness-MT5Trial1" in str(exc_info.value)
+        assert "65537" in str(exc_info.value)
+        assert "Invalid account" in str(exc_info.value)
 
     def test_login_not_called_if_initialize_failed(self, config, mock_mt5):
         mock_mt5.initialize.return_value = False
@@ -307,6 +317,62 @@ class TestReconnectAsyncFailure:
         assert str(exc_info.value) == (
             f"MT5 connection gave up after {config.reconnect_max_attempts} reconnect attempts"
         )
+
+
+class TestReconnectThroughBusy:
+    """A busy server is up: a reconnect waits out its delay and asks the same call again."""
+
+    @pytest.mark.parametrize(
+        ("busy_call", "answer"),
+        [("shutdown", None), ("initialize", True), ("login", True)],
+    )
+    async def test_a_busy_answer_is_asked_again_after_its_delay_at_no_attempts_cost(
+        self, config, mock_mt5, busy_call, answer
+    ):
+        getattr(mock_mt5, busy_call).side_effect = [
+            ServerBusy(f"{busy_call}: server busy", 7),
+            answer,
+        ]
+        conn = MT5Connection(replace(config, reconnect_max_attempts=1))
+        delays = []
+        states = []
+
+        async def wait(delay):
+            delays.append(delay)
+            with pytest.raises(MT5ConnectionError) as refused:
+                conn.ensure_connected()
+            states.append(str(refused.value))
+
+        with patch.object(connection.asyncio, "sleep", wait):
+            assert await conn.reconnect_async() is True
+
+        steps = ["shutdown", "initialize", "login"]
+        asked = [name for name, _, _ in mock_mt5.mock_calls if name in steps]
+        expected = steps[: steps.index(busy_call) + 1] + steps[steps.index(busy_call) :]
+        assert asked == expected
+        assert delays == [config.reconnect_initial_delay_s, 7]
+        assert all("RECONNECTING" in state for state in states)
+        conn.ensure_connected()
+
+    async def test_a_busy_account_read_after_the_login_leaves_the_connection_connected(
+        self, config, mock_mt5
+    ):
+        account = mock_mt5.account_info.return_value
+        mock_mt5.account_info.side_effect = [ServerBusy("account_info: server busy", 7), account]
+        conn = MT5Connection(replace(config, reconnect_max_attempts=1))
+        delays = []
+
+        async def wait(delay):
+            delays.append(delay)
+
+        with patch.object(connection.asyncio, "sleep", wait):
+            assert await conn.reconnect_async() is True
+
+        conn.ensure_connected()
+        steps = ["shutdown", "initialize", "login", "account_info"]
+        asked = [name for name, _, _ in mock_mt5.mock_calls if name in steps]
+        assert asked == steps + ["account_info"]
+        assert delays == [config.reconnect_initial_delay_s, 7]
 
 
 class TestReconnectAsyncSerialised:
@@ -457,9 +523,9 @@ class TestRepr:
         conn = MT5Connection(config)
         assert "12345678" not in repr(conn)
 
-    def test_repr_contains_server(self, config, mock_mt5):
+    def test_repr_omits_the_server(self, config, mock_mt5):
         conn = MT5Connection(config)
-        assert "Exness-MT5Trial1" in repr(conn)
+        assert "Exness-MT5Trial1" not in repr(conn)
 
     def test_repr_contains_state(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -609,3 +675,81 @@ class TestAccountSnapshot:
         assert "10000.00" in s
         assert "USD" in s
         assert "2000" in s
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 17. Credentials
+# ═════════════════════════════════════════════════════════════════════════════
+
+SERVER = "Zq7Broker-Live42"
+LOGIN = 918273645
+PASSWORD = "pw-Zq7-secret"
+
+
+def secret_config() -> MT5Config:
+    return MT5Config(
+        account=LOGIN,
+        password=PASSWORD,
+        server=SERVER,
+        symbols=["EURUSD"],
+        server_url="http://127.0.0.1:5000",
+        reconnect_initial_delay_s=0,
+        reconnect_max_attempts=1,
+    )
+
+
+def assert_names_no_credential(text: str) -> None:
+    for credential in (SERVER, str(LOGIN), PASSWORD):
+        assert credential not in text
+
+
+class TestCredentials:
+    """The broker server, the login and the password reach no log, repr, string or exception."""
+
+    @pytest.fixture
+    def secret_mt5(self, mock_mt5):
+        mock_mt5.account_info.return_value = account_info(login=LOGIN, server=SERVER)
+        return mock_mt5
+
+    def test_the_config_shows_none(self):
+        config = secret_config()
+        assert_names_no_credential(repr(config))
+        assert_names_no_credential(str(config))
+
+    def test_the_account_snapshot_shows_none(self, secret_mt5):
+        conn = MT5Connection(secret_config())
+        conn.connect()
+        snapshot = conn.get_account_info()
+        assert (snapshot.login, snapshot.server) == (LOGIN, SERVER)
+        assert_names_no_credential(repr(snapshot))
+        assert_names_no_credential(str(snapshot))
+
+    def test_the_connection_shows_none(self, secret_mt5):
+        conn = MT5Connection(secret_config())
+        assert_names_no_credential(repr(conn) + str(conn))
+        conn.connect()
+        assert_names_no_credential(repr(conn) + str(conn))
+
+    def test_a_failed_login_names_none(self, secret_mt5):
+        secret_mt5.login.return_value = False
+        secret_mt5.last_error.return_value = (-6, "Terminal: Authorization failed")
+        with pytest.raises(MT5LoginError) as failed:
+            MT5Connection(secret_config()).connect()
+        assert_names_no_credential(str(failed.value))
+        assert_names_no_credential(repr(failed.value))
+
+    async def test_the_logs_name_none(self, secret_mt5, caplog):
+        caplog.set_level(logging.DEBUG, logger="mt5connector")
+        secret_mt5.login.side_effect = [True, False, True]
+        secret_mt5.last_error.return_value = (-6, "Terminal: Authorization failed")
+        try:
+            conn, _ = _get_or_create_connection(
+                replace(secret_config(), reconnect_max_attempts=2), LiveClock()
+            )
+            conn.disconnect()
+            assert await conn.reconnect_async() is True
+            conn.disconnect()
+        finally:
+            _connection_registry.clear()
+        assert caplog.records
+        assert_names_no_credential("\n".join(record.getMessage() for record in caplog.records))
