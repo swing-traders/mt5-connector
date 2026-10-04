@@ -184,13 +184,8 @@ class MT5Connection:
         logger.info("MT5Connection: disconnected")
 
     def ensure_connected(self) -> None:
-        """
-        Call before EVERY mt5.* API call in data.py, execution.py, providers.py.
-
-        CONNECTED  → returns immediately (fast path).
-        FAILED     → raises MT5ConnectionError (gave up reconnecting).
-        anything else → raises MT5ConnectionError (not ready yet).
-        """
+        """Returns at once while connected; otherwise raises MT5ConnectionError naming the state, a
+        FAILED connection by the reconnect attempts it gave up after."""
         if self._state == ConnectionState.CONNECTED:
             return
 

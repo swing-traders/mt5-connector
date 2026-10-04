@@ -1,18 +1,5 @@
-"""
-tests/client/test_downloader.py
-
-Exhaustive tests for MT5DataDownloader.
-
-Every method, every path, every edge case — without a real MT5 terminal.
-
-Test groups:
-  1.  _ensure_utc()         — timezone handling
-  2.  DownloadResult        — dataclass behaviour
-  3.  download_bars()       — the backward walk over the server's windows
-  4.  download_ticks()      — the backward walk over UTC days
-  5.  instruments           — symbol not found, not connected, auto-load
-  6.  download_all()        — symbols, timeframes, ticks and bars switches
-"""
+"""MT5DataDownloader: its backward walks over the server's bar windows and UTC days, its instrument
+loading, and download_all."""
 
 from contextlib import contextmanager
 from datetime import UTC, datetime

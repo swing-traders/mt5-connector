@@ -1,6 +1,4 @@
-"""The broker clock's verification against the trade-server time the EA relays, and the routes it
-gates. Under EDT the broker's clock runs 10,800 s ahead of UTC: broker 1,752,580,800 is
-2025-07-15T09:00:00Z."""
+"""The broker clock's check against the trade-server time the EA relays, and the routes it gates."""
 
 import logging
 import math
@@ -18,7 +16,7 @@ from mt5connector.server.clock_check import ClockCheck
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
 
-BROKER_EPOCH = 1_752_580_800
+BROKER_EPOCH = 1_752_580_800  # an EDT date: the broker clock, New York + 7 h, runs 3 h ahead of UTC
 UTC_EPOCH = 1_752_570_000
 MAX_AGE_S = 30
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}

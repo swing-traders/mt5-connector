@@ -1,9 +1,5 @@
-"""
-tests/client/conftest.py
-
-Shared fixtures: a valid MT5Config, the shim mocked inside mt5connector.client.connection, and the
-shim the execution client calls.
-"""
+"""Shared fixtures: a valid MT5Config, the shim mocked inside mt5connector.client.connection, and
+the shim the execution client calls."""
 
 from unittest.mock import MagicMock, patch
 

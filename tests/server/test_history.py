@@ -1,6 +1,5 @@
 """The history protocol, its routes and its client, against a package double serving one symbol's
-history as the terminal does. The broker's clock runs 10,800 s ahead of UTC under EDT and 7,200 s
-under EST."""
+history as the terminal does."""
 
 import calendar
 import threading

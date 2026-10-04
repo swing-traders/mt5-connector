@@ -35,8 +35,8 @@ from mt5connector.server.wire.history_wire import BAR_TIMEFRAME
 from mt5connector.server.wire.push_wire import (
     CHARTS_PATH,
     CLOSE_TIMEOUT_S,
-    MISSED_PONGS,
     PING_INTERVAL_S,
+    PING_TIMEOUT_INTERVALS,
     PROTOCOL_VERSION,
     ChartState,
     FrameType,
@@ -506,7 +506,7 @@ def serve_hub(hub: Hub, host: str, port: int):
         port,
         process_request=hub.process_request,
         ping_interval=PING_INTERVAL_S,
-        ping_timeout=PING_INTERVAL_S * MISSED_PONGS,
+        ping_timeout=PING_INTERVAL_S * PING_TIMEOUT_INTERVALS,
         close_timeout=CLOSE_TIMEOUT_S,
     )
 

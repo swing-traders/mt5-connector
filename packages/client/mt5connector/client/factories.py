@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -26,9 +25,6 @@ from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 

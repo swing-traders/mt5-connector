@@ -13,7 +13,7 @@ PROTOCOL_VERSION = 1
 # many intervals without its pong fails the connection, dropped within the close timeout. Both wait
 # on the hub's writes to the peer draining, so a peer that stops reading delays them.
 PING_INTERVAL_S = 10
-MISSED_PONGS = 3
+PING_TIMEOUT_INTERVALS = 3
 CLOSE_TIMEOUT_S = 10
 
 # The hub's loopback route the server posts a symbol it serves a read of to.

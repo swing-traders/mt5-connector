@@ -1,9 +1,5 @@
-"""The history protocol against the installed MetaTrader5 package and a running terminal: the
-terminal's answers it rests on, and the answers it gives.
-
-Runs only with MT5_LIVE_CONFORMANCE=1, on a Windows host whose terminal initialize() can reach,
-with the broker's clock read from MT5_BROKER_TZ and MT5_BROKER_OFFSET_HOURS as the server reads it.
-A window the terminal does not prove yet keeps its test asking, as it keeps a client asking."""
+"""The history protocol against the installed MetaTrader5 package and a running terminal.
+Gated by MT5_LIVE_CONFORMANCE=1; the broker clock is MT5_BROKER_TZ plus MT5_BROKER_OFFSET_HOURS."""
 
 import os
 import time

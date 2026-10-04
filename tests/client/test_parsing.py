@@ -1,10 +1,5 @@
-"""
-tests/client/test_parsing.py
-
-The terminal's ticks and bars as NautilusTrader data: quote ticks from a live tick or a history
-row, bars stamped at their close, and the timeframe map. Symbol definitions are pinned in
-tests/client/test_instrument_definitions.py.
-"""
+"""The terminal's ticks and bars as NautilusTrader data: quote ticks from a live tick or a history
+row, bars stamped at their close, and the timeframe map."""
 
 from decimal import Decimal
 from unittest.mock import MagicMock

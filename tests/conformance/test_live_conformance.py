@@ -1,5 +1,4 @@
 """The inventory against the installed MetaTrader5 package and a running terminal.
-
 Runs only with MT5_LIVE_CONFORMANCE=1, on a Windows host whose terminal initialize() can reach."""
 
 import os
