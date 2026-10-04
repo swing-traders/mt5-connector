@@ -1,6 +1,7 @@
 """The hub's push protocol against a real websockets server and connection doubles."""
 
 import asyncio
+import calendar
 import json
 import logging
 import socket
@@ -771,6 +772,40 @@ async def test_a_chart_the_spawner_keeps_open_is_closed_only_after_a_further_idl
     await _closed(tasks, spawner, usdjpy)
 
 
+# ── The broker's repeated hour ──────────────────────────────────────────────
+
+# Broker 08:30 on 2025-11-02 and on 2024-11-03 is New York's repeated 01:30.
+REPEATED = calendar.timegm((2025, 11, 2, 8, 30, 0))
+REPEATED_A_YEAR_BEFORE = calendar.timegm((2024, 11, 3, 8, 30, 0))
+
+
+def repeated_hour_warning(epoch):
+    return f"tick: time {epoch} is in the broker's repeated hour, read as its first occurrence"
+
+
+async def test_two_repeated_broker_hours_alternating_are_each_warned_of_once(caplog):
+    caplog.set_level(logging.WARNING)
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    ea = Peer()
+    adapter = Peer()
+    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (ea, adapter)]
+    ea.put(ea_hello("EURUSD"))
+    adapter.put(adapter_hello())
+    adapter.put(subscribe(1, "ticks", symbol="EURUSD"))
+    await _settle()
+
+    for epoch in (REPEATED, REPEATED_A_YEAR_BEFORE, REPEATED + 60, REPEATED_A_YEAR_BEFORE + 60):
+        ea.put(tick(time_msc=epoch * 1000))
+    await _settle()
+
+    assert [frame["type"] for frame in adapter.sent] == ["ack", "tick", "tick", "tick", "tick"]
+    assert _warnings(caplog) == [
+        repeated_hour_warning(REPEATED),
+        repeated_hour_warning(REPEATED_A_YEAR_BEFORE),
+    ]
+    await _closed(tasks, ea, adapter)
+
+
 # ── Bounds and keepalive ─────────────────────────────────────────────────────
 
 
@@ -992,6 +1027,47 @@ async def test_a_publisher_leaving_while_a_consumers_leaving_is_told_ends_its_ha
     ]
     assert staying.sent == [{"v": 1, "type": "ack", "id": 1}, utc_tick()]
     await _closed(tasks, eurusd, staying)
+
+
+class GreetingOnSend(Peer):
+    """A connection double whose send of a frame of `kind` has an EA say hello, as an EA connecting
+    while the hub waits on a send does."""
+
+    def __init__(self, kind: FrameType):
+        super().__init__()
+        self.kind = kind
+        self.greeting = None
+
+    async def send(self, raw):
+        await super().send(raw)
+        if FrameType(json.loads(raw)["type"]) == self.kind and self.greeting is not None:
+            (ea, symbol), self.greeting = self.greeting, None
+            ea.put(ea_hello(symbol))
+            await _settle()
+
+
+async def test_a_held_chart_whose_ea_says_hello_while_the_spawner_is_told_another_is_not_sent():
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    await hub.use_chart("GBPUSD")
+    await hub.use_chart("USDJPY")
+    spawner = GreetingOnSend(FrameType.OPEN_CHART)
+    usdjpy = Peer()
+    spawner.greeting = (usdjpy, "USDJPY")
+    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (spawner, usdjpy)]
+
+    spawner.put(ea_hello("EURUSD", spawner=True))
+    await _settle()
+    await spawner.close()
+    await _settle()
+    successor = Peer()
+    tasks.append(asyncio.create_task(hub.handler(successor)))
+    successor.put(ea_hello("EURUSD", spawner=True))
+    await _settle()
+
+    assert spawner.sent == [wanted("EURUSD"), addressed("open_chart", "GBPUSD")]
+    assert usdjpy.sent == [wanted("USDJPY")]
+    assert successor.sent == [wanted("EURUSD"), addressed("open_chart", "GBPUSD")]
+    await _closed(tasks, successor, usdjpy)
 
 
 # ── Roles, kinds and malformed frames ────────────────────────────────────────

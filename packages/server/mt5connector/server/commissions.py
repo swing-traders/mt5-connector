@@ -6,11 +6,19 @@ absent symbol has never been relayed, a successful empty schedule confirms no ru
 stands until a later relay is accepted. Nothing is persisted."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 
-from mt5connector.server.wire.push_wire import PROTOCOL_VERSION, FrameType
-
-# The mode fields carry the names EnumToString gives MQL5's ENUM_SYMBOL_COMMISSION_* members: the
-# reference names those members but not their values.
+from mt5connector.server.wire.push_wire import (
+    PROTOCOL_VERSION,
+    CommissionChargeMode,
+    CommissionDirectionMode,
+    CommissionEntryMode,
+    CommissionMode,
+    CommissionProfitMode,
+    CommissionRangeMode,
+    CommissionVolumeType,
+    FrameType,
+)
 
 _FRAME_FIELDS = ("v", "type", "symbol", "ret", "last_error", "rules")
 _RULE_FIELDS = (
@@ -22,7 +30,14 @@ _RULE_FIELDS = (
     "mode_profit",
     "tiers",
 )
-_RULE_NAMES = ("mode_range", "mode_charge", "mode_entry", "mode_direction", "mode_profit")
+# The fields carrying an enum member by its EnumToString name, and the enum of each.
+_RULE_NAMES = {
+    "mode_range": CommissionRangeMode,
+    "mode_charge": CommissionChargeMode,
+    "mode_entry": CommissionEntryMode,
+    "mode_direction": CommissionDirectionMode,
+    "mode_profit": CommissionProfitMode,
+}
 _TIER_FIELDS = (
     "mode",
     "volume_type",
@@ -33,14 +48,14 @@ _TIER_FIELDS = (
     "range_to",
     "currency",
 )
-_TIER_NAMES = ("mode", "volume_type")
+_TIER_NAMES = {"mode": CommissionMode, "volume_type": CommissionVolumeType}
 _TIER_NUMBERS = ("value", "min_value", "max_value", "range_from", "range_to")
 
 
 @dataclass(frozen=True)
 class CommissionTier:
-    mode: str
-    volume_type: str
+    mode: CommissionMode
+    volume_type: CommissionVolumeType
     value: float
     min_value: float
     max_value: float
@@ -52,11 +67,11 @@ class CommissionTier:
 @dataclass(frozen=True)
 class CommissionRule:
     currency: str
-    mode_range: str
-    mode_charge: str
-    mode_entry: str
-    mode_direction: str
-    mode_profit: str
+    mode_range: CommissionRangeMode
+    mode_charge: CommissionChargeMode
+    mode_entry: CommissionEntryMode
+    mode_direction: CommissionDirectionMode
+    mode_profit: CommissionProfitMode
     tiers: tuple[CommissionTier, ...]
 
 
@@ -117,11 +132,15 @@ def commissions_refusal(frame: object, symbol: str) -> str | None:
 
 
 def commission_schedule(frame: dict) -> CommissionSchedule:
-    """The schedule a commissions frame carries; the frame is one commissions_refusal accepts."""
+    """The schedule a commissions frame carries, each name as the member it names; the frame is one
+    commissions_refusal accepts."""
     rules = []
     for rule in frame["rules"]:
-        tiers = tuple(CommissionTier(**tier) for tier in rule["tiers"])
-        rules.append(CommissionRule(**(rule | {"tiers": tiers})))
+        tiers = []
+        for tier in rule["tiers"]:
+            tiers.append(CommissionTier(**(tier | _members(tier, _TIER_NAMES))))
+        named = _members(rule, _RULE_NAMES)
+        rules.append(CommissionRule(**(rule | named | {"tiers": tuple(tiers)})))
     return CommissionSchedule(ret=frame["ret"], last_error=frame["last_error"], rules=tuple(rules))
 
 
@@ -136,7 +155,7 @@ def _rule_refusal(rule: object, where: str) -> str | None:
     elif not isinstance(rule["tiers"], list):
         return f"{where}.tiers is not a list: {rule['tiers']!r}"
     else:
-        names = (_name_refusal(rule, name, where) for name in _RULE_NAMES)
+        names = (_name_refusal(rule, name, members, where) for name, members in _RULE_NAMES.items())
         tiers = (
             _tier_refusal(tier, f"{where}.tiers[{index}]")
             for index, tier in enumerate(rule["tiers"])
@@ -153,7 +172,7 @@ def _tier_refusal(tier: object, where: str) -> str | None:
     elif not isinstance(tier["currency"], str):
         return f"{where}.currency is not a string: {tier['currency']!r}"
     else:
-        names = (_name_refusal(tier, name, where) for name in _TIER_NAMES)
+        names = (_name_refusal(tier, name, members, where) for name, members in _TIER_NAMES.items())
         numbers = (
             f"{where}.{name} is not a number: {tier[name]!r}"
             for name in _TIER_NUMBERS
@@ -173,11 +192,16 @@ def _fields_refusal(value: dict, fields: tuple[str, ...], where: str) -> str | N
         return None
 
 
-def _name_refusal(value: dict, name: str, where: str) -> str | None:
-    if isinstance(value[name], str) and value[name]:
+def _name_refusal(value: dict, name: str, members: type[StrEnum], where: str) -> str | None:
+    if isinstance(value[name], str) and value[name] in {member.value for member in members}:
         return None
     else:
-        return f"{where}.{name} is not a name: {value[name]!r}"
+        return f"{where}.{name} is unknown: {value[name]!r}"
+
+
+def _members(value: dict, names: dict[str, type[StrEnum]]) -> dict[str, StrEnum]:
+    """The member each name field of a rule or tier names."""
+    return {name: members(value[name]) for name, members in names.items()}
 
 
 def _first(refusals) -> str | None:

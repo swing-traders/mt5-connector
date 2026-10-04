@@ -1,5 +1,6 @@
 """The push protocol's vocabulary, shared by the hub, its consumers and the server: its frames,
-roles, streams and chart route, and the MQL5 trade-transaction names its frames carry."""
+roles, streams and chart route, and the MQL5 trade-transaction and commission names its frames
+carry."""
 
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
@@ -82,6 +83,75 @@ class TransactionType(IntEnum):
     DEAL_DELETE = 8
     POSITION = 9
     REQUEST = 10
+
+
+# The enums of SymbolInfoCommissions' MqlCommission and MqlCommissionTier, as the MQL5 reference's
+# SymbolInfoCommissions page lists them: each member by the name EnumToString gives it, since the
+# reference names the members without their values.
+
+
+class CommissionMode(StrEnum):
+    """How a commission tier states its value: ENUM_SYMBOL_COMMISSION_MODE."""
+
+    DISABLED = "SYMBOL_COMMISSION_DISABLED"
+    MONEY_DEPOSIT = "SYMBOL_COMMISSION_MONEY_DEPOSIT"
+    MONEY_SYMBOL_BASE = "SYMBOL_COMMISSION_MONEY_SYMBOL_BASE"
+    MONEY_SYMBOL_PROFIT = "SYMBOL_COMMISSION_MONEY_SYMBOL_PROFIT"
+    MONEY_SYMBOL_MARGIN = "SYMBOL_COMMISSION_MONEY_SYMBOL_MARGIN"
+    PIPS = "SYMBOL_COMMISSION_PIPS"
+    PERCENT = "SYMBOL_COMMISSION_PERCENT"
+    MONEY_SPECIFIED = "SYMBOL_COMMISSION_MONEY_SPECIFIED"
+    PERCENT_PROFIT = "SYMBOL_COMMISSION_PERCENT_PROFIT"
+
+
+class CommissionVolumeType(StrEnum):
+    """How a commission tier's value applies to a deal: ENUM_SYMBOL_COMMISSION_VOLUME_TYPE."""
+
+    TRADE = "SYMBOL_COMMISSION_VOLUME_TYPE_TRADE"
+    VOLUME = "SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME"
+    TURNOVER = "SYMBOL_COMMISSION_VOLUME_TYPE_TURNOVER"
+
+
+class CommissionRangeMode(StrEnum):
+    """What selects a commission rule's tier: ENUM_SYMBOL_COMMISSION_RANGE_MODE."""
+
+    VOLUME = "SYMBOL_COMMISSION_RANGE_VOLUME"
+    TURNOVER_MONEY = "SYMBOL_COMMISSION_RANGE_TURNOVER_MONEY"
+    TURNOVER_VOLUME = "SYMBOL_COMMISSION_RANGE_TURNOVER_VOLUME"
+    VALUE = "SYMBOL_COMMISSION_RANGE_VALUE"
+    PROFIT = "SYMBOL_COMMISSION_RANGE_PROFIT"
+
+
+class CommissionChargeMode(StrEnum):
+    """When a commission rule charges: ENUM_SYMBOL_COMMISSION_CHARGE_MODE."""
+
+    DAILY = "SYMBOL_COMMISSION_CHARGE_DAILY"
+    MONTHLY = "SYMBOL_COMMISSION_CHARGE_MONTHLY"
+    INSTANT = "SYMBOL_COMMISSION_CHARGE_INSTANT"
+
+
+class CommissionEntryMode(StrEnum):
+    """The legs a commission rule charges: ENUM_SYMBOL_COMMISSION_ENTRY_MODE."""
+
+    INOUT = "SYMBOL_COMMISSION_ENTRY_INOUT"
+    IN = "SYMBOL_COMMISSION_ENTRY_IN"
+    OUT = "SYMBOL_COMMISSION_ENTRY_OUT"
+
+
+class CommissionDirectionMode(StrEnum):
+    """The deal directions a commission rule charges: ENUM_SYMBOL_COMMISSION_DIRECTION_MODE."""
+
+    BOTH = "SYMBOL_COMMISSION_DIRECTION_BOTH"
+    BUY = "SYMBOL_COMMISSION_DIRECTION_BUY"
+    SELL = "SYMBOL_COMMISSION_DIRECTION_SELL"
+
+
+class CommissionProfitMode(StrEnum):
+    """The deal results a commission rule charges: ENUM_SYMBOL_COMMISSION_PROFIT_MODE."""
+
+    ALL = "SYMBOL_COMMISSION_PROFIT_ALL"
+    PROFIT = "SYMBOL_COMMISSION_PROFIT_PROFIT"
+    LOSS = "SYMBOL_COMMISSION_PROFIT_LOSS"
 
 
 # MqlTradeTransaction's fields, and those holding an epoch on the broker's clock.

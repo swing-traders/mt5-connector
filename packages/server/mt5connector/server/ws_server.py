@@ -6,8 +6,8 @@ frame last told it; the spawner; the chart requests held for symbols no EA publi
 spawner was sent; the spawner's reason for each chart it failed to open, standing until that chart
 opens or its symbol's EA says hello; when each symbol was last in use, and the symbols whose charts
 the spawner was told to close; each consumer's subscriptions and its queue of frames not yet sent;
-and the broker hour of the last repeated-hour warning. Nothing is persisted, and nothing is replayed
-to a consumer that reconnects."""
+and the repeated broker hours warned of. Nothing is persisted, and nothing is replayed to a consumer
+that reconnects."""
 
 import asyncio
 import http.client
@@ -29,6 +29,7 @@ from websockets.frames import CloseCode
 from websockets.http11 import Request, Response
 
 from mt5connector.server.push_frames import Published, hold, published
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.settings import HubSettings, read_hub_settings
 from mt5connector.server.wire.broker_clock import BrokerClock
 from mt5connector.server.wire.history_wire import BAR_TIMEFRAME
@@ -62,7 +63,6 @@ _EA_HELLO = ("v", "type", "role", "symbol", "spawner")
 _CHART_OPENED = ("v", "type", "symbol")
 _CHART_REASON = ("v", "type", "symbol", "reason")
 _ADAPTER_HELLO = ("v", "type", "role")
-_HOUR_S = 3_600
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ class Hub:
         self._used: dict[str, float] = {}
         self._close_sent: set[str] = set()
         self._consumers: dict[object, _Consumer] = {}
-        self._warned_hour: int | None = None
+        self._repeated_hours = RepeatedHours()
         self._closing: set[asyncio.Task] = set()
 
     async def handler(self, ws) -> None:
@@ -273,7 +273,9 @@ class Hub:
                 self._sent.clear()
                 self._close_sent.clear()
                 for symbol in sorted(self._requested):
-                    await self._request_chart(symbol)
+                    # Each send yields: a symbol whose EA said hello meanwhile is passed over.
+                    if symbol not in self._publishers:
+                        await self._request_chart(symbol)
 
     async def _op(self, ws, kind: FrameType, frame: dict) -> None:
         """Applies a consumer's subscribe or unsubscribe and queues its ack ahead of any frame the
@@ -305,7 +307,7 @@ class Hub:
         dropped silently."""
         ea = self._eas[ws]
         if self._publishers.get(ea.symbol) is ws:
-            passed = published(frame, self._clock)
+            passed = published(frame, self._clock, self._repeated_hours)
             if passed.symbol == ea.symbol or (passed.symbol == "" and ws is self._spawner):
                 await self._fan_out(passed)
             else:
@@ -317,8 +319,6 @@ class Hub:
                 )
 
     async def _fan_out(self, passed: Published) -> None:
-        if passed.ambiguous is not None:
-            self._warn_ambiguous(*passed.ambiguous)
         raw = json.dumps(passed.frame)
         overflowed = False
         for ws, consumer in list(self._consumers.items()):
@@ -456,17 +456,6 @@ class Hub:
             if item.symbol is not None:
                 self._used[item.symbol] = now
 
-    def _warn_ambiguous(self, field: str, broker_epoch: int) -> None:
-        """Warns once per repeated broker hour that its epochs read as their first occurrence."""
-        hour = broker_epoch // _HOUR_S
-        if hour != self._warned_hour:
-            self._warned_hour = hour
-            logger.warning(
-                "%s %d is in the broker's repeated hour, read as its first occurrence",
-                field,
-                broker_epoch,
-            )
-
     async def _send(self, ws, frame: dict) -> None:
         try:
             await ws.send(json.dumps(frame))
@@ -511,8 +500,8 @@ class Hub:
 def serve_hub(hub: Hub, host: str, port: int):
     """The hub served on `host`:`port` with its chart route, pinging every peer at the protocol's
     interval with one ping outstanding, failing a connection whose ping goes the ping timeout
-    without its pong, and dropping it within the close timeout; the ping and the close frame wait
-    on the hub's writes to the peer draining."""
+    without its pong, and dropping it within the close timeout; the ping and the close frame wait on
+    the hub's writes to the peer draining."""
     return serve(
         hub.handler,
         host,

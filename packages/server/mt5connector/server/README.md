@@ -30,8 +30,8 @@ The server mirrors the `MetaTrader5` package (5.0.6231), so code written against
 - Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, a time that is not an integer epoch, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
 - `POST /mt5/shutdown` is the one deliberate departure from the package: it answers `None` without calling the package's `shutdown()`. Every client shares the server's terminal session, and the adapter calls `shutdown()` whenever it disconnects, so passing it on would end the session for every client. `initialize` and `login` pass through unchanged.
 - `GET /health` answers the broker clock's latest verification — the relayed sample's chart `symbol`, its `trade_server` and `current` (last quote) times in true UTC, the terminal's own `gmt`, and the `skew_s` from the server's clock and the `offset_s` in effect — beside the server's load: the calls holding a slot `in_flight` now, the `peak_in_flight` and the `refusals` since start, and its `workers`. While the clock is not verified it answers HTTP 503. It never calls the terminal: the server initialized it at start, and the EAs' samples say whether it is connected to the trade server.
-- `POST /relay/server_time` and `POST /relay/commissions/<symbol>` take the `server_time` and `commissions` frames the WS hub relays from the EAs, the commission frame under the symbol of the EA that sent it, and answer `{"ok": true, "result": null}`. Each accepts a frame from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the frame's exact shape — for a commission frame, naming the path's symbol — with HTTP 400 and code -2. A refused commission frame is kept against the path's symbol until a later frame for it is accepted.
-- `GET /commissions/<symbol>` answers the commission schedule the symbol's EA last relayed — `ret` and `last_error` of its `SymbolInfoCommissions` call and its `rules`, every enum field by the name `EnumToString` gives it:
+- `POST /relay/server_time` and `POST /relay/commissions/<symbol>` take the `server_time` and `commissions` frames the WS hub relays from the EAs, the commission frame under the symbol of the EA that sent it, and answer `{"ok": true, "result": null}`. Each accepts a frame from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the frame's exact shape — for a commission frame, naming the path's symbol, and in each enum field a member of that field's enum — with HTTP 400 and code -2. A refused commission frame is kept against the path's symbol until a later frame for it is accepted.
+- `GET /commissions/<symbol>` answers the commission schedule the symbol's EA last relayed — `ret` and `last_error` of its `SymbolInfoCommissions` call and its `rules`, every enum field by the name `EnumToString` gives it, one of the members the MQL5 reference lists for the field's enum, which `push_wire.py` declares:
 
   | HTTP | When |
   |---|---|
@@ -59,7 +59,8 @@ Once the terminal is initialized, the server verifies the broker's clock against
 
 - A sample is fresh while it is younger than `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` and says the terminal is connected to the trade server.
 - A fresh sample verifies the clock only once the terminal has been connected without a break for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, so a terminal back from downtime is not trusted while it re-fetches what it missed. A sample that says the terminal is disconnected, or a gap of `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` between two samples, starts the run again.
-- A fresh sample's trade-server time, converted to true UTC, must sit within 120 s of the server's clock, or the server exits with both times and the offset in its log. A time in the repeated autumn hour may name either occurrence, so the occurrence nearer the server's clock is the one measured. The terminal extrapolates the trade server's time from the clock it shares with the server, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the host's clock reads.
+- A fresh sample's trade-server time, converted to true UTC, must sit within 120 s of the server's clock, or the server exits with both times and the offset in its log. The terminal extrapolates the trade server's time from the clock it shares with the server, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the host's clock reads.
+- A sample reads the terminal's clock live, so its times in the repeated autumn hour read as the occurrence nearer the server's clock: the trade-server time measured, the `trade_server` and `current` `/health` answers, and the terminal's time a history window's start is held to. Every epoch an answer carries keeps its first occurrence.
 - At start the server waits up to `MT5_CLOCK_BOOTSTRAP_SECONDS` for the first sample that verifies the clock, and exits when none arrives; the window includes the connected run, so with the defaults `/health` first answers 200 at least 30 s after the first connected sample. It then re-verifies the latest sample every `MT5_CLOCK_CHECK_SECONDS`.
 - The moment the latest sample no longer verifies the clock it is unverified, and stays so until a sample verifies it again. Each change is logged once.
 
@@ -215,12 +216,12 @@ The terminal is started as `terminal64.exe /config:<setup.ini> /portable`, so it
 | `[Common]` | `Login`, `Password`, `Server` | `MT5_LOGIN`, `MT5_PASSWORD` (quoted) and `MT5_SERVER` |
 | | `AutoConfiguration` | `true` |
 | | `ProxyEnable` | `false` |
-| `[Charts]` | `Profile` | `default` |
+| `[Charts]` | `Profile` | `default`, emptied of its charts before every launch, so the terminal starts with none |
 | `[Experts]` | `AllowDllImport` | `1` |
 | | `Enabled` | `1`: algorithmic trading on, without which the terminal refuses every order the adapter sends |
 | | `WebRequest` | `1` |
 | `[StartUp]` | `Script` | `ticks_setup` |
-| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol and closes its own when done. The deployment sets the symbol: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
+| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, and its own chart stays open. The deployment sets the symbol: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
 
 The terminal must know the trade server `MT5_SERVER` names — its `Config\servers.dat` lists it — before the login can succeed: a server a fresh install does not know is added by searching for its name once (File → Open an Account), or by copying in a `servers.dat` that lists it.
 
@@ -242,9 +243,9 @@ Both sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `
 - It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5`, with the `Include\` tree beside it — and the `.ex5` copied into place.
 - A clean compile writes `0 errors, 0 warnings` to its `/log:` file; a missing `.ex5` is a failed compile.
 
-On each terminal start `ticks_setup` closes every chart the terminal restored from its last profile but the spawner's — the chart of the symbol it runs on that runs the EA — and, when there is none, opens an M1 chart of that symbol and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
+On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner. It closes no chart, its own included: the terminal starts with none, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
 
-- The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's included.
+- The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's and the startup script's included.
 - A chart that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
 - The spawner refused as a duplicate keeps its chart and says hello again every `ReconnectIntervalSec`; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
 - A chart closes once its symbol has been out of use for `MT5_CHART_IDLE_SECONDS`: the spawner closes it and takes the symbol out of Market Watch, where the terminal would keep processing its ticks.

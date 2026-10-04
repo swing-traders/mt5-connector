@@ -1,10 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                        ticks_setup.mq5           |
-//| Startup script: close every chart the terminal restored but the  |
-//| spawner's - the chart of the symbol the script runs on that runs |
-//| the ticks EA - and open that chart with the spawner template     |
-//| when none is kept. Every other chart opens on demand. No         |
-//| includes - compiles with a bare MetaEditor.                      |
+//| Startup script: open the spawner's chart - an M1 chart of the    |
+//| symbol the script runs on - with the spawner template. The       |
+//| terminal starts from an empty profile, so a chart already        |
+//| running the ticks EA is a boot defect: the script reports it and |
+//| opens nothing. It closes no chart, its own included; every other |
+//| chart opens on demand. No includes - compiles with a bare        |
+//| MetaEditor.                                                      |
 //+------------------------------------------------------------------+
 #property script_show_inputs
 
@@ -16,11 +18,11 @@ input string ExpertName   = "ticks";
 //+------------------------------------------------------------------+
 void OnStart()
 {
-    const long spawner = CloseAllButSpawner();
-    if (spawner != 0)
+    const long running = ExpertChart();
+    if (running != -1)
     {
-        PrintFormat("ticks_setup: '%s' already runs on a '%s' chart - keeping it", ExpertName,
-                    Symbol());
+        PrintFormat("ticks_setup: a '%s' chart runs '%s' at start - not opening the spawner",
+                    ChartSymbol(running), ExpertName);
     }
     else
     {
@@ -40,48 +42,21 @@ void OnStart()
                         Symbol());
         }
     }
-
-    // close the setup chart
-    ChartClose(ChartID());
 }
 
 //+------------------------------------------------------------------+
-//| Close every chart but this script's and the first chart of its   |
-//| symbol that runs the EA 'ExpertName', which it returns; 0 when   |
-//| there is none                                                    |
+//| The first chart that runs the EA 'ExpertName', or -1 when none   |
+//| does                                                             |
 //+------------------------------------------------------------------+
-long CloseAllButSpawner()
+long ExpertChart()
 {
-    // Collected before any closes, so the walk never steps from a closed chart.
-    long charts[];
     long chart = ChartFirst();
     while (chart != -1)
     {
-        if (chart != ChartID())
-        {
-            const int n = ArraySize(charts);
-            ArrayResize(charts, n + 1);
-            charts[n] = chart;
-        }
+        string expert;
+        if (ChartGetString(chart, CHART_EXPERT_NAME, expert) && expert == ExpertName)
+            return chart;
         chart = ChartNext(chart);
     }
-
-    long spawner = 0;
-    for (int i = 0; i < ArraySize(charts); i++)
-    {
-        string expert;
-        if (spawner == 0
-            && ChartSymbol(charts[i]) == Symbol()
-            && ChartGetString(charts[i], CHART_EXPERT_NAME, expert)
-            && expert == ExpertName)
-        {
-            spawner = charts[i];
-        }
-        else if (!ChartClose(charts[i]))
-        {
-            PrintFormat("ticks_setup: ChartClose of a '%s' chart failed: %d",
-                        ChartSymbol(charts[i]), GetLastError());
-        }
-    }
-    return spawner;
+    return -1;
 }

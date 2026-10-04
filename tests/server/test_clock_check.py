@@ -15,8 +15,8 @@ from mirror_samples import CLOCK
 
 from mt5connector.server.app import create_app
 from mt5connector.server.clock_check import ClockCheck
-from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
 
 BROKER_EPOCH = 1_752_580_800  # an EDT date: the broker clock, New York + 7 h, runs 3 h ahead of UTC
@@ -524,6 +524,23 @@ def test_a_clock_an_hour_off_exits_through_the_repeated_autumn_hour(
     assert critical.startswith(
         f"broker clock: EURUSD trade server at broker epoch {broker + error_s} reads "
     )
+
+
+def test_health_answers_a_sample_in_the_repeated_hours_second_occurrence_at_its_true_utc(
+    timeline_at, terminal, commissions, exits
+):
+    utc, broker, _ = AUTUMN_CHECKS[AUTUMN_IDS.index("second-occurrence")]
+    timeline = timeline_at(utc - 30)
+    check = clock_check(timeline)
+    client = routes(terminal, commissions, check)
+    connected_samples_until(timeline, broker)
+    answers = health_at(timeline, client, [30])
+
+    run_to_its_end(check)
+
+    assert exits == []
+    result = answers[30].json["result"]
+    assert (result["trade_server"], result["current"]) == (utc, utc - 2)
 
 
 def test_a_sample_from_before_the_autumn_change_checked_after_it_verifies_the_clock(

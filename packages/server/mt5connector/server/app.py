@@ -26,8 +26,9 @@ from mt5connector.server.commissions import (
     commission_schedule,
     commissions_refusal,
 )
-from mt5connector.server.encoding import RepeatedHours, encode, non_epochs, package_arguments
+from mt5connector.server.encoding import encode, non_epochs, package_arguments
 from mt5connector.server.history import FloorStore, History, Syncing, bars_refusal, ticks_refusal
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.server_time import ServerTimeSink, server_time_refusal, server_time_sample
 from mt5connector.server.settings import Settings, read_settings
 from mt5connector.server.terminal import Answered, Failed, Terminal
@@ -467,9 +468,12 @@ def _history_ranges_view(history: History) -> Callable:
 
 def _terminal_time(server_times: ServerTimeSink, clock: BrokerClock) -> int:
     """The terminal's current time in true UTC: the trade-server time of the relay's latest sample,
-    which a verified clock always has, aged by the time since it arrived."""
+    which a verified clock always has, aged by the time since it arrived; in the broker's repeated
+    hour, the occurrence nearer the server's clock when it arrived."""
     received = server_times.latest()
-    return clock.to_utc(received.sample.trade_server) + int(time.monotonic() - received.arrived)
+    aged_s = int(time.monotonic() - received.arrived)
+    arrived_at = int(time.time()) - aged_s
+    return clock.to_utc_near(received.sample.trade_server, arrived_at) + aged_s
 
 
 def _clock_unverified() -> dict[str, object]:

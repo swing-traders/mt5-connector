@@ -1,10 +1,13 @@
 """The EA's tick, bar and trade-transaction frames as the hub passes them on: the struct fields
 verbatim, the subscription each reaches, and every epoch in true UTC."""
 
+import logging
+
 import pytest
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.server.push_frames import FrameError, published
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.history_wire import Series
 from mt5connector.server.wire.push_wire import (
@@ -61,21 +64,20 @@ def transaction_frame(**transaction):
 
 
 def test_a_ticks_epochs_reach_its_subscribers_in_true_utc():
-    passed = published(TICK, CLOCK)
+    passed = published(TICK, CLOCK, RepeatedHours())
 
     assert passed.subscription == Subscription(Stream.TICKS, "EURUSD")
     assert passed.frame == TICK | {"time": UTC_EPOCH, "time_msc": UTC_EPOCH * 1000 + 123}
-    assert passed.ambiguous is None
 
 
 def test_a_tick_at_broker_time_msc_1_752_580_800_000_reaches_them_at_1_752_570_000_000():
-    passed = published(TICK | {"time_msc": 1_752_580_800_000}, CLOCK)
+    passed = published(TICK | {"time_msc": 1_752_580_800_000}, CLOCK, RepeatedHours())
 
     assert passed.frame["time_msc"] == 1_752_570_000_000
 
 
 def test_a_bars_open_reaches_its_subscribers_in_true_utc_under_its_series_name():
-    passed = published(BAR, CLOCK)
+    passed = published(BAR, CLOCK, RepeatedHours())
 
     assert passed.subscription == Subscription(Stream.BARS, "EURUSD", Series.M1)
     assert passed.frame == BAR | {"timeframe": "M1", "time": UTC_EPOCH}
@@ -83,21 +85,28 @@ def test_a_bars_open_reaches_its_subscribers_in_true_utc_under_its_series_name()
 
 def test_a_transactions_expirations_reach_its_subscribers_in_true_utc_and_zero_stays_zero():
     frame = transaction_frame(time_expiration=BROKER_EPOCH, deal=7001, type=6)
-    passed = published(frame, CLOCK)
+    passed = published(frame, CLOCK, RepeatedHours())
 
     assert passed.subscription == Subscription(Stream.TRADE_TRANSACTIONS)
     assert passed.frame["transaction"] == frame["transaction"] | {"time_expiration": UTC_EPOCH}
     assert passed.frame["request"] == frame["request"] | {"expiration": UTC_EPOCH}
     assert passed.frame["result"] == frame["result"]
-    unexpiring = published(transaction_frame(), CLOCK)
+    unexpiring = published(transaction_frame(), CLOCK, RepeatedHours())
     assert unexpiring.frame["transaction"]["time_expiration"] == 0
 
 
-def test_an_epoch_in_the_brokers_repeated_hour_is_read_as_its_first_occurrence_and_named():
-    passed = published(TICK | {"time": REPEATED_BROKER_EPOCH}, CLOCK)
+def test_an_epoch_in_the_brokers_repeated_hour_is_read_as_its_first_occurrence_with_a_warning(
+    caplog,
+):
+    caplog.set_level(logging.WARNING)
+
+    passed = published(TICK | {"time": REPEATED_BROKER_EPOCH}, CLOCK, RepeatedHours())
 
     assert passed.frame["time"] == REPEATED_BROKER_EPOCH - 10_800
-    assert passed.ambiguous == ("tick.time", REPEATED_BROKER_EPOCH)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"tick: time {REPEATED_BROKER_EPOCH} is in the broker's repeated hour, read as its first "
+        "occurrence"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -128,6 +137,6 @@ def test_an_epoch_in_the_brokers_repeated_hour_is_read_as_its_first_occurrence_a
 )
 def test_a_frame_out_of_its_kinds_shape_is_refused_naming_what_is_wrong(frame, message):
     with pytest.raises(FrameError) as refused:
-        published(frame, CLOCK)
+        published(frame, CLOCK, RepeatedHours())
 
     assert str(refused.value) == message

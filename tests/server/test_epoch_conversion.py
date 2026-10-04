@@ -297,7 +297,7 @@ def test_the_repeated_hour_answers_its_first_occurrence_with_one_warning(client,
     ticks["time"] = [broker, broker + 1, broker + 2]
     ticks["time_msc"] = [broker * 1000, (broker + 1) * 1000, (broker + 2) * 1000]
     stub.copy_ticks_range.return_value = ticks
-    caplog.set_level(logging.WARNING, logger="mt5connector.server.encoding")
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
 
     response = client.post(
         "/mt5/copy_ticks_range",

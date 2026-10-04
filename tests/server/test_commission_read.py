@@ -15,7 +15,16 @@ from mt5connector.client.errors import MT5InstrumentError, ServerBusy, ServerUnr
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
 from mt5connector.server.wire import mirror
-from mt5connector.server.wire.push_wire import ChartState
+from mt5connector.server.wire.push_wire import (
+    ChartState,
+    CommissionChargeMode,
+    CommissionDirectionMode,
+    CommissionEntryMode,
+    CommissionMode,
+    CommissionProfitMode,
+    CommissionRangeMode,
+    CommissionVolumeType,
+)
 from mt5connector.server.ws_server import COMMISSIONS_RELAY_PATH, SERVER_TIME_RELAY_PATH, post_to
 
 EURUSD_RELAY_PATH = f"{COMMISSIONS_RELAY_PATH}/EURUSD.a"
@@ -64,15 +73,15 @@ SCHEDULE = CommissionSchedule(
     rules=(
         CommissionRule(
             currency="UST",
-            mode_range="SYMBOL_COMMISSION_RANGE_VOLUME",
-            mode_charge="SYMBOL_COMMISSION_CHARGE_INSTANT",
-            mode_entry="SYMBOL_COMMISSION_ENTRY_IN",
-            mode_direction="SYMBOL_COMMISSION_DIRECTION_BOTH",
-            mode_profit="SYMBOL_COMMISSION_PROFIT_ALL",
+            mode_range=CommissionRangeMode.VOLUME,
+            mode_charge=CommissionChargeMode.INSTANT,
+            mode_entry=CommissionEntryMode.IN,
+            mode_direction=CommissionDirectionMode.BOTH,
+            mode_profit=CommissionProfitMode.ALL,
             tiers=(
                 CommissionTier(
-                    mode="SYMBOL_COMMISSION_MONEY_DEPOSIT",
-                    volume_type="SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
+                    mode=CommissionMode.MONEY_DEPOSIT,
+                    volume_type=CommissionVolumeType.VOLUME,
                     value=6.0,
                     min_value=0.0,
                     max_value=0.0,

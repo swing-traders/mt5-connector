@@ -9,8 +9,8 @@ from mirror_samples import CLOCK
 
 from mt5connector.server.app import TerminalStartError, connect_terminal, create_app
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
-from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.settings import (
     Settings,
     SettingsError,
@@ -18,6 +18,15 @@ from mt5connector.server.settings import (
     read_settings,
 )
 from mt5connector.server.terminal import Terminal
+from mt5connector.server.wire.push_wire import (
+    CommissionChargeMode,
+    CommissionDirectionMode,
+    CommissionEntryMode,
+    CommissionMode,
+    CommissionProfitMode,
+    CommissionRangeMode,
+    CommissionVolumeType,
+)
 
 ENVIRONMENT = {
     "MT5_TERMINAL_PATH": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
@@ -333,15 +342,15 @@ def test_commissions_answer_the_relayed_schedule(client, commissions):
             rules=(
                 CommissionRule(
                     currency="USD",
-                    mode_range="SYMBOL_COMMISSION_RANGE_VOLUME",
-                    mode_charge="SYMBOL_COMMISSION_CHARGE_INSTANT",
-                    mode_entry="SYMBOL_COMMISSION_ENTRY_INOUT",
-                    mode_direction="SYMBOL_COMMISSION_DIRECTION_BOTH",
-                    mode_profit="SYMBOL_COMMISSION_PROFIT_ALL",
+                    mode_range=CommissionRangeMode.VOLUME,
+                    mode_charge=CommissionChargeMode.INSTANT,
+                    mode_entry=CommissionEntryMode.INOUT,
+                    mode_direction=CommissionDirectionMode.BOTH,
+                    mode_profit=CommissionProfitMode.ALL,
                     tiers=(
                         CommissionTier(
-                            mode="SYMBOL_COMMISSION_MONEY_DEPOSIT",
-                            volume_type="SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
+                            mode=CommissionMode.MONEY_DEPOSIT,
+                            volume_type=CommissionVolumeType.VOLUME,
                             value=3.5,
                             min_value=0.0,
                             max_value=0.0,

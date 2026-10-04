@@ -3,6 +3,7 @@ structs and passed on to consumers with every epoch in true UTC."""
 
 from dataclasses import dataclass
 
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
 from mt5connector.server.wire.history_wire import BAR_TIMEFRAME, Series
@@ -20,6 +21,7 @@ _TICK = mirror.STRUCTS[mirror.StructName.TICK]
 _REQUEST = mirror.STRUCTS[mirror.StructName.TRADE_REQUEST]
 _ENVELOPE = ("v", "type")
 _SERIES = {timeframe: series for series, timeframe in BAR_TIMEFRAME.items()}
+_HOUR_S = 3_600
 
 
 class FrameError(ValueError):
@@ -35,16 +37,16 @@ class Published:
     # transaction's own; empty for a transaction that names none.
     symbol: str
     frame: dict[str, object]
-    # The field and broker epoch, in seconds, of its first epoch in the broker's repeated hour.
-    ambiguous: tuple[str, int] | None
 
 
-def published(frame: dict[str, object], clock: BrokerClock) -> Published:
+def published(
+    frame: dict[str, object], clock: BrokerClock, repeated_hours: RepeatedHours
+) -> Published:
     """The tick, bar or trade-transaction frame an EA published, as its consumers receive it: its
     struct fields verbatim, every epoch in true UTC, and a bar's timeframe by its series name.
     Raises FrameError naming what breaks the shape, and for a frame of any other kind."""
     kind = frame.get("type")
-    conversion = _Conversion(clock)
+    conversion = _Conversion(clock, repeated_hours)
     if kind == FrameType.TICK:
         hold(frame, (*_ENVELOPE, "symbol", *_TICK.fields), kind)
         subscription = _subscription(kind, Stream.TICKS, frame["symbol"])
@@ -81,16 +83,16 @@ def published(frame: dict[str, object], clock: BrokerClock) -> Published:
         }
     else:
         raise FrameError(f"{kind} is not a published frame")
-    return Published(subscription, symbol, passed, conversion.ambiguous)
+    return Published(subscription, symbol, passed)
 
 
 class _Conversion:
-    """One frame's epochs converted to true UTC; remembers the first it read in the broker's
-    repeated hour."""
+    """A frame's epochs converted to true UTC, any in the broker's repeated hour warned of through
+    the process's RepeatedHours."""
 
-    def __init__(self, clock: BrokerClock) -> None:
+    def __init__(self, clock: BrokerClock, repeated_hours: RepeatedHours) -> None:
         self._clock = clock
-        self.ambiguous: tuple[str, int] | None = None
+        self._repeated_hours = repeated_hours
 
     def epochs(
         self, epochs: dict[str, mirror.EpochUnit], struct: dict[str, object], where: str
@@ -106,8 +108,8 @@ class _Conversion:
             else:
                 converted[name] = self._clock.to_utc_msc(value)
                 seconds = value // 1000
-            if self.ambiguous is None and value != 0 and self._clock.is_ambiguous(seconds):
-                self.ambiguous = (f"{where}.{name}", seconds)
+            if value != 0 and self._clock.is_ambiguous(seconds):
+                self._repeated_hours.warn(where, name, value, seconds // _HOUR_S)
         return converted
 
 

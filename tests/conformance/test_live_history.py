@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pytest
 
-from mt5connector.server.encoding import RepeatedHours
 from mt5connector.server.history import FloorStore, History, Syncing
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.terminal import Answered, Failed, Terminal
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock

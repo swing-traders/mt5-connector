@@ -1,19 +1,13 @@
 """The wire's conversions, shaped by the inventory: package answers to JSON and client arguments to
-the package's, with true-UTC epochs on the wire and the broker's clock at the package.
+the package's, with true-UTC epochs on the wire and the broker's clock at the package."""
 
-State: RepeatedHours, the broker's repeated hours already warned of, across every answer; nothing is
-persisted."""
-
-import logging
-import threading
 from datetime import UTC, datetime
 
 import numpy as np
 
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
-
-logger = logging.getLogger(__name__)
 
 _TRADE_REQUEST = mirror.STRUCTS[mirror.StructName.TRADE_REQUEST]
 _HOUR_S = 3_600
@@ -21,28 +15,6 @@ _HOUR_S = 3_600
 
 class ShapeError(Exception):
     """Raised when the package answers in a shape the inventory does not describe."""
-
-
-class RepeatedHours:
-    """The warning that an epoch in the broker's repeated hour reads as its first occurrence, given
-    once per broker hour across every answer the server's worker threads encode."""
-
-    def __init__(self) -> None:
-        self._warned: set[int] = set()
-        self._lock = threading.Lock()
-
-    def warn(self, function: mirror.Function, field: str, epoch: int, hour: int) -> None:
-        """Warns of an answer's epoch in a repeated broker hour, unless that hour was warned of."""
-        with self._lock:
-            warned = hour in self._warned
-            self._warned.add(hour)
-        if not warned:
-            logger.warning(
-                "%s: %s %d is in the broker's repeated hour, read as its first occurrence",
-                function.name,
-                field,
-                epoch,
-            )
 
 
 def encode(
@@ -64,7 +36,7 @@ def encode(
     else:
         encoded = _plain(value)
     for hour, (field, epoch) in answer.ambiguous.items():
-        repeated_hours.warn(function, field, epoch, hour)
+        repeated_hours.warn(function.name, field, epoch, hour)
     return encoded
 
 

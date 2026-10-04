@@ -16,7 +16,8 @@ from enum import StrEnum
 
 import numpy as np
 
-from mt5connector.server.encoding import RepeatedHours, broker_datetime, encode
+from mt5connector.server.encoding import broker_datetime, encode
+from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.terminal import Answered, Failed, Terminal
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
