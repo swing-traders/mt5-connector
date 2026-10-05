@@ -1,10 +1,13 @@
-"""The MT5 server's history routes, called through the shim's session (`remote_mt5`): the rows of a
-bar or tick window once the server vouches for them, and the floors it advertises."""
+"""The MT5 server's history routes, called on the transport of the connection each read is handed:
+the rows of a bar or tick window once the server vouches for them, and the floors it advertises."""
+
+from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
 from http import HTTPMethod, HTTPStatus
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -19,6 +22,9 @@ from mt5connector.wire.history_wire import (
     ServerCode,
     TickFlags,
 )
+
+if TYPE_CHECKING:
+    from mt5connector.client.connection import MT5Connection
 
 _BARS = "history/bars"
 _TICKS = "history/ticks"
@@ -44,12 +50,18 @@ class HistoryRanges:
 
 
 def bars(
-    symbol: str, series: Series, start: int, end: int, cancel: threading.Event | None = None
+    connection: MT5Connection,
+    symbol: str,
+    series: Series,
+    start: int,
+    end: int,
+    cancel: threading.Event | None = None,
 ) -> np.ndarray | None:
     """The bars opened in [start, end], true-UTC epoch seconds, each stamped at its open; None for a
-    failure, or when `cancel` is set while the server defers it, either leaving last_error set."""
+    failure, or when `cancel` is set while the server defers it, either leaving the connection's
+    last_error set."""
     body = {"symbol": symbol, "timeframe": series.value, "start": start, "end": end}
-    rows = _rows(_BARS, BARS_PATH, body, cancel)
+    rows = _rows(connection, _BARS, BARS_PATH, body, cancel)
     if rows is None:
         return None
     else:
@@ -57,6 +69,7 @@ def bars(
 
 
 def ticks(
+    connection: MT5Connection,
     symbol: str,
     start: int,
     end: int,
@@ -65,19 +78,24 @@ def ticks(
 ) -> np.ndarray | None:
     """The ticks from the start of second `start` through the end of second `end`, true-UTC epoch
     seconds; None for a failure, or when `cancel` is set while the server defers them, either
-    leaving last_error set."""
+    leaving the connection's last_error set."""
     body = {"symbol": symbol, "start": start, "end": end, "flags": flags.value}
-    rows = _rows(_TICKS, TICKS_PATH, body, cancel)
+    rows = _rows(connection, _TICKS, TICKS_PATH, body, cancel)
     if rows is None:
         return None
     else:
         return remote_mt5.decode_array(_TICKS, mirror.TICKS, rows)
 
 
-def ranges(symbol: str, cancel: threading.Event | None = None) -> HistoryRanges | None:
+def ranges(
+    connection: MT5Connection, symbol: str, cancel: threading.Event | None = None
+) -> HistoryRanges | None:
     """The terminal's MaxBars and the floors the server has measured for the symbol; None for a
-    failure, or when `cancel` is set while the server defers them, either leaving last_error set."""
-    reply = _reply(_RANGES, HTTPMethod.GET, RANGES_PATH, cancel, params={"symbol": symbol})
+    failure, or when `cancel` is set while the server defers them, either leaving the connection's
+    last_error set."""
+    reply = _reply(
+        connection, _RANGES, HTTPMethod.GET, RANGES_PATH, cancel, params={"symbol": symbol}
+    )
     if reply.envelope["ok"]:
         return _ranges(reply.envelope["result"])
     else:
@@ -85,10 +103,14 @@ def ranges(symbol: str, cancel: threading.Event | None = None) -> HistoryRanges 
 
 
 def _rows(
-    name: str, path: str, body: dict[str, object], cancel: threading.Event | None
+    connection: MT5Connection,
+    name: str,
+    path: str,
+    body: dict[str, object],
+    cancel: threading.Event | None,
 ) -> list | None:
     """The rows a window route answers."""
-    reply = _reply(name, HTTPMethod.POST, path, cancel, json=body)
+    reply = _reply(connection, name, HTTPMethod.POST, path, cancel, json=body)
     if not reply.envelope["ok"]:
         return None
     elif isinstance(reply.envelope["result"], list):
@@ -98,6 +120,7 @@ def _rows(
 
 
 def _reply(
+    connection: MT5Connection,
     name: str,
     method: HTTPMethod,
     path: str,
@@ -109,11 +132,11 @@ def _reply(
     """A route's answer, asked again each time the server defers it — the terminal syncing, or every
     slot taken — after the delay that answer gives, until it answers otherwise or `cancel` is
     set."""
-    reply = remote_mt5.call_route(name, method, path, json=json, params=params)
+    reply = connection.mt5.call_route(name, method, path, json=json, params=params)
     while _is_deferred(reply) and _waits_out(
         remote_mt5.retry_after_s(name, reply.retry_after), cancel
     ):
-        reply = remote_mt5.call_route(name, method, path, json=json, params=params)
+        reply = connection.mt5.call_route(name, method, path, json=json, params=params)
     return reply
 
 

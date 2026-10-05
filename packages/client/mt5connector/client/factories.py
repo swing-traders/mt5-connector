@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # SHARED CONNECTIONS AND INSTRUMENT PROVIDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_connection_registry: dict[int, MT5Connection] = {}
+_connection_registry: dict[tuple[int, str], MT5Connection] = {}
 
 _provider_registry: dict[
     tuple[MT5Connection, Venue, InstrumentProviderConfig], MT5InstrumentProvider
@@ -46,7 +46,7 @@ _mt5_config_registry: dict[str, MT5Config] = {}
 
 def _ensure_connection(config: MT5Config) -> MT5Connection:
     """The connection of the config's account and server, created and connected on first use."""
-    registry_key = hash((config.account, config.server))
+    registry_key = (config.account, config.server)
 
     if registry_key not in _connection_registry:
         logger.info("MT5 factories: creating the account's connection")

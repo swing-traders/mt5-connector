@@ -91,13 +91,13 @@ Releases are published as wheels on the fork's package index. The client pins th
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.6.0+st"
+  "mt5-connector-client==0.7.0+st"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.6.0+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.0+st"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
@@ -120,9 +120,9 @@ just test
 **2. Test the connection:**
 
 ```python
-from mt5connector.client import remote_mt5 as mt5
+from mt5connector.client.remote_mt5 import RemoteMT5
 
-mt5.configure("http://127.0.0.1:5000")
+mt5 = RemoteMT5("http://127.0.0.1:5000")
 info = mt5.account_info()
 print(info.currency, info.balance)
 ```
@@ -140,7 +140,7 @@ The adapter's own configuration goes through `MT5Config`; its required fields ar
 
 Its repr and string name none of the credentials: the login, the password and the broker server's name.
 
-The broker behind an account is the venue: a consumer running several brokers gives each its own venue, and every instrument id, client id and account id carries it. `venue` defaults to `Venue("MT5")`; an account at another broker beside it takes, say, `Venue("MT5_ALPHA")`, its instruments `XAUUSD.MT5_ALPHA` and its clients registered under `MT5_ALPHA`.
+The broker behind an account is the venue: a consumer running several brokers in one process gives each its own venue, and every instrument id, client id and account id carries it. Every connection owns its transport; nothing is shared across connections but the process. `venue` defaults to `Venue("MT5")`; an account at another broker beside it takes, say, `Venue("MT5_ALPHA")`, its instruments `XAUUSD.MT5_ALPHA` and its clients registered under `MT5_ALPHA`.
 
 ```python
 from mt5connector.client.config import MT5Config
@@ -364,7 +364,7 @@ The adapter runs against `mt5-connector-server`: an HTTP server under the termin
 ```
 
 - `MT5Config` requires the server's `server_url`, an `http` or `https` URL, and derives its `ws_url` (WebSocket) from the same host on port 9000 unless one is given; a given `ws_url` must be a `ws` or `wss` URL naming a host, and a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
-- The adapter calls the server through the shim `mt5connector.client.remote_mt5`, which `MT5Connection.connect()` binds to `server_url`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
+- Each `MT5Connection` calls its server through its own transport, `connection.mt5`: a `RemoteMT5` of the shim `mt5connector.client.remote_mt5` on the config's `server_url`, built with the connection and closed by its `disconnect()`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
 - A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
 - Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
   - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. Its history requests answer quote ticks sized the same way, and the venue's bars as the bar type requested. After a reconnect it holds the bars pushed until the first one arrives, then reads back over HTTP, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
@@ -374,13 +374,13 @@ The adapter runs against `mt5-connector-server`: an HTTP server under the termin
 - The account state carries the login's margin as one account-level margin balance in the account currency: the margin the venue states as used as initial, and the maintenance floor as maintenance.
 - There is no authentication: the server trusts its network. Its image publishes no host port, loopback included, so the API and the hub are reachable on the container network alone.
 
-The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function and carrying the delay the server's `Retry-After` gives as `retry_after_s`, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets the shim's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
+The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function and carrying the delay the server's `Retry-After` gives as `retry_after_s`, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets its transport's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
 
-`mt5connector.client.history` calls the server's history routes through the shim's session, with no read timeout:
+`mt5connector.client.history` calls the server's history routes on the transport of the connection each read is handed as its first argument, with no read timeout:
 
-- `bars()` and `ticks()` answer the rows as the package's arrays, and `ranges()` the advertised floors and `maxbars`.
+- `bars(connection, symbol, series, start, end)` and `ticks(connection, symbol, start, end)` answer the rows as the package's arrays, and `ranges(connection, symbol)` the advertised floors and `maxbars`.
 - On a 503 — the window not proven yet, or every slot taken — each waits its `Retry-After` and asks again, with no deadline of its own, until the server answers otherwise or the `cancel` event it was handed is set.
-- They answer `None` for a failure, a 400 among them, and for a cancellation, with `last_error()` set to the pair the server last answered.
+- They answer `None` for a failure, a 400 among them, and for a cancellation, with the connection's `mt5.last_error()` set to the pair the server last answered.
 
 ---
 

@@ -77,7 +77,6 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.objects import AccountBalance, MarginBalance, Money, Price, Quantity
 
-from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.connection import MarginMode
 from mt5connector.client.currencies import register_venue_currency, venue_currency
 from mt5connector.client.errors import (
@@ -480,7 +479,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         occupying its bracket, which it returns in the venue's order."""
         now = self._clock.utc_now()
         since = now - timedelta(minutes=self._config.history_lookback_mins)
-        deals = _answer("history_deals_get", mt5.history_deals_get(since, now))
+        deals = self._answer("history_deals_get", self._conn.mt5.history_deals_get(since, now))
         owed = [deal for deal in deals if self._owed_bracket_fill(deal)]
         self._seen_deals = {deal.ticket for deal in deals} - {deal.ticket for deal in owed}
         self._ended = set()
@@ -555,7 +554,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """Emits the fill of a deal the venue added, read from its history by the ticket: the
         transaction carries none of the deal's time, magic, entry, reason or charges. A deal the
         history does not hold yet is left to reconciliation."""
-        deals = _answer("history_deals_get", mt5.history_deals_get(ticket=ticket))
+        deals = self._answer("history_deals_get", self._conn.mt5.history_deals_get(ticket=ticket))
         if deals:
             self._on_deal(deals[0])
         else:
@@ -566,7 +565,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         filled, read from its history by the ticket; an order the history does not hold yet ends on
         the transaction that adds it there."""
         if ticket not in self._ended:
-            historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+            historical = self._answer(
+                "history_orders_get", self._conn.mt5.history_orders_get(ticket=ticket)
+            )
             if historical and historical[0].magic == self._magic:
                 self._emit_end(historical[0])
 
@@ -786,7 +787,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         except (MT5ConnectionError, MT5InstrumentError, MT5OrderError) as exc:
             self._reject(order, f"not sent: {exc}")
         else:
-            self._on_new_order_sent(order, _send(request))
+            self._on_new_order_sent(order, self._send(request))
 
     def _on_new_order_sent(self, order: Order, sent: _Sent) -> None:
         if sent.outcome == SendOutcome.DONE:
@@ -855,7 +856,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 return quote.ask_price.as_double()
             else:
                 return quote.bid_price.as_double()
-        last = _answer("symbol_info_tick", mt5.symbol_info_tick(order.instrument_id.symbol.value))
+        last = self._answer(
+            "symbol_info_tick", self._conn.mt5.symbol_info_tick(order.instrument_id.symbol.value)
+        )
         if last.time == 0:
             raise MT5OrderError(f"{order.instrument_id.symbol} has no quote")
         elif order.side == OrderSide.BUY:
@@ -891,7 +894,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         except (MT5ConnectionError, MT5InstrumentError, MT5OrderError) as exc:
             self._reject(order, f"not sent: {exc}")
         else:
-            self._on_new_order_sent(order, _send(request))
+            self._on_new_order_sent(order, self._send(request))
 
     def _close_request(self, order: Order, identifier: int) -> dict:
         """The deal closing the order's quantity of a position; raises MT5OrderError for a position
@@ -915,7 +918,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         else:
             venue_order_id = _next_exit_id(self._cache.orders(venue=self.venue), identifier, slot)
             displaced = self._occupant(identifier, slot)
-            sent = _send(_sltp_request(position, slot, level, self._magic), _BRACKET_DONE_RETCODES)
+            sent = self._send(
+                _sltp_request(position, slot, level, self._magic), _BRACKET_DONE_RETCODES
+            )
             self._on_bracket_sent(order, venue_order_id, displaced, sent)
 
     def _on_bracket_sent(
@@ -979,7 +984,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 self._exit_updated(order, exit_id.slot, command.quantity, level)
                 self._refresh_account()
             else:
-                sent = _send(
+                sent = self._send(
                     _sltp_request(position, exit_id.slot, level, self._magic),
                     _BRACKET_DONE_RETCODES,
                 )
@@ -1028,14 +1033,15 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             position = self._position(exit_id.identifier, order.instrument_id.symbol.value)
             deals = ()
             if position is None:
-                deals = _answer(
-                    "history_deals_get", mt5.history_deals_get(position=exit_id.identifier)
+                deals = self._answer(
+                    "history_deals_get",
+                    self._conn.mt5.history_deals_get(position=exit_id.identifier),
                 )
         except MT5ConnectionError as exc:
             self._cancel_rejected(order, order.venue_order_id, f"not sent: {exc}")
         else:
             if position is not None:
-                sent = _send(
+                sent = self._send(
                     _sltp_request(position, exit_id.slot, None, self._magic), _BRACKET_DONE_RETCODES
                 )
                 self._on_clear_sent(order, sent)
@@ -1155,7 +1161,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     "tp": 0.0,
                 }
                 request |= _pending_prices(order, price, trigger) | _expiry(order)
-                self._on_modify_sent(order, ticket, price, trigger, _send(request))
+                self._on_modify_sent(order, ticket, price, trigger, self._send(request))
             else:
                 self._modify_rejected(order, _venue_order_id(ticket), refusal)
                 self._refresh_account()
@@ -1206,8 +1212,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """Removes the commanding strategy's pending orders on the instrument, of the command's side
         when it names one; the other strategies' orders under the trader stay."""
         self._conn.ensure_connected()
-        venue_orders = _answer(
-            "orders_get", mt5.orders_get(symbol=command.instrument_id.symbol.value)
+        venue_orders = self._answer(
+            "orders_get", self._conn.mt5.orders_get(symbol=command.instrument_id.symbol.value)
         )
         ours = [venue_order for venue_order in venue_orders if venue_order.magic == self._magic]
         for venue_order in ours:
@@ -1244,7 +1250,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     "symbol": order.instrument_id.symbol.value,
                     "order": ticket,
                 }
-                self._on_remove_sent(order, ticket, _send(request))
+                self._on_remove_sent(order, ticket, self._send(request))
             else:
                 self._cancel_rejected(order, _venue_order_id(ticket), refusal)
                 self._refresh_account()
@@ -1284,9 +1290,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _not_resting(self, ticket: int) -> str | None:
         """None while the venue rests an order under the ticket; else why it cannot act on one — the
         state its history ended it in, or that it holds no such order."""
-        if _answer("orders_get", mt5.orders_get(ticket=ticket)):
+        if self._answer("orders_get", self._conn.mt5.orders_get(ticket=ticket)):
             return None
-        historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+        historical = self._answer(
+            "history_orders_get", self._conn.mt5.history_orders_get(ticket=ticket)
+        )
         if historical:
             return f"the order is {_order_state(historical[0])}"
         else:
@@ -1324,15 +1332,17 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         those tickets reports once, in their place."""
         self._conn.ensure_connected()
         if command.instrument_id is None:
-            resting = _answer("orders_get", mt5.orders_get())
+            resting = self._answer("orders_get", self._conn.mt5.orders_get())
         else:
-            resting = _answer(
-                "orders_get", mt5.orders_get(symbol=command.instrument_id.symbol.value)
+            resting = self._answer(
+                "orders_get", self._conn.mt5.orders_get(symbol=command.instrument_id.symbol.value)
             )
         venue_orders = {order.ticket: order for order in resting if order.magic == self._magic}
         if not command.open_only:
             date_from, date_to = self._window(command)
-            historical = _answer("history_orders_get", mt5.history_orders_get(date_from, date_to))
+            historical = self._answer(
+                "history_orders_get", self._conn.mt5.history_orders_get(date_from, date_to)
+            )
             for order in historical:
                 if self._is_ours(order) and _in_scope(order.symbol, command.instrument_id):
                     venue_orders.setdefault(order.ticket, order)
@@ -1363,7 +1373,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._conn.ensure_connected()
         date_from, date_to = self._window(command)
         reports = []
-        for deal in _answer("history_deals_get", mt5.history_deals_get(date_from, date_to)):
+        for deal in self._answer(
+            "history_deals_get", self._conn.mt5.history_deals_get(date_from, date_to)
+        ):
             owner = self._bracket_owner(deal)
             if (
                 (owner is not None or self._is_fill(deal))
@@ -1467,7 +1479,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         in_bracket = _bracket_orders(orders, identifier, slot)
         deals = ()
         if position is None:
-            deals = _answer("history_deals_get", mt5.history_deals_get(position=identifier))
+            deals = self._answer(
+                "history_deals_get", self._conn.mt5.history_deals_get(position=identifier)
+            )
         closing = _closing_deal(deals)
         if position is not None:
             return self._open_bracket_reports(identifier, slot, in_bracket, position)
@@ -1636,7 +1650,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         report = self._exit_report(order)
         if report is None:
             exit_id = _exit_id_of(order)
-            deals = _answer("history_deals_get", mt5.history_deals_get(position=exit_id.identifier))
+            deals = self._answer(
+                "history_deals_get", self._conn.mt5.history_deals_get(position=exit_id.identifier)
+            )
             executions = self._executions(deals, order)
             instrument = self._instrument(order.instrument_id.symbol.value)
             filled, avg_px = _execution_fills(executions, instrument)
@@ -1678,12 +1694,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _venue_order_by_comment(self, comment: str):
         """This trader's venue order carrying the comment, resting or in the history over the
         lookback; None when neither holds one."""
-        for venue_order in _answer("orders_get", mt5.orders_get()):
+        for venue_order in self._answer("orders_get", self._conn.mt5.orders_get()):
             if venue_order.magic == self._magic and venue_order.comment == comment:
                 return venue_order
         now = self._clock.utc_now()
         since = now - timedelta(minutes=self._config.history_lookback_mins)
-        for venue_order in _answer("history_orders_get", mt5.history_orders_get(since, now)):
+        for venue_order in self._answer(
+            "history_orders_get", self._conn.mt5.history_orders_get(since, now)
+        ):
             if venue_order.magic == self._magic and venue_order.comment == comment:
                 return venue_order
         return None
@@ -1858,10 +1876,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _venue_order(self, ticket: int):
         """The venue's order under a ticket — resting, else in its history — or None when it holds
         none."""
-        resting = _answer("orders_get", mt5.orders_get(ticket=ticket))
+        resting = self._answer("orders_get", self._conn.mt5.orders_get(ticket=ticket))
         if resting:
             return resting[0]
-        historical = _answer("history_orders_get", mt5.history_orders_get(ticket=ticket))
+        historical = self._answer(
+            "history_orders_get", self._conn.mt5.history_orders_get(ticket=ticket)
+        )
         if historical:
             return historical[0]
         else:
@@ -1871,10 +1891,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """The venue's open position under an identifier, at whatever ticket the venue holds it
         under now — a service operation can move a position to a new ticket while its identifier
         stays — or None when it holds none."""
-        for position in _answer("positions_get", mt5.positions_get(ticket=identifier)):
+        for position in self._answer(
+            "positions_get", self._conn.mt5.positions_get(ticket=identifier)
+        ):
             if position.identifier == identifier:
                 return position
-        for position in _answer("positions_get", mt5.positions_get(symbol=symbol)):
+        for position in self._answer("positions_get", self._conn.mt5.positions_get(symbol=symbol)):
             if position.identifier == identifier:
                 return position
         return None
@@ -1889,9 +1911,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _venue_positions(self, instrument_id: InstrumentId | None) -> tuple:
         """The venue's open positions, of the instrument when one is named."""
         if instrument_id is None:
-            return _answer("positions_get", mt5.positions_get())
+            return self._answer("positions_get", self._conn.mt5.positions_get())
         else:
-            return _answer("positions_get", mt5.positions_get(symbol=instrument_id.symbol.value))
+            return self._answer(
+                "positions_get", self._conn.mt5.positions_get(symbol=instrument_id.symbol.value)
+            )
 
     def _is_fill(self, deal) -> bool:
         """Whether a deal is a fill of this trader's: a trade carrying its magic, or a stop-out of a
@@ -1927,40 +1951,38 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         charge = finite_decimal(deal.commission, "commission") + finite_decimal(deal.fee, "fee")
         return Money(-charge, self.base_currency)
 
+    def _answer(self, function: str, value):
+        """A read's answer; raises MT5ConnectionError for the package's failure, None."""
+        if value is None:
+            code, message = self._conn.mt5.last_error()
+            raise MT5ConnectionError(f"{function} failed — error {code}: {message}")
+        return value
+
+    def _send(self, request: dict, done: frozenset[int] = _DONE_RETCODES) -> _Sent:
+        """Sends a trade request and classifies what the venue's answer to it proves, `done` naming
+        the retcodes that confirm it."""
+        try:
+            result = self._conn.mt5.order_send(request)
+        except ResponseLost as exc:
+            return _Sent(SendOutcome.LOST, str(exc))
+        except MT5ConnectionError as exc:
+            return _Sent(SendOutcome.NOT_SENT, f"not sent: {exc}")
+        if result is None:
+            code, message = self._conn.mt5.last_error()
+            return _Sent(SendOutcome.LOST, f"order_send failed — error {code}: {message}")
+        elif result.retcode in done:
+            return _Sent(SendOutcome.DONE, _retcode_reason(result), result)
+        elif result.retcode == mirror.TRADE_RETCODE_CONNECTION:
+            return _Sent(SendOutcome.LOST, _retcode_reason(result), result)
+        else:
+            return _Sent(SendOutcome.REFUSED, _retcode_reason(result), result)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LOST = "the venue may have acted on it, left to reconciliation"
-
-
-def _answer(function: str, value):
-    """A read's answer; raises MT5ConnectionError for the package's failure, None."""
-    if value is None:
-        code, message = mt5.last_error()
-        raise MT5ConnectionError(f"{function} failed — error {code}: {message}")
-    return value
-
-
-def _send(request: dict, done: frozenset[int] = _DONE_RETCODES) -> _Sent:
-    """Sends a trade request and classifies what the venue's answer to it proves, `done` naming the
-    retcodes that confirm it."""
-    try:
-        result = mt5.order_send(request)
-    except ResponseLost as exc:
-        return _Sent(SendOutcome.LOST, str(exc))
-    except MT5ConnectionError as exc:
-        return _Sent(SendOutcome.NOT_SENT, f"not sent: {exc}")
-    if result is None:
-        code, message = mt5.last_error()
-        return _Sent(SendOutcome.LOST, f"order_send failed — error {code}: {message}")
-    elif result.retcode in done:
-        return _Sent(SendOutcome.DONE, _retcode_reason(result), result)
-    elif result.retcode == mirror.TRADE_RETCODE_CONNECTION:
-        return _Sent(SendOutcome.LOST, _retcode_reason(result), result)
-    else:
-        return _Sent(SendOutcome.REFUSED, _retcode_reason(result), result)
 
 
 def _retcode_reason(result) -> str:

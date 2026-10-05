@@ -1,8 +1,8 @@
-"""The MetaTrader5 package's call surface served by the MT5 server, every epoch in true UTC, and the
+"""The MetaTrader5 package's call surface served by an MT5 server, every epoch in true UTC, and the
 commission schedules the server relays from the terminal.
 
-State: the server this module is configured against with its HTTP session, and the last_error() pair
-the last answered call carried."""
+State: per RemoteMT5, its server's URL, its HTTP session, and the last_error() pair its last
+answered call carried."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ import requests
 from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
 
 from mt5connector.client.errors import (
-    MT5ConfigError,
     MT5InstrumentError,
     ResponseLost,
     ServerBusy,
@@ -40,11 +39,6 @@ _ENVELOPE_STATUSES = frozenset(
 )
 _SERVER_CODES = frozenset(ServerCode)
 
-_server_url: str | None = None
-_ws_url: str | None = None
-_session: requests.Session | None = None
-_last_error: tuple[int, str] = mirror.SUCCESS
-
 globals().update(mirror.CONSTANTS)
 
 STRUCT_TYPES: dict[mirror.StructName, type] = {
@@ -53,35 +47,27 @@ STRUCT_TYPES: dict[mirror.StructName, type] = {
 globals().update({name.value: struct_type for name, struct_type in STRUCT_TYPES.items()})
 
 
-def configure(server_url: str, ws_url: str | None = None) -> None:
-    global _server_url, _ws_url, _session
-    if _session is not None:
-        _session.close()
-    _server_url = server_url.rstrip("/")
-    _ws_url = ws_url
-    _session = requests.Session()
-
-
-def last_error() -> tuple[int, str]:
-    """The (code, message) the package's last_error() reported after the last call."""
-    return _last_error
-
-
 def _mirror_function(function: mirror.Function) -> Callable:
+    """The package function as a RemoteMT5 method: bound, it takes the package's own signature."""
     signature = _signature(function)
 
-    def call(*args, **kwargs):
+    def call(self: RemoteMT5, *args, **kwargs):
         arguments = signature.bind(*args, **kwargs).arguments
         body = {}
         for param in function.params:
             if param.name in arguments:
                 body[param.name] = _wire_value(param, arguments[param.name])
-        return _call(function, body)
+        return self._call(function, body)
 
     call.__name__ = function.name.value
-    call.__qualname__ = function.name.value
+    call.__qualname__ = f"RemoteMT5.{function.name.value}"
     call.__module__ = __name__
-    call.__signature__ = signature
+    call.__signature__ = signature.replace(
+        parameters=[
+            inspect.Parameter("self", inspect.Parameter.POSITIONAL_ONLY),
+            *signature.parameters.values(),
+        ]
+    )
     return call
 
 
@@ -117,127 +103,254 @@ class Reply:
     retry_after: str | None
 
 
-def _call(function: mirror.Function, body: dict[str, object]) -> object:
-    reply = _exchange(
-        function.name,
-        HTTPMethod.POST,
-        f"/mt5/{function.name}",
-        _read_timeout_s(function, body),
-        json=body,
-    )
-    if reply.envelope["ok"]:
-        return _decode(function, reply.envelope["result"])
-    elif (
-        reply.status is HTTPStatus.SERVICE_UNAVAILABLE
-        and reply.envelope["error"]["code"] is ServerCode.BUSY
-    ):
-        raise ServerBusy(
-            f"{function.name}: server busy", retry_after_s(function.name, reply.retry_after)
+def _mirrored(cls: type) -> type:
+    """The class with every package function but last_error as a method calling the server."""
+    for function in mirror.FUNCTIONS.values():
+        if function.name is not mirror.FunctionName.LAST_ERROR:
+            setattr(cls, function.name.value, _mirror_function(function))
+    return cls
+
+
+# Buy, Sell and Close behave as the package's own helpers of the same names: a market order at the
+# given price, or at the current quote re-sent while the server answers a requote or no prices.
+_MARKET_ORDER_ATTEMPTS = 10
+_MARKET_ORDER_DEVIATION = 10
+_RETRY_RETCODES = (mirror.TRADE_RETCODE_REQUOTE, mirror.TRADE_RETCODE_PRICE_OFF)
+
+
+@_mirrored
+class RemoteMT5:
+    """The MetaTrader5 package as one MT5 server serves it, every call on this object's own HTTP
+    session."""
+
+    def __init__(self, server_url: str) -> None:
+        self._server_url = server_url.rstrip("/")
+        self._session = requests.Session()
+        self._last_error: tuple[int, str] = mirror.SUCCESS
+
+    def close_session(self) -> None:
+        """Closes the HTTP session's pooled connections; a later call opens a fresh one."""
+        self._session.close()
+
+    def last_error(self) -> tuple[int, str]:
+        """The (code, message) the package's last_error() reported after this object's last answered
+        call."""
+        return self._last_error
+
+    def call_route(
+        self,
+        name: str,
+        method: HTTPMethod,
+        path: str,
+        *,
+        json: dict[str, object] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> Reply:
+        """Calls one of the server's own routes and sets last_error to the pair its envelope
+        carries. No read timeout bounds it: a cold history read holds the terminal as long as the
+        package's own call takes."""
+        return self._exchange(name, method, path, None, json=json, params=params)
+
+    def commission_schedule(self, symbol: str) -> dict:
+        """Waits for the symbol's relayed schedule, retrying after the server's advertised delay;
+        raises MT5InstrumentError when the server refused the symbol's last relay or the symbol's
+        chart failed to open, and ServerBusy when it refuses the read with every slot taken. Leaves
+        last_error as it was: no package call answers it."""
+        name = "commissions"
+        while True:
+            try:
+                response = self._session.get(
+                    f"{self._server_url}/commissions/{quote(symbol, safe='')}",
+                    timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
+                )
+            except requests.RequestException as exc:
+                raise _unanswered(name, exc) from exc
+            try:
+                envelope = response.json()
+            except requests.JSONDecodeError as exc:
+                raise ResponseLost(f"{name}: HTTP {response.status_code} body is not JSON") from exc
+            if (
+                response.status_code == HTTPStatus.OK
+                and _is_relayed(envelope)
+                and isinstance(envelope["result"], dict)
+            ):
+                return envelope["result"]
+            elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(
+                envelope
+            ):
+                if envelope["error"]["code"] == ServerCode.SYNCING:
+                    time.sleep(retry_after_s(name, response.headers.get("Retry-After")))
+                else:
+                    raise ServerUnreachable(
+                        f"{name}: server not ready — {envelope['error']['message']}"
+                    )
+            elif (
+                response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+                and _is_error(envelope)
+                and envelope["error"]["code"] == ServerCode.BUSY
+            ):
+                raise ServerBusy(
+                    f"{name}: server busy", retry_after_s(name, response.headers.get("Retry-After"))
+                )
+            elif (
+                response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+                and _is_server_failure(envelope)
+                and envelope["error"]["code"] == ServerCode.RELAY_REFUSED
+            ):
+                raise MT5InstrumentError(f"{name}: {envelope['error']['message']}")
+            elif (
+                response.status_code == HTTPStatus.BAD_REQUEST
+                and _is_server_failure(envelope)
+                and envelope["error"]["code"] == ServerCode.CHART_FAILED
+            ):
+                raise MT5InstrumentError(f"{name}: {envelope['error']['message']}")
+            else:
+                raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
+
+    def Buy(self, symbol, volume, price=None, *, comment=None, ticket=None):
+        """A market buy at price, or at the current ask when price is None."""
+        if price is not None:
+            return self._market_order(mirror.ORDER_TYPE_BUY, symbol, volume, price, comment, ticket)
+        for _ in range(_MARKET_ORDER_ATTEMPTS):
+            tick = self.symbol_info_tick(symbol)
+            result = self._market_order(
+                mirror.ORDER_TYPE_BUY, symbol, volume, tick.ask, comment, ticket
+            )
+            if result is None or result.retcode not in _RETRY_RETCODES:
+                break
+        return result
+
+    def Sell(self, symbol, volume, price=None, *, comment=None, ticket=None):
+        """A market sell at price, or at the current bid when price is None."""
+        if price is not None:
+            return self._market_order(
+                mirror.ORDER_TYPE_SELL, symbol, volume, price, comment, ticket
+            )
+        for _ in range(_MARKET_ORDER_ATTEMPTS):
+            tick = self.symbol_info_tick(symbol)
+            result = self._market_order(
+                mirror.ORDER_TYPE_SELL, symbol, volume, tick.bid, comment, ticket
+            )
+            if result is None or result.retcode not in _RETRY_RETCODES:
+                break
+        return result
+
+    def Close(self, symbol, *, comment=None, ticket=None):
+        """Closes the symbol's buy and sell positions, or only the one with ticket: True when every
+        one closed, "Partially" when some did, False when none did, None when a quote or a send
+        failed."""
+        if ticket is not None:
+            positions = self.positions_get(ticket=ticket)
+        else:
+            positions = self.positions_get(symbol=symbol)
+        tried = 0
+        done = 0
+        for position in positions:
+            if position.type in (mirror.ORDER_TYPE_BUY, mirror.ORDER_TYPE_SELL):
+                tried += 1
+                result = self._close_position(symbol, position, comment)
+                if result is None:
+                    return None
+                elif result.retcode == mirror.TRADE_RETCODE_DONE:
+                    done += 1
+        if done == 0:
+            return False
+        elif done == tried:
+            return True
+        else:
+            return "Partially"
+
+    def _close_position(self, symbol, position, comment):
+        """The last answer to the opposite market order closing one position; None when a quote or a
+        send failed."""
+        for _ in range(_MARKET_ORDER_ATTEMPTS):
+            tick = self.symbol_info_tick(symbol)
+            if tick is None:
+                result = None
+            elif position.type == mirror.ORDER_TYPE_BUY:
+                result = self._market_order(
+                    mirror.ORDER_TYPE_SELL,
+                    symbol,
+                    position.volume,
+                    tick.bid,
+                    comment,
+                    position.ticket,
+                )
+            else:
+                result = self._market_order(
+                    mirror.ORDER_TYPE_BUY,
+                    symbol,
+                    position.volume,
+                    tick.ask,
+                    comment,
+                    position.ticket,
+                )
+            if result is None or result.retcode not in _RETRY_RETCODES:
+                return result
+        return result
+
+    def _market_order(self, order_type, symbol, volume, price, comment, ticket):
+        request = {
+            "action": mirror.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "price": price,
+            "deviation": _MARKET_ORDER_DEVIATION,
+        }
+        if comment is not None:
+            request["comment"] = comment
+        if ticket is not None:
+            request["position"] = ticket
+        return self.order_send(request)
+
+    def _call(self, function: mirror.Function, body: dict[str, object]) -> object:
+        reply = self._exchange(
+            function.name,
+            HTTPMethod.POST,
+            f"/mt5/{function.name}",
+            _read_timeout_s(function, body),
+            json=body,
         )
-    else:
-        return mirror.failure_value(function)
+        if reply.envelope["ok"]:
+            return _decode(function, reply.envelope["result"])
+        elif (
+            reply.status is HTTPStatus.SERVICE_UNAVAILABLE
+            and reply.envelope["error"]["code"] is ServerCode.BUSY
+        ):
+            raise ServerBusy(
+                f"{function.name}: server busy", retry_after_s(function.name, reply.retry_after)
+            )
+        else:
+            return mirror.failure_value(function)
 
-
-def call_route(
-    name: str,
-    method: HTTPMethod,
-    path: str,
-    *,
-    json: dict[str, object] | None = None,
-    params: dict[str, str] | None = None,
-) -> Reply:
-    """Calls one of the server's own routes and sets last_error to the pair its envelope carries. No
-    read timeout bounds it: a cold history read holds the terminal as long as the package's own call
-    takes."""
-    return _exchange(name, method, path, None, json=json, params=params)
-
-
-def _exchange(
-    name: str,
-    method: HTTPMethod,
-    path: str,
-    read_timeout_s: float | None,
-    *,
-    json: dict[str, object] | None = None,
-    params: dict[str, str] | None = None,
-) -> Reply:
-    """The server's reply to a request, its last_error recorded as the shim's."""
-    global _last_error
-    if _session is None:
-        raise MT5ConfigError("remote_mt5: no server is configured")
-    try:
-        response = _session.request(
-            method,
-            f"{_server_url}{path}",
-            json=json,
-            params=params,
-            timeout=(CONNECT_TIMEOUT_S, read_timeout_s),
-        )
-    except requests.RequestException as exc:
-        raise _unanswered(name, exc) from exc
-    envelope = _envelope(name, response)
-    code, message = envelope["last_error"]
-    _last_error = (code, message)
-    return Reply(HTTPStatus(response.status_code), envelope, response.headers.get("Retry-After"))
-
-
-def commission_schedule(symbol: str) -> dict:
-    """Waits for the symbol's relayed schedule, retrying after the server's advertised delay; raises
-    MT5InstrumentError when the server refused the symbol's last relay or the symbol's chart failed
-    to open, and ServerBusy when it refuses the read with every slot taken. Leaves last_error as it
-    was: no package call answers it."""
-    name = "commissions"
-    if _session is None:
-        raise MT5ConfigError("remote_mt5: no server is configured")
-    while True:
+    def _exchange(
+        self,
+        name: str,
+        method: HTTPMethod,
+        path: str,
+        read_timeout_s: float | None,
+        *,
+        json: dict[str, object] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> Reply:
+        """The server's reply to a request, its last_error recorded as this object's."""
         try:
-            response = _session.get(
-                f"{_server_url}/commissions/{quote(symbol, safe='')}",
-                timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
+            response = self._session.request(
+                method,
+                f"{self._server_url}{path}",
+                json=json,
+                params=params,
+                timeout=(CONNECT_TIMEOUT_S, read_timeout_s),
             )
         except requests.RequestException as exc:
             raise _unanswered(name, exc) from exc
-        try:
-            envelope = response.json()
-        except requests.JSONDecodeError as exc:
-            raise ResponseLost(f"{name}: HTTP {response.status_code} body is not JSON") from exc
-        if (
-            response.status_code == HTTPStatus.OK
-            and _is_relayed(envelope)
-            and isinstance(envelope["result"], dict)
-        ):
-            return envelope["result"]
-        elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(
-            envelope
-        ):
-            if envelope["error"]["code"] == ServerCode.SYNCING:
-                time.sleep(retry_after_s(name, response.headers.get("Retry-After")))
-            else:
-                raise ServerUnreachable(
-                    f"{name}: server not ready — {envelope['error']['message']}"
-                )
-        elif (
-            response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
-            and _is_error(envelope)
-            and envelope["error"]["code"] == ServerCode.BUSY
-        ):
-            raise ServerBusy(
-                f"{name}: server busy", retry_after_s(name, response.headers.get("Retry-After"))
-            )
-        elif (
-            response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
-            and _is_server_failure(envelope)
-            and envelope["error"]["code"] == ServerCode.RELAY_REFUSED
-        ):
-            raise MT5InstrumentError(f"{name}: {envelope['error']['message']}")
-        elif (
-            response.status_code == HTTPStatus.BAD_REQUEST
-            and _is_server_failure(envelope)
-            and envelope["error"]["code"] == ServerCode.CHART_FAILED
-        ):
-            raise MT5InstrumentError(f"{name}: {envelope['error']['message']}")
-        else:
-            raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
+        envelope = _envelope(name, response)
+        code, message = envelope["last_error"]
+        self._last_error = (code, message)
+        return Reply(
+            HTTPStatus(response.status_code), envelope, response.headers.get("Retry-After")
+        )
 
 
 def retry_after_s(name: str, retry_after: str | None) -> int:
@@ -423,102 +536,3 @@ def _fits(value: object, numpy_type: str) -> bool:
     else:
         bounds = np.iinfo(numpy_type)
         return isinstance(value, int) and bounds.min <= value <= bounds.max
-
-
-_MIRRORED: dict[mirror.FunctionName, Callable] = {
-    name: _mirror_function(function)
-    for name, function in mirror.FUNCTIONS.items()
-    if name is not mirror.FunctionName.LAST_ERROR
-}
-globals().update({name.value: function for name, function in _MIRRORED.items()})
-
-# Buy, Sell and Close behave as the package's own helpers of the same names: a market order at the
-# given price, or at the current quote re-sent while the server answers a requote or no prices.
-_MARKET_ORDER_ATTEMPTS = 10
-_MARKET_ORDER_DEVIATION = 10
-_RETRY_RETCODES = (mirror.TRADE_RETCODE_REQUOTE, mirror.TRADE_RETCODE_PRICE_OFF)
-
-
-def Buy(symbol, volume, price=None, *, comment=None, ticket=None):
-    """A market buy at price, or at the current ask when price is None."""
-    if price is not None:
-        return _market_order(mirror.ORDER_TYPE_BUY, symbol, volume, price, comment, ticket)
-    for _ in range(_MARKET_ORDER_ATTEMPTS):
-        tick = _MIRRORED[mirror.FunctionName.SYMBOL_INFO_TICK](symbol)
-        result = _market_order(mirror.ORDER_TYPE_BUY, symbol, volume, tick.ask, comment, ticket)
-        if result is None or result.retcode not in _RETRY_RETCODES:
-            break
-    return result
-
-
-def Sell(symbol, volume, price=None, *, comment=None, ticket=None):
-    """A market sell at price, or at the current bid when price is None."""
-    if price is not None:
-        return _market_order(mirror.ORDER_TYPE_SELL, symbol, volume, price, comment, ticket)
-    for _ in range(_MARKET_ORDER_ATTEMPTS):
-        tick = _MIRRORED[mirror.FunctionName.SYMBOL_INFO_TICK](symbol)
-        result = _market_order(mirror.ORDER_TYPE_SELL, symbol, volume, tick.bid, comment, ticket)
-        if result is None or result.retcode not in _RETRY_RETCODES:
-            break
-    return result
-
-
-def Close(symbol, *, comment=None, ticket=None):
-    """Closes the symbol's buy and sell positions, or only the one with ticket: True when every one
-    closed, "Partially" when some did, False when none did, None when a quote or a send failed."""
-    if ticket is not None:
-        positions = _MIRRORED[mirror.FunctionName.POSITIONS_GET](ticket=ticket)
-    else:
-        positions = _MIRRORED[mirror.FunctionName.POSITIONS_GET](symbol=symbol)
-    tried = 0
-    done = 0
-    for position in positions:
-        if position.type in (mirror.ORDER_TYPE_BUY, mirror.ORDER_TYPE_SELL):
-            tried += 1
-            result = _close_position(symbol, position, comment)
-            if result is None:
-                return None
-            elif result.retcode == mirror.TRADE_RETCODE_DONE:
-                done += 1
-    if done == 0:
-        return False
-    elif done == tried:
-        return True
-    else:
-        return "Partially"
-
-
-def _close_position(symbol, position, comment):
-    """The last answer to the opposite market order closing one position; None when a quote or a
-    send failed."""
-    for _ in range(_MARKET_ORDER_ATTEMPTS):
-        tick = _MIRRORED[mirror.FunctionName.SYMBOL_INFO_TICK](symbol)
-        if tick is None:
-            result = None
-        elif position.type == mirror.ORDER_TYPE_BUY:
-            result = _market_order(
-                mirror.ORDER_TYPE_SELL, symbol, position.volume, tick.bid, comment, position.ticket
-            )
-        else:
-            result = _market_order(
-                mirror.ORDER_TYPE_BUY, symbol, position.volume, tick.ask, comment, position.ticket
-            )
-        if result is None or result.retcode not in _RETRY_RETCODES:
-            return result
-    return result
-
-
-def _market_order(order_type, symbol, volume, price, comment, ticket):
-    request = {
-        "action": mirror.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": volume,
-        "type": order_type,
-        "price": price,
-        "deviation": _MARKET_ORDER_DEVIATION,
-    }
-    if comment is not None:
-        request["comment"] = comment
-    if ticket is not None:
-        request["position"] = ticket
-    return _MIRRORED[mirror.FunctionName.ORDER_SEND](request)

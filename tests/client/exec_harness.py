@@ -1,5 +1,5 @@
-"""An execution client wired to real NT components over doubles of the shim and of its push channel,
-recording what the client emits and logs."""
+"""An execution client wired to real NT components over doubles of its connection's transport and of
+its push channel, recording what the client emits and logs."""
 
 import asyncio
 from dataclasses import dataclass
@@ -241,6 +241,7 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
     loaded = {item.raw_symbol.value: item for item in (instruments or [instrument()])}
 
     conn = MagicMock(spec=MT5Connection)
+    conn.mt5 = venue
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
     conn.reconnect_async = AsyncMock(return_value=True)

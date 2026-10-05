@@ -117,9 +117,17 @@ def test_calling_convention_matches_the_package(package_surface, function):
     assert package_surface.functions[function.name].flags == CALLING_FLAGS[function.calling]
 
 
+@pytest.fixture
+def transport():
+    """A transport as a caller holds it; nothing in these tests sends a request."""
+    remote = shim.RemoteMT5("http://127.0.0.1:5000")
+    yield remote
+    remote.close_session()
+
+
 @pytest.mark.parametrize("function", mirror.FUNCTIONS.values(), ids=str)
-def test_shim_has_every_function(function):
-    assert callable(getattr(shim, function.name))
+def test_shim_has_every_function(transport, function):
+    assert callable(getattr(transport, function.name))
 
 
 def test_inventory_constants_are_the_packages_both_ways(package_surface):
@@ -163,8 +171,8 @@ def test_the_packages_helpers_are_buy_sell_close(package_surface):
 
 
 @pytest.mark.parametrize("name", HELPERS)
-def test_shim_helper_has_the_package_signature(package_surface, name):
-    assert inspect.signature(getattr(shim, name)) == _signature(package_surface.helpers[name])
+def test_shim_helper_has_the_package_signature(package_surface, transport, name):
+    assert inspect.signature(getattr(transport, name)) == _signature(package_surface.helpers[name])
 
 
 def _signature(function: ast.FunctionDef) -> inspect.Signature:

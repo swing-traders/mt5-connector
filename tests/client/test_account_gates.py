@@ -75,6 +75,7 @@ def _provider(instruments) -> MT5InstrumentProvider:
 
 
 def _client(
+    transport,
     raw_account,
     terminal_trade_allowed=True,
     instruments=(),
@@ -86,6 +87,7 @@ def _client(
     except RuntimeError:
         loop = asyncio.new_event_loop()
     conn = MagicMock(spec=MT5Connection)
+    conn.mt5 = transport
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(raw_account)
     conn.get_terminal_info.return_value = {
         "connected": True,
@@ -108,11 +110,12 @@ def _client(
 
 @pytest.fixture
 def venue():
-    with patch("mt5connector.client.execution.mt5") as package:
-        package.orders_get.return_value = ()
-        package.positions_get.return_value = ()
-        package.history_deals_get.return_value = ()
-        yield package
+    """The transport of the client's connection: no order, position or deal."""
+    package = MagicMock()
+    package.orders_get.return_value = ()
+    package.positions_get.return_value = ()
+    package.history_deals_get.return_value = ()
+    return package
 
 
 async def _stop_account_loop(client):
@@ -214,8 +217,8 @@ def test_the_terminal_info_exposes_trading_permission_and_connection(config, moc
 # ── The position model ───────────────────────────────────────────────────────
 
 
-def test_the_client_declares_hedging():
-    client = _client(account_info())
+def test_the_client_declares_hedging(venue):
+    client = _client(venue, account_info())
     assert client.oms_type == OmsType.HEDGING
 
 
@@ -229,7 +232,7 @@ def test_the_client_declares_hedging():
 async def test_a_non_hedging_account_fails_the_connect_naming_both_modes_before_anything_runs(
     venue, raw, named
 ):
-    client = _client(account_info(margin_mode=raw))
+    client = _client(venue, account_info(margin_mode=raw))
     with pytest.raises(MT5ConfigError) as refused:
         await client._connect()
     assert "HEDGING" in str(refused.value)
@@ -243,7 +246,7 @@ async def test_a_non_hedging_account_fails_the_connect_naming_both_modes_before_
 
 
 async def test_a_hedging_account_connects(venue):
-    client = _client(account_info(margin_mode=mirror.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING))
+    client = _client(venue, account_info(margin_mode=mirror.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING))
     await client._connect()
     client.generate_account_state.assert_called_once()
     assert not client._account_task.done()
@@ -255,7 +258,7 @@ async def test_a_hedging_account_connects(venue):
 
 
 async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue):
-    client = _client(account_info(trade_allowed=False), terminal_trade_allowed=True)
+    client = _client(venue, account_info(trade_allowed=False), terminal_trade_allowed=True)
     with pytest.raises(MT5ConfigError, match="read-only"):
         await client._connect()
     client.generate_account_state.assert_not_called()
@@ -267,7 +270,7 @@ async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue)
 
 
 async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(venue):
-    client = _client(account_info(trade_allowed=True), terminal_trade_allowed=True)
+    client = _client(venue, account_info(trade_allowed=True), terminal_trade_allowed=True)
     await client._connect()
     assert not client._account_task.done()
     assert client._push.connected
@@ -278,8 +281,8 @@ async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(v
 
 
 async def test_two_traders_on_one_login_book_under_two_ids_sharing_the_logins_hash(venue):
-    first = _client(account_info(login=7654321), trader_id="TESTER-001")
-    second = _client(account_info(login=7654321), trader_id="TESTER-002")
+    first = _client(venue, account_info(login=7654321), trader_id="TESTER-001")
+    second = _client(venue, account_info(login=7654321), trader_id="TESTER-002")
     try:
         await first._connect()
         await second._connect()
@@ -296,7 +299,7 @@ async def test_two_traders_on_one_login_book_under_two_ids_sharing_the_logins_ha
 
 
 async def test_a_client_of_a_named_venue_books_under_that_venue_and_is_its_client(venue):
-    client = _client(account_info(login=7654321), venue=Venue("MT5_ALPHA"))
+    client = _client(venue, account_info(login=7654321), venue=Venue("MT5_ALPHA"))
     try:
         await client._connect()
     finally:
@@ -306,7 +309,7 @@ async def test_a_client_of_a_named_venue_books_under_that_venue_and_is_its_clien
 
 
 async def test_the_default_venue_client_books_under_mt5(venue):
-    client = _client(account_info(login=7654321))
+    client = _client(venue, account_info(login=7654321))
     try:
         await client._connect()
     finally:
@@ -326,6 +329,7 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
     states = []
     msgbus.subscribe(topic="events.account.*", handler=states.append)
     conn = MagicMock(spec=MT5Connection)
+    conn.mt5 = venue
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(
         account_info(login=7654321, currency="EUR")
     )
@@ -355,7 +359,7 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
 
 async def test_a_pre_minted_account_currency_is_re_registered_at_the_accounts_digits(venue):
     Currency.register(Currency("UST", 8, 0, "UST", CurrencyType.CRYPTO), overwrite=True)
-    client = _client(account_info(currency="UST", currency_digits=2))
+    client = _client(venue, account_info(currency="UST", currency_digits=2))
     await client._connect()
     assert Currency.from_str("UST", strict=True).precision == 2
     assert nautilus_pyo3.Currency.from_str("UST", strict=True).precision == 2
@@ -366,7 +370,7 @@ async def test_a_pre_minted_account_currency_is_re_registered_at_the_accounts_di
 async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(venue):
     settlement = Currency("CLP", 0, 0, "CLP", CurrencyType.FIAT)
     base_only = Currency("BHD", 3, 0, "BHD", CurrencyType.FIAT)
-    client = _client(account_info(), instruments=[_pair("BHDCLP", base_only, settlement)])
+    client = _client(venue, account_info(), instruments=[_pair("BHDCLP", base_only, settlement)])
     await client._connect()
     assert Currency.from_str("CLP", strict=True).precision == 0
     assert Currency.from_internal_map("BHD") is None
@@ -381,14 +385,13 @@ def settlement_venue(venue):
         currency_base="XPT", currency_profit="UST", currency_margin="BHD"
     )
     venue.symbols_get.side_effect = lambda: (venue.symbol_info.return_value,)
-    with patch("mt5connector.client.providers.mt5", venue):
-        yield venue
+    return venue
 
 
 async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments(settlement_venue):
     seen = []
     for digits in (8, 2):
-        client = _client(account_info(currency="UST", currency_digits=digits))
+        client = _client(settlement_venue, account_info(currency="UST", currency_digits=digits))
         client._provider = MT5InstrumentProvider(
             connection=client._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
         )
@@ -415,14 +418,14 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
 async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
     settlement_venue, code, precision
 ):
-    first = _client(account_info(currency=code, currency_digits=8))
+    first = _client(settlement_venue, account_info(currency=code, currency_digits=8))
     try:
         await first._connect()
     finally:
         await _stop_account_loop(first)
 
     settlement_venue.symbol_info.return_value = symbol_info(currency_profit=code)
-    later = _client(account_info(currency="USD"))
+    later = _client(settlement_venue, account_info(currency="USD"))
     later._provider = MT5InstrumentProvider(
         connection=later._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
     )
@@ -463,7 +466,7 @@ def test_two_trader_ids_give_two_magics():
 
 async def test_the_client_owns_exactly_the_positions_its_trader_ids_magic_marks(venue):
     instrument = _pair("EURUSD", Currency.from_str("EUR"), Currency.from_str("USD"))
-    client = _client(account_info(), instruments=[instrument], trader_id="TRADER-001")
+    client = _client(venue, account_info(), instruments=[instrument], trader_id="TRADER-001")
     client._provider.get_instrument.side_effect = {"EURUSD": instrument}.get
     await client._connect()
     await _stop_account_loop(client)
@@ -481,7 +484,7 @@ async def test_the_client_owns_exactly_the_positions_its_trader_ids_magic_marks(
 
 async def test_the_currencies_register_before_the_first_account_state(venue):
     Currency.register(Currency("UST", 8, 0, "UST", CurrencyType.CRYPTO), overwrite=True)
-    client = _client(account_info(currency="UST", currency_digits=2))
+    client = _client(venue, account_info(currency="UST", currency_digits=2))
     seen = []
     client.generate_account_state = MagicMock(
         side_effect=lambda **_: seen.append(Currency.from_str("UST", strict=True).precision)
@@ -492,25 +495,24 @@ async def test_the_currencies_register_before_the_first_account_state(venue):
 
 
 @pytest.fixture
-def terminal():
-    """The package behind the provider's shim, serving EURUSD and GBPUSD, neither charging a
-    commission."""
+def terminal(venue):
+    """The venue serving EURUSD and GBPUSD, neither charging a commission."""
     definitions = {
         "EURUSD": symbol_info(name="EURUSD"),
         "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
     }
-    package = MagicMock()
-    package.symbol_select.side_effect = lambda name, enable: name in definitions
-    package.symbol_info.side_effect = definitions.get
-    package.symbols_get.return_value = tuple(definitions.values())
-    package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    with patch("mt5connector.client.providers.mt5", package):
-        yield package
+    venue.symbol_select.side_effect = lambda name, enable: name in definitions
+    venue.symbol_info.side_effect = definitions.get
+    venue.symbols_get.return_value = tuple(definitions.values())
+    venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    return venue
 
 
-def _served_client(provider_config: InstrumentProviderConfig):
-    """A client over a real provider whose config is `provider_config`."""
+def _served_client(transport, provider_config: InstrumentProviderConfig):
+    """A client over a real provider whose config is `provider_config`, its connection's transport
+    `transport`."""
     conn = MagicMock(spec=MT5Connection)
+    conn.mt5 = transport
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
@@ -531,9 +533,10 @@ def _served_client(provider_config: InstrumentProviderConfig):
     return client, provider
 
 
-async def test_connect_loads_exactly_the_ids_its_provider_config_names(venue, terminal):
+async def test_connect_loads_exactly_the_ids_its_provider_config_names(terminal):
     client, provider = _served_client(
-        InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("GBPUSD.MT5")}))
+        terminal,
+        InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("GBPUSD.MT5")})),
     )
     await client._connect()
     assert [instrument.id.value for instrument in provider.list_all()] == ["GBPUSD.MT5"]
@@ -545,10 +548,8 @@ async def test_connect_loads_exactly_the_ids_its_provider_config_names(venue, te
     [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
     ids=["no-ids", "empty-ids"],
 )
-async def test_connect_refuses_a_provider_config_that_names_nothing(
-    venue, terminal, provider_config
-):
-    client, provider = _served_client(provider_config)
+async def test_connect_refuses_a_provider_config_that_names_nothing(terminal, provider_config):
+    client, provider = _served_client(terminal, provider_config)
     with pytest.raises(MT5ConfigError, match="instrument_provider"):
         await client._connect()
     assert provider.list_all() == []
@@ -560,7 +561,7 @@ async def test_connect_refuses_a_provider_config_that_names_nothing(
 
 
 async def test_a_connect_on_a_connected_client_is_refused(venue):
-    client = _client(account_info())
+    client = _client(venue, account_info())
     await client._connect()
     try:
         with pytest.raises(RuntimeError, match="already connected"):
@@ -570,6 +571,6 @@ async def test_a_connect_on_a_connected_client_is_refused(venue):
 
 
 async def test_a_disconnect_on_a_client_never_connected_is_refused(venue):
-    client = _client(account_info())
+    client = _client(venue, account_info())
     with pytest.raises(RuntimeError, match="not connected"):
         await client._disconnect()

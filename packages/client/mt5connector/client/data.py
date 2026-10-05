@@ -36,7 +36,6 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import ClientId
 
 from mt5connector.client import history
-from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.currencies import register_venue_currency
 from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.parsing import (
@@ -249,8 +248,10 @@ class MT5DataClient(LiveMarketDataClient):
         series = _bar_subscription(bar_type).timeframe
         symbol = bar_type.instrument_id.symbol.value
         try:
-            rows = await _read_in_thread(history.bars, symbol, series, first_open, last_open)
-            failure = mt5.last_error()
+            rows = await _read_in_thread(
+                history.bars, self._conn, symbol, series, first_open, last_open
+            )
+            failure = self._conn.mt5.last_error()
         except MT5ConnectionError as exc:
             rows = None
             failure = exc
@@ -357,11 +358,11 @@ class MT5DataClient(LiveMarketDataClient):
         self._conn.ensure_connected()
         start = _epoch_s(request.start)
         end = self._end_s(request.end)
-        rows = await _read_in_thread(history.ticks, symbol, start, end)
+        rows = await _read_in_thread(history.ticks, self._conn, symbol, start, end)
         if rows is None:
             self._log.error(
                 f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: "
-                f"{mt5.last_error()}"
+                f"{self._conn.mt5.last_error()}"
             )
         else:
             ticks = [parse_quote_tick(row, instrument) for row in rows]
@@ -382,6 +383,7 @@ class MT5DataClient(LiveMarketDataClient):
         last_close = self._end_s(request.end)
         rows = await _read_in_thread(
             history.bars,
+            self._conn,
             symbol,
             series,
             first_close - BAR_PERIOD_S[series],
@@ -390,7 +392,7 @@ class MT5DataClient(LiveMarketDataClient):
         if rows is None:
             self._log.error(
                 f"MT5DataClient: {request.bar_type} bars closing "
-                f"{_iso(first_close)}..{_iso(last_close)} failed: {mt5.last_error()}"
+                f"{_iso(first_close)}..{_iso(last_close)} failed: {self._conn.mt5.last_error()}"
             )
         else:
             bars = [venue_bar(row, request.bar_type, instrument) for row in rows]

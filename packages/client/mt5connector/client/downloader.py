@@ -13,7 +13,6 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connector.client import history
-from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.errors import (
     MT5InstrumentError,
     MT5SymbolNotFoundError,
@@ -26,6 +25,7 @@ from mt5connector.client.parsing import (
     venue_bar,
     venue_bar_type,
 )
+from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import BAR_PERIOD_S, SPAN_MARGIN, Series, bar_series
 
 if TYPE_CHECKING:
@@ -124,7 +124,7 @@ class MT5DataDownloader:
         start = _ensure_utc(start)
         end = _ensure_utc(end)
         if timeframe is None:
-            timeframe = mt5.TIMEFRAME_H1
+            timeframe = mirror.TIMEFRAME_H1
         series = bar_series(timeframe)
         result = DownloadResult(symbol=symbol, data_type="bars", start=start, end=end)
 
@@ -149,7 +149,7 @@ class MT5DataDownloader:
         """Downloads each symbol's ticks, then its bars of each MT5 timeframe, H1 and D1 by default;
         answers each symbol's results in that order."""
         if timeframes is None:
-            timeframes = [mt5.TIMEFRAME_H1, mt5.TIMEFRAME_D1]
+            timeframes = [mirror.TIMEFRAME_H1, mirror.TIMEFRAME_D1]
         results: dict[str, list[DownloadResult]] = {}
 
         for symbol in symbols:
@@ -178,9 +178,9 @@ class MT5DataDownloader:
         self, result: DownloadResult, instrument: InstrumentAny, start: datetime, end: datetime
     ) -> None:
         """Walks the symbol's ticks back from end, a UTC day per window."""
-        ranges = history.ranges(result.symbol)
+        ranges = history.ranges(self._conn, result.symbol)
         if ranges is None:
-            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
         else:
             logger.info(f"Downloader: downloading ticks for {result.symbol} from {start} to {end}")
             first = int(start.timestamp())
@@ -196,7 +196,7 @@ class MT5DataDownloader:
                 first,
                 windows,
                 _advertised_floor(ranges, Series.TICKS),
-                lambda lo, hi: history.ticks(result.symbol, lo, hi),
+                lambda lo, hi: history.ticks(self._conn, result.symbol, lo, hi),
                 lambda rows: [parse_quote_tick(row, instrument) for row in rows],
             )
 
@@ -211,9 +211,9 @@ class MT5DataDownloader:
     ) -> None:
         """Walks the symbol's bars of `series` back from the one closing at end, as many periods per
         window as the terminal answers in one read."""
-        ranges = history.ranges(result.symbol)
+        ranges = history.ranges(self._conn, result.symbol)
         if ranges is None:
-            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
         else:
             logger.info(
                 f"Downloader: downloading {series} bars for {result.symbol} closing from {start} "
@@ -235,7 +235,7 @@ class MT5DataDownloader:
                 first,
                 windows,
                 _advertised_floor(ranges, series),
-                lambda lo, hi: history.bars(result.symbol, series, lo, hi),
+                lambda lo, hi: history.bars(self._conn, result.symbol, series, lo, hi),
                 lambda rows: [venue_bar(row, bar_type, instrument) for row in rows],
             )
 
@@ -265,7 +265,7 @@ class MT5DataDownloader:
                 _record_error(result, f"Window {label} failed: {exc}")
                 continue
             if rows is None:
-                _record_error(result, f"Window {label} failed: {mt5.last_error()}")
+                _record_error(result, f"Window {label} failed: {self._conn.mt5.last_error()}")
             elif len(rows) == 0:
                 result.chunks_empty += 1
                 floor = self._refresh_floor(result, series, floor)
@@ -283,9 +283,9 @@ class MT5DataDownloader:
     ) -> int | None:
         """Reads the series' floor the server advertises now; a failed read is recorded as an error
         and leaves the floor known before."""
-        ranges = history.ranges(result.symbol)
+        ranges = history.ranges(self._conn, result.symbol)
         if ranges is None:
-            _record_error(result, f"Ranges failed: {mt5.last_error()}")
+            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
             return floor
         else:
             return _advertised_floor(ranges, series)

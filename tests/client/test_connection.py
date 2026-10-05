@@ -1,6 +1,6 @@
-"""MT5Connection against a patched shim: its states, connect, disconnect and reconnect, the account
-and terminal reads, the account snapshot, and the credentials none of them shows. A test observes
-the connection's state through what ensure_connected answers."""
+"""MT5Connection against a patched transport: its states, connect, disconnect and reconnect, the
+account and terminal reads, the account snapshot, and the credentials none of them shows. A test
+observes the connection's state through what ensure_connected answers."""
 
 import asyncio
 import logging
@@ -16,6 +16,7 @@ from mt5connector.client.connection import AccountSnapshot, ConnectionState, MT5
 from mt5connector.client.errors import (
     MT5ConnectionError,
     MT5LoginError,
+    ResponseLost,
     ServerBusy,
     ServerUnreachable,
 )
@@ -76,13 +77,12 @@ class TestInitialState:
 
 class TestSuccessfulConnect:
 
-    def test_connect_binds_the_shim_to_the_configured_server_before_initializing(
+    def test_the_connection_holds_its_own_transport_on_the_configured_server(
         self, config, mock_mt5
     ):
         conn = MT5Connection(config)
-        conn.connect()
-        mock_mt5.configure.assert_called_once_with("http://127.0.0.1:5000", "ws://127.0.0.1:9000")
-        assert [name for name, _, _ in mock_mt5.mock_calls][:2] == ["configure", "initialize"]
+        assert conn.mt5 is mock_mt5
+        connection.RemoteMT5.assert_called_once_with("http://127.0.0.1:5000")
 
     def test_connect_calls_initialize_and_login(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -112,11 +112,22 @@ class TestSuccessfulConnect:
         conn.connect()
         conn.ensure_connected()
 
-    def test_disconnect_calls_mt5_shutdown(self, config, mock_mt5):
+    def test_disconnect_shuts_the_terminal_session_down_then_closes_the_transport(
+        self, config, mock_mt5
+    ):
         conn = MT5Connection(config)
         conn.connect()
         conn.disconnect()
         mock_mt5.shutdown.assert_called_once()
+        assert [name for name, _, _ in mock_mt5.mock_calls][-2:] == ["shutdown", "close_session"]
+
+    def test_a_disconnect_whose_shutdown_raises_still_closes_the_transport(self, config, mock_mt5):
+        mock_mt5.shutdown.side_effect = ResponseLost("shutdown: lost")
+        conn = MT5Connection(config)
+        conn.connect()
+        with pytest.raises(ResponseLost):
+            conn.disconnect()
+        mock_mt5.close_session.assert_called_once()
 
     def test_state_is_disconnected_after_disconnect(self, config, mock_mt5):
         conn = MT5Connection(config)
@@ -278,6 +289,13 @@ class TestReconnectAsync:
         mock_mt5.shutdown.assert_called()
         mock_mt5.initialize.assert_called_once()
         mock_mt5.login.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_reconnect_keeps_the_transport_open(self, config, mock_mt5):
+        conn = MT5Connection(config)
+        conn.connect()
+        await conn.reconnect_async()
+        mock_mt5.close_session.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_async_reconnect_resets_attempt_counter(self, config, mock_mt5):
@@ -597,7 +615,6 @@ class TestLifecycleTransitions:
         conn.connect()
         with pytest.raises(MT5ConnectionError, match="CONNECTED"):
             conn.connect()
-        mock_mt5.configure.assert_called_once()
         mock_mt5.initialize.assert_called_once()
         mock_mt5.login.assert_called_once()
 

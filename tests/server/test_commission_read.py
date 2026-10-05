@@ -160,7 +160,7 @@ def test_a_read_the_server_is_busy_for_raises_server_busy_and_leaves_last_error(
 
 
 @pytest.fixture
-def provider(stub):
+def provider(stub, remote):
     info = struct_sample(mirror.StructName.SYMBOL_INFO)._replace(
         name="EURUSD.a",
         digits=5,
@@ -183,7 +183,7 @@ def provider(stub):
     stub.symbol_info_tick.return_value = struct_sample(mirror.StructName.TICK)._replace(
         bid=1.085, ask=1.085
     )
-    connection = MagicMock()
+    connection = MagicMock(mt5=remote)
     connection.get_account_info.return_value = MagicMock(currency="USD", currency_digits=2)
     return MT5InstrumentProvider(connection=connection, venue=MT5_VENUE, clock=TestClock())
 

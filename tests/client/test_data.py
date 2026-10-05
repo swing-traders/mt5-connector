@@ -411,7 +411,9 @@ class TestRequestQuoteTicks:
         with patch("mt5connector.client.history.ticks", return_value=rows) as ticks:
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        ticks.assert_called_once_with("EURUSDm", 1_752_570_000, 1_752_573_600, cancel=ANY)
+        ticks.assert_called_once_with(
+            recorded._conn, "EURUSDm", 1_752_570_000, 1_752_573_600, cancel=ANY
+        )
         delivered = recorded._handle_quote_ticks.call_args[0][1]
         assert [tick.ts_event for tick in delivered] == [
             ((1_752_570_000 + i) * 1000 + 250) * 1_000_000 for i in range(10)
@@ -429,13 +431,16 @@ class TestRequestQuoteTicks:
         assert recorded._log.warning.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_a_failed_window_is_an_error_and_delivers_nothing(self, recorded):
+    async def test_a_failed_window_is_an_error_naming_its_connections_last_error(self, recorded):
+        recorded._conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
         with patch("mt5connector.client.history.ticks", return_value=None):
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
         recorded._handle_quote_ticks.assert_not_called()
         assert recorded._log.error.call_count == 1
-        assert "2025-07-15T09:00:00+00:00" in recorded._log.error.call_args[0][0]
+        error = recorded._log.error.call_args[0][0]
+        assert "2025-07-15T09:00:00+00:00" in error
+        assert error.endswith("failed: (-4, 'Terminal: Not found')")
 
     @pytest.mark.asyncio
     async def test_both_sizes_are_the_instruments_largest_order(self, recorded):
@@ -471,7 +476,9 @@ class TestRequestBars:
         with patch("mt5connector.client.history.bars", return_value=rows) as bars:
             await recorded._request_bars(minute_bars_request(c0, c1))
 
-        bars.assert_called_once_with("EURUSDm", Series.M1, c0 - 60, c1 - 60, cancel=ANY)
+        bars.assert_called_once_with(
+            recorded._conn, "EURUSDm", Series.M1, c0 - 60, c1 - 60, cancel=ANY
+        )
         delivered = recorded._handle_bars.call_args[0][1]
         assert [bar.ts_event for bar in delivered] == [
             close * 1_000_000_000 for close in range(c0, c1 + 1, 60)
@@ -489,7 +496,8 @@ class TestRequestBars:
         assert recorded._log.warning.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_a_failed_window_is_an_error_and_delivers_nothing(self, recorded):
+    async def test_a_failed_window_is_an_error_naming_its_connections_last_error(self, recorded):
+        recorded._conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
         with patch("mt5connector.client.history.bars", return_value=None):
             await recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
 
@@ -497,6 +505,7 @@ class TestRequestBars:
         assert recorded._log.error.call_count == 1
         error = recorded._log.error.call_args[0][0]
         assert "2025-07-15T09:01:00+00:00" in error and "2025-07-15T09:05:00+00:00" in error
+        assert error.endswith("failed: (-4, 'Terminal: Not found')")
 
     @pytest.mark.asyncio
     async def test_cancelling_the_request_stops_the_history_calls_retries(self, recorded):
@@ -693,8 +702,8 @@ USDJPY = InstrumentId.from_str("USDJPY.MT5")
 
 @pytest.fixture
 def terminal():
-    """The package behind the provider's shim, serving EURUSD, GBPUSD and USDJPY, none of them
-    charging a commission."""
+    """The transport of the served client's connection, serving EURUSD, GBPUSD and USDJPY, none of
+    them charging a commission."""
     definitions = {
         "EURUSD": symbol_info(name="EURUSD"),
         "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
@@ -705,14 +714,14 @@ def terminal():
     package.symbol_info.side_effect = definitions.get
     package.symbols_get.return_value = tuple(definitions.values())
     package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    with patch("mt5connector.client.providers.mt5", package):
-        yield package
+    return package
 
 
-def served_client(provider_config: InstrumentProviderConfig):
-    """A data client over a real provider whose config is `provider_config`, what it hands NT as
-    data recorded."""
+def served_client(transport, provider_config: InstrumentProviderConfig):
+    """A data client over a real provider whose config is `provider_config`, its connection's
+    transport `transport`, what it hands NT as data recorded."""
     conn = MagicMock(spec=MT5Connection)
+    conn.mt5 = transport
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     provider = MT5InstrumentProvider(
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
@@ -746,7 +755,7 @@ class TestInstrumentsNtNames:
         self, terminal
     ):
         client, provider = served_client(
-            InstrumentProviderConfig(load_ids=frozenset({EURUSD, GBPUSD}))
+            terminal, InstrumentProviderConfig(load_ids=frozenset({EURUSD, GBPUSD}))
         )
 
         await client._connect()
@@ -758,7 +767,7 @@ class TestInstrumentsNtNames:
 
     @pytest.mark.asyncio
     async def test_connect_with_load_all_hands_nt_every_symbol_the_terminal_serves(self, terminal):
-        client, provider = served_client(InstrumentProviderConfig(load_all=True))
+        client, provider = served_client(terminal, InstrumentProviderConfig(load_all=True))
 
         await client._connect()
 
@@ -774,7 +783,7 @@ class TestInstrumentsNtNames:
     async def test_connect_refuses_a_provider_config_that_names_nothing(
         self, terminal, provider_config
     ):
-        client, provider = served_client(provider_config)
+        client, provider = served_client(terminal, provider_config)
 
         with pytest.raises(MT5ConfigError, match="instrument_provider"):
             await client._connect()
@@ -785,7 +794,9 @@ class TestInstrumentsNtNames:
 
     @pytest.mark.asyncio
     async def test_a_symbol_no_config_named_is_loaded_and_answered_on_request(self, terminal):
-        client, provider = served_client(InstrumentProviderConfig(load_ids=frozenset({EURUSD})))
+        client, provider = served_client(
+            terminal, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        )
         await client._connect()
         responses = responses_of(client)
         request = instrument_request("GBPUSD")
