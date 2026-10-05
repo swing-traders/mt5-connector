@@ -91,13 +91,13 @@ Releases are published as wheels on the fork's package index. The client pins th
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.5.0"
+  "mt5-connector-client==0.5.0+st"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.5.0"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.5.0+st"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
@@ -380,8 +380,8 @@ The shim raises `ServerUnreachable` when the server cannot be reached or answers
 ## Releases
 
 - `VERSION` holds the one version both distributions carry.
-- A `vX.Y.Z` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, attaches all four files to one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
-- Consumers pin a release exactly from that index.
+- A `vX.Y.Z+st` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, attaches all four files to one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
+- Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
 
 ---
 
