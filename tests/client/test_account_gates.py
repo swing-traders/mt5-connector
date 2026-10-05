@@ -146,11 +146,26 @@ def test_the_snapshots_leverage_is_decimal():
 
 
 @pytest.mark.parametrize(
-    "field", ["balance", "equity", "margin", "margin_free", "margin_level", "credit", "profit"]
+    "field",
+    [
+        "balance",
+        "equity",
+        "margin",
+        "margin_maintenance",
+        "margin_free",
+        "margin_level",
+        "credit",
+        "profit",
+    ],
 )
 def test_a_non_finite_account_amount_is_refused_naming_it(field):
     with pytest.raises(MT5ConnectionError, match=field):
         AccountSnapshot.from_mt5(account_info(**{field: float("nan")}))
+
+
+def test_the_snapshot_carries_the_maintenance_floor():
+    snapshot = AccountSnapshot.from_mt5(account_info(margin_maintenance=80.0))
+    assert snapshot.margin_maintenance == Decimal("80.0")
 
 
 def test_the_snapshots_money_is_decimal_from_the_boundary_on():
