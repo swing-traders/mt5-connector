@@ -23,8 +23,8 @@ It ships code, never infrastructure: two distributions in one `mt5connector` nam
 Delivery:
 
 - PRs merge to `main`; CI runs `just lint` and `just test` on every PR and push to `main`.
-- `VERSION` is the one version both projects read. A release is a `v0.4.0+st.N` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, publishes them as one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
-- Consumers pin a release exactly, by its full local version, from that index; PyPI can never satisfy a `+st` version, so the pin proves provenance.
+- `VERSION` is the one version both projects read. A release is a `vX.Y.Z` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, publishes them as one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
+- Consumers pin a release exactly from that index.
 
 ---
 

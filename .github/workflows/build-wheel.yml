@@ -4,7 +4,7 @@ name: build-wheel
 
 on:
   push:
-    tags: ["v0.*"]
+    tags: ["v[0-9]*"]
   workflow_dispatch:
 
 jobs:
