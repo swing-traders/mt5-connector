@@ -334,7 +334,7 @@ async def test_the_route_answers_failed_with_the_spawners_reason_until_the_chart
 
 
 async def test_a_read_of_a_symbol_whose_chart_failed_to_open_fails_at_once_naming_the_reason(
-    served, remote, hub_port, hub_posts, monkeypatch
+    served, remote, connection, hub_port, hub_posts, monkeypatch
 ):
     server = await serve_hub(Hub(CLOCK, post_to(served), idle_s=900), "127.0.0.1", hub_port)
     spawner = await _ea(hub_port, "EURUSD", spawner=True)
@@ -349,7 +349,7 @@ async def test_a_read_of_a_symbol_whose_chart_failed_to_open_fails_at_once_namin
     def reads():
         with pytest.raises(MT5InstrumentError) as refused:
             remote.commission_schedule("XYZ")
-        bars = history_client.bars("XYZ", Series.H1, 1_752_570_000, 1_752_573_600)
+        bars = history_client.bars(connection, "XYZ", Series.H1, 1_752_570_000, 1_752_573_600)
         return str(refused.value), bars, remote.last_error()
 
     refused, bars, last_error = await loop.run_in_executor(None, reads)

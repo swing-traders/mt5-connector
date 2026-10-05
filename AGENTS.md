@@ -280,7 +280,7 @@ NT TradingNode ──> mt5connector.client (data + exec clients, provider, facto
                      the MetaTrader5 package ──> the terminal ──> the broker
 ```
 
-The adapter reaches the terminal through the server alone: every module that calls the package imports the shim, as `mt5`, and the shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
+The adapter reaches the terminal through the server alone, every call on the transport of the connection it belongs to (`MT5Connection.mt5`); no module holds a server, a session or a last error. The shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
 
 ---
 
@@ -399,7 +399,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ## Test tiers
 
-- **Every test runs without a terminal.** Client tests (`tests/client/`) patch the shim where a module imported it (`tests/client/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and points the shim at it. The server imports the package only inside `main()`.
+- **Every test runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, or patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and builds a client connection on its URL. The server imports the package only inside `main()`.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
 - **The static conformance tier** (`tests/conformance/test_static_conformance.py`) fetches the pinned wheel by sha256 and checks the inventory and shim against it. **The live tier** needs a Windows host and a terminal and runs only when asked for; `README.md` says how to run both.
 - **An `xfail` is `strict=True` and names the defect it pins.** An xfail that starts passing is a fix to record, never a marker to leave.

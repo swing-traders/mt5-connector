@@ -17,6 +17,7 @@ from mirror_samples import (
 )
 
 from mt5connector.client.errors import ServerUnreachable
+from mt5connector.client.remote_mt5 import STRUCT_TYPES
 from mt5connector.server.wire import mirror
 
 FUNCTIONS = [
@@ -392,6 +393,6 @@ def test_close_answers_none_without_a_quote(remote, stub):
     stub.order_send.assert_not_called()
 
 
-def test_package_types_are_the_shims(remote):
+def test_package_types_are_the_shims():
     for name, package_type in PACKAGE_TYPES.items():
-        assert remote.STRUCT_TYPES[name]._fields == package_type._fields
+        assert STRUCT_TYPES[name]._fields == package_type._fields

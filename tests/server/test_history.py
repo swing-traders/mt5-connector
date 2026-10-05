@@ -19,6 +19,7 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from saturation import Held, counters, until
 
 import mt5connector.client.history as history_client
+import mt5connector.client.remote_mt5 as shim
 import mt5connector.wire.history_wire as wire
 from mt5connector.client.downloader import MT5DataDownloader
 from mt5connector.client.errors import ServerUnreachable
@@ -464,7 +465,7 @@ def test_the_downloader_writes_every_tick_across_midnight_once(remote, stub, flo
     provider = MagicMock()
     provider.get_instrument.return_value = TestInstrumentProvider.default_fx_ccy("EUR/USD")
     catalog = MagicMock()
-    downloader = MT5DataDownloader(MagicMock(), provider, catalog)
+    downloader = MT5DataDownloader(MagicMock(mt5=remote), provider, catalog)
 
     result = downloader.download_ticks(
         "EURUSD",
@@ -1259,16 +1260,18 @@ def test_a_floor_in_a_repeated_hour_an_answer_warned_of_adds_no_warning(
 # ── The client ────────────────────────────────────────────────────────────────
 
 
-def test_the_client_answers_a_window_in_the_packages_types(remote, stub, floors):
+def test_the_client_answers_a_window_in_the_packages_types(remote, connection, stub, floors):
     floor = broker(2025, 7, 15, 12)
     stub.rates[H1] = rates(floor, floor + HOUR)
     kept(floors, Series.H1, floor)
 
-    answered = history_client.bars("EURUSD", wire.Series.H1, floor - DAY - EDT, floor + HOUR - EDT)
+    answered = history_client.bars(
+        connection, "EURUSD", wire.Series.H1, floor - DAY - EDT, floor + HOUR - EDT
+    )
 
     assert answered.dtype == RATES
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
-    ranges = history_client.ranges("EURUSD")
+    ranges = history_client.ranges(connection, "EURUSD")
     assert ranges == history_client.HistoryRanges(
         maxbars=100_000,
         series={
@@ -1279,35 +1282,39 @@ def test_the_client_answers_a_window_in_the_packages_types(remote, stub, floors)
     )
 
 
-def test_the_client_answers_none_for_a_failure_and_records_its_error(remote, stub):
+def test_the_client_answers_none_for_a_failure_and_records_its_error(remote, connection, stub):
     stub.script("symbol_select", (False, (-4, "Terminal: Not found")))
 
-    assert history_client.ticks("EURUSD", 1_752_570_000, 1_752_573_600) is None
+    assert history_client.ticks(connection, "EURUSD", 1_752_570_000, 1_752_573_600) is None
     assert remote.last_error() == (-4, "Terminal: Not found")
 
 
-def test_the_client_answers_none_for_a_window_in_the_future_and_records_the_refusal(remote, stub):
+def test_the_client_answers_none_for_a_window_in_the_future_and_records_the_refusal(
+    remote, connection, stub
+):
     start = NOW_UTC + HOUR
 
-    assert history_client.ticks("EURUSD", start, start + HOUR) is None
+    assert history_client.ticks(connection, "EURUSD", start, start + HOUR) is None
     assert remote.last_error() == (-2, f"start {start} is after the terminal's time {NOW_UTC}")
     assert stub.calls == []
 
 
-def test_the_client_waits_past_the_mirrors_read_timeout(remote, stub, floors, monkeypatch):
-    monkeypatch.setattr(remote, "READ_TIMEOUT_S", 0.2)
+def test_the_client_waits_past_the_mirrors_read_timeout(
+    remote, connection, stub, floors, monkeypatch
+):
+    monkeypatch.setattr(shim, "READ_TIMEOUT_S", 0.2)
     floor = broker(2025, 7, 15, 12)
     stub.rates[H1] = rates(floor)
     kept(floors, Series.H1, floor)
     stub.delay_s = 0.3
 
-    answered = history_client.bars("EURUSD", wire.Series.H1, floor - EDT, floor - EDT)
+    answered = history_client.bars(connection, "EURUSD", wire.Series.H1, floor - EDT, floor - EDT)
 
     assert len(answered) == 1
 
 
 def test_the_client_asks_again_after_each_syncing_answers_retry_after_until_the_rows(
-    remote, stub, floors, monkeypatch
+    remote, connection, stub, floors, monkeypatch
 ):
     slept = []
     monkeypatch.setattr(history_client, "time", types.SimpleNamespace(sleep=slept.append))
@@ -1316,14 +1323,16 @@ def test_the_client_asks_again_after_each_syncing_answers_retry_after_until_the_
     kept(floors, Series.H1, floor)
     stub.syncing = lambda: len(stub.windows("symbol_select")) <= 2
 
-    answered = history_client.bars("EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT)
+    answered = history_client.bars(
+        connection, "EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT
+    )
 
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
     assert len(stub.windows("symbol_select")) == 3
     assert slept == [5.0, 5.0]
 
 
-def test_a_cancellation_between_retries_stops_the_client(remote, stub, floors):
+def test_a_cancellation_between_retries_stops_the_client(remote, connection, stub, floors):
     floor = broker(2025, 7, 15, 12)
     stub.rates[H1] = rates(floor, floor + HOUR)
     kept(floors, Series.H1, floor)
@@ -1333,7 +1342,7 @@ def test_a_cancellation_between_retries_stops_the_client(remote, stub, floors):
     request = threading.Thread(
         target=lambda: answered.append(
             history_client.bars(
-                "EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT, cancel=cancel
+                connection, "EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT, cancel=cancel
             )
         )
     )
@@ -1377,7 +1386,7 @@ def releasing_sleep(cold_reads: Held, monkeypatch) -> list[float]:
 
 
 def test_the_client_asks_a_window_again_after_a_busy_answers_retry_after(
-    remote, stub, served, floors, cold_reads, monkeypatch
+    remote, connection, stub, served, floors, cold_reads, monkeypatch
 ):
     floor = broker(2025, 7, 15, 12)
     stub.rates[H1] = rates(floor, floor + HOUR)
@@ -1392,7 +1401,9 @@ def test_the_client_asks_a_window_again_after_a_busy_answers_retry_after(
     asked = asked_routes(remote, monkeypatch)
     slept = releasing_sleep(cold_reads, monkeypatch)
 
-    answered = history_client.bars("EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT)
+    answered = history_client.bars(
+        connection, "EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT
+    )
 
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
     assert asked == ["/history/bars", "/history/bars"]
@@ -1401,7 +1412,7 @@ def test_the_client_asks_a_window_again_after_a_busy_answers_retry_after(
 
 
 def test_the_client_asks_the_ranges_again_after_a_busy_answers_retry_after(
-    remote, stub, served, floors, cold_reads, monkeypatch
+    remote, connection, stub, served, floors, cold_reads, monkeypatch
 ):
     floor = broker(2025, 7, 15, 12)
     stub.rates[H1] = rates(floor, floor + HOUR)
@@ -1416,7 +1427,7 @@ def test_the_client_asks_the_ranges_again_after_a_busy_answers_retry_after(
     asked = asked_routes(remote, monkeypatch)
     slept = releasing_sleep(cold_reads, monkeypatch)
 
-    answered = history_client.ranges("EURUSD")
+    answered = history_client.ranges(connection, "EURUSD")
 
     assert answered.maxbars == 100_000
     assert set(answered.series) == {wire.Series.H1}
@@ -1430,16 +1441,19 @@ def test_the_client_asks_the_ranges_again_after_a_busy_answers_retry_after(
     [
         (
             "/history/bars",
-            lambda cancel: history_client.bars(
-                "EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600, cancel=cancel
+            lambda connection, cancel: history_client.bars(
+                connection, "EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600, cancel=cancel
             ),
         ),
-        ("/history/ranges", lambda cancel: history_client.ranges("EURUSD", cancel=cancel)),
+        (
+            "/history/ranges",
+            lambda connection, cancel: history_client.ranges(connection, "EURUSD", cancel=cancel),
+        ),
     ],
     ids=["bars", "ranges"],
 )
 def test_a_cancellation_while_the_server_is_busy_stops_the_client(
-    remote, stub, served, floors, cold_reads, monkeypatch, route, read
+    remote, connection, stub, served, floors, cold_reads, monkeypatch, route, read
 ):
     floor = broker(2025, 7, 15, 12)
     stub.rates[H1] = rates(floor, floor + HOUR)
@@ -1454,7 +1468,7 @@ def test_a_cancellation_while_the_server_is_busy_stops_the_client(
     asked = asked_routes(remote, monkeypatch)
     cancel = threading.Event()
     answered = []
-    request = threading.Thread(target=lambda: answered.append(read(cancel)))
+    request = threading.Thread(target=lambda: answered.append(read(connection, cancel)))
 
     request.start()
     until(lambda: counters(served)["refusals"] == 1)
@@ -1480,7 +1494,7 @@ def test_a_syncing_reply_carries_its_status_and_code_as_members_and_its_retry_af
 
 
 def test_the_client_raises_server_unreachable_while_the_server_is_not_ready(
-    remote, stub, clock_status
+    remote, connection, stub, clock_status
 ):
     clock_status.clear()
 
@@ -1488,6 +1502,6 @@ def test_the_client_raises_server_unreachable_while_the_server_is_not_ready(
         ServerUnreachable,
         match="^history/bars: server not ready — the broker clock is not verified$",
     ):
-        history_client.bars("EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600)
+        history_client.bars(connection, "EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600)
     with pytest.raises(ServerUnreachable, match="^history/ranges: server not ready"):
-        history_client.ranges("EURUSD")
+        history_client.ranges(connection, "EURUSD")

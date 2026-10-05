@@ -15,7 +15,6 @@ from nautilus_trader.model.objects import Price, Quantity
 
 from mt5connector.client.downloader import DownloadResult, MT5DataDownloader, _ensure_utc
 from mt5connector.client.errors import (
-    MT5ConfigError,
     MT5ConnectionError,
     MT5InstrumentError,
     MT5SymbolNotFoundError,
@@ -66,15 +65,15 @@ class Server:
         self.asked = []
         self.ranges_read = 0
 
-    def bars(self, symbol, series, lo, hi):
+    def bars(self, connection, symbol, series, lo, hi):
         self.asked.append((symbol, series, lo, hi))
         return self._answer(rate_rows(hi - HOUR, hi))
 
-    def ticks(self, symbol, lo, hi):
+    def ticks(self, connection, symbol, lo, hi):
         self.asked.append((symbol, lo, hi))
         return self._answer(tick_rows(hi * 1000))
 
-    def ranges(self, symbol):
+    def ranges(self, connection, symbol):
         self.ranges_read += 1
         series = {}
         if len(self.asked) >= self.measured_after:
@@ -185,12 +184,11 @@ def downloader(conn, provider, catalog):
 
 
 @pytest.fixture
-def package():
-    with patch("mt5connector.client.downloader.mt5") as mt5:
-        mt5.TIMEFRAME_H1 = mirror.TIMEFRAME_H1
-        mt5.TIMEFRAME_D1 = mirror.TIMEFRAME_D1
-        mt5.last_error.return_value = (-4, "Terminal: Not found")
-        yield mt5
+def package(conn):
+    """The transport of the downloader's connection, its last error a symbol the terminal does not
+    know."""
+    conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
+    return conn.mt5
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -379,20 +377,17 @@ class TestDownloadBarsWalk:
         assert (result.chunks_processed, result.total_written) == (2, 1)
         assert str(failure) in result.errors[0]
 
-    @pytest.mark.parametrize(
-        "failure",
-        [RuntimeError("a defect"), MT5ConfigError("remote_mt5: no server is configured")],
-        ids=["defect", "unconfigured"],
-    )
     def test_a_window_failing_any_other_way_raises_and_ends_the_walk(
-        self, downloader, catalog, package, failure
+        self, downloader, catalog, package
     ):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN - SPAN - 50 * HOUR})
         with (
             serving(server),
-            patch("mt5connector.client.history.bars", side_effect=[failure]) as bars,
+            patch(
+                "mt5connector.client.history.bars", side_effect=[RuntimeError("a defect")]
+            ) as bars,
         ):
-            with pytest.raises(type(failure), match=str(failure)):
+            with pytest.raises(RuntimeError, match="a defect"):
                 downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert bars.call_count == 1

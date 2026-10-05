@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 
-from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.commissions import (
     MONEY_MODES,
     CommissionRule,
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
     from nautilus_trader.config import InstrumentProviderConfig
 
     from mt5connector.client.connection import AccountSnapshot, MT5Connection
+    from mt5connector.client.remote_mt5 import RemoteMT5
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         """Loads every symbol the terminal serves, selecting each in Market Watch; the commission
         read of a symbol no EA publishes opens its chart, and the terminal holds at most CHARTS_MAX
         charts."""
-        self._load(sorted(info.name for info in _venue_symbols()))
+        self._load(sorted(info.name for info in _venue_symbols(self._conn.mt5)))
 
     async def load_ids_async(
         self,
@@ -119,9 +119,9 @@ class MT5InstrumentProvider(InstrumentProvider):
 
     def _select_and_read(self, symbol: str):
         """Selects a symbol in Market Watch and reads its definition."""
-        if not mt5.symbol_select(symbol, True):
+        if not self._conn.mt5.symbol_select(symbol, True):
             raise MT5SymbolNotFoundError(symbol)
-        info = mt5.symbol_info(symbol)
+        info = self._conn.mt5.symbol_info(symbol)
         if info is None:
             raise MT5SymbolNotFoundError(symbol)
         return info
@@ -131,12 +131,13 @@ class MT5InstrumentProvider(InstrumentProvider):
         commission rule the server relays, selecting first the symbol that converts a money rule's
         currency into the quote currency; raises MT5InstrumentError when the venue refuses that
         selection."""
-        rule = parse_schedule(mt5.commission_schedule(info.name))
+        rule = parse_schedule(self._conn.mt5.commission_schedule(info.name))
         if rule is not None and rule.mode in MONEY_MODES and rule.currency != info.currency_profit:
             converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
-            if not mt5.symbol_select(converter, True):
+            if not self._conn.mt5.symbol_select(converter, True):
                 raise MT5InstrumentError(f"{converter} cannot be selected")
-        return parse_symbol_info(info, self._venue, account, _taker_fee(info, rule, pairs), ts)
+        fee = _taker_fee(self._conn.mt5, info, rule, pairs)
+        return parse_symbol_info(info, self._venue, account, fee, ts)
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
 
@@ -145,7 +146,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         loads, else one fully tradable, else the first that prices once selected, each in
         alphabetical order."""
         buckets: dict[tuple[str, str], list[tuple[str, TradeMode]]] = {}
-        for info in sorted(_venue_symbols(), key=attrgetter("name")):
+        for info in sorted(_venue_symbols(self._conn.mt5), key=attrgetter("name")):
             try:
                 if calc_mode(info) in FOREX_MODES:
                     pair = (info.currency_base, info.currency_profit)
@@ -154,7 +155,7 @@ class MT5InstrumentProvider(InstrumentProvider):
                 raise MT5InstrumentError(f"{info.name}: {exc}") from exc
         pairs = {}
         for pair, candidates in buckets.items():
-            symbol = _select_quoting_symbol(candidates, loaded)
+            symbol = _select_quoting_symbol(self._conn.mt5, candidates, loaded)
             if symbol is not None:
                 pairs[pair] = symbol
         return pairs
@@ -177,7 +178,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         return f"MT5InstrumentProvider(loaded={len(self._instruments)})"
 
 
-def _venue_symbols() -> tuple:
+def _venue_symbols(mt5: RemoteMT5) -> tuple:
     """Every symbol the terminal serves; raises MT5ConnectionError for a listing that reads None."""
     venue_symbols = mt5.symbols_get()
     if venue_symbols is None:
@@ -186,7 +187,9 @@ def _venue_symbols() -> tuple:
     return venue_symbols
 
 
-def _select_quoting_symbol(candidates: list[tuple[str, TradeMode]], loaded: set[str]) -> str | None:
+def _select_quoting_symbol(
+    mt5: RemoteMT5, candidates: list[tuple[str, TradeMode]], loaded: set[str]
+) -> str | None:
     for symbol, _ in candidates:
         if symbol in loaded:
             return symbol
@@ -202,7 +205,7 @@ def _select_quoting_symbol(candidates: list[tuple[str, TradeMode]], loaded: set[
     return None
 
 
-def _taker_fee(info, rule: CommissionRule | None, pairs: _Pairs) -> Decimal:
+def _taker_fee(mt5: RemoteMT5, info, rule: CommissionRule | None, pairs: _Pairs) -> Decimal:
     """The symbol's taker fee under its commission rule, zero without one; the conversion into its
     quote currency is the venue's own quote, never NT's."""
     if rule is None:
@@ -210,23 +213,23 @@ def _taker_fee(info, rule: CommissionRule | None, pairs: _Pairs) -> Decimal:
     else:
         return taker_fee(
             rule,
-            price=_mid(info.name),
+            price=_mid(mt5, info.name),
             contract_size=finite_decimal(info.trade_contract_size, "trade_contract_size"),
             point=finite_decimal(info.point, "point"),
-            rate=lambda currency: _rate(currency, info.currency_profit, pairs),
+            rate=lambda currency: _rate(mt5, currency, info.currency_profit, pairs),
         )
 
 
-def _rate(source: str, target: str, pairs: _Pairs) -> Decimal:
+def _rate(mt5: RemoteMT5, source: str, target: str, pairs: _Pairs) -> Decimal:
     """`target` units per `source` unit at the mid of the venue's quote for the pair."""
     if source == target:
         return Decimal(1)
     else:
         symbol, inverse = _conversion(source, target, pairs)
         if inverse:
-            return 1 / _mid(symbol)
+            return 1 / _mid(mt5, symbol)
         else:
-            return _mid(symbol)
+            return _mid(mt5, symbol)
 
 
 def _conversion(source: str, target: str, pairs: _Pairs) -> tuple[str, bool]:
@@ -240,7 +243,7 @@ def _conversion(source: str, target: str, pairs: _Pairs) -> tuple[str, bool]:
         raise MT5InstrumentError(f"no venue symbol converts {source} into {target}")
 
 
-def _mid(symbol: str) -> Decimal:
+def _mid(mt5: RemoteMT5, symbol: str) -> Decimal:
     """The mid of a selected symbol's last quote; raises MT5InstrumentError while it has none."""
     quote = mt5.symbol_info_tick(symbol)
     if quote is None or quote.time == 0:

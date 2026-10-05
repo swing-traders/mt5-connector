@@ -7,7 +7,8 @@ from chart_posts import ChartPosts, publishers_on
 from mirror_samples import CLOCK
 from saturation import Held
 
-import mt5connector.client.remote_mt5 as shim
+from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import MT5Connection
 from mt5connector.server.app import create_app
 from mt5connector.server.clock_check import ClockStatus, ClockVerification
 from mt5connector.server.commissions import CommissionStore
@@ -135,15 +136,20 @@ def served(app, workers):
 
 
 @pytest.fixture
-def remote(served, monkeypatch):
-    """The remote shim configured against the served app."""
-    monkeypatch.setattr(shim, "_session", None)
-    monkeypatch.setattr(shim, "_server_url", None)
-    monkeypatch.setattr(shim, "_ws_url", None)
-    monkeypatch.setattr(shim, "_last_error", shim._last_error)
-    shim.configure(served)
-    yield shim
-    shim._session.close()
+def connection(served):
+    """A client connection to the served app, never logged in: what its history reads and its
+    transport's calls reach is the app."""
+    connection = MT5Connection(
+        MT5Config(account=12345678, password="p", server="MT5_ALPHA", server_url=served)
+    )
+    yield connection
+    connection.mt5.close_session()
+
+
+@pytest.fixture
+def remote(connection):
+    """The transport of the client connection to the served app."""
+    return connection.mt5
 
 
 @pytest.fixture

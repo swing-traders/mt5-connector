@@ -1,8 +1,8 @@
 """The adapter's connection to the MT5 terminal behind the server, and the account as the terminal
 reports it.
 
-State: where the connection is in its lifecycle, and the reconnect attempts made since it last
-connected."""
+State: the connection's own transport to its server, where the connection is in its lifecycle, and
+the reconnect attempts made since it last connected."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from decimal import Decimal
 from enum import Enum, StrEnum, auto
 from typing import TYPE_CHECKING
 
-from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.errors import MT5ConnectionError, MT5LoginError, ServerBusy
+from mt5connector.client.remote_mt5 import RemoteMT5
 from mt5connector.wire import mirror
 
 if TYPE_CHECKING:
@@ -145,11 +145,12 @@ def _finite(value: float, field: str) -> Decimal:
 
 
 class MT5Connection:
-    """The lifecycle of the connection to the MT5 terminal behind the server, shared by the clients
-    of one account."""
+    """The connection to the MT5 terminal behind one server, shared by the clients of one account:
+    its lifecycle, and the transport every call to that server travels on."""
 
     def __init__(self, config: MT5Config) -> None:
         self._config = config
+        self.mt5 = RemoteMT5(config.server_url)
         self._state = ConnectionState.DISCONNECTED
         self._attempt = 0
         self._reconnect_lock = asyncio.Lock()
@@ -157,27 +158,30 @@ class MT5Connection:
     # ── Core lifecycle ────────────────────────────────────────────────────────
 
     def connect(self) -> None:
-        """Binds the shim to the configured server, initializes the terminal and logs in to the
-        broker. Raises MT5ConnectionError naming the state on a connection already connected or
-        connecting, and MT5ConnectionError or MT5LoginError for a step that fails."""
+        """Initializes the terminal and logs in to the broker. Raises MT5ConnectionError naming the
+        state on a connection already connected or connecting, and MT5ConnectionError or
+        MT5LoginError for a step that fails."""
         if self._state in _CONNECTED_OR_CONNECTING:
             raise MT5ConnectionError(
                 f"MT5 already connected or connecting (state={self._state.name})"
             )
-        mt5.configure(self._config.server_url, self._config.ws_url)
         self._initialize()
         self._login()
         self._log_connected()
         self._attempt = 0
 
     def disconnect(self) -> None:
-        """Shuts the terminal session down; raises MT5ConnectionError naming the state on a
-        connection not connected."""
+        """Shuts the terminal session down and closes the transport's HTTP session, even when the
+        shutdown raises; raises MT5ConnectionError naming the state on a connection not
+        connected."""
         if self._state in (ConnectionState.DISCONNECTED, ConnectionState.SHUTTING_DOWN):
             raise MT5ConnectionError(f"MT5 not connected (state={self._state.name})")
         logger.info("MT5Connection: shutting down")
         self._state = ConnectionState.SHUTTING_DOWN
-        mt5.shutdown()
+        try:
+            self.mt5.shutdown()
+        finally:
+            self.mt5.close_session()
         self._state = ConnectionState.DISCONNECTED
         logger.info("MT5Connection: disconnected")
 
@@ -225,7 +229,7 @@ class MT5Connection:
             delay = min(delay * 2.0, self._config.reconnect_max_delay_s)
 
             try:
-                await self._served(mt5.shutdown)
+                await self._served(self.mt5.shutdown)
                 await self._served(self._initialize)
                 await self._served(self._login)
                 await self._served(self._log_connected)
@@ -262,9 +266,9 @@ class MT5Connection:
         """The account as the terminal reports it now; raises MT5ConnectionError when not connected
         or when the read fails."""
         self.ensure_connected()
-        info = mt5.account_info()
+        info = self.mt5.account_info()
         if info is None:
-            code, msg = mt5.last_error()
+            code, msg = self.mt5.last_error()
             raise MT5ConnectionError(f"mt5.account_info() returned None — error {code}: {msg}")
         return AccountSnapshot.from_mt5(info)
 
@@ -272,9 +276,9 @@ class MT5Connection:
         """The server's MT5 terminal as `terminal_info()` reports it, its trading permission and
         connection included; raises MT5ConnectionError when not connected or when the read fails."""
         self.ensure_connected()
-        info = mt5.terminal_info()
+        info = self.mt5.terminal_info()
         if info is None:
-            code, msg = mt5.last_error()
+            code, msg = self.mt5.last_error()
             raise MT5ConnectionError(f"mt5.terminal_info() returned None — error {code}: {msg}")
         return {
             "name": info.name,
@@ -295,12 +299,12 @@ class MT5Connection:
         self._state = ConnectionState.INITIALIZING
 
         try:
-            ok = mt5.initialize()
+            ok = self.mt5.initialize()
         except MT5ConnectionError:
             self._state = ConnectionState.DISCONNECTED
             raise
         if not ok:
-            code, msg = mt5.last_error()
+            code, msg = self.mt5.last_error()
             self._state = ConnectionState.DISCONNECTED
             raise MT5ConnectionError(
                 f"mt5.initialize() failed on the server's MT5 terminal — error {code}: {msg}"
@@ -316,7 +320,7 @@ class MT5Connection:
         self._state = ConnectionState.LOGGING_IN
 
         try:
-            ok = mt5.login(
+            ok = self.mt5.login(
                 login=self._config.account,
                 password=self._config.password,
                 server=self._config.server,
@@ -327,14 +331,14 @@ class MT5Connection:
             raise
 
         if not ok:
-            code, msg = mt5.last_error()
+            code, msg = self.mt5.last_error()
             self._state = ConnectionState.INITIALIZED
             raise MT5LoginError(f"mt5.login() failed — error {code}: {msg}")
 
         self._state = ConnectionState.CONNECTED
 
     def _log_connected(self) -> None:
-        info = mt5.account_info()
+        info = self.mt5.account_info()
         if info:
             logger.info(f"MT5Connection: connected — {AccountSnapshot.from_mt5(info)}")
         else:

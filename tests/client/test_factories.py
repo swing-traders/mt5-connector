@@ -171,6 +171,14 @@ class TestConnectionRegistryIsolation:
         _ensure_connection(make_config(account=10000003))
         assert len(_connection_registry) == 3
 
+    def test_two_accounts_get_two_connections_keyed_by_account_and_server(self, mock_mt5_conn):
+        MockConn, _ = mock_mt5_conn
+        MockConn.side_effect = lambda config: MagicMock()
+        first = _ensure_connection(make_config(account=1001, server="MT5_ALPHA"))
+        second = _ensure_connection(make_config(account=1002, server="MT5_BETA"))
+        assert first is not second
+        assert _connection_registry == {(1001, "MT5_ALPHA"): first, (1002, "MT5_BETA"): second}
+
 
 class TestDataClientFactory:
     def test_create_returns_mt5_data_client(self, mock_mt5_conn, mock_provider):
@@ -359,9 +367,10 @@ class TestBuildMt5NodeConfig:
 
 
 @pytest.fixture
-def terminal():
-    """The package behind the provider's shim, serving EURUSD and GBPUSD, neither charging a
+def terminal(mock_mt5_conn):
+    """The transport of the shared connection, serving EURUSD and GBPUSD, neither charging a
     commission."""
+    _, conn = mock_mt5_conn
     definitions = {
         "EURUSD": symbol_info(name="EURUSD"),
         "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
@@ -371,8 +380,8 @@ def terminal():
     package.symbol_info.side_effect = definitions.get
     package.symbols_get.return_value = tuple(definitions.values())
     package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    with patch("mt5connector.client.providers.mt5", package):
-        yield package
+    conn.mt5 = package
+    return package
 
 
 def loaded_ids(provider) -> set[InstrumentId]:

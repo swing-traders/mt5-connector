@@ -354,7 +354,7 @@ class History:
         self.reads = []
         self.gates = []
 
-    def __call__(self, symbol, series, start, end, cancel):
+    def __call__(self, connection, symbol, series, start, end, cancel):
         gate = threading.Event()
         self.reads.append((symbol, series, start, end))
         self.gates.append(gate)
@@ -478,7 +478,9 @@ async def test_a_failed_read_back_is_an_error_and_the_held_bars_go_on():
         c.push.deliver(bar(NINE + 180))
         await until(lambda: c.bars())
 
-    history_bars.assert_called_once_with("EURUSD", Series.M1, NINE - 29, NINE + 179, cancel=ANY)
+    history_bars.assert_called_once_with(
+        c.client._conn, "EURUSD", Series.M1, NINE - 29, NINE + 179, cancel=ANY
+    )
     assert opens(c) == [NINE + 180]
     assert len(c.client._log.error.call_args_list) == 1
 

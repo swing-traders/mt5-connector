@@ -5,7 +5,7 @@ The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5
 Releases are wheels on the fork's package index, versioned together with the client's:
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.6.0+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.0+st"
 ```
 
 | Part | What it is |
@@ -19,7 +19,7 @@ python -m pip install --extra-index-url https://swing-traders.github.io/mt5-conn
 
 ## HTTP API
 
-The server mirrors the `MetaTrader5` package (5.0.6231), so code written against `import MetaTrader5 as mt5` runs unchanged against the client's `mt5connector.client.remote_mt5`. Both are generated from one inventory of the package, `mirror.py` in the wire vocabulary.
+The server mirrors the `MetaTrader5` package (5.0.6231): a `RemoteMT5` of the client's `mt5connector.client.remote_mt5`, one per connection, carries the package's functions with their signatures, and the package's constants and struct types live in `mirror.py`, the one inventory of the package in the wire vocabulary that both sides are generated from.
 
 - `POST /mt5/<function>` for each of the package's 32 functions, its arguments a JSON object keyed by parameter name; datetimes travel as true-UTC epoch seconds.
 - A package call answers `{"ok": true, "result": ..., "last_error": [code, message]}` or `{"ok": false, "error": {"code": ..., "message": ...}, "last_error": [code, message]}`. `last_error` is the package's `last_error()` read right after the call; a failure's error is that same pair. Structs answer as objects in the package's field order, arrays as lists of objects keyed by the dtype's fields.
