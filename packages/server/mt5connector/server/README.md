@@ -5,7 +5,7 @@ The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5
 Releases are wheels on the fork's package index, versioned together with the client's:
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.0+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.1+st"
 ```
 
 | Part | What it is |
