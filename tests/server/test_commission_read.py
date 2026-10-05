@@ -11,6 +11,7 @@ from mirror_samples import struct_sample
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.identifiers import InstrumentId
 
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import MT5InstrumentError, ServerBusy, ServerUnreachable
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
@@ -184,7 +185,7 @@ def provider(stub):
     )
     connection = MagicMock()
     connection.get_account_info.return_value = MagicMock(currency="USD", currency_digits=2)
-    return MT5InstrumentProvider(connection=connection, clock=TestClock())
+    return MT5InstrumentProvider(connection=connection, venue=MT5_VENUE, clock=TestClock())
 
 
 def test_a_relayed_empty_schedule_loads_a_zero_fee(remote, served, provider):

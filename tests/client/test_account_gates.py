@@ -15,7 +15,14 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.model.enums import CurrencyType, OmsType
-from nautilus_trader.model.identifiers import InstrumentId, PositionId, Symbol, TraderId
+from nautilus_trader.model.identifiers import (
+    ClientId,
+    InstrumentId,
+    PositionId,
+    Symbol,
+    TraderId,
+    Venue,
+)
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
@@ -26,6 +33,7 @@ from venue_doubles import account_info, symbol_info, trade_position
 from mt5connector.client import connection, execution
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
@@ -34,12 +42,13 @@ from mt5connector.wire import mirror
 EURUSD_ONLY = InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("EURUSD.MT5")}))
 
 
-def _config() -> MT5Config:
+def _config(venue: Venue = MT5_VENUE) -> MT5Config:
     return MT5Config(
         account=12345678,
         password="p",
         server="Broker-Demo",
         server_url="http://127.0.0.1:5000",
+        venue=venue,
     )
 
 
@@ -70,6 +79,7 @@ def _client(
     terminal_trade_allowed=True,
     instruments=(),
     trader_id="TESTER-001",
+    venue: Venue = MT5_VENUE,
 ) -> MT5LiveExecutionClient:
     try:
         loop = asyncio.get_running_loop()
@@ -90,7 +100,7 @@ def _client(
             cache=TestComponentStubs.cache(),
             clock=clock,
             instrument_provider=_provider(instruments),
-            config=_config(),
+            config=_config(venue),
         )
     client.generate_account_state = MagicMock()
     return client
@@ -285,6 +295,26 @@ async def test_two_traders_on_one_login_book_under_two_ids_sharing_the_logins_ha
     assert "7654321" not in first.account_id.value + second.account_id.value
 
 
+async def test_a_client_of_a_named_venue_books_under_that_venue_and_is_its_client(venue):
+    client = _client(account_info(login=7654321), venue=Venue("MT5_ALPHA"))
+    try:
+        await client._connect()
+    finally:
+        await _stop_account_loop(client)
+    assert client.account_id == account_id_of(7654321, "TESTER-001", "MT5_ALPHA")
+    assert (client.id, client.venue) == (ClientId("MT5_ALPHA"), Venue("MT5_ALPHA"))
+
+
+async def test_the_default_venue_client_books_under_mt5(venue):
+    client = _client(account_info(login=7654321))
+    try:
+        await client._connect()
+    finally:
+        await _stop_account_loop(client)
+    assert client.account_id == account_id_of(7654321, "TESTER-001")
+    assert (client.id, client.venue) == (ClientId("MT5"), Venue("MT5"))
+
+
 # ── The account's currency ───────────────────────────────────────────────────
 
 
@@ -360,7 +390,7 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
     for digits in (8, 2):
         client = _client(account_info(currency="UST", currency_digits=digits))
         client._provider = MT5InstrumentProvider(
-            connection=client._conn, clock=LiveClock(), config=EURUSD_ONLY
+            connection=client._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
         )
         try:
             await client._connect()
@@ -394,7 +424,7 @@ async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
     settlement_venue.symbol_info.return_value = symbol_info(currency_profit=code)
     later = _client(account_info(currency="USD"))
     later._provider = MT5InstrumentProvider(
-        connection=later._conn, clock=LiveClock(), config=EURUSD_ONLY
+        connection=later._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
     )
     try:
         if precision is None:
@@ -484,7 +514,9 @@ def _served_client(provider_config: InstrumentProviderConfig):
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
-    provider = MT5InstrumentProvider(connection=conn, clock=clock, config=provider_config)
+    provider = MT5InstrumentProvider(
+        connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
+    )
     with patch.object(execution, "PushClient", PushDouble):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),

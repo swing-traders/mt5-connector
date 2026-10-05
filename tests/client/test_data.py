@@ -22,6 +22,7 @@ from venue_doubles import account_info, symbol_info
 
 from mt5connector.client import data
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient, _epoch_s
 from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.providers import MT5InstrumentProvider
@@ -82,7 +83,7 @@ def make_raw_rate(
     return arr[0]
 
 
-def make_config(ws_url=None):
+def make_config(ws_url=None, venue=MT5_VENUE):
     from mt5connector.client.config import MT5Config
 
     return MT5Config(
@@ -91,6 +92,7 @@ def make_config(ws_url=None):
         server="Exness-MT5Trial1",
         server_url="http://127.0.0.1:5000",
         ws_url=ws_url,
+        venue=venue,
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
         reconnect_max_attempts=2,
@@ -119,6 +121,7 @@ def make_provider(instrument=None):
 
     InstrumentProvider.__init__(provider, InstrumentProviderConfig(load_ids=frozenset({inst.id})))
     provider._conn = conn
+    provider._venue = MT5_VENUE
     provider._failed_symbols = []
 
     provider.get_instrument = MagicMock(return_value=inst)
@@ -148,6 +151,7 @@ def make_client(
     client_class=MT5DataClient,
     nt_handlers=False,
     ws_url=None,
+    venue=MT5_VENUE,
 ):
     """Build a fully wired MT5DataClient with real NautilusTrader components, its handlers recorded
     unless `nt_handlers` keeps NT's own."""
@@ -160,7 +164,7 @@ def make_client(
     except RuntimeError:
         loop = asyncio.new_event_loop()
 
-    config = make_config(ws_url=ws_url)
+    config = make_config(ws_url=ws_url, venue=venue)
     conn = make_conn(connected)
     provider = make_provider(instrument)
 
@@ -225,7 +229,12 @@ class TestEpochS:
 class TestInitialState:
 
     def test_client_id_is_mt5(self, client):
-        assert client.id == ClientId("MT5")
+        assert (client.id, client.venue) == (ClientId("MT5"), Venue("MT5"))
+
+    def test_the_client_id_and_venue_are_the_configs_venue(self):
+        client, conn, provider, loop = make_client(venue=Venue("MT5_ALPHA"))
+        assert (client.id, client.venue) == (ClientId("MT5_ALPHA"), Venue("MT5_ALPHA"))
+        loop.close()
 
     def test_no_subscribed_ticks_initially(self, client):
         assert client.subscribed_quote_ticks() == []
@@ -612,6 +621,26 @@ class TestRequestInstruments:
         assert response.data == provider.list_all()
 
     @pytest.mark.asyncio
+    async def test_an_instruments_request_answers_at_the_configs_venue(self):
+        client, conn, provider, loop = make_client(nt_handlers=True, venue=Venue("MT5_ALPHA"))
+        responses = responses_of(client)
+        request = RequestInstruments(
+            start=None,
+            end=None,
+            client_id=ClientId("MT5_ALPHA"),
+            venue=Venue("MT5_ALPHA"),
+            callback=None,
+            request_id=UUID4(),
+            ts_init=0,
+            params=None,
+        )
+
+        await client._request_instruments(request)
+
+        [response] = responses
+        assert (response.correlation_id, response.venue) == (request.id, Venue("MT5_ALPHA"))
+
+    @pytest.mark.asyncio
     async def test_an_instrument_loaded_later_registers_its_settlement_currency_first(self):
         from nautilus_trader.core import nautilus_pyo3
         from nautilus_trader.model.enums import CurrencyType
@@ -685,7 +714,9 @@ def served_client(provider_config: InstrumentProviderConfig):
     data recorded."""
     conn = MagicMock(spec=MT5Connection)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
-    provider = MT5InstrumentProvider(conn, clock=LiveClock(), config=provider_config)
+    provider = MT5InstrumentProvider(
+        conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
+    )
     with patch.object(data, "PushClient", PushDouble):
         client = MT5DataClient(
             loop=asyncio.get_running_loop(),

@@ -7,11 +7,13 @@ import numpy as np
 import pytest
 from nautilus_trader.model.data import Bar, BarType, QuoteTick
 from nautilus_trader.model.enums import BarAggregation
+from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from venue_doubles import account_info, symbol_info
 
 from mt5connector.client.connection import AccountSnapshot
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.parsing import (
     _MT5_TIMEFRAME_MAP,
     parse_quote_tick,
@@ -29,7 +31,7 @@ from mt5connector.wire import mirror
 def instrument(**fields):
     """The instrument the parser builds from a symbol definition under `fields`."""
     account = AccountSnapshot.from_mt5(account_info())
-    return parse_symbol_info(symbol_info(**fields), account, Decimal(0), 0)
+    return parse_symbol_info(symbol_info(**fields), MT5_VENUE, account, Decimal(0), 0)
 
 
 TICKS = np.dtype(list(mirror.TICKS.dtype))
@@ -67,6 +69,18 @@ def make_rate(
         [(time_s, open_, high, low, close, tick_volume, spread, real_volume)], dtype=dtype
     )
     return arr[0]
+
+
+class TestParseSymbolInfo:
+    def test_the_instrument_id_is_the_symbol_at_the_venue_given(self):
+        account = AccountSnapshot.from_mt5(account_info())
+        result = parse_symbol_info(
+            symbol_info(name="XAUUSD"), Venue("MT5_ALPHA"), account, Decimal(0), 0
+        )
+        assert result.id == InstrumentId.from_str("XAUUSD.MT5_ALPHA")
+
+    def test_the_default_venue_builds_the_symbol_at_mt5(self):
+        assert instrument(name="EURUSD").id == InstrumentId.from_str("EURUSD.MT5")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

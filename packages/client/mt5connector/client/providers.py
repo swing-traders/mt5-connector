@@ -12,7 +12,7 @@ from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from nautilus_trader.common.providers import InstrumentProvider
-from nautilus_trader.model.identifiers import InstrumentId, Symbol
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 
 from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.commissions import (
@@ -21,7 +21,6 @@ from mt5connector.client.commissions import (
     parse_schedule,
     taker_fee,
 )
-from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import (
     MT5ConfigError,
     MT5ConnectionError,
@@ -56,11 +55,13 @@ class MT5InstrumentProvider(InstrumentProvider):
     def __init__(
         self,
         connection: MT5Connection,
+        venue: Venue,
         clock: Clock,
         config: InstrumentProviderConfig | None = None,
     ) -> None:
         super().__init__(config)
         self._conn = connection
+        self._venue = venue
         self._clock = clock
         self._quoted_pairs: dict[tuple[str, str], str] = {}
 
@@ -135,7 +136,7 @@ class MT5InstrumentProvider(InstrumentProvider):
             converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
             if not mt5.symbol_select(converter, True):
                 raise MT5InstrumentError(f"{converter} cannot be selected")
-        return parse_symbol_info(info, account, _taker_fee(info, rule, pairs), ts)
+        return parse_symbol_info(info, self._venue, account, _taker_fee(info, rule, pairs), ts)
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
 
@@ -170,7 +171,7 @@ class MT5InstrumentProvider(InstrumentProvider):
 
     def get_instrument(self, symbol: str) -> InstrumentAny | None:
         """The loaded instrument of a symbol, by its exact broker name; None while not loaded."""
-        return self.find(InstrumentId(Symbol(symbol), MT5_VENUE))
+        return self.find(InstrumentId(Symbol(symbol), self._venue))
 
     def __repr__(self) -> str:
         return f"MT5InstrumentProvider(loaded={len(self._instruments)})"

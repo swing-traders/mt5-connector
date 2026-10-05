@@ -11,11 +11,10 @@ from typing import TYPE_CHECKING
 
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, MarkPriceUpdate, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
-from nautilus_trader.model.identifiers import InstrumentId, Symbol
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 
-from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.currencies import base_currency, venue_currency
 from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.wire import mirror
@@ -137,29 +136,33 @@ def _member(value: int, members: dict, field: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def parse_symbol_info(info, account: AccountSnapshot, taker_fee: Decimal, ts: int) -> InstrumentAny:
-    """The instrument an mt5.symbol_info() definition describes: a FOREX calc mode is a CurrencyPair
-    and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it. Margins stay NT's
-    defaults: the venue states them as money per lot, which no ratio expresses without a price."""
+def parse_symbol_info(
+    info, venue: Venue, account: AccountSnapshot, taker_fee: Decimal, ts: int
+) -> InstrumentAny:
+    """The instrument an mt5.symbol_info() definition describes at `venue`: a FOREX calc mode is a
+    CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
+    Margins stay NT's defaults: the venue states them as money per lot, which no ratio expresses
+    without a price."""
     kind = calc_mode(info)
     if kind in FOREX_MODES:
-        return CurrencyPair(**_definition(info, kind, account, taker_fee, ts))
+        return CurrencyPair(**_definition(info, kind, venue, account, taker_fee, ts))
     elif kind in CFD_MODES:
         return Cfd(
-            asset_class=_asset_class(kind), **_definition(info, kind, account, taker_fee, ts)
+            asset_class=_asset_class(kind),
+            **_definition(info, kind, venue, account, taker_fee, ts),
         )
     else:
         raise MT5InstrumentError(f"trade_calc_mode {kind} is not one this adapter trades")
 
 
 def _definition(
-    info, kind: CalcMode, account: AccountSnapshot, taker_fee: Decimal, ts: int
+    info, kind: CalcMode, venue: Venue, account: AccountSnapshot, taker_fee: Decimal, ts: int
 ) -> dict:
     if info.trade_tick_size <= 0:
         raise MT5InstrumentError(f"trade_tick_size {info.trade_tick_size} is not positive")
     size_precision = _decimals(info.volume_step)
     return {
-        "instrument_id": InstrumentId(Symbol(info.name), MT5_VENUE),
+        "instrument_id": InstrumentId(Symbol(info.name), venue),
         "raw_symbol": Symbol(info.name),
         "base_currency": base_currency(info.currency_base, account),
         "quote_currency": venue_currency(info.currency_profit, account),

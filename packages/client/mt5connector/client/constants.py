@@ -1,4 +1,5 @@
-"""The venue's id and the client's defaults for its account loop and its reconnect backoff."""
+"""The default venue's id, and the client's defaults for its account loop and its reconnect
+backoff."""
 
 from nautilus_trader.model.identifiers import Venue
 

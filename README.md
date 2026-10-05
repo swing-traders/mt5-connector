@@ -91,13 +91,13 @@ Releases are published as wheels on the fork's package index. The client pins th
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.5.1+st"
+  "mt5-connector-client==0.6.0+st"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.5.1+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.6.0+st"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
@@ -135,9 +135,12 @@ The adapter's own configuration goes through `MT5Config`; its required fields ar
 
 - without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
 - with a `ws_url` that is not a `ws` or `wss` URL naming a host;
-- with either URL malformed, or naming a port outside 1–65535.
+- with either URL malformed, or naming a port outside 1–65535;
+- with a `venue` that is not a NautilusTrader `Venue`, or whose name is neither `MT5` nor `MT5_` followed by 1 to 8 capital letters or digits — NautilusTrader reads an account id's issuer as the text before its first hyphen, so a venue cannot carry one.
 
 Its repr and string name none of the credentials: the login, the password and the broker server's name.
+
+The broker behind an account is the venue: a consumer running several brokers gives each its own venue, and every instrument id, client id and account id carries it. `venue` defaults to `Venue("MT5")`; an account at another broker beside it takes, say, `Venue("MT5_ALPHA")`, its instruments `XAUUSD.MT5_ALPHA` and its clients registered under `MT5_ALPHA`.
 
 ```python
 from mt5connector.client.config import MT5Config
@@ -159,6 +162,9 @@ config = MT5Config(
     password = "your_password",
     server   = "Exness-MT5Trial9",
     server_url = "http://127.0.0.1:5000",
+
+    # The NautilusTrader venue the account's instruments, clients and account id carry
+    venue = Venue("MT5"),          # default: MT5
 
     # The WebSocket push hub (default: derived from server_url, on port 9000)
     ws_url = "ws://127.0.0.1:9000",
@@ -256,7 +262,7 @@ config = MT5Config(
 conn     = MT5Connection(config)
 conn.connect()
 
-provider = MT5InstrumentProvider(conn, clock=LiveClock())
+provider = MT5InstrumentProvider(conn, venue=config.venue, clock=LiveClock())
 catalog  = ParquetDataCatalog("./catalog")
 
 # Write the instrument definition first (required by the backtest engine)
@@ -297,7 +303,7 @@ The data and execution clients run in NautilusTrader's `TradingNode`, and the no
 - `build_mt5_node_config` makes both clients the node's default route and gives each its `InstrumentProviderConfig(load_ids=...)`: the data client the instruments the node reads, those it trades and those it follows; the execution client those it trades.
 - A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — each selected in Market Watch, the commission read of one no EA publishes opening its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
 - A symbol no config names is loaded when it is requested (`request_instrument`): the server serves any symbol the account has, so another deployment's instruments need no change to it.
-- The factories, registered before `node.build()`, build the clients on one connection per account and server, and one instrument provider per connection and `instrument_provider` config.
+- The factories, registered before `node.build()` under the config's venue, build the clients on one connection per account and server, and one instrument provider per connection, venue and `instrument_provider` config.
 
 ```python
 import os
