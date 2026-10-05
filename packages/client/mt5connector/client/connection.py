@@ -82,6 +82,9 @@ class AccountSnapshot:
     balance: Decimal
     equity: Decimal
     margin: Decimal
+    # ACCOUNT_MARGIN_MAINTENANCE: the minimum equity reserved for the open positions (MQL5's
+    # ENUM_ACCOUNT_INFO_DOUBLE).
+    margin_maintenance: Decimal
     margin_free: Decimal
     margin_level: Decimal
     credit: Decimal
@@ -106,6 +109,7 @@ class AccountSnapshot:
             balance=_finite(info.balance, "balance"),
             equity=_finite(info.equity, "equity"),
             margin=_finite(info.margin, "margin"),
+            margin_maintenance=_finite(info.margin_maintenance, "margin_maintenance"),
             margin_free=_finite(info.margin_free, "margin_free"),
             margin_level=_finite(info.margin_level, "margin_level"),
             credit=_finite(info.credit, "credit"),

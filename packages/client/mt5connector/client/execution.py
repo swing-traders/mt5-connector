@@ -74,7 +74,7 @@ from nautilus_trader.model.identifiers import (
     TraderId,
     VenueOrderId,
 )
-from nautilus_trader.model.objects import AccountBalance, Money, Price, Quantity
+from nautilus_trader.model.objects import AccountBalance, MarginBalance, Money, Price, Quantity
 
 from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.connection import MarginMode
@@ -724,16 +724,22 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     def _refresh_account(self) -> None:
         """Reports the account: its balance and credit in total, its margin locked and the rest
-        free; NT's portfolio adds the open positions' unrealised P&L. A report that fails stays owed
-        to the next account turn."""
+        free, and one account-level margin — the margin the venue states as used as initial, the
+        maintenance floor as maintenance; NT's portfolio adds the open positions' unrealised P&L. A
+        report that fails stays owed to the next account turn."""
         self._account_owed = True
         account = self._conn.get_account_info()
         total = Money(account.balance + account.credit, self.base_currency)
         locked = Money(account.margin, self.base_currency)
         free = Money(total.as_decimal() - locked.as_decimal(), self.base_currency)
+        margin = MarginBalance(
+            initial=Money(account.margin, self.base_currency),
+            maintenance=Money(account.margin_maintenance, self.base_currency),
+            instrument_id=None,
+        )
         self.generate_account_state(
             balances=[AccountBalance(total, locked, free)],
-            margins=[],
+            margins=[margin],
             reported=True,
             ts_event=self._clock.timestamp_ns(),
         )

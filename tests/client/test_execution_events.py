@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 from exec_harness import ACCOUNT_ID, MAGIC, STRATEGY_ID, TRADER_ID, build, ours_deal, ours_order
+from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import CancelOrder, GenerateFillReports, SubmitOrder
@@ -19,6 +20,7 @@ from push_double import order_left, request_done, transaction_frame
 from venue_doubles import account_info, send_result, trade_deal
 
 from mt5connector.client import errors, execution
+from mt5connector.client.connection import AccountSnapshot
 from mt5connector.wire import mirror
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
@@ -633,6 +635,35 @@ async def test_the_account_books_balance_and_credit_with_the_margin_locked(exec_
         Money(Decimal("100.00"), USD),
         Money(Decimal("9950.00"), USD),
     )
+
+
+async def test_the_account_reports_its_margin_as_one_account_level_balance(exec_shim):
+    h = build(
+        exec_shim, account=account_info(margin=100.0, margin_initial=25.5, margin_maintenance=80.0)
+    )
+    await h.connect()
+    h.client._account_owed = True
+    h.client._account_turn()
+    (margin,) = h.ledger[-1].margins
+    assert margin.instrument_id is None
+    assert (margin.initial, margin.maintenance) == (
+        Money(Decimal("100.00"), USD),
+        Money(Decimal("80.00"), USD),
+    )
+
+
+async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec_shim):
+    h = build(exec_shim)
+    await h.connect_keeping_events()
+    account = MarginAccount(h.ledger[-1])
+    h.conn.get_account_info.return_value = AccountSnapshot.from_mt5(
+        account_info(margin=200.0, margin_initial=40.0, margin_maintenance=150.0)
+    )
+    h.client._account_owed = True
+    h.client._account_turn()
+    account.apply(h.ledger[-1])
+    assert account.account_margins_init() == {USD: Money(Decimal("200.00"), USD)}
+    assert account.account_margins_maint() == {USD: Money(Decimal("150.00"), USD)}
 
 
 async def test_a_turn_owing_no_report_and_before_the_refresh_period_reports_nothing(exec_shim):
