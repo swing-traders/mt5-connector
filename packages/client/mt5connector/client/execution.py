@@ -72,13 +72,13 @@ from nautilus_trader.model.identifiers import (
     PositionId,
     TradeId,
     TraderId,
+    Venue,
     VenueOrderId,
 )
 from nautilus_trader.model.objects import AccountBalance, MarginBalance, Money, Price, Quantity
 
 from mt5connector.client import remote_mt5 as mt5
 from mt5connector.client.connection import MarginMode
-from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.currencies import register_venue_currency, venue_currency
 from mt5connector.client.errors import (
     MT5ConfigError,
@@ -107,12 +107,12 @@ def magic_for(trader_id: TraderId) -> int:
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
-def _account_id_of(login: int, magic: int) -> AccountId:
+def _account_id_of(venue: Venue, login: int, magic: int) -> AccountId:
     """The account id a trader books under: the venue, the first 8 hex digits of the SHA-256 of the
     login's decimal string, so the login reaches no log, and the trader's magic, so the traders of
     one login book apart."""
     login_hash = sha256(str(login).encode("utf-8")).hexdigest()[:8]
-    return AccountId(f"{MT5_VENUE}-{login_hash}-{magic}")
+    return AccountId(f"{venue}-{login_hash}-{magic}")
 
 
 # The venue refuses a comment of 30 characters or more.
@@ -361,8 +361,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         account = connection.get_account_info()
         super().__init__(
             loop=loop,
-            client_id=ClientId(MT5_VENUE.value),
-            venue=MT5_VENUE,
+            client_id=ClientId(config.venue.value),
+            venue=config.venue,
             oms_type=OmsType.HEDGING,
             account_type=AccountType.MARGIN,
             # The account keeps one balance, in its currency; NT takes it only at construction.
@@ -409,7 +409,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         elif terminal["trade_allowed"] and not account.trade_allowed:
             raise MT5ConfigError("read-only (investor) session: the account does not allow trading")
 
-        self._set_account_id(_account_id_of(account.login, self._magic))
+        self._set_account_id(_account_id_of(self._config.venue, account.login, self._magic))
         await self._provider.initialize()
         # Money mints at its currency's registered precision, which NT may hold at a guess.
         register_venue_currency(self.base_currency)

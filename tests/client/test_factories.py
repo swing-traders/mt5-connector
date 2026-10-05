@@ -6,12 +6,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from nautilus_trader.config import InstrumentProviderConfig
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.objects import Currency
 from venue_doubles import account_info, symbol_info
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.factories import (
@@ -19,6 +20,8 @@ from mt5connector.client.factories import (
     MT5LiveExecClientFactory,
     _connection_registry,
     _ensure_connection,
+    _ensure_provider,
+    _mt5_config_registry,
     _provider_registry,
     build_mt5_node_config,
 )
@@ -27,12 +30,13 @@ EURUSD = InstrumentId.from_str("EURUSD.MT5")
 GBPUSD = InstrumentId.from_str("GBPUSD.MT5")
 
 
-def make_config(account=12345678, server="Exness-MT5Trial1"):
+def make_config(account=12345678, server="Exness-MT5Trial1", venue=MT5_VENUE):
     return MT5Config(
         account=account,
         password="test_password",
         server=server,
         server_url="http://127.0.0.1:5000",
+        venue=venue,
     )
 
 
@@ -444,4 +448,97 @@ class TestInstrumentProviders:
         )
         assert data_client._provider is not exec_client._provider
         assert data_client._conn is exec_client._conn
+        assert MockConn.call_count == 1
+
+
+ALPHA = Venue("MT5_ALPHA")
+BETA = Venue("MT5_BETA")
+
+
+class TestNamedVenues:
+    def test_the_node_config_of_a_named_venue_is_keyed_and_routed_by_it(self):
+        config = make_config(venue=ALPHA)
+        result = node_config(config)
+        assert _mt5_config_registry == {"MT5_ALPHA": config}
+        assert set(result.data_clients) == {"MT5_ALPHA"}
+        assert set(result.exec_clients) == {"MT5_ALPHA"}
+        assert result.data_clients["MT5_ALPHA"].routing.venues == frozenset({"MT5_ALPHA"})
+        assert result.exec_clients["MT5_ALPHA"].routing.venues == frozenset({"MT5_ALPHA"})
+
+    def test_two_venues_node_configs_coexist_each_factory_finding_its_own_config(
+        self, mock_mt5_conn, mock_provider
+    ):
+        ftmo = make_config(account=11111111, venue=ALPHA)
+        icm = make_config(account=22222222, venue=BETA)
+        ftmo_node = node_config(ftmo)
+        icm_node = node_config(icm)
+        assert _mt5_config_registry == {"MT5_ALPHA": ftmo, "MT5_BETA": icm}
+
+        loop = asyncio.new_event_loop()
+        clients = {}
+        for name, node in (("MT5_ALPHA", ftmo_node), ("MT5_BETA", icm_node)):
+            msgbus, cache, clock = make_nt_components()
+            msgbus2, cache2, clock2 = make_nt_components()
+            clients[name] = (
+                MT5LiveDataClientFactory.create(
+                    loop, name, node.data_clients[name], msgbus, cache, clock
+                ),
+                MT5LiveExecClientFactory.create(
+                    loop, name, node.exec_clients[name], msgbus2, cache2, clock2
+                ),
+            )
+
+        for name, config in (("MT5_ALPHA", ftmo), ("MT5_BETA", icm)):
+            data_client, exec_client = clients[name]
+            assert data_client._config is config
+            assert exec_client._config is config
+            assert (data_client.id, data_client.venue) == (ClientId(name), Venue(name))
+            assert (exec_client.id, exec_client.venue) == (ClientId(name), Venue(name))
+
+    def test_a_factory_of_a_venue_no_node_config_names_is_refused(self):
+        node = node_config(make_config(venue=ALPHA))
+        msgbus, cache, clock = make_nt_components()
+        with pytest.raises(RuntimeError, match="no MT5Config for MT5_BETA"):
+            MT5LiveDataClientFactory.create(
+                asyncio.new_event_loop(),
+                "MT5_BETA",
+                node.data_clients["MT5_ALPHA"],
+                msgbus,
+                cache,
+                clock,
+            )
+
+    def test_one_connection_serves_two_venues_through_a_provider_each(self, mock_mt5_conn):
+        _, conn_inst = mock_mt5_conn
+        load = InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        _, _, clock = make_nt_components()
+        ftmo = _ensure_provider(conn_inst, ALPHA, load, clock)
+        icm = _ensure_provider(conn_inst, BETA, load, clock)
+        assert ftmo is not icm
+        assert ftmo is _ensure_provider(conn_inst, ALPHA, load, clock)
+
+    async def test_two_venues_on_one_login_load_their_instruments_each_at_its_own_venue(
+        self, mock_mt5_conn, terminal
+    ):
+        MockConn, _ = mock_mt5_conn
+        loop = asyncio.get_running_loop()
+        loaded_by_venue = {}
+        for venue in (ALPHA, BETA):
+            node = build_mt5_node_config(
+                make_config(venue=venue),
+                data_instruments=frozenset({EURUSD}),
+                exec_instruments=frozenset({EURUSD}),
+            )
+            msgbus, cache, clock = make_nt_components()
+            data_client = MT5LiveDataClientFactory.create(
+                loop, venue.value, node.data_clients[venue.value], msgbus, cache, clock
+            )
+            await data_client._provider.initialize()
+            loaded_by_venue[venue.value] = loaded_ids(data_client._provider)
+            assert data_client._provider.get_instrument("EURUSD").id.venue == venue
+
+        assert loaded_by_venue == {
+            "MT5_ALPHA": {InstrumentId.from_str("EURUSD.MT5_ALPHA")},
+            "MT5_BETA": {InstrumentId.from_str("EURUSD.MT5_BETA")},
+        }
         assert MockConn.call_count == 1

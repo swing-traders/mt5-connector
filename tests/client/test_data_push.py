@@ -30,6 +30,7 @@ from push_double import PushDouble
 
 from mt5connector.client import data
 from mt5connector.client.config import MT5Config
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
 from mt5connector.client.errors import MT5InstrumentError, ServerUnreachable
 from mt5connector.client.providers import MT5InstrumentProvider
@@ -94,6 +95,7 @@ class Client:
         InstrumentProvider.__init__(
             provider, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
         )
+        provider._venue = MT5_VENUE
         provider.add(instrument())
         provider.load_ids_async = AsyncMock()
         config = MT5Config(

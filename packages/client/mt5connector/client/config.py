@@ -1,17 +1,25 @@
 """`MT5Config`: what the adapter runs with, checked when it is built."""
 
 import math
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import ParseResult, urlparse, urlunparse
 
+from nautilus_trader.model.identifiers import Venue
+
 from mt5connector.client.constants import (
     DEFAULT_EXEC_POLL_INTERVAL_MS,
+    MT5_VENUE,
     RECONNECT_INITIAL_DELAY_S,
     RECONNECT_MAX_ATTEMPTS,
     RECONNECT_MAX_DELAY_S,
 )
 from mt5connector.client.errors import MT5ConfigError
+
+# NT reads an account id's issuer as the text before its first hyphen, so a hyphenated venue cannot
+# be the client id its account books under.
+_VENUE_LABEL = re.compile(r"MT5(_[A-Z0-9]{1,8})?")
 
 
 class HttpScheme(StrEnum):
@@ -39,6 +47,7 @@ class MT5Config:
     server: str = field(repr=False)
 
     # ── Optional / defaults ───────────────────────────────────────────────────
+    venue: Venue = MT5_VENUE
     exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
     deviation_points: int = 20
     account_refresh_seconds: int = 10
@@ -59,6 +68,12 @@ class MT5Config:
             raise ValueError("MT5Config.password cannot be empty.")
         if not self.server:
             raise ValueError("MT5Config.server cannot be empty.")
+        if not isinstance(self.venue, Venue):
+            raise MT5ConfigError(f"MT5Config.venue {self.venue!r} is not a Venue")
+        if not _VENUE_LABEL.fullmatch(self.venue.value):
+            raise MT5ConfigError(
+                f"MT5Config.venue {self.venue} is not MT5 or MT5_ followed by 1 to 8 of A-Z and 0-9"
+            )
 
         if self.exec_poll_interval_ms < 50:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")

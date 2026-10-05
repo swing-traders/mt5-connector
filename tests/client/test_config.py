@@ -1,6 +1,7 @@
 import traceback
 
 import pytest
+from nautilus_trader.model.identifiers import Venue
 
 from mt5connector.client.config import MT5Config, derive_ws_url
 from mt5connector.client.errors import MT5ConfigError
@@ -37,6 +38,28 @@ def test_ws_url_explicit_wins():
 
 def test_derive_ws_url_http():
     assert derive_ws_url("http://localhost:5000") == "ws://localhost:9000"
+
+
+def test_the_venue_defaults_to_mt5():
+    assert _base(server_url="http://192.168.1.10:5000").venue == Venue("MT5")
+
+
+@pytest.mark.parametrize("label", ["MT5", "MT5_ALPHA", "MT5_BETA", "MT5_A", "MT5_12345678"])
+def test_a_venue_of_mt5_or_mt5_and_up_to_eight_capitals_or_digits_is_kept(label):
+    assert _base(server_url="http://192.168.1.10:5000", venue=Venue(label)).venue == Venue(label)
+
+
+@pytest.mark.parametrize(
+    "label", ["MT5-ALPHA", "MT5_", "MT5_ABCDEFGHI", "MT5_ftmo", "MT5ALPHA", "ALPHA", "MT5_FT-MO"]
+)
+def test_a_venue_of_any_other_shape_is_refused_naming_it(label):
+    with pytest.raises(MT5ConfigError, match=f"venue {label} "):
+        _base(server_url="http://192.168.1.10:5000", venue=Venue(label))
+
+
+def test_a_venue_given_as_a_string_is_refused():
+    with pytest.raises(MT5ConfigError, match="venue 'MT5_ALPHA' is not a Venue"):
+        _base(server_url="http://192.168.1.10:5000", venue="MT5_ALPHA")
 
 
 def test_the_execution_settings_default():

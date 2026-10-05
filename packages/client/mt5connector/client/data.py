@@ -37,7 +37,6 @@ from nautilus_trader.model.identifiers import ClientId
 
 from mt5connector.client import history
 from mt5connector.client import remote_mt5 as mt5
-from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.currencies import register_venue_currency
 from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.parsing import (
@@ -83,8 +82,8 @@ class MT5DataClient(LiveMarketDataClient):
     ) -> None:
         super().__init__(
             loop=loop,
-            client_id=ClientId(MT5_VENUE.value),
-            venue=MT5_VENUE,
+            client_id=ClientId(config.venue.value),
+            venue=config.venue,
             msgbus=msgbus,
             cache=cache,
             clock=clock,
@@ -349,7 +348,7 @@ class MT5DataClient(LiveMarketDataClient):
         instruments = self._provider.list_all()
         _register_settlement(instruments)
         self._handle_instruments(
-            MT5_VENUE, instruments, request.id, request.start, request.end, request.params
+            self._config.venue, instruments, request.id, request.start, request.end, request.params
         )
 
     async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:

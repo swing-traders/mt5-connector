@@ -8,11 +8,13 @@ import pytest
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import Venue as NtVenue
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from venue_doubles import account_info, symbol_info, tick
 
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
+from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import (
     MT5ConfigError,
     MT5ConnectionError,
@@ -136,7 +138,7 @@ def provider_of(config: InstrumentProviderConfig, **account) -> MT5InstrumentPro
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info(**account))
     clock = TestClock()
     clock.set_time(NOW_NS)
-    return MT5InstrumentProvider(connection=conn, clock=clock, config=config)
+    return MT5InstrumentProvider(connection=conn, venue=MT5_VENUE, clock=clock, config=config)
 
 
 def provider_for(*symbols, **account):
@@ -370,6 +372,25 @@ async def test_loading_ids_loads_the_symbols_named_with_their_broker_casing(venu
     provider = provider_for()
     await provider.load_ids_async([InstrumentId.from_str("XAUUSDm.MT5")])
     assert provider.get_instrument("XAUUSDm").id.value == "XAUUSDm.MT5"
+
+
+async def test_a_provider_of_a_named_venue_builds_and_finds_its_instruments_at_that_venue(venue):
+    venue.add(symbol_info(name="XAUUSD", digits=2, trade_tick_size=0.01))
+    conn = MagicMock(spec=MT5Connection)
+    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
+    clock = TestClock()
+    clock.set_time(NOW_NS)
+    provider = MT5InstrumentProvider(
+        connection=conn,
+        venue=NtVenue("MT5_ALPHA"),
+        clock=clock,
+        config=InstrumentProviderConfig(
+            load_ids=frozenset({InstrumentId.from_str("XAUUSD.MT5_ALPHA")})
+        ),
+    )
+    await provider.initialize()
+    assert [instrument.id.value for instrument in provider.list_all()] == ["XAUUSD.MT5_ALPHA"]
+    assert provider.get_instrument("XAUUSD").id.value == "XAUUSD.MT5_ALPHA"
 
 
 # ── Currencies ───────────────────────────────────────────────────────────────
