@@ -21,7 +21,6 @@ def config():
         account=12345678,
         password="test_password",
         server="Exness-MT5Trial1",
-        symbols=["EURUSD", "XAUUSD"],
         server_url="http://127.0.0.1:5000",
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,

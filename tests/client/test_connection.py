@@ -8,7 +8,6 @@ from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
-from nautilus_trader.common.component import LiveClock
 from venue_doubles import account_info
 
 from mt5connector.client import connection
@@ -20,7 +19,7 @@ from mt5connector.client.errors import (
     ServerBusy,
     ServerUnreachable,
 )
-from mt5connector.client.factories import _connection_registry, _get_or_create_connection
+from mt5connector.client.factories import _connection_registry, _ensure_connection
 
 
 def assert_not_connected(conn, state: str) -> None:
@@ -98,6 +97,18 @@ class TestSuccessfulConnect:
 
     def test_connected_after_connect(self, config, mock_mt5):
         conn = MT5Connection(config)
+        conn.connect()
+        conn.ensure_connected()
+
+    def test_a_config_of_the_credentials_and_the_server_url_alone_connects(self, mock_mt5):
+        conn = MT5Connection(
+            MT5Config(
+                account=12345678,
+                password="test_password",
+                server="Exness-MT5Trial1",
+                server_url="http://127.0.0.1:5000",
+            )
+        )
         conn.connect()
         conn.ensure_connected()
 
@@ -691,7 +702,6 @@ def secret_config() -> MT5Config:
         account=LOGIN,
         password=PASSWORD,
         server=SERVER,
-        symbols=["EURUSD"],
         server_url="http://127.0.0.1:5000",
         reconnect_initial_delay_s=0,
         reconnect_max_attempts=1,
@@ -743,9 +753,7 @@ class TestCredentials:
         secret_mt5.login.side_effect = [True, False, True]
         secret_mt5.last_error.return_value = (-6, "Terminal: Authorization failed")
         try:
-            conn, _ = _get_or_create_connection(
-                replace(secret_config(), reconnect_max_attempts=2), LiveClock()
-            )
+            conn = _ensure_connection(replace(secret_config(), reconnect_max_attempts=2))
             conn.disconnect()
             assert await conn.reconnect_async() is True
             conn.disconnect()

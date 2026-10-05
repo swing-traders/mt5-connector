@@ -77,7 +77,6 @@ def config(port):
         account=12345678,
         password="p",
         server="Broker-Demo",
-        symbols=["EURUSD"],
         server_url="http://127.0.0.1:5000",
         ws_url=f"ws://127.0.0.1:{port}",
         reconnect_initial_delay_s=0.05,

@@ -131,7 +131,7 @@ print(info.currency, info.balance)
 
 ## Configuration
 
-All configuration goes through `MT5Config`. The required fields are your account credentials, symbols, and the MT5 server's URL. A config is refused when it is built:
+The adapter's own configuration goes through `MT5Config`; its required fields are your account credentials and the MT5 server's URL. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
 
 - without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
 - with a `ws_url` that is not a `ws` or `wss` URL naming a host;
@@ -146,7 +146,6 @@ config = MT5Config(
     account    = 12345678,            # MT5 account number
     password   = "your_password",
     server     = "Exness-MT5Trial9",  # broker server name
-    symbols    = ["EURUSDm", "XAUUSDm"],
     server_url = "http://127.0.0.1:5000",  # the MT5 server's HTTP API
 )
 ```
@@ -159,7 +158,6 @@ config = MT5Config(
     account  = 12345678,
     password = "your_password",
     server   = "Exness-MT5Trial9",
-    symbols  = ["EURUSDm", "XAUUSDm"],
     server_url = "http://127.0.0.1:5000",
 
     # The WebSocket push hub (default: derived from server_url, on port 9000)
@@ -193,7 +191,6 @@ config = MT5Config(
     account  = int(os.environ["MT5_ACCOUNT"]),
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
-    symbols  = os.environ["MT5_SYMBOLS"].split(","),
     server_url = os.environ["MT5_SERVER_URL"],
 )
 ```
@@ -209,7 +206,7 @@ Different brokers use different symbol names. Always use the **exact name shown 
 | IC Markets | `EURUSD` | `XAUUSD` | `BTCUSD` |
 | Pepperstone | `EURUSD` | `XAUUSD` | `BTCUSD` |
 
-The instrument provider loads exactly these symbols and builds each one from the venue's own definition — nothing is inferred from a symbol's name:
+The instrument provider loads a symbol by this exact name — one a client's `instrument_provider` config names, or one requested later — and builds it from the venue's own definition; nothing is inferred from a symbol's name:
 
 - **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
 - **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
@@ -252,7 +249,7 @@ from datetime import datetime, timezone
 
 config = MT5Config(
     account=12345678, password="your_password",
-    server="Exness-MT5Trial9", symbols=["EURUSDm"],
+    server="Exness-MT5Trial9",
     server_url="http://127.0.0.1:5000",
 )
 
@@ -295,11 +292,17 @@ conn.disconnect()
 
 ## Running in a node
 
-The data and execution clients run in NautilusTrader's `TradingNode`. `build_mt5_node_config` makes them the node's default route, each loading the config's symbols, and the factories, registered before `node.build()`, build them on one connection and one instrument provider per account and server:
+The data and execution clients run in NautilusTrader's `TradingNode`, and the node's instrument set is NT's own: each client loads what its `instrument_provider` config names, as NT's adapters do.
+
+- `build_mt5_node_config` makes both clients the node's default route and gives each its `InstrumentProviderConfig(load_ids=...)`: the data client the instruments the node reads, those it trades and those it follows; the execution client those it trades.
+- A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — each selected in Market Watch, the commission read of one no EA publishes opening its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
+- A symbol no config names is loaded when it is requested (`request_instrument`): the server serves any symbol the account has, so another deployment's instruments need no change to it.
+- The factories, registered before `node.build()`, build the clients on one connection per account and server, and one instrument provider per connection and `instrument_provider` config.
 
 ```python
 import os
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.identifiers import InstrumentId
 from mt5connector.client.config import MT5Config
 from mt5connector.client.factories import (
     build_mt5_node_config,
@@ -311,15 +314,23 @@ mt5_config = MT5Config(
     account  = int(os.environ["MT5_ACCOUNT"]),
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
-    symbols  = os.environ["MT5_SYMBOLS"].split(","),
     server_url = os.environ["MT5_SERVER_URL"],
 )
 
-node = TradingNode(config=build_mt5_node_config(mt5_config=mt5_config))
+traded   = frozenset({InstrumentId.from_str("EURUSDm.MT5")})
+followed = frozenset({InstrumentId.from_str("XAUUSDm.MT5")})
+
+node = TradingNode(
+    config=build_mt5_node_config(
+        mt5_config,
+        data_instruments=traded | followed,
+        exec_instruments=traded,
+    )
+)
 node.add_data_client_factory("MT5", MT5LiveDataClientFactory)
 node.add_exec_client_factory("MT5", MT5LiveExecClientFactory)
 node.build()  # builds the clients, connecting to the MT5 server
-node.run()    # connects the clients: loads the config's symbols and starts the push channels
+node.run()    # connects the clients: each loads what its config names, and the push channels start
 ```
 
 ### Bar types

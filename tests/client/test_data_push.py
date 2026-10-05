@@ -4,12 +4,13 @@ reconnect missed read back once."""
 import asyncio
 import threading
 from decimal import Decimal
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.messages import (
     SubscribeBars,
@@ -90,14 +91,15 @@ class Client:
         self.clock = TestClock()
         self.clock.set_time(now * SECOND_NS)
         provider = MT5InstrumentProvider.__new__(MT5InstrumentProvider)
-        InstrumentProvider.__init__(provider)
+        InstrumentProvider.__init__(
+            provider, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        )
         provider.add(instrument())
-        provider.load_symbol = MagicMock(side_effect=lambda symbol: instrument())
+        provider.load_ids_async = AsyncMock()
         config = MT5Config(
             account=12345678,
             password="p",
             server="Broker-Demo",
-            symbols=["EURUSD"],
             server_url="http://127.0.0.1:5000",
         )
         with patch.object(data, "PushClient", PushDouble):
@@ -220,7 +222,7 @@ async def settle():
 # ── Subscriptions ────────────────────────────────────────────────────────────
 
 
-async def test_connect_loads_the_configured_symbols_and_connects_the_push_channel():
+async def test_connect_hands_nt_the_instruments_its_provider_holds_and_connects_the_push_channel():
     c = Client(NINE)
 
     await c.client._connect()

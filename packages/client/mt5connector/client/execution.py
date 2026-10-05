@@ -70,7 +70,6 @@ from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
     PositionId,
-    Symbol,
     TradeId,
     TraderId,
     VenueOrderId,
@@ -392,10 +391,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     async def _connect(self) -> None:
         """Connects for this trader: refuses an account that is not a tradable hedging session
-        before anything is reported or sent, then takes in what the venue holds — emitting the
-        bracket fills NT has yet to book — reports the account and subscribes its trade
-        transactions. Raises MT5ConfigError for such an account, MT5OrderError naming a deal whose
-        owed fill cannot be built, RuntimeError on a connected client."""
+        before anything is reported or sent, then loads what the instrument provider's config names,
+        takes in what the venue holds — emitting the bracket fills NT has yet to book — reports the
+        account and subscribes its trade transactions. Raises MT5ConfigError for such an account or
+        a provider config that names nothing to load, MT5OrderError naming a deal whose owed fill
+        cannot be built, RuntimeError on a connected client."""
         if self._account_task is not None:
             raise RuntimeError("execution client: already connected")
         self._conn.ensure_connected()
@@ -410,9 +410,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             raise MT5ConfigError("read-only (investor) session: the account does not allow trading")
 
         self._set_account_id(_account_id_of(account.login, self._magic))
-        await self._provider.load_ids_async(
-            [InstrumentId(Symbol(symbol), MT5_VENUE) for symbol in self._config.symbols]
-        )
+        await self._provider.initialize()
         # Money mints at its currency's registered precision, which NT may hold at a guess.
         register_venue_currency(self.base_currency)
         for instrument in self._provider.list_all():

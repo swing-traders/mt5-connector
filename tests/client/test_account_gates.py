@@ -1,5 +1,6 @@
 """The account the execution client connects to: its snapshot, the gates it is held to, the identity
-it books under, the currencies it registers, and the magic that marks its orders."""
+it books under, the instruments it loads and the currencies it registers, and the magic that marks
+its orders."""
 
 import asyncio
 from decimal import Decimal
@@ -30,13 +31,14 @@ from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import mirror
 
+EURUSD_ONLY = InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("EURUSD.MT5")}))
+
 
 def _config() -> MT5Config:
     return MT5Config(
         account=12345678,
         password="p",
         server="Broker-Demo",
-        symbols=["EURUSD"],
         server_url="http://127.0.0.1:5000",
     )
 
@@ -342,7 +344,9 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
     seen = []
     for digits in (8, 2):
         client = _client(account_info(currency="UST", currency_digits=digits))
-        client._provider = MT5InstrumentProvider(connection=client._conn, clock=LiveClock())
+        client._provider = MT5InstrumentProvider(
+            connection=client._conn, clock=LiveClock(), config=EURUSD_ONLY
+        )
         try:
             await client._connect()
             instrument = client._provider.get_instrument("EURUSD")
@@ -374,7 +378,9 @@ async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
 
     settlement_venue.symbol_info.return_value = symbol_info(currency_profit=code)
     later = _client(account_info(currency="USD"))
-    later._provider = MT5InstrumentProvider(connection=later._conn, clock=LiveClock())
+    later._provider = MT5InstrumentProvider(
+        connection=later._conn, clock=LiveClock(), config=EURUSD_ONLY
+    )
     try:
         if precision is None:
             with pytest.raises(MT5InstrumentError, match=f"EURUSD: currency {code}"):
@@ -440,32 +446,30 @@ async def test_the_currencies_register_before_the_first_account_state(venue):
     await _stop_account_loop(client)
 
 
-async def test_each_client_loads_its_own_configs_symbols_from_a_shared_provider(venue):
+@pytest.fixture
+def terminal():
+    """The package behind the provider's shim, serving EURUSD and GBPUSD, neither charging a
+    commission."""
     definitions = {
         "EURUSD": symbol_info(name="EURUSD"),
         "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
     }
     package = MagicMock()
-    package.symbol_select.return_value = True
+    package.symbol_select.side_effect = lambda name, enable: name in definitions
     package.symbol_info.side_effect = definitions.get
     package.symbols_get.return_value = tuple(definitions.values())
     package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    with patch("mt5connector.client.providers.mt5", package):
+        yield package
+
+
+def _served_client(provider_config: InstrumentProviderConfig):
+    """A client over a real provider whose config is `provider_config`."""
     conn = MagicMock(spec=MT5Connection)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
-    provider = MT5InstrumentProvider(
-        connection=conn,
-        clock=clock,
-        config=InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("EURUSD.MT5")})),
-    )
-    config = MT5Config(
-        account=12345678,
-        password="p",
-        server="Broker-Demo",
-        symbols=["GBPUSD"],
-        server_url="http://127.0.0.1:5000",
-    )
+    provider = MT5InstrumentProvider(connection=conn, clock=clock, config=provider_config)
     with patch.object(execution, "PushClient", PushDouble):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
@@ -474,13 +478,35 @@ async def test_each_client_loads_its_own_configs_symbols_from_a_shared_provider(
             cache=TestComponentStubs.cache(),
             clock=clock,
             instrument_provider=provider,
-            config=config,
+            config=_config(),
         )
     client.generate_account_state = MagicMock()
-    with patch("mt5connector.client.providers.mt5", package):
-        await client._connect()
-    assert provider.get_instrument("GBPUSD") is not None
+    return client, provider
+
+
+async def test_connect_loads_exactly_the_ids_its_provider_config_names(venue, terminal):
+    client, provider = _served_client(
+        InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("GBPUSD.MT5")}))
+    )
+    await client._connect()
+    assert [instrument.id.value for instrument in provider.list_all()] == ["GBPUSD.MT5"]
     await _stop_account_loop(client)
+
+
+@pytest.mark.parametrize(
+    "provider_config",
+    [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
+    ids=["no-ids", "empty-ids"],
+)
+async def test_connect_refuses_a_provider_config_that_names_nothing(
+    venue, terminal, provider_config
+):
+    client, provider = _served_client(provider_config)
+    with pytest.raises(MT5ConfigError, match="instrument_provider"):
+        await client._connect()
+    assert provider.list_all() == []
+    assert not client._push.connected
+    client.generate_account_state.assert_not_called()
 
 
 # ── The lifecycle ────────────────────────────────────────────────────────────

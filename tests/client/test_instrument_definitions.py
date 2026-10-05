@@ -131,21 +131,28 @@ def venue():
         yield double
 
 
-def provider_for(*symbols, **account):
+def provider_of(config: InstrumentProviderConfig, **account) -> MT5InstrumentProvider:
     conn = MagicMock(spec=MT5Connection)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info(**account))
     clock = TestClock()
     clock.set_time(NOW_NS)
-    config = InstrumentProviderConfig(
-        load_ids=frozenset(InstrumentId.from_str(f"{s}.MT5") for s in symbols)
-    )
     return MT5InstrumentProvider(connection=conn, clock=clock, config=config)
+
+
+def provider_for(*symbols, **account):
+    """A provider whose config names `symbols`."""
+    return provider_of(
+        InstrumentProviderConfig(
+            load_ids=frozenset(InstrumentId.from_str(f"{s}.MT5") for s in symbols)
+        ),
+        **account,
+    )
 
 
 async def loaded(venue, info, **account):
     venue.add(info)
     provider = provider_for(info.name, **account)
-    await provider.load_all_async()
+    await provider.initialize()
     return provider.find(InstrumentId.from_str(f"{info.name}.MT5"))
 
 
@@ -177,7 +184,7 @@ async def test_a_calc_mode_this_adapter_does_not_trade_fails_the_load_naming_it(
     venue.add(symbol_info(name="ZN", trade_calc_mode=mirror.CONSTANTS[calc_mode]))
     provider = provider_for("ZN")
     with pytest.raises(MT5InstrumentError) as refused:
-        await provider.load_all_async()
+        await provider.initialize()
     assert "ZN" in str(refused.value)
     assert calc_mode.removeprefix("SYMBOL_CALC_MODE_") in str(refused.value)
 
@@ -253,7 +260,7 @@ async def test_a_zero_tick_size_fails_the_load_naming_the_symbol(venue):
     venue.add(symbol_info(name="BROKEN", trade_tick_size=0.0))
     provider = provider_for("BROKEN")
     with pytest.raises(MT5InstrumentError, match="BROKEN"):
-        await provider.load_all_async()
+        await provider.initialize()
 
 
 async def test_the_info_carries_the_venue_facts_and_session_calendar(venue):
@@ -300,22 +307,53 @@ async def test_a_last_built_symbol_names_its_chart_mode(venue):
 # ── Loading ──────────────────────────────────────────────────────────────────
 
 
-async def test_loading_all_loads_exactly_the_symbols_the_config_names(venue):
+def three_symbols(venue):
     venue.add(symbol_info(name="EURUSDm"))
     venue.add(symbol_info(name="GBPUSDm", currency_base="GBP"))
     venue.add(symbol_info(name="USDJPYm", currency_base="USD", currency_profit="JPY"))
+
+
+async def test_initializing_loads_exactly_the_ids_the_config_names(venue):
+    three_symbols(venue)
     provider = provider_for("EURUSDm", "GBPUSDm")
-    await provider.load_all_async()
+    await provider.initialize()
     assert {instrument.id.value for instrument in provider.list_all()} == {
         "EURUSDm.MT5",
         "GBPUSDm.MT5",
     }
 
 
+async def test_initializing_with_load_all_loads_every_symbol_the_terminal_serves(venue):
+    three_symbols(venue)
+    provider = provider_of(InstrumentProviderConfig(load_all=True))
+    await provider.initialize()
+    assert {instrument.id.value for instrument in provider.list_all()} == {
+        "EURUSDm.MT5",
+        "GBPUSDm.MT5",
+        "USDJPYm.MT5",
+    }
+    for symbol in ("EURUSDm", "GBPUSDm", "USDJPYm"):
+        assert ("symbol_select", symbol) in venue.calls
+
+
+@pytest.mark.parametrize(
+    "config",
+    [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
+    ids=["no-ids", "empty-ids"],
+)
+async def test_initializing_a_config_that_names_nothing_to_load_is_refused(venue, config):
+    three_symbols(venue)
+    provider = provider_of(config)
+    with pytest.raises(MT5ConfigError, match="instrument_provider"):
+        await provider.initialize()
+    assert provider.list_all() == []
+    assert venue.calls == []
+
+
 async def test_each_symbol_is_selected_before_its_definition_is_read(venue):
     venue.add(symbol_info(name="EURUSDm"))
     provider = provider_for("EURUSDm")
-    await provider.load_all_async()
+    await provider.initialize()
     definition_calls = [call for call in venue.calls if call[1] == "EURUSDm"]
     assert definition_calls[:2] == [("symbol_select", "EURUSDm"), ("symbol_info", "EURUSDm")]
 
@@ -324,7 +362,7 @@ async def test_a_symbol_the_venue_does_not_know_fails_the_load_naming_it(venue):
     venue.add(symbol_info(name="EURUSD"))
     provider = provider_for("EURUSD", "NOSUCH")
     with pytest.raises(MT5SymbolNotFoundError, match="NOSUCH"):
-        await provider.load_all_async()
+        await provider.initialize()
 
 
 async def test_loading_ids_loads_the_symbols_named_with_their_broker_casing(venue):
@@ -357,7 +395,7 @@ async def test_a_currency_neither_iso_nor_the_accounts_fails_the_load_naming_it(
     venue.add(symbol_info(name="ODDPAIR", currency_profit="XYZ"))
     provider = provider_for("ODDPAIR")
     with pytest.raises(MT5InstrumentError, match="XYZ"):
-        await provider.load_all_async()
+        await provider.initialize()
 
 
 async def test_a_metal_whose_base_nt_ships_beyond_its_python_module_loads(venue):
@@ -404,7 +442,7 @@ async def test_a_pair_prefers_the_fully_tradable_symbol_over_a_disabled_one(venu
     venue.add(symbol_info(name="EURUSD+", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL))
     venue.add(symbol_info(name="GBPUSD+", currency_base="GBP"))
     provider = provider_for("GBPUSD+")
-    await provider.load_all_async()
+    await provider.initialize()
     assert provider.quoted_pairs()[("EUR", "USD")] == "EURUSD+"
 
 
@@ -421,7 +459,7 @@ async def test_a_pair_no_symbol_trades_fully_is_the_first_that_prices(venue):
     )
     venue.add(symbol_info(name="EURUSD+"))
     provider = provider_for("EURUSD+", currency="UST")
-    await provider.load_all_async()
+    await provider.initialize()
     assert provider.quoted_pairs()[("UST", "USD")] == "USTUSD"
     assert ("symbol_select", "USTUSD") in venue.calls
 
@@ -430,7 +468,7 @@ async def test_a_pair_the_run_trades_is_its_own_quote(venue):
     venue.add(symbol_info(name="EURUSD+", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL))
     venue.add(symbol_info(name="EURUSD.a", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL))
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     assert provider.quoted_pairs()[("EUR", "USD")] == "EURUSD.a"
 
 
@@ -445,7 +483,7 @@ async def test_only_forex_symbols_quote_a_pair(venue):
         )
     )
     provider = provider_for("EURUSD")
-    await provider.load_all_async()
+    await provider.initialize()
     assert set(provider.quoted_pairs()) == {("EUR", "USD")}
 
 
@@ -470,7 +508,7 @@ async def test_a_deposit_currency_rule_charged_on_both_legs_is_a_whole_fee_per_f
         schedule=schedule(3.5, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
     )
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
     value, contract_size, price = Decimal("3.5"), Decimal("100000"), Decimal("1.08500")
     assert isinstance(fee, Decimal)
@@ -496,7 +534,7 @@ async def test_an_entry_only_rule_in_the_deposit_currency_is_halved_and_converte
         schedule=schedule(6.0, "UST", mode=MONEY_DEPOSIT, entry=ENTRY_IN),
     )
     provider = provider_for("EURUSD+", currency="UST", currency_digits=2)
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("EURUSD+").taker_fee
     value, rate, contract_size, price = Decimal(6), Decimal(1), Decimal(100000), Decimal("1.085")
     assert abs(fee - value * rate / 2 / (contract_size * price)) < Decimal("1e-18")
@@ -522,7 +560,7 @@ async def test_a_per_share_rule_in_a_named_currency_is_divided_by_the_price(venu
         schedule=schedule(0.02, "USD", mode=MONEY_SPECIFIED, entry=ENTRY_IN),
     )
     provider = provider_for("AAPL")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("AAPL").taker_fee
     assert abs(fee - Decimal("0.02") / 2 / Decimal(230)) < Decimal("1e-18")
     assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000435")
@@ -548,7 +586,7 @@ async def test_a_rule_in_a_currency_the_venue_quotes_inversely_is_converted_thro
         schedule=schedule(5.0, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
     )
     provider = provider_for("DE40")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("DE40").taker_fee
     assert abs(fee - Decimal(5) / Decimal("1.25") / (Decimal(1) * Decimal(20000))) < Decimal(
         "1e-18"
@@ -575,7 +613,7 @@ async def test_a_conversion_symbol_the_venue_refuses_to_select_fails_the_load_na
     venue.unselectable.add("EURUSD")
     provider = provider_for("DE40")
     with pytest.raises(MT5InstrumentError, match="EURUSD") as refused:
-        await provider.load_all_async()
+        await provider.initialize()
     assert "DE40" in str(refused.value)
     assert provider.list_all() == []
 
@@ -589,7 +627,7 @@ async def test_a_rule_in_a_currency_the_venue_cannot_convert_fails_the_load_nami
     )
     provider = provider_for("EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a") as refused:
-        await provider.load_all_async()
+        await provider.initialize()
     assert "GBP" in str(refused.value)
 
 
@@ -601,7 +639,7 @@ async def test_a_percent_rule_charged_on_both_legs_is_its_percentage_of_the_noti
         schedule=schedule(0.002, "", mode=PERCENT, entry=ENTRY_INOUT),
     )
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
     pct = Decimal("0.002")
     assert fee == pct / 100
@@ -615,7 +653,7 @@ async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
         schedule=schedule(0.004, "", mode=PERCENT, entry=ENTRY_IN),
     )
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
     pct = Decimal("0.004")
     assert fee == pct / 100 / 2
@@ -629,7 +667,7 @@ async def test_a_points_rule_is_its_points_in_price_over_the_price(venue):
         schedule=schedule(30.0, "", mode=POINTS, entry=ENTRY_INOUT),
     )
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
     pts, point, price = Decimal(30), Decimal("0.00001"), Decimal("1.08500")
     assert abs(fee - pts * point / price) < Decimal("1e-18")
@@ -644,7 +682,7 @@ async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
         schedule=schedule(30.0, "", mode=POINTS, entry=ENTRY_IN),
     )
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
     assert abs(fee - Decimal(30) * Decimal("0.00001") / Decimal("1.085") / 2) < Decimal("1e-18")
 
@@ -670,7 +708,7 @@ async def test_a_commission_rule_without_a_fee_derivation_fails_the_load_naming_
     )
     provider = provider_for("EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a") as refused:
-        await provider.load_all_async()
+        await provider.initialize()
     assert named in str(refused.value)
 
 
@@ -683,7 +721,7 @@ async def test_a_non_finite_commission_value_fails_the_load_naming_the_symbol(ve
     )
     provider = provider_for("EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a"):
-        await provider.load_all_async()
+        await provider.initialize()
 
 
 async def test_a_non_finite_quote_fails_the_load_naming_the_symbol(venue):
@@ -695,16 +733,16 @@ async def test_a_non_finite_quote_fails_the_load_naming_the_symbol(venue):
     )
     provider = provider_for("EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a"):
-        await provider.load_all_async()
+        await provider.initialize()
 
 
 async def test_a_reload_recomputes_the_fee_from_the_current_schedule(venue):
     venue.add(symbol_info(name="EURUSD.a"), bid=1.085, ask=1.085)
     provider = provider_for("EURUSD.a")
-    await provider.load_all_async()
+    await provider.initialize()
     assert provider.get_instrument("EURUSD.a").taker_fee == Decimal(0)
     venue.schedules["EURUSD.a"] = schedule(3.5, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT)
-    await provider.load_all_async()
+    await provider.initialize(reload=True)
     fee = provider.get_instrument("EURUSD.a").taker_fee
     assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000323")
 
@@ -722,13 +760,6 @@ async def test_every_load_refuses_a_lost_connection(venue):
         await provider.load_ids_async([InstrumentId.from_str("EURUSD.MT5")])
     with pytest.raises(MT5ConnectionError):
         provider.load_symbol("EURUSD")
-
-
-async def test_loading_all_without_configured_symbols_is_refused(venue):
-    conn = MagicMock(spec=MT5Connection)
-    provider = MT5InstrumentProvider(connection=conn, clock=TestClock())
-    with pytest.raises(MT5ConfigError):
-        await provider.load_all_async()
 
 
 def test_loading_one_symbol_answers_and_holds_its_instrument(venue):
