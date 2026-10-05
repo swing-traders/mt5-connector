@@ -37,7 +37,6 @@ class MT5Config:
     account: int = field(repr=False)
     password: str = field(repr=False)
     server: str = field(repr=False)
-    symbols: list[str]
 
     # ── Optional / defaults ───────────────────────────────────────────────────
     exec_poll_interval_ms: int = DEFAULT_EXEC_POLL_INTERVAL_MS
@@ -60,13 +59,6 @@ class MT5Config:
             raise ValueError("MT5Config.password cannot be empty.")
         if not self.server:
             raise ValueError("MT5Config.server cannot be empty.")
-        if not self.symbols:
-            raise ValueError("MT5Config.symbols cannot be empty.")
-
-        # Broker casing is the symbol (EURUSDm): only surrounding whitespace goes.
-        self.symbols = [s.strip() for s in self.symbols]
-        if "" in self.symbols:
-            raise ValueError("MT5Config.symbols holds a blank symbol")
 
         if self.exec_poll_interval_ms < 50:
             raise ValueError("exec_poll_interval_ms must be at least 50ms.")

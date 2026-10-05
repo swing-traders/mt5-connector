@@ -115,7 +115,6 @@ def config(**fields) -> MT5Config:
         account=12345678,
         password="p",
         server="Broker-Demo",
-        symbols=["EURUSD"],
         server_url="http://127.0.0.1:5000",
         **fields,
     )
@@ -247,7 +246,7 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
     conn.reconnect_async = AsyncMock(return_value=True)
 
     provider = MagicMock(spec=MT5InstrumentProvider)
-    provider.load_ids_async = AsyncMock()
+    provider.initialize = AsyncMock()
     provider.list_all.return_value = list(loaded.values())
     provider.get_instrument.side_effect = loaded.get
 

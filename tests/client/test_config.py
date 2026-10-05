@@ -7,7 +7,7 @@ from mt5connector.client.errors import MT5ConfigError
 
 
 def _base(**kw):
-    return MT5Config(account=1, password="p", server="s", symbols=["EURUSD"], **kw)
+    return MT5Config(account=1, password="p", server="s", **kw)
 
 
 def test_a_config_without_a_server_url_is_refused_naming_the_field():
@@ -97,18 +97,6 @@ def test_a_connection_setting_out_of_range_is_refused_naming_it(field, value):
 def test_a_connection_setting_at_its_bound_is_kept(field, value):
     c = _base(server_url="http://192.168.1.10:5000", **{field: value})
     assert getattr(c, field) == value
-
-
-@pytest.mark.parametrize("symbols", [["EURUSD", "   "], [""], ["\t"]])
-def test_a_blank_symbol_is_refused(symbols):
-    with pytest.raises(ValueError, match="symbols"):
-        MT5Config(
-            account=1,
-            password="p",
-            server="s",
-            symbols=symbols,
-            server_url="http://192.168.1.10:5000",
-        )
 
 
 @pytest.mark.parametrize(

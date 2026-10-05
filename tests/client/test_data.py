@@ -9,16 +9,22 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from nautilus_trader.common.component import LiveClock
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.messages import DataResponse, RequestInstrument, RequestInstruments
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from push_double import PushDouble
+from venue_doubles import account_info, symbol_info
 
 from mt5connector.client import data
+from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.data import MT5DataClient, _epoch_s
-from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import Series
 from mt5connector.wire.push_wire import Stream, Subscription
@@ -76,14 +82,13 @@ def make_raw_rate(
     return arr[0]
 
 
-def make_config(symbols=None, ws_url=None):
+def make_config(ws_url=None):
     from mt5connector.client.config import MT5Config
 
     return MT5Config(
         account=12345678,
         password="test",
         server="Exness-MT5Trial1",
-        symbols=symbols or ["EURUSDm"],
         server_url="http://127.0.0.1:5000",
         ws_url=ws_url,
         reconnect_initial_delay_s=0.01,
@@ -102,11 +107,8 @@ def make_conn(connected=True):
 
 
 def make_provider(instrument=None):
-    """A real MT5InstrumentProvider, whose type NT checks, answering `instrument` without the
-    venue."""
-    from mt5connector.client.connection import MT5Connection
-    from mt5connector.client.providers import MT5InstrumentProvider
-
+    """A real MT5InstrumentProvider, whose type NT checks, its config naming `instrument`, answering
+    it without the venue."""
     conn = MagicMock(spec=MT5Connection)
     conn.ensure_connected = MagicMock()
 
@@ -115,13 +117,14 @@ def make_provider(instrument=None):
     provider = MT5InstrumentProvider.__new__(MT5InstrumentProvider)
     from nautilus_trader.common.providers import InstrumentProvider
 
-    InstrumentProvider.__init__(provider)
+    InstrumentProvider.__init__(provider, InstrumentProviderConfig(load_ids=frozenset({inst.id})))
     provider._conn = conn
     provider._failed_symbols = []
 
     provider.get_instrument = MagicMock(return_value=inst)
     provider.load_symbol = MagicMock(return_value=inst)
     provider.list_all = MagicMock(return_value=[inst])
+    provider.load_ids_async = AsyncMock()
     provider.load_all_async = AsyncMock()
 
     return provider
@@ -140,7 +143,6 @@ class RecordedDataClient(MT5DataClient):
 
 
 def make_client(
-    symbols=None,
     connected=True,
     instrument=None,
     client_class=MT5DataClient,
@@ -158,7 +160,7 @@ def make_client(
     except RuntimeError:
         loop = asyncio.new_event_loop()
 
-    config = make_config(symbols, ws_url)
+    config = make_config(ws_url=ws_url)
     conn = make_conn(connected)
     provider = make_provider(instrument)
 
@@ -244,10 +246,10 @@ class TestConnect:
         await c._disconnect()
 
     @pytest.mark.asyncio
-    async def test_connect_loads_instruments(self):
+    async def test_connect_loads_the_ids_its_provider_config_names(self):
         c, conn, prov, loop = make_client()
         await c._connect()
-        prov.get_instrument.assert_called()
+        assert prov.load_ids_async.await_args.args[0] == [InstrumentId.from_str("EURUSDm.MT5")]
         await c._disconnect()
 
     @pytest.mark.asyncio
@@ -263,19 +265,14 @@ class TestConnect:
             "MT5DataClient: connected, the push channel at ws://127.0.0.1:9000/push"
         )
 
-    @pytest.mark.parametrize("held", [False, True], ids=["loaded-at-connect", "already-held"])
     @pytest.mark.asyncio
-    async def test_connect_registers_the_settlement_currency_of_each_instrument_it_hands(
-        self, held
-    ):
+    async def test_connect_registers_the_settlement_currency_of_each_instrument_it_hands(self):
         from nautilus_trader.model.enums import CurrencyType
         from nautilus_trader.model.objects import Currency
 
         Currency.register(Currency("CLP", 8, 0, "CLP", CurrencyType.FIAT), overwrite=True)
         clp = Currency("CLP", 0, 0, "CLP", CurrencyType.FIAT)
-        c, conn, prov, loop = make_client(symbols=["USDCLP"], instrument=clp_instrument(clp))
-        if not held:
-            prov.get_instrument.return_value = None
+        c, conn, prov, loop = make_client(instrument=clp_instrument(clp))
         precisions = []
         c._handle_data.side_effect = lambda *_: precisions.append(
             Currency.from_str("CLP", strict=True).precision
@@ -657,7 +654,122 @@ def clp_instrument(clp):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 10. No-op methods — don't raise
+# 10. The instruments NT names
+# ═════════════════════════════════════════════════════════════════════════════
+
+EURUSD = InstrumentId.from_str("EURUSD.MT5")
+GBPUSD = InstrumentId.from_str("GBPUSD.MT5")
+USDJPY = InstrumentId.from_str("USDJPY.MT5")
+
+
+@pytest.fixture
+def terminal():
+    """The package behind the provider's shim, serving EURUSD, GBPUSD and USDJPY, none of them
+    charging a commission."""
+    definitions = {
+        "EURUSD": symbol_info(name="EURUSD"),
+        "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
+        "USDJPY": symbol_info(name="USDJPY", currency_base="USD", currency_profit="JPY"),
+    }
+    package = MagicMock()
+    package.symbol_select.side_effect = lambda name, enable: name in definitions
+    package.symbol_info.side_effect = definitions.get
+    package.symbols_get.return_value = tuple(definitions.values())
+    package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    with patch("mt5connector.client.providers.mt5", package):
+        yield package
+
+
+def served_client(provider_config: InstrumentProviderConfig):
+    """A data client over a real provider whose config is `provider_config`, what it hands NT as
+    data recorded."""
+    conn = MagicMock(spec=MT5Connection)
+    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
+    provider = MT5InstrumentProvider(conn, clock=LiveClock(), config=provider_config)
+    with patch.object(data, "PushClient", PushDouble):
+        client = MT5DataClient(
+            loop=asyncio.get_running_loop(),
+            connection=conn,
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=LiveClock(),
+            instrument_provider=provider,
+            config=make_config(),
+        )
+    client._handle_data = MagicMock()
+    return client, provider
+
+
+def handed_ids(client) -> list[str]:
+    return sorted(call.args[0].id.value for call in client._handle_data.call_args_list)
+
+
+def loaded_ids(provider) -> list[str]:
+    return sorted(instrument.id.value for instrument in provider.list_all())
+
+
+class TestInstrumentsNtNames:
+
+    @pytest.mark.asyncio
+    async def test_connect_loads_and_hands_nt_exactly_the_ids_its_provider_config_names(
+        self, terminal
+    ):
+        client, provider = served_client(
+            InstrumentProviderConfig(load_ids=frozenset({EURUSD, GBPUSD}))
+        )
+
+        await client._connect()
+
+        assert handed_ids(client) == ["EURUSD.MT5", "GBPUSD.MT5"]
+        assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
+        assert client._push.connected
+        await client._disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_with_load_all_hands_nt_every_symbol_the_terminal_serves(self, terminal):
+        client, provider = served_client(InstrumentProviderConfig(load_all=True))
+
+        await client._connect()
+
+        assert handed_ids(client) == ["EURUSD.MT5", "GBPUSD.MT5", "USDJPY.MT5"]
+        await client._disconnect()
+
+    @pytest.mark.parametrize(
+        "provider_config",
+        [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
+        ids=["no-ids", "empty-ids"],
+    )
+    @pytest.mark.asyncio
+    async def test_connect_refuses_a_provider_config_that_names_nothing(
+        self, terminal, provider_config
+    ):
+        client, provider = served_client(provider_config)
+
+        with pytest.raises(MT5ConfigError, match="instrument_provider"):
+            await client._connect()
+
+        assert provider.list_all() == []
+        client._handle_data.assert_not_called()
+        assert not client._push.connected
+
+    @pytest.mark.asyncio
+    async def test_a_symbol_no_config_named_is_loaded_and_answered_on_request(self, terminal):
+        client, provider = served_client(InstrumentProviderConfig(load_ids=frozenset({EURUSD})))
+        await client._connect()
+        responses = responses_of(client)
+        request = instrument_request("GBPUSD")
+
+        await client._request_instrument(request)
+
+        [response] = responses
+        assert response.correlation_id == request.id
+        assert [instrument.id for instrument in response.data] == [GBPUSD]
+        assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
+        await client._disconnect()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 11. No-op methods — don't raise
 # ═════════════════════════════════════════════════════════════════════════════
 
 
@@ -701,7 +813,7 @@ class TestNoOpMethods:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 11. Properties
+# 12. Properties
 # ═════════════════════════════════════════════════════════════════════════════
 
 

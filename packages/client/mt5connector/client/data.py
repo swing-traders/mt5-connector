@@ -103,15 +103,16 @@ class MT5DataClient(LiveMarketDataClient):
         self._read_backs: set[asyncio.Task] = set()
 
     async def _connect(self) -> None:
-        """Loads the config's symbols into NT and connects the push channel."""
+        """Loads what the instrument provider's config names, hands NT every instrument the provider
+        holds and connects the push channel; raises MT5ConfigError for a config that names nothing
+        to load."""
         self._conn.ensure_connected()
-        for symbol in self._config.symbols:
-            instrument = self._provider.get_instrument(symbol)
-            if instrument is None:
-                instrument = self._provider.load_symbol(symbol)
-            _register_settlement([instrument])
+        await self._provider.initialize()
+        instruments = self._provider.list_all()
+        _register_settlement(instruments)
+        for instrument in instruments:
             self._handle_data(instrument)
-            self._log.info(f"MT5DataClient: loaded instrument {symbol}")
+            self._log.info(f"MT5DataClient: loaded instrument {instrument.raw_symbol}")
         await self._push.connect()
         self._log.info(
             f"MT5DataClient: connected, the push channel at {self._config.ws_display_url}"

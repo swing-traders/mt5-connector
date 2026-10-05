@@ -64,13 +64,20 @@ class MT5InstrumentProvider(InstrumentProvider):
         self._clock = clock
         self._quoted_pairs: dict[tuple[str, str], str] = {}
 
-    # ── Required NautilusTrader overrides ─────────────────────────────────────
+    # ── NautilusTrader overrides ──────────────────────────────────────────────
+
+    async def initialize(self, reload: bool = False) -> None:
+        """NT's initialization, refusing a config that names nothing to load, which NT's would only
+        warn of."""
+        if not self._config.load_all and not self._config.load_ids:
+            raise MT5ConfigError("instrument_provider: load_all is off and load_ids names nothing")
+        await super().initialize(reload)
 
     async def load_all_async(self, filters: dict | None = None) -> None:
-        """Loads every symbol the provider's config names."""
-        if self._config.load_ids is None:
-            raise MT5ConfigError("instrument provider: no symbols are configured")
-        self._load(sorted(instrument_id.symbol.value for instrument_id in self._config.load_ids))
+        """Loads every symbol the terminal serves, selecting each in Market Watch; the commission
+        read of a symbol no EA publishes opens its chart, and the terminal holds at most CHARTS_MAX
+        charts."""
+        self._load(sorted(info.name for info in _venue_symbols()))
 
     async def load_ids_async(
         self,
@@ -136,12 +143,8 @@ class MT5InstrumentProvider(InstrumentProvider):
         """The venue symbol quoting each (base, profit) pair its FOREX symbols cover: one the run
         loads, else one fully tradable, else the first that prices once selected, each in
         alphabetical order."""
-        venue_symbols = mt5.symbols_get()
-        if venue_symbols is None:
-            code, msg = mt5.last_error()
-            raise MT5ConnectionError(f"mt5.symbols_get() returned None — error {code}: {msg}")
         buckets: dict[tuple[str, str], list[tuple[str, TradeMode]]] = {}
-        for info in sorted(venue_symbols, key=attrgetter("name")):
+        for info in sorted(_venue_symbols(), key=attrgetter("name")):
             try:
                 if calc_mode(info) in FOREX_MODES:
                     pair = (info.currency_base, info.currency_profit)
@@ -171,6 +174,15 @@ class MT5InstrumentProvider(InstrumentProvider):
 
     def __repr__(self) -> str:
         return f"MT5InstrumentProvider(loaded={len(self._instruments)})"
+
+
+def _venue_symbols() -> tuple:
+    """Every symbol the terminal serves; raises MT5ConnectionError for a listing that reads None."""
+    venue_symbols = mt5.symbols_get()
+    if venue_symbols is None:
+        code, msg = mt5.last_error()
+        raise MT5ConnectionError(f"mt5.symbols_get() returned None — error {code}: {msg}")
+    return venue_symbols
 
 
 def _select_quoting_symbol(candidates: list[tuple[str, TradeMode]], loaded: set[str]) -> str | None:
