@@ -1,0 +1,54 @@
+# Builds the server image from the checkout and runs the image tier against it; with `push`, then
+# pushes it to this repository's container registry, tagged with the release tag, `+` read as `-`.
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: Push the image once the image tier has passed on it.
+        type: boolean
+        required: true
+
+jobs:
+  image:
+    name: image tier
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # A runner guarantees 14 GB of disk, and the image alone, built beside the test environment,
+      # takes over 6 GB.
+      - name: Free disk space
+        run: >-
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          /opt/hostedtoolcache/CodeQL
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+
+      - name: Layer the dev tooling and the server
+        run: micromamba env update -n mt5-connector -f environment.dev.yml --yes
+
+      - name: Build the image
+        run: docker build -t mt5-connector-server .
+
+      - name: Image tier
+        env:
+          MT5_IMAGE_TEST: mt5-connector-server
+        run: pytest tests/image
+
+      - name: Push the image
+        if: inputs.push
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/swing-traders/mt5-connector-server:${GITHUB_REF_NAME//+/-}"
+          printf '%s' "$REGISTRY_TOKEN" \
+            | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag mt5-connector-server "$image"
+          docker push "$image"

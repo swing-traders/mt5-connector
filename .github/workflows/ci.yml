@@ -29,3 +29,8 @@ jobs:
 
       - name: Test (pytest)
         run: just test
+
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      push: false

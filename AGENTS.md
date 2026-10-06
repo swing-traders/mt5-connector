@@ -12,7 +12,7 @@ This file holds GUIDELINES and rules of engagement. How a subsystem works belong
 
 An owned hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5-connector): a [NautilusTrader](https://nautilustrader.io/) (NT) adapter for MetaTrader 5. It does not track upstream.
 
-It ships code, never infrastructure: two distributions in one `mt5connector` namespace package (no `__init__.py` at `mt5connector/`), each its own hatchling project.
+It ships two distributions and the image that runs the server, never a deployment. The distributions share one `mt5connector` namespace package (no `__init__.py` at `mt5connector/`), each its own hatchling project:
 
 - **`mt5-connector-client`** (`packages/client/`) — `mt5connector.client`: NT data and execution clients, the instrument provider, the factories, the remote backend (an HTTP shim generated from the inventory), the history client and the downloader.
 - **Wire vocabulary** (`packages/client/mt5connector/wire/`: `mirror.py`, `broker_clock.py`, `history_wire.py`, `push_wire.py`) — the inventory of the pinned `MetaTrader5` package, the broker-clock conversion, and the history and push protocols' names. It lives once, in the client's tree, and ships in both wheels.
@@ -22,8 +22,8 @@ It ships code, never infrastructure: two distributions in one `mt5connector` nam
 
 Delivery:
 
-- PRs merge to `main`; CI runs `just lint` and `just test` on every PR and push to `main`.
-- `VERSION` is the one version both projects read. A release is a `vX.Y.Z+st` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, publishes them as one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
+- PRs merge to `main`; CI runs `just lint` and `just test`, and builds the image and runs the image tier against it, on every PR and push to `main`.
+- `VERSION` is the one version both projects read. A release is a `vX.Y.Z+st` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, and the image, pushes the image once the image tier passes on it, then publishes the wheels as one GitHub release and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
 - Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
 
 ---
@@ -190,7 +190,7 @@ A durable **design principle** (a real why-it's-built-this-way) belongs in the c
 
 ### 8. Dependencies go through `environment.yml` + mamba, never ad-hoc pip
 
-The env (`mt5-connector`) is declared by `environment.yml` — the client's runtime deps in its `pip:` subsection (conda-forge for `python`/`pip` only) and `packages/client` installed editable — and `environment.dev.yml`, which layers the dev tooling and `packages/server` editable. A distribution's dependencies are declared in its `pyproject.toml`; the client's are also pinned in `environment.yml`, the server's live in its `pyproject.toml` alone. The client pins `nautilus_trader` to one exact fork build (`==1.231.0+st.N`), the build its consumer pins: releasing a new fork build updates both pins in one release, and a client that lags its consumer's pin is a release defect. To add or bump a dependency:
+The env (`mt5-connector`) is declared by `environment.yml` — the client's runtime deps in its `pip:` subsection (conda-forge for `python`/`pip` only) and `packages/client` installed editable — and `environment.dev.yml`, which layers the dev tooling and `packages/server` editable. A distribution's dependencies are declared in its `pyproject.toml`; the client's are also pinned in `environment.yml`, and the server's closure for the image's Windows Python in `image/requirements-wine.txt`, by hash. The client pins `nautilus_trader` to one exact fork build (`==1.231.0+st.N`), the build its consumer pins: releasing a new fork build updates both pins in one release, and a client that lags its consumer's pin is a release defect. To add or bump a dependency:
 
 ```bash
 # 1. edit the distribution's pyproject.toml, and for the client the pin in environment.yml (pip: subsection)
@@ -282,11 +282,13 @@ NT TradingNode ──> mt5connector.client (data + exec clients, provider, facto
 
 The adapter reaches the terminal through the server alone, every call on the transport of the connection it belongs to (`MT5Connection.mt5`); no module holds a server, a session or a last error. The shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
 
+The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `environment.yml`, the server and the EA from `packages/server`. Every apt package the `Dockerfile` pins takes its version from an `ARG VERSION_<PACKAGE>` used at every pin, never a literal, and every file it downloads is versioned by its row in `image/artifacts.txt` alone — the URL carries the version, the SHA-256 pins the bytes.
+
 ---
 
 ## The server — rules of engagement
 
-The design documents itself in-repo: `packages/server/mt5connector/server/` module docstrings carry the contracts, and its `README.md` the API, the envelope and what the image must provide. What an agent must not get wrong when touching anything nearby:
+The design documents itself in-repo: `packages/server/mt5connector/server/` module docstrings carry the contracts, and its `README.md` the API, the envelope and what the image provides. What an agent must not get wrong when touching anything nearby:
 
 - **The wire vocabulary lives once.** `packages/server/mt5connector/server/wire` is a symlink to `packages/client/mt5connector/wire`, and the server's wheel build follows it into real copies; the server imports `mt5connector.server.wire` and nothing of `mt5connector.wire` or `mt5connector.client`, and a wire module imports its siblings relatively. A server module that needs more of the client is a design question, never a second copy.
 - **The inventory is the single source.** `mirror.py` declares every mirrored function, its parameters, its structs with their epoch fields and units, the dtypes and the constants; the server's routes, the shim's functions and namedtuples, and the conformance samples are all generated from it. Adding or changing a package function is one inventory row — never a hand-written route, shim function or sample. The static conformance tier decodes the pinned wheel (`MetaTrader5==5.0.6231`, verified by sha256) against the inventory; **the package wins** over any recollection of its API.
@@ -297,7 +299,7 @@ The design documents itself in-repo: `packages/server/mt5connector/server/` modu
 - **One worker is always free.** Every call that can reach the terminal or the hub — the mirror routes, the three history routes and the commission read — takes a slot from a pool one smaller than the worker count (`MT5_API_THREADS`, at least 2), without waiting, and a read's publisher check runs inside its slot; a call that finds none is refused at once with the busy code and `Retry-After`, never queued on a worker. `/health` and the relays take no slot. The worker count is set from the peak `/health` reports, with a margin, so normal operation never refuses.
 - **No authentication.** The API and the hub trust their network. The image publishes no host port, loopback included, so both are reachable on the container network alone; publishing one is a design change.
 - **Two Pythons, one distribution.** The Flask app runs under Wine's Windows Python (the terminal's package is Windows-only) and the hub under a Linux Python; both install `mt5-connector-server`, whose `pyproject.toml` declares every server dependency: `MetaTrader5` under the Windows marker, `numpy` held at 2.2.1, `tzdata` pinned because the Windows Python has no system zone database.
-- **The image contract lives in the server's README.** A change to a setting, an entry point, the EA's inputs or what the terminal needs updates its "What the image must provide" section in the same change.
+- **The image contract lives in the server's README.** A change to a setting, an entry point, the EA's inputs, what the terminal needs or how the image builds and boots updates its "What the image provides" section in the same change.
 
 ---
 
@@ -399,8 +401,9 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ## Test tiers
 
-- **Every test runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, or patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and builds a client connection on its URL. The server imports the package only inside `main()`.
+- **Every test but the image tier runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, or patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and builds a client connection on its URL. The server imports the package only inside `main()`.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
+- **The image tier** (`tests/image/`) starts a built image on a made-up account and runs only when asked for, its GUI-driver and log-tail tests aside; the server README says how to run it.
 - **The static conformance tier** (`tests/conformance/test_static_conformance.py`) fetches the pinned wheel by sha256 and checks the inventory and shim against it. **The live tier** needs a Windows host and a terminal and runs only when asked for; `README.md` says how to run both.
 - **An `xfail` is `strict=True` and names the defect it pins.** An xfail that starts passing is a fix to record, never a marker to leave.
 
@@ -413,5 +416,5 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 - **Don't hand-write what the inventory generates** — a route, a shim function, a struct, a conformance sample.
 - **Don't do clock math outside the server.** The server answers in true UTC, so a consumer that converts broker time converts it twice.
 - **Don't trust `[]`.** An empty package answer proves nothing on its own; the protocol's evidence rules decide what is canonical.
-- **Don't `pip install` into any of the Pythons.** The env files and the two projects' `pyproject.toml` are the declarations.
+- **Don't `pip install` into any of the Pythons.** The env files, the two projects' `pyproject.toml` and the image's hashed `image/requirements-wine.txt` are the declarations.
 - **Don't reach for a second lock, a lock bypass or a wait inside a request** when a terminal call is slow; health does not need the terminal, a call that cannot get a slot is refused, and a window that cannot be proven is a 503 the client retries.
