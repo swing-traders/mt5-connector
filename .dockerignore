@@ -1,0 +1,7 @@
+# The image's build context: the runtime environment, both packages and the image's own files.
+*
+!environment.yml
+!VERSION
+!packages/
+!image/
+**/__pycache__

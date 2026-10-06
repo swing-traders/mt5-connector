@@ -6,7 +6,7 @@ This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](
 
 > ⚠️ **Disclaimer:** This is an independent community project. It is **not** affiliated with, endorsed by, or supported by [Nautech Systems Pty Ltd](https://nautilustrader.io) or the official [NautilusTrader](https://nautilustrader.io) project.
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
 [![Unofficial](https://img.shields.io/badge/NautilusTrader-unofficial%20community%20adapter-orange.svg)](https://nautilustrader.io)
@@ -33,7 +33,7 @@ MT5 server ←→ mt5-connector-client ←→ NautilusTrader
 - Automatic reconnection with exponential backoff
 - Works with any MT5 broker — Exness, IC Markets, Pepperstone, OANDA, and more
 
-> **Platform note:** The adapter talks only to the MT5 server — `mt5-connector-server`, running beside the MT5 terminal (see [The MT5 server](#the-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package. It runs where the NautilusTrader build it pins installs: CPython 3.12 on Linux x86_64.
+> **Platform note:** The adapter talks only to the MT5 server — `mt5-connector-server`, running beside the MT5 terminal (see [The MT5 server](#the-mt5-server)) — over HTTP and WebSocket, so it needs no `MetaTrader5` package. It runs on CPython 3.13 on Linux x86_64, where the NautilusTrader build it pins installs.
 
 ---
 
@@ -77,7 +77,7 @@ The repository ships two distributions, versioned together: one release builds b
 
 ## Requirements
 
-- CPython 3.12 on Linux x86_64 where the client runs: the NautilusTrader build it pins exists for that platform alone
+- CPython 3.13 on Linux x86_64 where the client runs: the NautilusTrader build it pins exists for Linux x86_64 alone
 - An MT5 server (`mt5-connector-server`, see [The MT5 server](#the-mt5-server)) running beside a MetaTrader 5 terminal logged in to your broker account
 - An MT5 broker account (demo accounts work perfectly for development)
 
@@ -91,13 +91,13 @@ Releases are published as wheels on the fork's package index. The client pins th
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.7.2+st"
+  "mt5-connector-client==0.8.0+st"
 ```
 
-and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
+and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub), or run the image each release publishes with both installed ([The MT5 server](#the-mt5-server)):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.2+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.8.0+st"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
@@ -115,7 +115,7 @@ just test
 
 ## Quick start
 
-**1. Run an MT5 server.** The adapter talks to the MT5 terminal through `mt5-connector-server` — [its README](packages/server/mt5connector/server/README.md) states what the terminal and the server need. The server must be up, and the terminal's AutoTrading on, before you run any script; without AutoTrading every order is rejected.
+**1. Run an MT5 server.** The adapter talks to the MT5 terminal through `mt5-connector-server`, which the image each release publishes runs beside the terminal — [its README](packages/server/mt5connector/server/README.md) states what the terminal and the server need, and how to run the image. The server must be up, and the terminal's AutoTrading on, before you run any script; without AutoTrading every order is rejected.
 
 **2. Test the connection:**
 
@@ -353,7 +353,7 @@ Any other bar type is `INTERNAL`: NautilusTrader aggregates it from the symbol's
 
 ## The MT5 server
 
-The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and that EA's source. Its HTTP API, its history protocol, its hub and everything the image running it must provide are in [its README](packages/server/mt5connector/server/README.md).
+The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and that EA's source. Its HTTP API, its history protocol, its hub and the image that runs it are in [its README](packages/server/mt5connector/server/README.md). Each release publishes that image, built from this repository's `Dockerfile`, as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, the release tag with `+` as `-`.
 
 ```
 ┌─ your bot (Linux) ─────────────────┐      ┌─ beside the MT5 terminal ──────┐
@@ -387,7 +387,8 @@ The shim raises `ServerUnreachable` when the server cannot be reached or answers
 ## Releases
 
 - `VERSION` holds the one version both distributions carry.
-- A `vX.Y.Z+st` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, attaches all four files to one GitHub release, and rebuilds the PEP 503 index on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
+- A `vX.Y.Z+st` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, and the server image. The image is pushed to `ghcr.io/swing-traders/mt5-connector-server:vX.Y.Z-st` once the image tier passes on it; only then are all four wheel files attached to one GitHub release and the PEP 503 index rebuilt on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
+- The image package is public. A new package's visibility is private by GitHub's default and no API sets it, so the first release's push is followed, once, by making the package public in its settings (Change visibility); later pushes keep it.
 - Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
 
 ---
@@ -398,14 +399,17 @@ The shim raises `ServerUnreachable` when the server cannot be reached or answers
 just test
 ```
 
-All tests mock the MT5 terminal — no live connection required to run tests.
+All tests but the image tier's mock the MT5 terminal — no live connection required to run tests.
 
 ```
 tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the shim, the history client and the downloader
 tests/server/              — the server's routes, lifecycle, WS hub and history protocol, and the shim through them
 tests/conformance/         — the inventory against the pinned MetaTrader5 wheel
+tests/image/               — the server image, started on a made-up account; its GUI driver and log tail
 tests/test_distributions.py — the two distributions' shared version and the import boundary between them
 ```
+
+The image tier runs against a built image when `MT5_IMAGE_TEST` names it, as the server README's [image tests](packages/server/mt5connector/server/README.md#the-image-tests) state; CI builds the image and runs it on every pull request.
 
 The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`.
 
@@ -416,6 +420,8 @@ The conformance suite's static tier downloads the pinned `MetaTrader5` wheel onc
 ```
 mt5-connector/
 ├── VERSION                       # the one version both distributions carry
+├── Dockerfile                    # the server image
+├── image/                        # the image's boot scripts, GUI driver, log tail, startup ini, template and pins
 ├── packages/
 │   ├── client/                   # mt5-connector-client
 │   │   ├── pyproject.toml
@@ -445,13 +451,13 @@ mt5-connector/
 │       ├── pyproject.toml
 │       └── mt5connector/
 │           └── server/
-│               ├── README.md        # the server's API and what its image must provide
+│               ├── README.md        # the server's API and what its image provides
 │               ├── app.py           # the HTTP server (mt5-connector-server)
 │               ├── ws_server.py     # the push hub (mt5-connector-hub)
 │               ├── push_frames.py   # the EA's frames, held to their structs and converted to UTC
 │               ├── wire -> ../../../client/mt5connector/wire
 │               └── mql5/            # the EA, its startup script and their includes
-└── tests/                        # full test suite (no live MT5 required)
+└── tests/                        # full test suite (no live MT5 required; the image tier runs the image)
 ```
 
 ---

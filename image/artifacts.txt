@@ -1,0 +1,4 @@
+winehq.key https://dl.winehq.org/wine-builds/winehq.key d965d646defe94b3dfba6d5b4406900ac6c81065428bf9d9303ad7a72ee8d1b8
+wine-mono-9.4.0-x86.msi https://dl.winehq.org/wine/wine-mono/9.4.0/wine-mono-9.4.0-x86.msi cf6173ae94b79e9de13d9a74cdb2560a886fc3d271f9489acb1cfdbd961cacb2
+python-3.13.16-amd64.exe https://www.python.org/ftp/python/3.13.16/python-3.13.16-amd64.exe fb4f9f5d438b2396da0086dc70b935c530cb578e37adc6d354f7ad2037fee83b
+mt5setup.exe https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe a879492dd9d7b168d0538edd1c0dc5604ca43dc0951825b3501818e8b18f4c93
