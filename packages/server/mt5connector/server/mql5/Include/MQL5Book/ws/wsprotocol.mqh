@@ -2,6 +2,7 @@
 //|                                                   wsprotocol.mqh |
 //|                             Copyright 2020-2022, MetaQuotes Ltd. |
 //|                                             https://www.mql5.com |
+//| Modified for mt5-connector: a pong echoes the ping's raw bytes.  |
 //+------------------------------------------------------------------+
 #include "wstools.mqh"
 #include "wsframe.mqh"
@@ -298,7 +299,10 @@ protected:
          break;
       case WS_FRAME_OPCODE::WS_PING_FRAME:
          {
-            IWebSocketFrame *temp = WebSocketFrame::create(WS_FRAME_OPCODE::WS_PONG_FRAME, frame.getData());
+            // a pong must echo the ping's bytes, and a string round trip does not preserve them
+            uchar payload[];
+            frame.getData(payload);
+            IWebSocketFrame *temp = WebSocketFrame::create(WS_FRAME_OPCODE::WS_PONG_FRAME, payload);
             sendFrame(temp);
             delete temp;
          }

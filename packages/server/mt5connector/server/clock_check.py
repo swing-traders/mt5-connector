@@ -2,7 +2,8 @@
 
 State: `status`, the latest verification, held while the latest relayed sample is fresh and the
 terminal has been connected without a break for the maximum age, and cleared while it is not; the
-server exits on a sample the broker clock contradicts, and when none verifies it at connect."""
+server exits on a sample the broker clock contradicts, when none verifies it at connect, and when
+the broker does not list the spawner symbol."""
 
 import logging
 import os
@@ -12,15 +13,28 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
+from mt5connector.server.terminal import Answered, Failed, Terminal
+from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
 
 logger = logging.getLogger(__name__)
 
 _TOLERANCE_S = 120
+# terminal_info is a local IPC read; the connected state is polled rather than relayed because no
+# EA runs before the spawner chart exists.
+SPAWNER_CHECK_POLL_SECONDS = 1.0
+
+_TERMINAL_INFO = mirror.FUNCTIONS[mirror.FunctionName.TERMINAL_INFO]
+_SYMBOLS_TOTAL = mirror.FUNCTIONS[mirror.FunctionName.SYMBOLS_TOTAL]
+_SYMBOL_INFO = mirror.FUNCTIONS[mirror.FunctionName.SYMBOL_INFO]
 
 
 class ClockCheckFailed(Exception):
     """Raised when a sample contradicts the broker clock's schedule, or none is fresh at connect."""
+
+
+class SpawnerSymbolUnlisted(Exception):
+    """Raised when the terminal has no definition of the spawner symbol."""
 
 
 @dataclass(frozen=True)
@@ -61,14 +75,18 @@ class ClockCheck:
     def __init__(
         self,
         server_times: ServerTimeSink,
+        terminal: Terminal,
         clock: BrokerClock,
         *,
+        spawner_symbol: str,
         max_age_s: int,
         check_s: int,
         bootstrap_s: int,
     ) -> None:
         self._server_times = server_times
+        self._terminal = terminal
         self._clock = clock
+        self._spawner_symbol = spawner_symbol
         self._max_age_s = max_age_s
         self._check_s = check_s
         self._bootstrap_s = bootstrap_s
@@ -79,6 +97,9 @@ class ClockCheck:
         try:
             received = self._bootstrap()
             self._watch(received)
+        except SpawnerSymbolUnlisted as failure:
+            logger.critical("%s", failure)
+            os._exit(1)
         except ClockCheckFailed as failure:
             logger.critical("broker clock: %s", failure)
             os._exit(1)
@@ -87,10 +108,14 @@ class ClockCheck:
             os._exit(1)
 
     def _bootstrap(self) -> Received:
-        """Verifies the first sample to become verifiable within the bootstrap window."""
+        """Verifies the first sample to become verifiable within the bootstrap window, and checks
+        the spawner symbol once the terminal has the broker's symbol list."""
         deadline = time.monotonic() + self._bootstrap_s
         received = None
+        spawner_checked = False
         while not self._is_verifiable(received, time.monotonic()):
+            if not spawner_checked:
+                spawner_checked = self._check_spawner_symbol()
             now = time.monotonic()
             remaining = deadline - now
             fresh = self._is_fresh(received, now)
@@ -106,6 +131,8 @@ class ClockCheck:
                 timeout = min(remaining, received.connected_since + self._max_age_s - now)
             else:
                 timeout = remaining
+            if not spawner_checked:
+                timeout = min(timeout, SPAWNER_CHECK_POLL_SECONDS)
             received = self._server_times.wait_newer(received, timeout)
         self.status.set(self._verify(received.sample))
         logger.info("broker clock verified")
@@ -141,6 +168,29 @@ class ClockCheck:
             elif now >= due:
                 self.status.set(self._verify(received.sample))
                 due = now + self._check_s
+
+    def _check_spawner_symbol(self) -> bool:
+        """Asks the terminal for the spawner symbol's definition when it is connected with the
+        broker's symbol list loaded, and answers whether it asked; raises SpawnerSymbolUnlisted
+        when the terminal has none."""
+        if self._symbol_list_loaded():
+            definition = self._terminal.call(_SYMBOL_INFO, {"symbol": self._spawner_symbol})
+            if isinstance(definition, Failed):
+                raise SpawnerSymbolUnlisted(
+                    f"spawner symbol {self._spawner_symbol} is not listed at the broker"
+                )
+            return True
+        else:
+            return False
+
+    def _symbol_list_loaded(self) -> bool:
+        """Whether the terminal reports itself connected and lists at least one symbol."""
+        info = self._terminal.call(_TERMINAL_INFO, {})
+        if isinstance(info, Answered) and info.value.connected:
+            total = self._terminal.call(_SYMBOLS_TOTAL, {})
+            return isinstance(total, Answered) and total.value > 0
+        else:
+            return False
 
     def _is_fresh(self, received: Received | None, now: float) -> bool:
         """Whether a sample says the terminal is connected and arrived less than the maximum age
