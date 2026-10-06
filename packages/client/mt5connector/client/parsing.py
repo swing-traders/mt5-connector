@@ -104,10 +104,10 @@ _CHART_MODES = {
 FOREX_MODES = frozenset({CalcMode.FOREX, CalcMode.FOREX_NO_LEVERAGE})
 CFD_MODES = frozenset({CalcMode.CFD, CalcMode.CFDINDEX, CalcMode.CFDLEVERAGE})
 
-# The venue's trading day opens at broker midnight, 17:00 in New York, and its week on Sunday's.
-_SESSION_TZ = "America/New_York"
-_SESSION_DAY_OPEN = "17:00"
-_SESSION_WEEK_OPEN = calendar.Day.SUNDAY.name
+# The venue's bar day opens at broker midnight, 17:00 in New York, and its bar week on Sunday's.
+_BAR_TZ = "America/New_York"
+_BAR_DAY_OPEN = "17:00"
+_BAR_WEEK_OPEN = calendar.Day.SUNDAY.name
 
 
 def calc_mode(info) -> CalcMode:
@@ -186,9 +186,9 @@ def _definition(
             "trade_freeze_level": info.trade_freeze_level,
             "volume_limit": info.volume_limit,
             "currency_margin": info.currency_margin,
-            "session_tz": _SESSION_TZ,
-            "session_day_open": _SESSION_DAY_OPEN,
-            "session_week_open": _SESSION_WEEK_OPEN,
+            "bar_tz": _BAR_TZ,
+            "bar_day_open": _BAR_DAY_OPEN,
+            "bar_week_open": _BAR_WEEK_OPEN,
             "bar_volume": BarVolume.TICK_COUNT.value,
         },
     }
