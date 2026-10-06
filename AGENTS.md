@@ -282,7 +282,7 @@ NT TradingNode ──> mt5connector.client (data + exec clients, provider, facto
 
 The adapter reaches the terminal through the server alone, every call on the transport of the connection it belongs to (`MT5Connection.mt5`); no module holds a server, a session or a last error. The shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
 
-The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `environment.yml`, the server and the EA from `packages/server`. Every versioned package the `Dockerfile` installs takes its version from an `ARG VERSION_<PACKAGE>` used at every pin and artifact path, never a literal, and every file it downloads carries its URL and SHA-256 in `image/artifacts.txt`.
+The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `environment.yml`, the server and the EA from `packages/server`. Every apt package the `Dockerfile` pins takes its version from an `ARG VERSION_<PACKAGE>` used at every pin, never a literal, and every file it downloads is versioned by its row in `image/artifacts.txt` alone — the URL carries the version, the SHA-256 pins the bytes.
 
 ---
 

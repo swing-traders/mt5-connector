@@ -160,8 +160,8 @@ The repository's `Dockerfile` builds one image that runs the terminal, the HTTP 
 |---|---|
 | the base, `mambaorg/micromamba` on Debian 13 | by tag in the final stage's `FROM` |
 | WineHQ stable, amd64 and i386 | `ARG VERSION_WINE` |
-| wine-mono | `ARG VERSION_WINE_MONO`; the installer's bytes in `image/artifacts.txt` |
-| the Windows Python, python.org's x64 installer, at `C:\Python<major><minor>` | `ARG VERSION_PYTHON_WINDOWS`; the installer's bytes in `image/artifacts.txt` |
+| wine-mono | `image/artifacts.txt` |
+| the Windows Python, python.org's x64 installer, at `C:\Python` | `image/artifacts.txt` |
 | the Linux Python, the base environment at `/opt/conda` | `environment.yml` |
 | `mt5-connector-server`, one wheel built from the checkout into both Pythons | `VERSION` |
 | the Windows Python's dependencies, `MetaTrader5` among them | `image/requirements-wine.txt`, by hash |
@@ -507,9 +507,9 @@ The build also:
 
 ### Pins
 
-- Every versioned package the `Dockerfile` installs takes its version from an `ARG` named `VERSION_<PACKAGE>` — `VERSION_WINE`, `VERSION_WINE_MONO`, `VERSION_PYTHON_WINDOWS` — used at every apt pin and artifact path. The Windows Python's directory, `MT5_PYTHON_DIR`, follows `VERSION_PYTHON_WINDOWS`'s major and minor.
-- `image/artifacts.txt` lists every file the download stage fetches, one per line as `<name> <url> <sha256>`. One build step fetches them all and checks every hash, so a changed upstream file fails the build.
-- To bump a version whose file the build downloads, replace that file's line with the new file's name, URL and `sha256sum`, then set the `ARG`: an `ARG` naming a file `artifacts.txt` does not list fails the build on the missing file. The WineHQ packages are bumped by `VERSION_WINE` alone.
+- Every apt package the `Dockerfile` pins takes its version from an `ARG` named `VERSION_<PACKAGE>` — `VERSION_WINE` — used at every pin.
+- `image/artifacts.txt` lists every file the download stage fetches, one per line as `<name> <url> <sha256>`: its URL carries the version, its hash pins the bytes, and nothing else states that version. One build step fetches them all and checks every hash, so a changed upstream file fails the build.
+- A downloaded artifact is bumped by editing its row's URL and `sha256sum` and nothing else. The WineHQ packages are bumped by `VERSION_WINE` alone.
 - `image/requirements-wine.txt` is a pip `--require-hashes` file, binary wheels only: the server's dependency closure for the Windows Python, every package at its version with the hash of its `cp313` `win_amd64` wheel or its pure wheel. A change to the server's dependencies, or to the Windows Python's minor version, updates it in the same change.
 - numpy is held at `2.2.1` by the server's own pin: later releases crash on import under Wine 10.0, calling `ucrtbase.dll.crealf`, which Wine 10.0 does not implement.
 

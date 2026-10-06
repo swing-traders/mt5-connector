@@ -1,9 +1,8 @@
 # The MT5 server: the terminal under Wine with the connector's EA compiled in, the connector's HTTP
 # server under the Windows Python and its push hub under the environment's Linux Python, headless.
-# Build context: the repository root.
+# Build context: the repository root. The Wine apt version is the one version held here; every
+# downloaded artifact is versioned by its row in image/artifacts.txt.
 ARG VERSION_WINE=10.0.0.0~trixie-1
-ARG VERSION_WINE_MONO=9.4.0
-ARG VERSION_PYTHON_WINDOWS=3.13.16
 
 FROM docker.io/library/debian:trixie-slim AS fetch
 
@@ -24,8 +23,6 @@ COPY image/requirements-wine.txt image/first-start.sh ./
 
 FROM docker.io/mambaorg/micromamba:2.8-debian13-slim
 ARG VERSION_WINE
-ARG VERSION_WINE_MONO
-ARG VERSION_PYTHON_WINDOWS
 
 # The registry links a package to its repository by this label; the base image's own value names
 # micromamba's repository.
@@ -66,15 +63,13 @@ RUN groupadd --gid 65532 mt5 \
 
 USER mt5
 WORKDIR /home/mt5
-# The Windows Python's directory is C:\Python<major><minor>.
-ARG PYTHON_WINDOWS_MAJOR_MINOR=${VERSION_PYTHON_WINDOWS%.*}
 # The EA templates are written against MT5_HUB_PORT, so the ports are the image's, not a run's.
 ENV HOME=/home/mt5 \
     WINEPREFIX=/home/mt5/.wine \
     WINEARCH=win64 \
     WINEDEBUG=-all \
     MT5_TERMINAL_PATH="C:\\Program Files\\MetaTrader 5\\terminal64.exe" \
-    MT5_PYTHON_DIR="C:\\Python${PYTHON_WINDOWS_MAJOR_MINOR/./}" \
+    MT5_PYTHON_DIR="C:\\Python" \
     MT5_API_PORT=5000 \
     MT5_HUB_PORT=9000
 
@@ -86,12 +81,12 @@ RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
         WINEDLLOVERRIDES="mscoree,mshtml=" wineboot -u; \
         wineserver -w; \
         WINEDLLOVERRIDES=mscoree=d wine msiexec \
-            /i "Z:\\artifacts\\wine-mono-${VERSION_WINE_MONO}-x86.msi" /qn; \
+            /i "Z:\\artifacts\\wine-mono.msi" /qn; \
         wineserver -w'
 
 RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
     tini -- xvfb-run -a sh -ec ' \
-        wine "/artifacts/python-${VERSION_PYTHON_WINDOWS}-amd64.exe" /quiet InstallAllUsers=1 \
+        wine /artifacts/python-windows.exe /quiet InstallAllUsers=1 \
             PrependPath=1 Include_test=0 Include_launcher=0 "TargetDir=$MT5_PYTHON_DIR"; \
         wineserver -w; \
         wine python -m pip install --no-cache-dir --require-hashes \
