@@ -265,7 +265,7 @@ async def test_a_zero_tick_size_fails_the_load_naming_the_symbol(venue):
         await provider.initialize()
 
 
-async def test_the_info_carries_the_venue_facts_and_session_calendar(venue):
+async def test_the_info_carries_the_venue_facts_and_bar_calendar(venue):
     instrument = await loaded(
         venue,
         symbol_info(
@@ -288,9 +288,9 @@ async def test_the_info_carries_the_venue_facts_and_session_calendar(venue):
         "trade_freeze_level": 5,
         "volume_limit": 50.0,
         "currency_margin": "EUR",
-        "session_tz": "America/New_York",
-        "session_day_open": "17:00",
-        "session_week_open": "SUNDAY",
+        "bar_tz": "America/New_York",
+        "bar_day_open": "17:00",
+        "bar_week_open": "SUNDAY",
         "bar_volume": "tick_count",
     }
 
