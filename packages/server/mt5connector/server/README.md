@@ -2,10 +2,10 @@
 
 The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5` package with every epoch in true UTC, the WebSocket hub that pushes the terminal's ticks, closed bars and trade transactions, and the source of the EA and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
 
-Releases are wheels on the fork's package index, versioned together with the client's:
+Releases are wheels on the fork's package index, versioned together with the client's; `<version>` is a release's version, the `VERSION` file's value at its tag, the latest listed on the [releases page](https://github.com/swing-traders/mt5-connector/releases):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.8.1+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==<version>"
 ```
 
 | Part | What it is |
@@ -155,7 +155,7 @@ The EA, `ticks.mq5`, one per symbol on its own chart:
 
 ## What the image provides
 
-The repository's `Dockerfile` builds one image that runs the terminal, the HTTP server and the hub: a MetaTrader 5 terminal under Wine with the EA compiled in, the HTTP server under a Windows Python and the hub under a Linux Python, headless under Xvfb. Its server and EA are the checkout's, and everything else is downloaded at build time; it carries no credential, login, server name or server list. A release publishes it as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, `<tag>` the release tag with `+` as `-`: `v0.8.1-st` for `v0.8.1+st`.
+The repository's `Dockerfile` builds one image that runs the terminal, the HTTP server and the hub: a MetaTrader 5 terminal under Wine with the EA compiled in, the HTTP server under a Windows Python and the hub under a Linux Python, headless under Xvfb. Its server and EA are the checkout's, and everything else is downloaded at build time; it carries no credential, login, server name or server list. A release publishes it as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, `<tag>` the release tag `v<version>` with its `+` replaced by `-`.
 
 | Component | Where it is pinned |
 |---|---|
@@ -184,7 +184,7 @@ podman run -d --name mt5-alpha \
   -e MT5_LOGIN -e MT5_PASSWORD -e MT5_SERVER -e MT5_SPAWNER_SYMBOL=XAUUSD \
   -v mt5-alpha-bases:"/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases" \
   --stop-timeout 190 \
-  ghcr.io/swing-traders/mt5-connector-server:v0.8.1-st
+  ghcr.io/swing-traders/mt5-connector-server:<tag>
 ```
 
 - The HTTP server listens on port 5000 and the hub on 9000, inside the container ([Network](#network)). The image fixes `MT5_API_PORT` and `MT5_HUB_PORT`, since the EA's templates are written against the hub's port.

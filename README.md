@@ -85,19 +85,19 @@ The repository ships two distributions, versioned together: one release builds b
 
 ## Installation
 
-Releases are published as wheels on the fork's package index. The client pins the NautilusTrader fork's own build, `nautilus_trader==1.231.0+st.22`, which only that fork's index serves. Install the adapter where NautilusTrader runs, from both indexes:
+Releases are published as wheels on the fork's package index; `<version>` below is a release's version, the `VERSION` file's value at its tag, the latest listed on the [releases page](https://github.com/swing-traders/mt5-connector/releases). The client pins one exact build of the NautilusTrader fork, the `nautilus_trader` pin in `packages/client/pyproject.toml`, which only that fork's index serves. Install the adapter where NautilusTrader runs, from both indexes:
 
 ```bash
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.8.1+st"
+  "mt5-connector-client==<version>"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub), or run the image each release publishes with both installed ([The MT5 server](#the-mt5-server)):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.8.1+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==<version>"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
