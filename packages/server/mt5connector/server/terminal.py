@@ -31,7 +31,12 @@ class Terminal:
         """Calls the package function with arguments keyed by parameter name."""
         args, kwargs = package_call(function, arguments)
         with self._lock:
-            value = getattr(self._package, function.name)(*args, **kwargs)
+            package_function = getattr(self._package, function.name)
+            # The package's trade calls refuse positional arguments beside any **kwargs, even {}.
+            if kwargs:
+                value = package_function(*args, **kwargs)
+            else:
+                value = package_function(*args)
             code, message = self._package.last_error()
         if mirror.is_failure(function, value):
             return Failed((code, message))

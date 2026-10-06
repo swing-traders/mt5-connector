@@ -377,6 +377,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 - **`MqlTradeRequest.magic` is `ulong`, `ORDER_MAGIC` reads back `long`**; 63 bits are safely positive in both views.
 - **The filling mode is per symbol**, a bitmask on `symbol_info().filling_mode`; a wrong mode is retcode 10030.
 - **`order_send` can report "no connection" (10031) for a trade the server executed.** The order exists; the reply does not say so.
+- **`order_check` and `order_send` refuse their request with `(-2, 'Unnamed arguments not allowed')` when any keyword mapping is passed beside it, an empty `**{}` included**; the read and history functions tolerate one, so the fault shows on trading alone.
 - **`account_info.trade_allowed == false` under `terminal_info.trade_allowed == true` marks an investor (read-only) session** — a configuration error to fail at startup, not a refusal to discover on the first order.
 - **`OnTradeTransaction` is account-scoped and complete through one EA**: two EAs receive byte-identical streams. `DEAL_ADD` alone carries the fill; `order_state` on it is a meaningless default; fill ordering against `ORDER_DELETE`/`HISTORY_ADD` is not guaranteed; `TRADE_TRANSACTION_REQUEST` trails the lifecycle events with the full request and result, and the MQL5 reference fills only its type — its symbol is the request's, which a delete or modify of a pending order may leave empty.
 
@@ -401,10 +402,10 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ## Test tiers
 
-- **Every test but the image tier runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, or patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and builds a client connection on its URL. The server imports the package only inside `main()`.
+- **Every test but the image tier and the live conformance tests runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, or patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`); `tests/server/conftest.py` wraps a `MagicMock` package double in a real `Terminal`, serves the app through Flask's test client or a real waitress on a loopback port, and builds a client connection on its URL. The server imports the package only inside `main()`.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
 - **The image tier** (`tests/image/`) starts a built image on a made-up account and runs only when asked for, its GUI-driver and log-tail tests aside; the server README says how to run it.
-- **The static conformance tier** (`tests/conformance/test_static_conformance.py`) fetches the pinned wheel by sha256 and checks the inventory and shim against it. **The live tier** needs a Windows host and a terminal and runs only when asked for; `README.md` says how to run both.
+- **The static conformance tier** (`tests/conformance/test_static_conformance.py`) fetches the pinned wheel by sha256 and checks the inventory and shim against it. **The live tier** needs a Windows host and a terminal, and **the live server test** a running server; both run only when asked for, and `README.md` says how to run them. The live server test is the one test that reaches the package's own argument parser through the server's call, which no double can stand in for.
 - **An `xfail` is `strict=True` and names the defect it pins.** An xfail that starts passing is a fix to record, never a marker to leave.
 
 ---
