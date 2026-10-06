@@ -5,7 +5,7 @@ The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5
 Releases are wheels on the fork's package index, versioned together with the client's:
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.1+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.2+st"
 ```
 
 | Part | What it is |
@@ -166,6 +166,7 @@ The HTTP server reads its settings from the environment once at start; a missing
 | `MT5_LOGIN` | account number | required |
 | `MT5_PASSWORD` | account password | required |
 | `MT5_SERVER` | trade server name | required |
+| `MT5_SPAWNER_SYMBOL` | the symbol of the spawner's chart, the terminal's `[StartUp]` `Symbol` | required |
 | `MT5_LOGIN_TIMEOUT_MS` | initialize timeout | `60000` |
 | `MT5_API_HOST` | bind address | `0.0.0.0` |
 | `MT5_API_PORT` | HTTP port | `5000` |
@@ -202,6 +203,7 @@ The credentials reach the processes as environment variables at start; the image
 - Both Pythons install `mt5-connector-server` from the index. Its dependencies pin `MetaTrader5` on Windows alone, `numpy` at 2.2.1 because later releases crash under Wine, and `tzdata` because the Windows Python has no zone database. The hub imports none of these, but installing the distribution brings them all, and numpy 2.2.1 publishes wheels for CPython 3.10 to 3.13 only.
 - The hub posts every relayed server time and commission schedule to `127.0.0.1`, the server posts the symbols it reads to the hub's chart route on `127.0.0.1`, and each accepts those routes from `127.0.0.1` alone: the two share a loopback.
 - At start the server initializes the terminal named by `MT5_TERMINAL_PATH` with the account's login, password and server, and exits non-zero when that fails.
+- Once the terminal reports itself connected with the broker's symbol list loaded, the server asks it for the definition of `MT5_SPAWNER_SYMBOL`, and exits non-zero with `spawner symbol <symbol> is not listed at the broker` when it has none: the startup script never runs on a chart without a symbol, so no EA would ever relay.
 - It then answers HTTP 503 on every route but `/health` and the relays until a server-time sample from an EA verifies the broker clock, and exits non-zero when none does within `MT5_CLOCK_BOOTSTRAP_SECONDS`, or when any sample it measures, then or later, puts the trade server more than 120 s from the server's clock. The terminal, the spawner's EA and the hub must therefore be up within that window of the server's start; whatever starts the server decides whether to start it again.
 - `/health` answers HTTP 200 once the clock is verified, and 503 whenever it is not.
 
@@ -221,7 +223,7 @@ The terminal is started as `terminal64.exe /config:<setup.ini> /portable`, so it
 | | `Enabled` | `1`: algorithmic trading on, without which the terminal refuses every order the adapter sends |
 | | `WebRequest` | `1` |
 | `[StartUp]` | `Script` | `ticks_setup` |
-| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, then closes its own. The deployment sets the symbol: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
+| | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, then closes its own. The symbol is `MT5_SPAWNER_SYMBOL`, which the deployment sets: the first instrument it trades, or the first Market Watch symbol for one that trades nothing |
 
 The terminal must know the trade server `MT5_SERVER` names — its `Config\servers.dat` lists it — before the login can succeed: a server a fresh install does not know is added by searching for its name once (File → Open an Account), or by copying in a `servers.dat` that lists it.
 
@@ -243,10 +245,10 @@ Both sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `
 - It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5`, with the `Include\` tree beside it — and the `.ex5` copied into place.
 - A clean compile writes `0 errors, 0 warnings` to its `/log:` file; a missing `.ex5` is a failed compile.
 
-On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
+On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on, which the server's start checks the broker lists, and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
 
 - The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's included.
-- A chart that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
+- A chart the spawner opens on demand that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
 - The spawner refused as a duplicate keeps its chart and says hello again every `ReconnectIntervalSec`; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
 - A chart closes once its symbol has been out of use for `MT5_CHART_IDLE_SECONDS`: the spawner closes it and takes the symbol out of Market Watch, where the terminal would keep processing its ticks.
 - A symbol with open positions or pending orders never closes idle: the spawner keeps its chart and the hub counts it in use for another `MT5_CHART_IDLE_SECONDS`.

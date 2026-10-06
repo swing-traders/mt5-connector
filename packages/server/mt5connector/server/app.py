@@ -559,7 +559,9 @@ def main() -> None:
     server_times = ServerTimeSink(max_age_s=settings.clock_sample_max_age_seconds)
     clock_check = ClockCheck(
         server_times,
+        terminal,
         clock,
+        spawner_symbol=settings.spawner_symbol,
         max_age_s=settings.clock_sample_max_age_seconds,
         check_s=settings.clock_check_seconds,
         bootstrap_s=settings.clock_bootstrap_seconds,

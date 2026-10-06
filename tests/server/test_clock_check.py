@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from chart_posts import ChartPosts, publishers_on
@@ -18,10 +19,12 @@ from mt5connector.server.clock_check import ClockCheck
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
+from mt5connector.server.terminal import Terminal
 
 BROKER_EPOCH = 1_752_580_800  # an EDT date: the broker clock, New York + 7 h, runs 3 h ahead of UTC
 UTC_EPOCH = 1_752_570_000
 MAX_AGE_S = 30
+SPAWNER_SYMBOL = "XAUUSD"
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
 
 
@@ -76,6 +79,50 @@ class Timeline:
         return self._sink.latest()
 
 
+class SpawnerTerminal:
+    """A MetaTrader5 package double answering on the timeline's clock: the terminal connects at
+    `connected_at` and has the broker's symbol list from `loaded_at`, None being never, and lists
+    the spawner symbol or not."""
+
+    def __init__(
+        self,
+        timeline: Timeline,
+        *,
+        connected_at: float | None = 0.0,
+        loaded_at: float | None = 0.0,
+        listed: bool = True,
+    ) -> None:
+        self._timeline = timeline
+        self._connected_at = connected_at
+        self._loaded_at = loaded_at
+        self._listed = listed
+        self.polled: list[float] = []
+        self.asked: list[tuple[float, str]] = []
+
+    def terminal_info(self) -> SimpleNamespace:
+        self.polled.append(self._timeline.now)
+        return SimpleNamespace(connected=self._reached(self._connected_at))
+
+    def symbols_total(self) -> int:
+        if self._reached(self._loaded_at):
+            return 1
+        else:
+            return 0
+
+    def symbol_info(self, symbol: str) -> SimpleNamespace | None:
+        self.asked.append((self._timeline.now, symbol))
+        if self._listed:
+            return SimpleNamespace(name=symbol)
+        else:
+            return None
+
+    def last_error(self) -> tuple[int, str]:
+        return (1, "Success")
+
+    def _reached(self, at: float | None) -> bool:
+        return at is not None and self._timeline.now >= at
+
+
 def sample(trade_server: int, connected: bool = True) -> ServerTimeSample:
     """EURUSD's sample with the last quote 2 s before the trade server's time."""
     return ServerTimeSample(
@@ -113,8 +160,20 @@ def check_logs(caplog):
     caplog.set_level(logging.INFO, logger="mt5connector.server.clock_check")
 
 
-def clock_check(timeline: Timeline) -> ClockCheck:
-    return ClockCheck(timeline, CLOCK, max_age_s=MAX_AGE_S, check_s=300, bootstrap_s=120)
+def clock_check(timeline: Timeline, package: SpawnerTerminal | None = None) -> ClockCheck:
+    """The check on the timeline, its terminal connected from the start with the spawner symbol
+    listed unless a package double says otherwise."""
+    if package is None:
+        package = SpawnerTerminal(timeline)
+    return ClockCheck(
+        timeline,
+        Terminal(package),
+        CLOCK,
+        spawner_symbol=SPAWNER_SYMBOL,
+        max_age_s=MAX_AGE_S,
+        check_s=300,
+        bootstrap_s=120,
+    )
 
 
 def routes(terminal, commissions, check: ClockCheck):
@@ -252,6 +311,70 @@ def test_no_fresh_sample_within_the_bootstrap_window_exits(timeline_at, exits, c
     assert exits == [1]
     assert timeline.now == 120
     assert check.status.read() is None
+    assert messages(caplog, logging.CRITICAL) == [
+        "broker clock: no fresh server-time sample in 120 s"
+    ]
+
+
+def test_an_unlisted_spawner_symbol_exits_once_the_terminal_has_its_symbol_list(
+    timeline_at, exits, caplog
+):
+    timeline = timeline_at(UTC_EPOCH)
+    package = SpawnerTerminal(timeline, connected_at=3, loaded_at=5, listed=False)
+    check = clock_check(timeline, package)
+
+    check.run()
+
+    assert exits == [1]
+    assert timeline.now == 5
+    assert package.asked == [(5, "XAUUSD")]
+    assert check.status.read() is None
+    assert messages(caplog, logging.CRITICAL) == [
+        "spawner symbol XAUUSD is not listed at the broker"
+    ]
+
+
+def test_a_listed_spawner_symbol_is_asked_for_once_and_the_clock_verifies_as_before(
+    timeline_at, terminal, commissions, exits, caplog
+):
+    timeline = timeline_at(UTC_EPOCH + 30)
+    package = SpawnerTerminal(timeline, connected_at=3, loaded_at=5)
+    check = clock_check(timeline, package)
+    client = routes(terminal, commissions, check)
+    for at in range(0, 41, 5):
+        timeline.arrive(at, sample(BROKER_EPOCH + at))
+    answers = health_at(timeline, client, [29, 30])
+
+    run_to_its_end(check)
+
+    assert exits == []
+    assert statuses(answers) == {29: 503, 30: 200}
+    assert package.asked == [(5, "XAUUSD")]
+    assert package.polled[-1] == 5
+    assert messages(caplog, logging.INFO)[:2] == [
+        "broker clock measured on EURUSD: trade server at 2025-07-15T09:00:30+00:00, -30 s from "
+        "the server clock; offset +10800 s",
+        "broker clock verified",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("connected_at", "loaded_at"),
+    [(None, 0.0), (0.0, None)],
+    ids=["never-connected", "symbol-list-never-loaded"],
+)
+def test_a_terminal_without_its_symbol_list_leaves_the_bootstrap_timeout_standing(
+    connected_at, loaded_at, timeline_at, exits, caplog
+):
+    timeline = timeline_at(UTC_EPOCH)
+    package = SpawnerTerminal(timeline, connected_at=connected_at, loaded_at=loaded_at)
+    check = clock_check(timeline, package)
+
+    check.run()
+
+    assert exits == [1]
+    assert timeline.now == 120
+    assert package.asked == []
     assert messages(caplog, logging.CRITICAL) == [
         "broker clock: no fresh server-time sample in 120 s"
     ]

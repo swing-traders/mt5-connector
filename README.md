@@ -91,13 +91,13 @@ Releases are published as wheels on the fork's package index. The client pins th
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.7.1+st"
+  "mt5-connector-client==0.7.2+st"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.1+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.7.2+st"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:

@@ -21,6 +21,7 @@ class Settings:
     login: int = field(repr=False)
     password: str = field(repr=False)
     server: str = field(repr=False)
+    spawner_symbol: str
     login_timeout_ms: int
     api_host: str
     api_port: int
@@ -72,6 +73,7 @@ def read_settings(environ: Mapping[str, str]) -> Settings:
         login=_integer("MT5_LOGIN", _required(environ, "MT5_LOGIN")),
         password=_required(environ, "MT5_PASSWORD"),
         server=_required(environ, "MT5_SERVER"),
+        spawner_symbol=_required(environ, "MT5_SPAWNER_SYMBOL"),
         login_timeout_ms=_integer(
             "MT5_LOGIN_TIMEOUT_MS", environ.get("MT5_LOGIN_TIMEOUT_MS", "60000")
         ),
