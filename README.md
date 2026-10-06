@@ -85,19 +85,19 @@ The repository ships two distributions, versioned together: one release builds b
 
 ## Installation
 
-Releases are published as wheels on the fork's package index. The client pins the NautilusTrader fork's own build, `nautilus_trader==1.231.0+st.22`, which only that fork's index serves. Install the adapter where NautilusTrader runs, from both indexes:
+Releases are published as wheels on the fork's package index; `<version>` below is a release's version, the `VERSION` file's value at its tag, the latest listed on the [releases page](https://github.com/swing-traders/mt5-connector/releases). The client pins one exact build of the NautilusTrader fork, the `nautilus_trader` pin in `packages/client/pyproject.toml`, which only that fork's index serves. Install the adapter where NautilusTrader runs, from both indexes:
 
 ```bash
 pip install \
   --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ \
   --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/ \
-  "mt5-connector-client==0.8.0+st"
+  "mt5-connector-client==<version>"
 ```
 
 and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub), or run the image each release publishes with both installed ([The MT5 server](#the-mt5-server)):
 
 ```bash
-python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==0.8.0+st"
+python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==<version>"
 ```
 
 For development, create the environment with mamba and layer the dev tooling on top; `environment.yml` installs the client editable from `packages/client`, and `environment.dev.yml` the server from `packages/server`:
@@ -411,7 +411,7 @@ tests/test_distributions.py — the two distributions' shared version and the im
 
 The image tier runs against a built image when `MT5_IMAGE_TEST` names it, as the server README's [image tests](packages/server/mt5connector/server/README.md#the-image-tests) state; CI builds the image and runs it on every pull request.
 
-The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`.
+The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`. Its live server test, `tests/conformance/test_live_trade_request.py`, runs from any host when `MT5_LIVE_SERVER_URL` names a running server, and checks a market request on the symbol the server's `/health` names through the client shim without placing it.
 
 ---
 
