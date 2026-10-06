@@ -3,6 +3,7 @@
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from chart_posts import ChartPosts, publishers_on
@@ -161,15 +162,26 @@ class _SinkEndingTheCheck(ServerTimeSink):
 
 
 def test_a_frame_relayed_through_the_route_verifies_the_clock(
-    terminal, commissions, repeated_hours, history, monkeypatch
+    terminal, stub, commissions, repeated_hours, history, monkeypatch
 ):
+    stub.terminal_info.return_value = SimpleNamespace(connected=True)
+    stub.symbols_total.return_value = 1
+    stub.symbol_info.return_value = SimpleNamespace(name="XAUUSD")
     exits = []
     monkeypatch.setattr(os, "_exit", exits.append)
     monkeypatch.setattr(time, "time", lambda: 1_752_570_030.0)
     monotonic = [0.0]
     monkeypatch.setattr(time, "monotonic", lambda: monotonic[0])
     server_times = _SinkEndingTheCheck()
-    check = ClockCheck(server_times, CLOCK, max_age_s=30, check_s=300, bootstrap_s=60)
+    check = ClockCheck(
+        server_times,
+        terminal,
+        CLOCK,
+        spawner_symbol="XAUUSD",
+        max_age_s=30,
+        check_s=300,
+        bootstrap_s=60,
+    )
     client = create_app(
         terminal,
         commissions,

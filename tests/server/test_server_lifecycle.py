@@ -33,6 +33,7 @@ ENVIRONMENT = {
     "MT5_LOGIN": "12345678",
     "MT5_PASSWORD": "secret-password",
     "MT5_SERVER": "example-server",
+    "MT5_SPAWNER_SYMBOL": "XAUUSD",
 }
 
 
@@ -42,6 +43,7 @@ def test_settings_read_the_environment_with_defaults():
     assert settings.login == 12345678
     assert settings.password == "secret-password"
     assert settings.server == "example-server"
+    assert settings.spawner_symbol == "XAUUSD"
     assert settings.login_timeout_ms == 60000
     assert settings.api_host == "0.0.0.0"
     assert settings.api_port == 5000
@@ -92,12 +94,19 @@ def test_settings_take_overrides():
     assert (settings.hub_port, settings.chart_idle_seconds) == (9100, 60)
 
 
-@pytest.mark.parametrize("name", ["MT5_TERMINAL_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"])
+@pytest.mark.parametrize(
+    "name", ["MT5_TERMINAL_PATH", "MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_SPAWNER_SYMBOL"]
+)
 def test_settings_refuse_a_missing_variable(name):
     environment = dict(ENVIRONMENT)
     del environment[name]
     with pytest.raises(SettingsError, match=name):
         read_settings(environment)
+
+
+def test_settings_refuse_a_blank_spawner_symbol():
+    with pytest.raises(SettingsError, match="MT5_SPAWNER_SYMBOL is not set"):
+        read_settings(ENVIRONMENT | {"MT5_SPAWNER_SYMBOL": ""})
 
 
 @pytest.mark.parametrize(
@@ -140,6 +149,7 @@ def test_settings_built_directly_refuse_an_out_of_range_value():
             login=12345678,
             password="secret-password",
             server="example-server",
+            spawner_symbol="XAUUSD",
             login_timeout_ms=60000,
             api_host="0.0.0.0",
             api_port=5000,
