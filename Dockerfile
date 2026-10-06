@@ -27,6 +27,10 @@ ARG VERSION_WINE
 ARG VERSION_WINE_MONO
 ARG VERSION_PYTHON_WINDOWS
 
+# The registry links a package to its repository by this label; the base image's own value names
+# micromamba's repository.
+LABEL org.opencontainers.image.source=https://github.com/swing-traders/mt5-connector
+
 USER root
 COPY --from=fetch /artifacts/winehq.key /etc/apt/keyrings/winehq-archive.key
 
