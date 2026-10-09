@@ -20,7 +20,7 @@ dependencies:
       # The fork's index serves the patched `+st` builds; PyPI can never satisfy a local version, so
       # this pin proves provenance.
       - --extra-index-url https://swing-traders.github.io/nautilus_trader/simple/
-      - nautilus_trader==1.231.0+st.23
+      - nautilus_trader==1.231.0+st.24
       - numpy>=1.26.4
       - python-dotenv>=1.0
       - requests>=2.32
