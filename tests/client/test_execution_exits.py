@@ -564,12 +564,57 @@ async def test_a_trigger_amend_of_the_stop_moves_the_stop_loss_and_updates_it(ex
     assert h.events[0].trigger_price == Price.from_str("1.08300")
 
 
-async def test_an_amend_to_a_quantity_the_position_does_not_hold_is_rejected_naming_it(exec_shim):
+async def test_an_amend_to_a_quantity_above_the_positions_volume_updates_it_without_a_request(
+    exec_shim,
+):
     h, stop_order, _ = await occupied(exec_shim)
     await modify(h, stop_order, quantity=Quantity.from_str("0.02"))
-    assert h.names() == ["OrderModifyRejected", "AccountState"]
-    assert "0.02" in h.events[0].reason
+    assert h.names() == ["OrderUpdated", "AccountState"]
+    assert (h.events[0].quantity, h.events[0].trigger_price) == (
+        Quantity.from_str("0.02"),
+        Price.from_str("1.08000"),
+    )
     h.venue.order_send.assert_not_called()
+
+
+async def test_a_level_amend_above_the_positions_volume_moves_the_bracket_and_updates_it(
+    exec_shim,
+):
+    h, stop_order, _ = await occupied(exec_shim)
+    await modify(
+        h, stop_order, quantity=Quantity.from_str("0.02"), trigger_price=Price.from_str("1.08300")
+    )
+    assert sent_requests(h) == [
+        {
+            "action": mirror.TRADE_ACTION_SLTP,
+            "symbol": "EURUSD",
+            "position": POSITION,
+            "magic": MAGIC,
+            "sl": 1.083,
+            "tp": 1.1,
+        }
+    ]
+    assert h.names() == ["OrderUpdated", "AccountState"]
+    assert (h.events[0].quantity, h.events[0].trigger_price) == (
+        Quantity.from_str("0.02"),
+        Price.from_str("1.08300"),
+    )
+
+
+async def test_a_level_amend_above_the_positions_volume_the_venue_refuses_is_rejected_with_it(
+    exec_shim,
+):
+    h, stop_order, _ = await occupied(exec_shim)
+    h.venue.order_send.return_value = send_result(
+        retcode=mirror.TRADE_RETCODE_INVALID_STOPS, comment="Invalid stops", order=0
+    )
+    await modify(
+        h, stop_order, quantity=Quantity.from_str("0.02"), trigger_price=Price.from_str("1.10500")
+    )
+    assert h.names() == ["OrderModifyRejected", "AccountState"]
+    assert "TRADE_RETCODE_INVALID_STOPS" in h.events[0].reason
+    assert "Invalid stops" in h.events[0].reason
+    assert len(h.venue.order_send.call_args_list) == 1
 
 
 async def test_an_amend_to_the_whole_positions_quantity_updates_it_without_a_request(exec_shim):
@@ -584,14 +629,13 @@ async def test_an_amend_to_the_whole_positions_quantity_updates_it_without_a_req
     h.venue.order_send.assert_not_called()
 
 
-async def test_an_amend_of_a_partly_filled_stop_names_its_whole_quantity_with_its_fills(
-    exec_shim,
-):
+async def test_an_amend_of_a_partly_filled_stop_updates_it_to_each_quantity_commanded(exec_shim):
     h, stop_order, _ = await occupied(exec_shim)
     fill_on(h, stop_order, "7101", "0.006")
     h.venue.positions_get.side_effect = holding(long_position(sl=1.08, volume=0.004))
     await modify(h, stop_order, quantity=Quantity.from_str("0.004"))
-    assert h.names() == ["OrderModifyRejected", "AccountState"]
+    assert h.names() == ["OrderUpdated", "AccountState"]
+    assert h.events[0].quantity == Quantity.from_str("0.004")
     h.ledger.clear()
     await modify(h, stop_order, quantity=Quantity.from_str("0.010"))
     assert h.names() == ["OrderUpdated", "AccountState"]
@@ -627,12 +671,24 @@ async def test_a_flatten_with_a_target_standing_closes_the_position_by_its_ticke
     assert h.events[1].venue_order_id == VenueOrderId("9701")
 
 
-async def test_a_partial_close_with_a_target_standing_is_rejected_naming_it_unsent(exec_shim):
+@pytest.mark.parametrize(("quantity", "volume"), [("0.005", 0.005), ("0.02", 0.02)])
+async def test_a_close_with_a_target_standing_is_sent_at_its_volume_leaving_the_target(
+    exec_shim, quantity, volume
+):
     h, _, _ = await occupied(exec_shim)
-    await submit(h, close(h, quantity="0.005"))
-    assert h.names() == ["OrderSubmitted", "OrderRejected"]
-    assert f"{POSITION}-TP-1" in h.events[1].reason
-    h.venue.order_send.assert_not_called()
+    h.venue.order_send.return_value = send_result(order=9701, deal=7701)
+    order = close(h, quantity=quantity)
+    await submit(h, order)
+    (request,) = sent_requests(h)
+    assert (request["action"], request["position"], request["type"], request["volume"]) == (
+        mirror.TRADE_ACTION_DEAL,
+        POSITION,
+        mirror.ORDER_TYPE_SELL,
+        volume,
+    )
+    assert h.names() == ["OrderSubmitted", "OrderAccepted", "AccountState"]
+    assert [event.client_order_id for event in h.events] == [order.client_order_id] * 2
+    assert h.events[1].venue_order_id == VenueOrderId("9701")
 
 
 async def test_a_partial_close_with_no_target_is_sent(exec_shim):

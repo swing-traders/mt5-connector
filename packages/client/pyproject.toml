@@ -35,7 +35,7 @@ classifiers = [
 ]
 # The fork's own NautilusTrader build, served by its index alone, for Linux x86_64.
 dependencies = [
-    "nautilus_trader==1.231.0+st.22",
+    "nautilus_trader==1.231.0+st.23",
     "numpy>=1.26.4",
     "python-dotenv>=1.0",
     "requests>=2.32",
