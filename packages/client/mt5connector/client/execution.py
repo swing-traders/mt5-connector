@@ -897,16 +897,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._on_new_order_sent(order, self._send(request))
 
     def _close_request(self, order: Order, identifier: int) -> dict:
-        """The deal closing the order's quantity of a position; raises MT5OrderError for a position
-        the venue does not hold, and for a partial close while a target stands, which the venue's
-        whole-position target cannot follow."""
+        """The deal closing the order's quantity of a position, whatever brackets stand; raises
+        MT5OrderError for a position the venue does not hold."""
         instrument = self._instrument(order.instrument_id.symbol.value)
         position = self._held_position(identifier, order.instrument_id.symbol.value)
-        target = self._occupant(identifier, Slot.TP)
-        if target is not None and order.quantity != instrument.make_qty(position.volume):
-            raise MT5OrderError(
-                f"a partial close of position {identifier} while {target.venue_order_id} stands"
-            )
         return self._deal_request(order, instrument) | {"position": position.ticket}
 
     def _place_bracket(self, order: Order, identifier: int, slot: Slot, level: Price) -> None:
@@ -954,9 +948,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._log.warning(f"{order.client_order_id!r} exit: {sent.reason}; {_LOST}")
 
     def _modify_exit(self, order: Order, exit_id: _ExitId, command: ModifyOrder) -> None:
-        """Moves the bracket an exit occupies to the level the modify states. The bracket is the
-        whole position's, so the only quantity it takes is the order's fills and the position's
-        volume together, and that one changes nothing at the venue."""
+        """Moves the bracket an exit occupies to the level the modify states. The bracket has no
+        volume, so a quantity the modify states is not sent and is reported as stated."""
         refusal = self._not_occupying(order, exit_id)
         if refusal is not None:
             self._modify_rejected(order, order.venue_order_id, refusal)
@@ -966,21 +959,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     def _amend_bracket(self, order: Order, exit_id: _ExitId, command: ModifyOrder) -> None:
         try:
             self._conn.ensure_connected()
-            instrument = self._instrument(order.instrument_id.symbol.value)
             position = self._held_position(exit_id.identifier, order.instrument_id.symbol.value)
-        except (MT5ConnectionError, MT5InstrumentError, MT5OrderError) as exc:
+        except (MT5ConnectionError, MT5OrderError) as exc:
             self._modify_rejected(order, order.venue_order_id, f"not sent: {exc}")
         else:
             level = _stated_level(command, exit_id.slot)
-            whole = order.filled_qty + instrument.make_qty(position.volume)
-            if command.quantity is not None and command.quantity != whole:
-                self._modify_rejected(
-                    order,
-                    order.venue_order_id,
-                    f"unsupported: quantity {command.quantity}, the whole position is {whole}",
-                )
-                self._refresh_account()
-            elif level is None:
+            if level is None:
                 self._exit_updated(order, exit_id.slot, command.quantity, level)
                 self._refresh_account()
             else:
