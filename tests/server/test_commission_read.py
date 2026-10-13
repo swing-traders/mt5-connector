@@ -15,6 +15,7 @@ from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import MT5InstrumentError, ServerBusy, ServerUnreachable
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
+from mt5connector.server.sessions import TradingSessions
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.push_wire import (
     ChartState,
@@ -67,6 +68,16 @@ EURUSD_SERVER_TIME = {
     "gmt": 1_752_570_000,
     "connected": 1,
 }
+# Sunday first: a session from 18:00 Sunday to 16:57 Friday, broken from 16:59 to 18:00 each day.
+WEEK = (
+    ((64800, 0),),
+    ((0, 61140), (64800, 0)),
+    ((0, 61140), (64800, 0)),
+    ((0, 61140), (64800, 0)),
+    ((0, 61140), (64800, 0)),
+    ((0, 61020),),
+    (),
+)
 
 SCHEDULE = CommissionSchedule(
     ret=1,
@@ -160,7 +171,9 @@ def test_a_read_the_server_is_busy_for_raises_server_busy_and_leaves_last_error(
 
 
 @pytest.fixture
-def provider(stub, remote):
+def provider(stub, remote, sessions):
+    """A provider over the served app, EURUSD.a's trading sessions relayed already."""
+    sessions.write("EURUSD.a", TradingSessions(quote=WEEK, trade=WEEK, last_error=0))
     info = struct_sample(mirror.StructName.SYMBOL_INFO)._replace(
         name="EURUSD.a",
         digits=5,

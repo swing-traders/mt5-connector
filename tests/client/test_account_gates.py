@@ -28,7 +28,7 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from push_double import PushDouble
-from venue_doubles import account_info, symbol_info, trade_position
+from venue_doubles import account_info, relayed_sessions, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
 from mt5connector.client.config import MT5Config
@@ -381,6 +381,7 @@ async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(v
 def settlement_venue(venue):
     venue.symbol_select.return_value = True
     venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    venue.trading_sessions.return_value = relayed_sessions()
     venue.symbol_info.return_value = symbol_info(
         currency_base="XPT", currency_profit="UST", currency_margin="BHD"
     )
@@ -505,6 +506,7 @@ def terminal(venue):
     venue.symbol_info.side_effect = definitions.get
     venue.symbols_get.return_value = tuple(definitions.values())
     venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    venue.trading_sessions.return_value = relayed_sessions()
     return venue
 
 

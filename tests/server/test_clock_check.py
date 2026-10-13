@@ -19,6 +19,7 @@ from mt5connector.server.clock_check import ClockCheck
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.server_time import Received, ServerTimeSample, ServerTimeSink
+from mt5connector.server.sessions import SessionStore
 from mt5connector.server.terminal import Terminal
 
 BROKER_EPOCH = 1_752_580_800  # an EDT date: the broker clock, New York + 7 h, runs 3 h ahead of UTC
@@ -182,6 +183,7 @@ def routes(terminal, commissions, check: ClockCheck):
     return create_app(
         terminal,
         commissions,
+        SessionStore(),
         CLOCK,
         repeated_hours,
         ServerTimeSink(max_age_s=MAX_AGE_S),

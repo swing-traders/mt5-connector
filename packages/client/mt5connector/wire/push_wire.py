@@ -40,6 +40,7 @@ class FrameType(StrEnum):
     TRADE_TRANSACTION = "trade_transaction"
     SERVER_TIME = "server_time"
     COMMISSIONS = "commissions"
+    SESSIONS = "sessions"
 
 
 class Role(StrEnum):

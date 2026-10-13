@@ -15,6 +15,7 @@ from mt5connector.server.commissions import CommissionStore
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.server_time import ServerTimeSink
+from mt5connector.server.sessions import SessionStore
 from mt5connector.server.terminal import Terminal
 
 
@@ -29,6 +30,11 @@ def stub():
 @pytest.fixture
 def commissions():
     return CommissionStore()
+
+
+@pytest.fixture
+def sessions():
+    return SessionStore()
 
 
 @pytest.fixture
@@ -97,6 +103,7 @@ def workers():
 def app(
     terminal,
     commissions,
+    sessions,
     repeated_hours,
     server_times,
     clock_status,
@@ -108,6 +115,7 @@ def app(
     return create_app(
         terminal,
         commissions,
+        sessions,
         CLOCK,
         repeated_hours,
         server_times,

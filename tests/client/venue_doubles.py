@@ -1,5 +1,6 @@
 """The terminal's account, symbol and tick structs as the shim decodes them, every field the package
-carries present, for tests that feed the client a venue."""
+carries present, and the trading sessions the server relays, for tests that feed the client a
+venue."""
 
 from mt5connector.client.remote_mt5 import STRUCT_TYPES
 from mt5connector.wire import mirror
@@ -169,3 +170,22 @@ def send_result(**fields):
         frozenset({"comment"}),
         {"retcode": mirror.TRADE_RETCODE_DONE, "order": 9001, "request": request} | fields,
     )
+
+
+def week() -> list[list[list[int]]]:
+    """A week of sessions, Sunday first, as the server relays one: open from 18:00 on Sunday to
+    16:57 on Friday, with a break from 16:59 to 18:00 every day between."""
+    return [
+        [[64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61020]],
+        [],
+    ]
+
+
+def relayed_sessions() -> dict:
+    """The server's answer for a symbol whose quote and trade sessions are both week()."""
+    return {"quote": week(), "trade": week(), "last_error": 0}

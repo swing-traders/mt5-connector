@@ -11,6 +11,7 @@ from mt5connector.server.app import TerminalStartError, connect_terminal, create
 from mt5connector.server.commissions import CommissionRule, CommissionSchedule, CommissionTier
 from mt5connector.server.history import FloorStore, History
 from mt5connector.server.repeated_hours import RepeatedHours
+from mt5connector.server.sessions import SessionStore
 from mt5connector.server.settings import (
     Settings,
     SettingsError,
@@ -268,6 +269,7 @@ def test_start_initializes_the_configured_terminal_once(
     client = create_app(
         terminal,
         commissions,
+        SessionStore(),
         CLOCK,
         repeated_hours,
         server_times,

@@ -8,7 +8,7 @@ import pytest
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.objects import Currency
-from venue_doubles import account_info, symbol_info
+from venue_doubles import account_info, relayed_sessions, symbol_info
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot
@@ -380,6 +380,7 @@ def terminal(mock_mt5_conn):
     package.symbol_info.side_effect = definitions.get
     package.symbols_get.return_value = tuple(definitions.values())
     package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    package.trading_sessions.return_value = relayed_sessions()
     conn.mt5 = package
     return package
 

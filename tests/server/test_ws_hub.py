@@ -18,6 +18,7 @@ from mt5connector.server.wire.push_wire import ChartState, FrameType
 from mt5connector.server.ws_server import (
     COMMISSIONS_RELAY_PATH,
     SERVER_TIME_RELAY_PATH,
+    SESSIONS_RELAY_PATH,
     Hub,
     post_to,
     serve_hub,
@@ -50,6 +51,18 @@ def commissions(symbol="EURUSD"):
         "ret": 0,
         "last_error": 0,
         "rules": [],
+    }
+
+
+def sessions(symbol="EURUSD"):
+    week = [[[64800, 0]]] + [[[0, 61140], [64800, 0]]] * 4 + [[[0, 61020]], []]
+    return {
+        "v": 1,
+        "type": "sessions",
+        "symbol": symbol,
+        "quote": week,
+        "trade": week,
+        "last_error": 0,
     }
 
 
@@ -1177,7 +1190,7 @@ async def test_a_frame_of_an_unknown_kind_is_logged_and_skipped(caplog):
 # ── Relays ───────────────────────────────────────────────────────────────────
 
 
-async def test_an_eas_server_time_and_commissions_are_relayed_under_its_symbol_never_fanned_out():
+async def test_an_eas_server_time_commissions_and_sessions_are_relayed_never_fanned_out():
     hub, server, port, relayed = await _run_hub()
     ea = await _ea(port, "EURUSD.a")
     adapter = await _adapter(port)
@@ -1186,11 +1199,14 @@ async def test_an_eas_server_time_and_commissions_are_relayed_under_its_symbol_n
 
     await ea.send(json.dumps(server_time("EURUSD.a")))
     await ea.send(json.dumps(commissions("EURUSD.a")))
+    await ea.send(json.dumps(sessions("EURUSD.a")))
 
     await _nothing(adapter)
-    assert relayed == [
-        (SERVER_TIME_RELAY_PATH, server_time("EURUSD.a")),
+    await _settle_relays(relayed, 3)
+    assert sorted(relayed, key=lambda posted: posted[0]) == [
         (f"{COMMISSIONS_RELAY_PATH}/EURUSD.a", commissions("EURUSD.a")),
+        (SERVER_TIME_RELAY_PATH, server_time("EURUSD.a")),
+        (f"{SESSIONS_RELAY_PATH}/EURUSD.a", sessions("EURUSD.a")),
     ]
     await _close(server, adapter, ea)
 
@@ -1203,6 +1219,17 @@ async def test_a_commissions_frame_naming_another_symbol_is_relayed_under_the_ea
     await _settle_relays(relayed, 1)
 
     assert relayed == [(f"{COMMISSIONS_RELAY_PATH}/US500%23", commissions("EURUSD"))]
+    await _close(server, ea)
+
+
+async def test_a_sessions_frame_naming_another_symbol_is_relayed_under_the_eas():
+    hub, server, port, relayed = await _run_hub()
+    ea = await _ea(port, "US500#")
+
+    await ea.send(json.dumps(sessions("EURUSD")))
+    await _settle_relays(relayed, 1)
+
+    assert relayed == [(f"{SESSIONS_RELAY_PATH}/US500%23", sessions("EURUSD"))]
     await _close(server, ea)
 
 

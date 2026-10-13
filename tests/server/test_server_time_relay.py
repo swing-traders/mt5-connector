@@ -12,6 +12,7 @@ from mirror_samples import CLOCK
 from mt5connector.server.app import create_app
 from mt5connector.server.clock_check import ClockCheck
 from mt5connector.server.server_time import ServerTimeSample, ServerTimeSink
+from mt5connector.server.sessions import SessionStore
 
 FRAME = {
     "v": 1,
@@ -185,6 +186,7 @@ def test_a_frame_relayed_through_the_route_verifies_the_clock(
     client = create_app(
         terminal,
         commissions,
+        SessionStore(),
         CLOCK,
         repeated_hours,
         server_times,

@@ -1,5 +1,5 @@
 """The MetaTrader5 package's call surface served by an MT5 server, every epoch in true UTC, and the
-commission schedules the server relays from the terminal.
+commission schedules and trading sessions the server relays from the terminal.
 
 State: per RemoteMT5, its server's URL, its HTTP session, and the last_error() pair its last
 answered call carried."""
@@ -152,15 +152,22 @@ class RemoteMT5:
         return self._exchange(name, method, path, None, json=json, params=params)
 
     def commission_schedule(self, symbol: str) -> dict:
-        """Waits for the symbol's relayed schedule, retrying after the server's advertised delay;
-        raises MT5InstrumentError when the server refused the symbol's last relay or the symbol's
-        chart failed to open, and ServerBusy when it refuses the read with every slot taken. Leaves
-        last_error as it was: no package call answers it."""
-        name = "commissions"
+        """The symbol's relayed commission schedule, waited for as _relayed() waits."""
+        return self._relayed("commissions", f"/commissions/{quote(symbol, safe='')}")
+
+    def trading_sessions(self, symbol: str) -> dict:
+        """The symbol's relayed trading sessions, waited for as _relayed() waits."""
+        return self._relayed("sessions", f"/sessions/{quote(symbol, safe='')}")
+
+    def _relayed(self, name: str, path: str) -> dict:
+        """Waits for what the terminal relayed that the server's route at `path` reads, retrying
+        after the server's advertised delay; raises MT5InstrumentError when the server refused the
+        symbol's last relay or the symbol's chart failed to open, and ServerBusy when it refuses the
+        read with every slot taken. Leaves last_error as it was: no package call answers it."""
         while True:
             try:
                 response = self._session.get(
-                    f"{self._server_url}/commissions/{quote(symbol, safe='')}",
+                    f"{self._server_url}{path}",
                     timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
                 )
             except requests.RequestException as exc:

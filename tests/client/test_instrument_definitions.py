@@ -11,7 +11,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue as NtVenue
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
-from venue_doubles import account_info, symbol_info, tick
+from venue_doubles import account_info, relayed_sessions, symbol_info, tick
 
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.constants import MT5_VENUE
@@ -51,13 +51,14 @@ REFUSED_MODES = [
 
 
 class Venue:
-    """The terminal behind the provider's connection: symbol definitions, quotes and relayed
-    commission schedules, and the calls made on it in order."""
+    """The terminal behind the provider's connection: symbol definitions, quotes, and relayed
+    commission schedules and trading sessions, and the calls made on it in order."""
 
     def __init__(self) -> None:
         self.symbols = {}
         self.ticks = {}
         self.schedules = {}
+        self.sessions = {}
         self.unselectable = set()
         self.calls = []
         self.package = MagicMock()
@@ -66,14 +67,17 @@ class Venue:
         self.package.symbols_get.side_effect = self.symbols_get
         self.package.symbol_info_tick.side_effect = self.symbol_info_tick
         self.package.commission_schedule.side_effect = self.commission_schedule
+        self.package.trading_sessions.side_effect = self.trading_sessions
         self.package.last_error.return_value = (1, "Success")
 
-    def add(self, info, bid=None, ask=None, schedule=None):
+    def add(self, info, bid=None, ask=None, schedule=None, sessions=None):
         self.symbols[info.name] = info
         if bid is not None:
             self.ticks[info.name] = tick(bid, ask)
         if schedule is not None:
             self.schedules[info.name] = schedule
+        if sessions is not None:
+            self.sessions[info.name] = sessions
 
     def symbol_select(self, name, enable):
         self.calls.append(("symbol_select", name))
@@ -94,6 +98,9 @@ class Venue:
 
     def commission_schedule(self, name):
         return self.schedules.get(name, {"ret": 0, "last_error": 0, "rules": []})
+
+    def trading_sessions(self, name):
+        return self.sessions.get(name, relayed_sessions())
 
 
 def schedule(value, currency, mode=MONEY_DEPOSIT, entry=ENTRY_INOUT):
@@ -292,7 +299,77 @@ async def test_the_info_carries_the_venue_facts_and_bar_calendar(venue):
         "bar_day_open": "17:00",
         "bar_week_open": "SUNDAY",
         "bar_volume": "tick_count",
+        "quote_sessions": relayed_sessions()["quote"],
+        "trade_sessions": relayed_sessions()["trade"],
     }
+
+
+async def test_the_info_carries_the_quote_and_trade_sessions_exactly_as_relayed(venue):
+    quote = [
+        [[64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61020]],
+        [],
+    ]
+    # The trade week differs from the quote week, so each key is seen to carry its own.
+    trade = [
+        [[65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 60900]],
+        [],
+    ]
+    info = symbol_info(name="XAUUSD", chart_mode=mirror.SYMBOL_CHART_MODE_BID)
+    venue.add(info, sessions={"quote": quote, "trade": trade, "last_error": 4307})
+    provider = provider_for(venue, "XAUUSD")
+    await provider.initialize()
+    instrument = provider.find(InstrumentId.from_str("XAUUSD.MT5"))
+
+    assert instrument.info["quote_sessions"] == [
+        [[64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61140], [64800, 0]],
+        [[0, 61020]],
+        [],
+    ]
+    assert instrument.info["trade_sessions"] == [
+        [[65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 61140], [65100, 0]],
+        [[0, 60900]],
+        [],
+    ]
+    assert (
+        instrument.info["chart_mode"],
+        instrument.info["bar_tz"],
+        instrument.info["bar_day_open"],
+    ) == ("BID", "America/New_York", "17:00")
+
+
+@pytest.mark.parametrize(
+    "sessions",
+    [
+        relayed_sessions() | {"quote": relayed_sessions()["quote"][:6]},
+        relayed_sessions() | {"trade": None},
+        relayed_sessions() | {"trade": [[[0, 61140.0]]] + relayed_sessions()["trade"][1:]},
+        relayed_sessions() | {"quote": [[[0]]] + relayed_sessions()["quote"][1:]},
+    ],
+    ids=["six-days", "no-trade-week", "float-second", "short-session"],
+)
+async def test_a_sessions_answer_out_of_shape_fails_the_load_naming_the_symbol(venue, sessions):
+    venue.add(symbol_info(name="XAUUSD"), sessions=sessions)
+    provider = provider_for(venue, "XAUUSD")
+    with pytest.raises(MT5InstrumentError, match="^XAUUSD: "):
+        await provider.initialize()
 
 
 async def test_a_last_built_symbol_names_its_chart_mode(venue):
