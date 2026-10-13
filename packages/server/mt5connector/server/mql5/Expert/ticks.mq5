@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                                       ticks.mq5  |
 //|  Publishes its chart symbol's trade transactions, the ticks and  |
-//|  closed bars the hub wants of it, its commission schedule and    |
-//|  the trade server's time to the WS hub; the spawner also opens   |
-//|  and closes the charts the hub asks it to                        |
+//|  closed bars the hub wants of it, its commission schedule, its   |
+//|  trading sessions and the trade server's time to the WS hub; the |
+//|  spawner also opens and closes the charts the hub asks it to     |
 //+------------------------------------------------------------------+
 #property script_show_inputs
 
@@ -46,12 +46,20 @@ enum ENUM_FRAME_KIND
     FRAME_BAR,
     FRAME_TRADE_TRANSACTION,
     FRAME_SERVER_TIME,
-    FRAME_COMMISSIONS
+    FRAME_COMMISSIONS,
+    FRAME_SESSIONS
 };
 
 enum ENUM_ROLE
 {
     ROLE_EA
+};
+
+// The two session schedules a symbol states per weekday.
+enum ENUM_SESSION_KIND
+{
+    SESSION_QUOTE,
+    SESSION_TRADE
 };
 
 // Whether the tick cursor knows how many ticks of its millisecond came before it.
@@ -183,6 +191,9 @@ string FrameName(const ENUM_FRAME_KIND kind)
     case FRAME_COMMISSIONS:
         name = "commissions";
         break;
+    case FRAME_SESSIONS:
+        name = "sessions";
+        break;
     }
     return name;
 }
@@ -284,6 +295,72 @@ void SendCommissions()
         frame += "]}";
     }
     Send(frame + "]}");
+}
+
+//+------------------------------------------------------------------+
+//| Read one session of the symbol's quote or trade schedule on a    |
+//| weekday                                                          |
+//+------------------------------------------------------------------+
+bool ReadSession(const ENUM_SESSION_KIND kind, const ENUM_DAY_OF_WEEK day, const uint index,
+                 datetime &opens, datetime &closes)
+{
+    bool found = false;
+    switch (kind)
+    {
+    case SESSION_QUOTE:
+        found = SymbolInfoSessionQuote(_Symbol, day, index, opens, closes);
+        break;
+    case SESSION_TRADE:
+        found = SymbolInfoSessionTrade(_Symbol, day, index, opens, closes);
+        break;
+    }
+    return found;
+}
+
+//+------------------------------------------------------------------+
+//| The symbol's quote or trade schedule, Sunday first: per weekday  |
+//| each session's [from, to] as the terminal gives them, seconds    |
+//| from 00:00                                                       |
+//+------------------------------------------------------------------+
+string SessionWeek(const ENUM_SESSION_KIND kind)
+{
+    string week = "[";
+    for (int day = SUNDAY; day <= SATURDAY; day++)
+    {
+        if (day > SUNDAY)
+            week += ",";
+        week += "[";
+        datetime opens = 0;
+        datetime closes = 0;
+        uint index = 0;
+        while (ReadSession(kind, (ENUM_DAY_OF_WEEK)day, index, opens, closes))
+        {
+            if (index > 0)
+                week += ",";
+            week += "[" + IntegerToString((long)opens) + "," + IntegerToString((long)closes) + "]";
+            index++;
+        }
+        week += "]";
+    }
+    return week + "]";
+}
+
+//+------------------------------------------------------------------+
+//| Relay the symbol's quote and trade sessions per weekday, and the |
+//| error the reads left                                             |
+//+------------------------------------------------------------------+
+void SendSessions()
+{
+    ResetLastError();
+    const string quoteWeek = SessionWeek(SESSION_QUOTE);
+    const string tradeWeek = SessionWeek(SESSION_TRADE);
+    const int error = GetLastError();
+    Send("{" + Envelope(FRAME_SESSIONS)
+             + ",\"symbol\":" + Quote(_Symbol)
+             + ",\"quote\":" + quoteWeek
+             + ",\"trade\":" + tradeWeek
+             + ",\"last_error\":" + IntegerToString(error)
+             + "}");
 }
 
 //+------------------------------------------------------------------+
@@ -933,14 +1010,15 @@ void PublishBars()
 }
 
 //+------------------------------------------------------------------+
-//| The relay cadence: the server time and the symbol's commission   |
-//| schedule                                                         |
+//| The relay cadence: the server time, and the symbol's commission  |
+//| schedule and trading sessions                                    |
 //+------------------------------------------------------------------+
 void Relay()
 {
     g_lastRelay = GetTickCount64();
     SendServerTime();
     SendCommissions();
+    SendSessions();
 }
 
 //+------------------------------------------------------------------+

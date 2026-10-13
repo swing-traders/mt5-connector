@@ -18,7 +18,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from push_double import PushDouble
-from venue_doubles import account_info, symbol_info
+from venue_doubles import account_info, relayed_sessions, symbol_info
 
 from mt5connector.client import data
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
@@ -714,6 +714,7 @@ def terminal():
     package.symbol_info.side_effect = definitions.get
     package.symbols_get.return_value = tuple(definitions.values())
     package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
+    package.trading_sessions.return_value = relayed_sessions()
     return package
 
 

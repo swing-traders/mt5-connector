@@ -86,7 +86,7 @@ class CommissionSchedule:
 
 @dataclass(frozen=True)
 class RelayRefusal:
-    """A relayed commissions frame the server refused, and why."""
+    """A relayed frame the server refused, and why."""
 
     reason: str
 

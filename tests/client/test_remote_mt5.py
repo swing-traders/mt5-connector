@@ -8,13 +8,16 @@ import threading
 import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
+from venue_doubles import relayed_sessions
 
 import mt5connector.client.remote_mt5 as rmt5
 from mt5connector.client import errors
 from mt5connector.client.errors import (
     MT5ConnectionError,
+    MT5InstrumentError,
     ServerBusy,
     ServerUnreachable,
 )
@@ -210,6 +213,46 @@ def test_a_busy_commission_read_raises_server_busy_carrying_its_retry_after(stan
     with pytest.raises(ServerBusy, match="^commissions: server busy$") as refused:
         shim.commission_schedule("EURUSD")
     assert refused.value.retry_after_s == 7
+
+
+def test_a_sessions_read_waits_out_each_retry_then_answers_the_relayed_sessions(
+    stand_in, shim, monkeypatch
+):
+    relayed = relayed_sessions()
+    syncing = {"ok": False, "error": {"code": -20_001, "message": "no trading sessions relayed"}}
+    stand_in.reply(503, syncing, headers={"Retry-After": "5"})
+    sleeps = []
+
+    def wait(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            stand_in.reply(200, {"ok": True, "result": relayed})
+
+    # The shim's own clock alone: the stand-in server sleeps on the time module too.
+    monkeypatch.setattr(rmt5, "time", SimpleNamespace(sleep=wait))
+    before = shim.last_error()
+
+    assert shim.trading_sessions("XAUUSD.a") == relayed_sessions()
+    assert sleeps == [5, 5]
+    assert [path for path, _, _ in stand_in.received] == ["/sessions/XAUUSD.a"] * 3
+    assert shim.last_error() == before
+
+
+def test_a_busy_sessions_read_raises_server_busy_carrying_its_retry_after(stand_in, shim):
+    stand_in.reply(
+        503, _failure(-20_002, "/sessions/EURUSD: the server is busy"), headers={"Retry-After": "7"}
+    )
+    with pytest.raises(ServerBusy, match="^sessions: server busy$") as refused:
+        shim.trading_sessions("EURUSD")
+    assert refused.value.retry_after_s == 7
+
+
+def test_a_refused_sessions_relay_raises_naming_the_servers_reason(stand_in, shim):
+    message = "the sessions relay for EURUSD was refused: quote holds 6 days, not 7"
+    stand_in.reply(422, {"ok": False, "error": {"code": -20_003, "message": message}})
+    with pytest.raises(MT5InstrumentError) as refused:
+        shim.trading_sessions("EURUSD")
+    assert str(refused.value) == f"sessions: {message}"
 
 
 @pytest.mark.parametrize("status", [200, 400, 503])

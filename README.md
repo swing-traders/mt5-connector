@@ -224,7 +224,11 @@ The instrument provider loads a symbol by this exact name — one a client's `in
   - The account currency, with every loaded settlement currency, is registered before the first account state.
   - Base-only codes are never registered.
 - **Taker fee** from the commission schedule the server relays for the symbol, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the server has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, a conversion symbol the venue refuses to select, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
-- **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, where the bar day and the bar week open (`bar_tz`, `bar_day_open`, `bar_week_open`) and `bar_volume` (`tick_count`).
+- **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, where the bar day and the bar week open (`bar_tz`, `bar_day_open`, `bar_week_open`), `bar_volume` (`tick_count`), and the symbol's sessions:
+  - `quote_sessions` — the broker's quote sessions, as `SymbolInfoSessionQuote` states them: seven days, Sunday first, each a list of `[from, to]` in seconds from the broker day's 00:00, unconverted;
+  - `trade_sessions` — the broker's trade sessions, as `SymbolInfoSessionTrade` states them, in the same shape.
+
+  Loading waits for the symbol's EA to relay its sessions as it waits for its commission schedule, and a refused relay, or an answer out of that shape, fails the load naming the symbol.
 
 The provider also answers what a consumer discovers its settlement currencies by:
 
@@ -440,6 +444,7 @@ mt5-connector/
 │   │       │   ├── history.py       # the server's history routes, as a client
 │   │       │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
 │   │       │   ├── providers.py     # MT5InstrumentProvider
+│   │       │   ├── sessions.py      # the relayed trading sessions an instrument's info carries
 │   │       │   ├── push.py          # the hub's push channel on NT's WebSocketClient
 │   │       │   └── remote_mt5.py    # the HTTP shim generated from the inventory
 │   │       └── wire/

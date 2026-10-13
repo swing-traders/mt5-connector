@@ -22,6 +22,7 @@ from mt5connector.wire.history_wire import Series, bar_series
 
 if TYPE_CHECKING:
     from mt5connector.client.connection import AccountSnapshot
+    from mt5connector.client.sessions import TradingSessions
 
 InstrumentAny = CurrencyPair | Cfd
 
@@ -137,7 +138,12 @@ def _member(value: int, members: dict, field: str):
 
 
 def parse_symbol_info(
-    info, venue: Venue, account: AccountSnapshot, taker_fee: Decimal, ts: int
+    info,
+    venue: Venue,
+    account: AccountSnapshot,
+    taker_fee: Decimal,
+    sessions: TradingSessions,
+    ts: int,
 ) -> InstrumentAny:
     """The instrument an mt5.symbol_info() definition describes at `venue`: a FOREX calc mode is a
     CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
@@ -145,18 +151,24 @@ def parse_symbol_info(
     without a price."""
     kind = calc_mode(info)
     if kind in FOREX_MODES:
-        return CurrencyPair(**_definition(info, kind, venue, account, taker_fee, ts))
+        return CurrencyPair(**_definition(info, kind, venue, account, taker_fee, sessions, ts))
     elif kind in CFD_MODES:
         return Cfd(
             asset_class=_asset_class(kind),
-            **_definition(info, kind, venue, account, taker_fee, ts),
+            **_definition(info, kind, venue, account, taker_fee, sessions, ts),
         )
     else:
         raise MT5InstrumentError(f"trade_calc_mode {kind} is not one this adapter trades")
 
 
 def _definition(
-    info, kind: CalcMode, venue: Venue, account: AccountSnapshot, taker_fee: Decimal, ts: int
+    info,
+    kind: CalcMode,
+    venue: Venue,
+    account: AccountSnapshot,
+    taker_fee: Decimal,
+    sessions: TradingSessions,
+    ts: int,
 ) -> dict:
     if info.trade_tick_size <= 0:
         raise MT5InstrumentError(f"trade_tick_size {info.trade_tick_size} is not positive")
@@ -190,6 +202,8 @@ def _definition(
             "bar_day_open": _BAR_DAY_OPEN,
             "bar_week_open": _BAR_WEEK_OPEN,
             "bar_volume": BarVolume.TICK_COUNT.value,
+            "quote_sessions": sessions.quote,
+            "trade_sessions": sessions.trade,
         },
     }
 

@@ -1,5 +1,6 @@
 """The MT5 server: the MetaTrader5 package mirrored over HTTP in true UTC, the history windows it
-vouches for, its liveness, and the trade-server time and commission schedules the EAs relay.
+vouches for, its liveness, and the trade-server time, commission schedules and trading sessions the
+EAs relay.
 
 State: the calls holding a slot of the cap now, the most at once and the calls refused since start;
 nothing is persisted."""
@@ -30,6 +31,7 @@ from mt5connector.server.encoding import encode, non_epochs, package_arguments
 from mt5connector.server.history import FloorStore, History, Syncing, bars_refusal, ticks_refusal
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.server_time import ServerTimeSink, server_time_refusal, server_time_sample
+from mt5connector.server.sessions import SessionStore, sessions_refusal, trading_sessions
 from mt5connector.server.settings import Settings, read_settings
 from mt5connector.server.terminal import Answered, Failed, Terminal
 from mt5connector.server.wire import mirror
@@ -43,7 +45,11 @@ from mt5connector.server.wire.history_wire import (
     TickFlags,
 )
 from mt5connector.server.wire.push_wire import ChartState
-from mt5connector.server.ws_server import COMMISSIONS_RELAY_PATH, SERVER_TIME_RELAY_PATH
+from mt5connector.server.ws_server import (
+    COMMISSIONS_RELAY_PATH,
+    SERVER_TIME_RELAY_PATH,
+    SESSIONS_RELAY_PATH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +59,25 @@ _LOOPBACK = "127.0.0.1"
 class _Endpoint(StrEnum):
     HEALTH = "health"
     COMMISSIONS = "commissions"
+    SESSIONS = "sessions"
     SERVER_TIME_RELAY = "server_time_relay"
     COMMISSIONS_RELAY = "commissions_relay"
+    SESSIONS_RELAY = "sessions_relay"
     HISTORY_BARS = "history_bars"
     HISTORY_TICKS = "history_ticks"
     HISTORY_RANGES = "history_ranges"
 
 
 # The routes that answer while the broker clock is not verified: the liveness, the relay that
-# verifies it, and the commission relay, which carries no time.
-_UNGATED = frozenset({_Endpoint.HEALTH, _Endpoint.SERVER_TIME_RELAY, _Endpoint.COMMISSIONS_RELAY})
+# verifies it, and the commission and sessions relays, which carry no epoch.
+_UNGATED = frozenset(
+    {
+        _Endpoint.HEALTH,
+        _Endpoint.SERVER_TIME_RELAY,
+        _Endpoint.COMMISSIONS_RELAY,
+        _Endpoint.SESSIONS_RELAY,
+    }
+)
 
 
 class TerminalStartError(Exception):
@@ -143,6 +158,7 @@ class _Concurrency:
 def create_app(
     terminal: Terminal,
     commissions: CommissionStore,
+    sessions: SessionStore,
     clock: BrokerClock,
     repeated_hours: RepeatedHours,
     server_times: ServerTimeSink,
@@ -153,10 +169,10 @@ def create_app(
     workers: int,
     retry_s: int,
 ) -> Flask:
-    """The server's routes — the package mirror, /health, the commission read, the relays and the
-    history routes — behind the clock gate, then the cap of `workers` − 1 calls that can hold a
-    worker on the terminal or the hub, and inside it the publisher check; `retry_s` is the
-    Retry-After of every deferring answer."""
+    """The server's routes — the package mirror, /health, the commission and sessions reads, the
+    relays and the history routes — behind the clock gate, then the cap of `workers` − 1 calls that
+    can hold a worker on the terminal or the hub, and inside it the publisher check; `retry_s` is
+    the Retry-After of every deferring answer."""
     concurrency = _Concurrency(workers)
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
@@ -185,6 +201,12 @@ def create_app(
         methods=["GET"],
     )
     app.add_url_rule(
+        "/sessions/<symbol>",
+        endpoint=_Endpoint.SESSIONS.value,
+        view_func=_capped(concurrency, retry_s, _sessions_view(sessions, publishers, retry_s)),
+        methods=["GET"],
+    )
+    app.add_url_rule(
         SERVER_TIME_RELAY_PATH,
         endpoint=_Endpoint.SERVER_TIME_RELAY.value,
         view_func=_server_time_relay_view(server_times, publishers),
@@ -194,6 +216,12 @@ def create_app(
         f"{COMMISSIONS_RELAY_PATH}/<symbol>",
         endpoint=_Endpoint.COMMISSIONS_RELAY.value,
         view_func=_commissions_relay_view(commissions),
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        f"{SESSIONS_RELAY_PATH}/<symbol>",
+        endpoint=_Endpoint.SESSIONS_RELAY.value,
+        view_func=_sessions_relay_view(sessions),
         methods=["POST"],
     )
     app.add_url_rule(
@@ -377,6 +405,32 @@ def _commissions_view(
     return view
 
 
+def _sessions_view(sessions: SessionStore, publishers: Publishers, retry_s: int) -> Callable:
+    # No package call answers relayed sessions, so these envelopes carry no last_error.
+    def view(symbol: str):
+        unserved = _ensure_published(publishers, symbol, retry_s)
+        relay = sessions.read(symbol)
+        if unserved is not None:
+            error = {"code": unserved.code, "message": unserved.message}
+            return {"ok": False, "error": error}, unserved.status, unserved.headers
+        elif relay is None:
+            message = f"no trading sessions relayed for {symbol}"
+            error = {"code": ServerCode.SYNCING, "message": message}
+            return (
+                {"ok": False, "error": error},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"Retry-After": str(retry_s)},
+            )
+        elif isinstance(relay, RelayRefusal):
+            message = f"the sessions relay for {symbol} was refused: {relay.reason}"
+            error = {"code": ServerCode.RELAY_REFUSED, "message": message}
+            return {"ok": False, "error": error}, HTTPStatus.UNPROCESSABLE_ENTITY
+        else:
+            return {"ok": True, "result": dataclasses.asdict(relay)}, HTTPStatus.OK
+
+    return view
+
+
 def _server_time_relay_view(server_times: ServerTimeSink, publishers: Publishers) -> Callable:
     # No package call answers a relayed frame, so these envelopes carry no last_error.
     def view():
@@ -409,6 +463,24 @@ def _commissions_relay_view(commissions: CommissionStore) -> Callable:
             return {"ok": False, "error": error}, HTTPStatus.BAD_REQUEST
         else:
             commissions.write(symbol, commission_schedule(frame))
+            return {"ok": True, "result": None}, HTTPStatus.OK
+
+    return view
+
+
+def _sessions_relay_view(sessions: SessionStore) -> Callable:
+    # No package call answers a relayed frame, so these envelopes carry no last_error.
+    def view(symbol: str):
+        frame = _body_arguments()
+        refusal = sessions_refusal(frame, symbol)
+        if request.remote_addr != _LOOPBACK:
+            return _not_loopback()
+        elif refusal is not None:
+            sessions.write(symbol, RelayRefusal(refusal))
+            error = {"code": mirror.RES_E_INVALID_PARAMS, "message": refusal}
+            return {"ok": False, "error": error}, HTTPStatus.BAD_REQUEST
+        else:
+            sessions.write(symbol, trading_sessions(frame))
             return {"ok": True, "result": None}, HTTPStatus.OK
 
     return view
@@ -585,6 +657,7 @@ def main() -> None:
     app = create_app(
         terminal,
         CommissionStore(),
+        SessionStore(),
         clock,
         repeated_hours,
         server_times,

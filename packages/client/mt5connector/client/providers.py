@@ -35,6 +35,7 @@ from mt5connector.client.parsing import (
     parse_symbol_info,
     trade_mode,
 )
+from mt5connector.client.sessions import parse_sessions
 
 if TYPE_CHECKING:
     from nautilus_trader.common.component import Clock
@@ -129,15 +130,16 @@ class MT5InstrumentProvider(InstrumentProvider):
     def _load_definition(self, info, account: AccountSnapshot, pairs: _Pairs, ts: int):
         """Builds the instrument a selected symbol's definition describes, its taker fee from the
         commission rule the server relays, selecting first the symbol that converts a money rule's
-        currency into the quote currency; raises MT5InstrumentError when the venue refuses that
-        selection."""
+        currency into the quote currency, and its trading sessions as the server relays them; raises
+        MT5InstrumentError when the venue refuses that selection."""
         rule = parse_schedule(self._conn.mt5.commission_schedule(info.name))
+        sessions = parse_sessions(self._conn.mt5.trading_sessions(info.name))
         if rule is not None and rule.mode in MONEY_MODES and rule.currency != info.currency_profit:
             converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
             if not self._conn.mt5.symbol_select(converter, True):
                 raise MT5InstrumentError(f"{converter} cannot be selected")
         fee = _taker_fee(self._conn.mt5, info, rule, pairs)
-        return parse_symbol_info(info, self._venue, account, fee, ts)
+        return parse_symbol_info(info, self._venue, account, fee, sessions, ts)
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
 

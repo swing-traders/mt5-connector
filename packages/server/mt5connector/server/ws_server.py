@@ -49,6 +49,7 @@ from mt5connector.server.wire.push_wire import (
 
 SERVER_TIME_RELAY_PATH = "/relay/server_time"
 COMMISSIONS_RELAY_PATH = "/relay/commissions"
+SESSIONS_RELAY_PATH = "/relay/sessions"
 # The most frames a consumer's queue holds; the next one closes it with the overflow code.
 QUEUE_BOUND = 10_000
 OVERFLOW = 4008
@@ -56,7 +57,7 @@ _RELAY_TIMEOUT_S = 5
 _IDLE_SWEEP_S = 5
 _LOOPBACK = "127.0.0.1"
 _PUBLISHED = frozenset({FrameType.TICK, FrameType.BAR, FrameType.TRADE_TRANSACTION})
-_RELAYED = frozenset({FrameType.SERVER_TIME, FrameType.COMMISSIONS})
+_RELAYED = frozenset({FrameType.SERVER_TIME, FrameType.COMMISSIONS, FrameType.SESSIONS})
 _OPS = frozenset({FrameType.SUBSCRIBE, FrameType.UNSUBSCRIBE})
 _CHART_ANSWERS = frozenset({FrameType.CHART_OPENED, FrameType.CHART_FAILED, FrameType.CHART_KEPT})
 _EA_HELLO = ("v", "type", "role", "symbol", "spawner")
@@ -328,14 +329,19 @@ class Hub:
             await self._tell_publishers()
 
     def _relay_frame(self, ws, kind: FrameType, frame: dict) -> None:
-        """Hands the server the EA's commission schedule, or a server-time sample naming its own
-        symbol, off the loop and not awaited, so a slow server never holds back the stream."""
+        """Hands the server the EA's commission schedule or trading sessions, or a server-time
+        sample naming its own symbol, off the loop and not awaited, so a slow server never holds
+        back the stream."""
         ea = self._eas[ws]
         if self._publishers.get(ea.symbol) is ws:
             loop = asyncio.get_running_loop()
+            # A schedule or sessions frame is posted under the EA's symbol, so the server records a
+            # refused frame against it.
             if kind == FrameType.COMMISSIONS:
-                # Posted under the EA's symbol, so the server records a refused frame against it.
                 path = f"{COMMISSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}"
+                loop.run_in_executor(None, self._relay, path, frame)
+            elif kind == FrameType.SESSIONS:
+                path = f"{SESSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}"
                 loop.run_in_executor(None, self._relay, path, frame)
             elif frame.get("symbol") == ea.symbol:
                 loop.run_in_executor(None, self._relay, SERVER_TIME_RELAY_PATH, frame)

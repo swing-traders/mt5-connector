@@ -12,7 +12,7 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from venue_doubles import account_info, symbol_info, tick
+from venue_doubles import account_info, relayed_sessions, symbol_info, tick
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import MT5Connection
@@ -79,6 +79,7 @@ class Terminal:
             "/mt5/symbols_get": _answer([symbol_info()._asdict()]),
             "/mt5/symbol_info_tick": _answer(tick(bid=1.085, ask=1.0852)._asdict()),
             "/commissions/EURUSD": {"ok": True, "result": {"ret": 0, "last_error": 0, "rules": []}},
+            "/sessions/EURUSD": {"ok": True, "result": relayed_sessions()},
             "/history/ranges": _answer({"maxbars": 100_000, "ranges": {}}),
             "/history/bars": _answer([]),
             "/history/ticks": _answer([]),
