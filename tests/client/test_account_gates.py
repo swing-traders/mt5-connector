@@ -48,6 +48,7 @@ def _config(venue: Venue = MT5_VENUE) -> MT5Config:
         password="p",
         server="Broker-Demo",
         server_url="http://127.0.0.1:5000",
+        ws_url="ws://127.0.0.1:9000",
         venue=venue,
     )
 

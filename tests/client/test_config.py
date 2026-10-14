@@ -3,50 +3,53 @@ import traceback
 import pytest
 from nautilus_trader.model.identifiers import Venue
 
-from mt5connector.client.config import MT5Config, derive_ws_url
+from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import MT5ConfigError
+
+_SERVER_URL = "http://192.168.1.10:5000"
+_WS_URL = "ws://192.168.1.10:9001"
 
 
 def _base(**kw):
     return MT5Config(account=1, password="p", server="s", **kw)
 
 
+def _config(**kw):
+    return _base(**{"server_url": _SERVER_URL, "ws_url": _WS_URL, **kw})
+
+
 def test_a_config_without_a_server_url_is_refused_naming_the_field():
     with pytest.raises(MT5ConfigError, match="server_url"):
-        _base()
+        _base(ws_url=_WS_URL)
 
 
 def test_an_empty_server_url_is_refused_naming_the_field():
     with pytest.raises(MT5ConfigError, match="server_url"):
-        _base(server_url="")
+        _base(server_url="", ws_url=_WS_URL)
 
 
-def test_server_url_is_kept():
-    c = _base(server_url="http://192.168.1.10:5000")
-    assert c.server_url == "http://192.168.1.10:5000"
+def test_a_config_without_a_ws_url_is_refused_naming_the_field():
+    with pytest.raises(MT5ConfigError, match=r"^MT5Config\.ws_url cannot be empty\.$"):
+        _base(server_url=_SERVER_URL)
 
 
-def test_ws_url_derived_when_omitted():
-    c = _base(server_url="http://192.168.1.10:5000")
-    assert c.ws_url == "ws://192.168.1.10:9000"
+def test_an_empty_ws_url_is_refused_naming_the_field():
+    with pytest.raises(MT5ConfigError, match=r"^MT5Config\.ws_url cannot be empty\.$"):
+        _base(server_url=_SERVER_URL, ws_url="")
 
 
-def test_ws_url_explicit_wins():
-    c = _base(server_url="http://192.168.1.10:5000", ws_url="ws://192.168.1.10:9001")
-    assert c.ws_url == "ws://192.168.1.10:9001"
-
-
-def test_derive_ws_url_http():
-    assert derive_ws_url("http://localhost:5000") == "ws://localhost:9000"
+def test_a_config_with_both_urls_keeps_them():
+    c = _base(server_url=_SERVER_URL, ws_url=_WS_URL)
+    assert (c.server_url, c.ws_url) == (_SERVER_URL, _WS_URL)
 
 
 def test_the_venue_defaults_to_mt5():
-    assert _base(server_url="http://192.168.1.10:5000").venue == Venue("MT5")
+    assert _config().venue == Venue("MT5")
 
 
 @pytest.mark.parametrize("label", ["MT5", "MT5_ALPHA", "MT5_BETA", "MT5_A", "MT5_12345678"])
 def test_a_venue_of_mt5_or_mt5_and_up_to_eight_capitals_or_digits_is_kept(label):
-    assert _base(server_url="http://192.168.1.10:5000", venue=Venue(label)).venue == Venue(label)
+    assert _config(venue=Venue(label)).venue == Venue(label)
 
 
 @pytest.mark.parametrize(
@@ -54,16 +57,16 @@ def test_a_venue_of_mt5_or_mt5_and_up_to_eight_capitals_or_digits_is_kept(label)
 )
 def test_a_venue_of_any_other_shape_is_refused_naming_it(label):
     with pytest.raises(MT5ConfigError, match=f"venue {label} "):
-        _base(server_url="http://192.168.1.10:5000", venue=Venue(label))
+        _config(venue=Venue(label))
 
 
 def test_a_venue_given_as_a_string_is_refused():
     with pytest.raises(MT5ConfigError, match="venue 'MT5_ALPHA' is not a Venue"):
-        _base(server_url="http://192.168.1.10:5000", venue="MT5_ALPHA")
+        _config(venue="MT5_ALPHA")
 
 
 def test_the_execution_settings_default():
-    c = _base(server_url="http://192.168.1.10:5000")
+    c = _config()
     assert c.deviation_points == 20
     assert c.account_refresh_seconds == 10
     assert c.history_lookback_mins == 60
@@ -75,7 +78,7 @@ def test_the_execution_settings_default():
 )
 def test_an_execution_setting_out_of_range_is_refused_naming_it(field, value):
     with pytest.raises(ValueError, match=field):
-        _base(server_url="http://192.168.1.10:5000", **{field: value})
+        _config(**{field: value})
 
 
 @pytest.mark.parametrize(
@@ -83,7 +86,7 @@ def test_an_execution_setting_out_of_range_is_refused_naming_it(field, value):
     [("deviation_points", 0), ("account_refresh_seconds", 1), ("history_lookback_mins", 1)],
 )
 def test_an_execution_setting_at_its_bound_is_kept(field, value):
-    c = _base(server_url="http://192.168.1.10:5000", **{field: value})
+    c = _config(**{field: value})
     assert getattr(c, field) == value
 
 
@@ -105,7 +108,7 @@ def test_an_execution_setting_at_its_bound_is_kept(field, value):
 )
 def test_a_connection_setting_out_of_range_is_refused_naming_it(field, value):
     with pytest.raises(ValueError, match=field):
-        _base(server_url="http://192.168.1.10:5000", **{field: value})
+        _config(**{field: value})
 
 
 @pytest.mark.parametrize(
@@ -118,7 +121,7 @@ def test_a_connection_setting_out_of_range_is_refused_naming_it(field, value):
     ],
 )
 def test_a_connection_setting_at_its_bound_is_kept(field, value):
-    c = _base(server_url="http://192.168.1.10:5000", **{field: value})
+    c = _config(**{field: value})
     assert getattr(c, field) == value
 
 
@@ -127,13 +130,12 @@ def test_a_connection_setting_at_its_bound_is_kept(field, value):
 )
 def test_a_server_url_without_a_scheme_and_host_is_refused_naming_it(server_url):
     with pytest.raises(MT5ConfigError, match="server_url"):
-        _base(server_url=server_url)
+        _config(server_url=server_url)
 
 
 @pytest.mark.parametrize(
     "ws_url",
     [
-        "",
         "nonsense",
         "localhost:9000",
         "ws://",
@@ -145,12 +147,12 @@ def test_a_server_url_without_a_scheme_and_host_is_refused_naming_it(server_url)
 )
 def test_a_ws_url_that_is_no_websocket_url_with_a_host_is_refused_naming_it(ws_url):
     with pytest.raises(MT5ConfigError, match="ws_url"):
-        _base(server_url="http://192.168.1.10:5000", ws_url=ws_url)
+        _config(ws_url=ws_url)
 
 
 @pytest.mark.parametrize("ws_url", ["ws://192.168.1.10:9001", "wss://hub.example.com/push"])
 def test_a_ws_or_wss_url_with_a_host_is_kept(ws_url):
-    assert _base(server_url="http://192.168.1.10:5000", ws_url=ws_url).ws_url == ws_url
+    assert _config(ws_url=ws_url).ws_url == ws_url
 
 
 @pytest.mark.parametrize(
@@ -158,7 +160,7 @@ def test_a_ws_or_wss_url_with_a_host_is_kept(ws_url):
 )
 def test_a_server_url_that_is_no_http_or_https_url_is_refused_naming_it(server_url):
     with pytest.raises(MT5ConfigError, match="server_url"):
-        _base(server_url=server_url)
+        _config(server_url=server_url)
 
 
 @pytest.mark.parametrize(
@@ -173,7 +175,7 @@ def test_a_server_url_that_is_no_http_or_https_url_is_refused_naming_it(server_u
 )
 def test_a_server_url_that_is_malformed_or_names_no_tcp_port_is_refused_naming_it(server_url):
     with pytest.raises(MT5ConfigError, match="server_url"):
-        _base(server_url=server_url)
+        _config(server_url=server_url)
 
 
 @pytest.mark.parametrize(
@@ -182,7 +184,7 @@ def test_a_server_url_that_is_malformed_or_names_no_tcp_port_is_refused_naming_i
 )
 def test_a_ws_url_that_names_no_tcp_port_is_refused_naming_it(ws_url):
     with pytest.raises(MT5ConfigError, match="ws_url"):
-        _base(server_url="http://127.0.0.1:5000", ws_url=ws_url)
+        _config(ws_url=ws_url)
 
 
 # The parser refuses a full-width colon naming the whole authority, credentials included.
@@ -202,7 +204,7 @@ def test_a_ws_url_that_names_no_tcp_port_is_refused_naming_it(ws_url):
 )
 def test_a_malformed_url_is_refused_without_echoing_its_credentials(field, urls):
     with pytest.raises(MT5ConfigError, match=field) as refused:
-        _base(**urls)
+        _config(**urls)
     assert "SYNTHETIC_SECRET" not in "".join(traceback.format_exception(refused.value))
 
 
@@ -210,13 +212,12 @@ def test_a_malformed_url_is_refused_without_echoing_its_credentials(field, urls)
     "server_url", ["http://127.0.0.1:1", "https://127.0.0.1:65535", "http://127.0.0.1"]
 )
 def test_an_http_or_https_server_url_with_a_port_in_range_or_none_is_kept(server_url):
-    config = _base(server_url=server_url)
-    assert (config.server_url, config.ws_url) == (server_url, "ws://127.0.0.1:9000")
+    assert _config(server_url=server_url).server_url == server_url
 
 
 @pytest.mark.parametrize("ws_url", ["ws://127.0.0.1:1", "wss://127.0.0.1:65535", "ws://127.0.0.1"])
 def test_a_ws_url_with_a_port_in_range_or_none_is_kept(ws_url):
-    assert _base(server_url="http://127.0.0.1:5000", ws_url=ws_url).ws_url == ws_url
+    assert _config(ws_url=ws_url).ws_url == ws_url
 
 
 @pytest.mark.parametrize(
@@ -225,13 +226,7 @@ def test_a_ws_url_with_a_port_in_range_or_none_is_kept(ws_url):
         ("ws://hub:SYNTHETIC_SECRET@127.0.0.1:9000/push", "ws://127.0.0.1:9000/push"),
         ("wss://hub@[::1]:9000/push?token=SYNTHETIC_SECRET#top", "wss://[::1]:9000/push"),
         ("ws://127.0.0.1:9000", "ws://127.0.0.1:9000"),
-        (None, "ws://127.0.0.1:9000"),
     ],
 )
 def test_the_hubs_display_url_is_its_scheme_host_port_and_path(ws_url, shown):
-    assert _base(server_url="http://127.0.0.1:5000", ws_url=ws_url).ws_display_url == shown
-
-
-def test_a_bracketed_ipv6_host_keeps_its_brackets_in_the_derived_ws_url():
-    assert derive_ws_url("http://[::1]:5000") == "ws://[::1]:9000"
-    assert _base(server_url="http://[fe80::1]:5000/api").ws_url == "ws://[fe80::1]:9000/api"
+    assert _config(ws_url=ws_url).ws_display_url == shown

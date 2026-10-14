@@ -771,6 +771,7 @@ def _client_config(server_url: str) -> MT5Config:
         password=_ACCOUNT["MT5_PASSWORD"],
         server=_ACCOUNT["MT5_SERVER"],
         server_url=server_url,
+        ws_url=f"ws://127.0.0.1:{_HUB_PORT}",
         venue=Venue("MT5_TEST"),
     )
 

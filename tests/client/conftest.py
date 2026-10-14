@@ -23,6 +23,7 @@ def config():
         password="test_password",
         server="Exness-MT5Trial1",
         server_url="http://127.0.0.1:5000",
+        ws_url="ws://127.0.0.1:9000",
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
         reconnect_max_attempts=3,
