@@ -324,7 +324,11 @@ async def test_a_bar_reaches_the_consumers_of_its_series_by_the_series_name_in_t
 
     await ea.send(json.dumps(bar(mirror.TIMEFRAME_M5)))
 
-    assert await _received(m5) == bar() | {"timeframe": "M5", "time": UTC_EPOCH}
+    assert await _received(m5) == bar() | {
+        "timeframe": "M5",
+        "time": UTC_EPOCH,
+        "time_close": UTC_EPOCH + 300,
+    }
     await _nothing(m1)
     await _close(server, m5, m1, ea)
 
@@ -817,6 +821,76 @@ async def test_two_repeated_broker_hours_alternating_are_each_warned_of_once(cap
         repeated_hour_warning(REPEATED_A_YEAR_BEFORE),
     ]
     await _closed(tasks, ea, adapter)
+
+
+# On a symbol that trades weekends the H1 bar stamped broker 09:00 on 2026-03-08, in the hour the
+# broker's clock skips, and the one stamped 10:00 both open at 07:00Z and close at 08:00Z.
+SKIPPED = calendar.timegm((2026, 3, 8, 9, 0, 0))
+AFTER_SKIPPED = calendar.timegm((2026, 3, 8, 10, 0, 0))
+NEXT_HOUR = calendar.timegm((2026, 3, 8, 11, 0, 0))
+SPRING_OPEN = calendar.timegm((2026, 3, 8, 7, 0, 0))
+SPRING_BARS = {
+    SKIPPED: {"open": 1.11, "high": 1.13, "low": 1.10, "close": 1.12, "tick_volume": 110},
+    AFTER_SKIPPED: {"open": 1.12, "high": 1.16, "low": 1.11, "close": 1.15, "tick_volume": 490},
+    NEXT_HOUR: {"open": 1.15, "high": 1.17, "low": 1.14, "close": 1.16, "tick_volume": 600},
+}
+
+
+def spring_bar(stamp):
+    return bar(mirror.TIMEFRAME_H1) | {"time": stamp} | SPRING_BARS[stamp]
+
+
+def pushed_spring_bar(stamp, opened):
+    return spring_bar(stamp) | {"timeframe": "H1", "time": opened, "time_close": opened + 3_600}
+
+
+async def _pushed_h1(*stamps):
+    """The frames an adapter subscribed to EURUSD's H1 bars receives as the EA publishes bars
+    stamped at `stamps`."""
+    hub = Hub(CLOCK, lambda path, frame: None, idle_s=IDLE_S)
+    ea = Peer()
+    adapter = Peer()
+    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (ea, adapter)]
+    ea.put(ea_hello("EURUSD"))
+    adapter.put(adapter_hello())
+    adapter.put(subscribe(1, "bars", symbol="EURUSD", timeframe="H1"))
+    await _settle()
+
+    for stamp in stamps:
+        ea.put(spring_bar(stamp))
+    await _settle()
+
+    await _closed(tasks, ea, adapter)
+    return adapter.sent[1:]
+
+
+async def test_of_two_bars_converting_to_one_period_the_first_is_pushed_with_one_warning(caplog):
+    caplog.set_level(logging.WARNING)
+
+    pushed = await _pushed_h1(SKIPPED, AFTER_SKIPPED, NEXT_HOUR)
+
+    assert pushed == [
+        pushed_spring_bar(SKIPPED, SPRING_OPEN),
+        pushed_spring_bar(NEXT_HOUR, SPRING_OPEN + 3_600),
+    ]
+    assert _warnings(caplog) == [
+        f"bar: time {SKIPPED} is in the hour the broker's clock skips, read at the offset before "
+        "the change",
+        f"bar: time {AFTER_SKIPPED} opens in the true-UTC period of the bar before it and is "
+        "dropped",
+    ]
+
+
+async def test_a_bar_after_the_skipped_hour_no_bar_was_stamped_in_is_pushed(caplog):
+    caplog.set_level(logging.WARNING)
+
+    pushed = await _pushed_h1(AFTER_SKIPPED, NEXT_HOUR)
+
+    assert pushed == [
+        pushed_spring_bar(AFTER_SKIPPED, SPRING_OPEN),
+        pushed_spring_bar(NEXT_HOUR, SPRING_OPEN + 3_600),
+    ]
+    assert _warnings(caplog) == []
 
 
 # ── Bounds and keepalive ─────────────────────────────────────────────────────

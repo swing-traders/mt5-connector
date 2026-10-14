@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from mt5connector.wire.broker_clock import BrokerClock, NonexistentWallTime
+from mt5connector.wire.broker_clock import BrokerClock
 
 CLOCK = BrokerClock(ZoneInfo("America/New_York"), timedelta(hours=7))
 EDT_S = 10_800
@@ -67,15 +67,21 @@ def test_hourly_sweep_across_a_changeover_day(day, changeover_hour, before_s, af
 
 
 @pytest.mark.parametrize(
-    "wall",
-    [(2026, 3, 8, 9, 0, 0), (2026, 3, 8, 9, 30, 0), (2026, 3, 8, 9, 59, 59)],
+    ("wall", "utc"),
+    [
+        ((2026, 3, 8, 9, 0, 0), (2026, 3, 8, 7, 0, 0)),
+        ((2026, 3, 8, 9, 30, 0), (2026, 3, 8, 7, 30, 0)),
+        ((2026, 3, 8, 9, 59, 59), (2026, 3, 8, 7, 59, 59)),
+    ],
     ids=["09:00:00", "09:30:00", "09:59:59"],
 )
-def test_the_skipped_hour_raises(wall):
-    with pytest.raises(NonexistentWallTime):
-        CLOCK.to_utc(broker_epoch(*wall))
-    with pytest.raises(NonexistentWallTime):
-        CLOCK.to_utc_msc(broker_epoch(*wall) * 1000 + 500)
+def test_the_skipped_hour_reads_at_the_offset_before_the_change(wall, utc):
+    broker = broker_epoch(*wall)
+    assert CLOCK.to_utc(broker) == broker_epoch(*utc)
+    assert CLOCK.to_utc_msc(broker * 1000 + 500) == broker_epoch(*utc) * 1000 + 500
+    assert not CLOCK.is_ambiguous(broker)
+    # The reading after the change lies an hour earlier; the instant nearest it changes nothing.
+    assert CLOCK.to_utc_near(broker, broker_epoch(*utc) - 3_600) == broker_epoch(*utc)
 
 
 def test_the_skipped_hour_is_bounded():

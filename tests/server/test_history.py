@@ -23,11 +23,12 @@ import mt5connector.client.remote_mt5 as shim
 import mt5connector.wire.history_wire as wire
 from mt5connector.client.downloader import MT5DataDownloader
 from mt5connector.client.errors import ServerUnreachable
+from mt5connector.client.parsing import venue_bar, venue_bar_type
 from mt5connector.server import history as history_module
 from mt5connector.server.history import FloorOrigin
 from mt5connector.server.server_time import ServerTimeSample, ServerTimeSink
 from mt5connector.server.wire import mirror
-from mt5connector.server.wire.history_wire import Series
+from mt5connector.server.wire.history_wire import BAR_PERIOD_S, BAR_TIMEFRAME, Series
 
 RATES = np.dtype(list(mirror.RATES.dtype))
 TICKS = np.dtype(list(mirror.TICKS.dtype))
@@ -48,12 +49,17 @@ def broker(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> i
     return calendar.timegm((year, month, day, hour, minute, 0))
 
 
+def utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
+    return calendar.timegm((year, month, day, hour, minute, 0))
+
+
 # The trade-server time the relay last carried: broker 2026-01-15 12:00, under EST.
 NOW = broker(2026, 1, 15, 12)
 NOW_UTC = NOW - EST
-# The span of one read at the double's MaxBars of 100,000.
-H1_SPAN = 99_989 * HOUR
-M1_SPAN = 99_989 * MINUTE
+# The period of each package timeframe the double serves.
+PERIODS = {BAR_TIMEFRAME[series]: BAR_PERIOD_S[series] for series in BAR_TIMEFRAME}
+# MT5's unlimited bars setting, as terminal_info reads it.
+UNLIMITED_MAXBARS = 100_000_000
 
 
 def rates(*times: int) -> np.ndarray:
@@ -65,6 +71,7 @@ def ticks(*times_msc: int) -> np.ndarray:
 
 
 def bar_json(utc: int) -> dict[str, object]:
+    """An H1 bar as the bars route answers it, its close an hour after its open."""
     return {
         "time": utc,
         "open": 1.1,
@@ -74,6 +81,7 @@ def bar_json(utc: int) -> dict[str, object]:
         "tick_volume": 10,
         "spread": 2,
         "real_volume": 0,
+        "time_close": utc + HOUR,
     }
 
 
@@ -190,7 +198,7 @@ class Package:
 
     def _rates(self, timeframe, lo, hi):
         series = self.rates.get(timeframe, rates())
-        period = {M1: MINUTE, H1: HOUR}[timeframe]
+        period = PERIODS[timeframe]
         if self.syncing() or hi - lo > (self.maxbars - 11) * period:
             return series[:0]
         elif len(series) > 0 and hi < series["time"][0]:
@@ -228,6 +236,13 @@ def server_times():
     sink = ServerTimeSink(max_age_s=30)
     sink.write(ServerTimeSample("EURUSD", NOW, NOW, NOW - EST, True))
     return sink
+
+
+@pytest.fixture
+def later(server_times):
+    """The relay's latest sample carrying the trade server at broker 2026-10-14 12:00, under EDT."""
+    sample = broker(2026, 10, 14, 12)
+    server_times.write(ServerTimeSample("EURUSD", sample, sample, sample - EDT, True))
 
 
 @pytest.fixture
@@ -503,7 +518,7 @@ def test_a_bar_window_nothing_proves_answers_503_once_its_evidence_reads_are_mad
     assert stub.windows("copy_rates_range") == [
         (H1, 93_600, 97_200),
         (H1, window, window + HOUR),
-        (H1, window + HOUR, window + HOUR + H1_SPAN),
+        (H1, window + HOUR, stub.last_quote),
     ]
     stub.rates[H1] = rates(window, window + HOUR)
 
@@ -602,8 +617,8 @@ def test_an_empty_minute_window_with_bars_on_both_sides_is_answered_empty(client
     response = post_bars(client, "M1", lo - EDT, hi - EDT)
 
     assert response.json == ok([])
-    # The probe, the window, the last quote, the span after the window and the last bar opened at
-    # or before its start.
+    # The probe, the window, the last quote, the read from the window's end to that quote and the
+    # last bar opened at or before its start.
     assert stub.names() == [
         "symbol_select",
         "terminal_info",
@@ -616,7 +631,7 @@ def test_an_empty_minute_window_with_bars_on_both_sides_is_answered_empty(client
     assert stub.windows("copy_rates_range") == [
         (M1, 93_600, 93_660),
         (M1, lo, hi),
-        (M1, hi, hi + M1_SPAN),
+        (M1, hi, stub.last_quote),
     ]
     assert stub.windows("copy_rates_from") == [(M1, lo, 1)]
 
@@ -681,7 +696,136 @@ def test_an_empty_tick_day_with_no_tick_after_it_while_the_last_quote_is_later_a
     assert stub.names()[-2:] == ["symbol_info_tick", "copy_ticks_from"]
 
 
+# ── A window holding no bar ───────────────────────────────────────────────────
+
+
+def test_an_hour_window_inside_a_weekend_is_answered_empty_under_unlimited_maxbars(
+    client, stub, floors
+):
+    stub.maxbars = UNLIMITED_MAXBARS
+    friday = [broker(2025, 7, 18, hour) for hour in range(20, 24)]
+    monday = [broker(2025, 7, 21, hour) for hour in range(1, 4)]
+    stub.rates[H1] = rates(*friday, *monday)
+    kept(floors, Series.H1, friday[0])
+    stub.last_quote = monday[-1] + 30 * MINUTE
+    lo, hi = broker(2025, 7, 20, 9), broker(2025, 7, 20, 13)
+
+    response = post_bars(client, "H1", lo - EDT, hi - EDT)
+
+    assert (response.status_code, response.json) == (200, ok([]))
+
+
+def test_a_day_window_inside_a_holiday_is_answered_empty_under_unlimited_maxbars(
+    client, stub, floors
+):
+    stub.maxbars = UNLIMITED_MAXBARS
+    d1 = mirror.TIMEFRAME_D1
+    stub.rates[d1] = rates(broker(2025, 12, 23), broker(2025, 12, 24), broker(2025, 12, 26))
+    kept(floors, Series.D1, broker(2025, 12, 23))
+    stub.last_quote = broker(2025, 12, 26, 12)
+    holiday = broker(2025, 12, 25)
+
+    response = post_bars(client, "D1", holiday - EST, holiday - EST)
+
+    assert (response.status_code, response.json) == (200, ok([]))
+
+
+def test_a_window_before_the_measured_floor_is_answered_empty_under_unlimited_maxbars(client, stub):
+    stub.maxbars = UNLIMITED_MAXBARS
+    first = broker(2025, 7, 21, 1)
+    stub.rates[H1] = rates(first, first + HOUR)
+    stub.last_quote = first + HOUR + 30 * MINUTE
+    lo = broker(2025, 7, 20, 9)
+
+    response = post_bars(client, "H1", lo - EDT, lo + 4 * HOUR - EDT)
+
+    assert (response.status_code, response.json) == (200, ok([]))
+
+
+def test_a_window_before_an_unmeasured_floor_answers_503_under_unlimited_maxbars(
+    client, stub, no_sleep
+):
+    stub.maxbars = UNLIMITED_MAXBARS
+    first = broker(2025, 7, 21, 1)
+    stub.rates[H1] = rates(first, first + HOUR)
+    stub.last_quote = first + HOUR + 30 * MINUTE
+    # The floor's probe answers nothing, which proves nothing.
+    stub.script("copy_rates_range", (rates(), SUCCESS))
+    lo = broker(2025, 7, 20, 9)
+    start, end = lo - EDT, lo + 4 * HOUR - EDT
+
+    response = post_bars(client, "H1", start, end)
+
+    assert (response.status_code, response.headers["Retry-After"], response.json) == (
+        503,
+        "5",
+        syncing(f"EURUSD H1 {start}..{end}: syncing"),
+    )
+
+
+@pytest.mark.parametrize("series", [series for series in Series if series is not Series.TICKS])
+def test_the_read_after_an_empty_window_ends_at_the_last_quote(client, stub, floors, series):
+    period = BAR_PERIOD_S[series]
+    timeframe = BAR_TIMEFRAME[series]
+    first = broker(2025, 7, 14)
+    stub.rates[timeframe] = rates(first, first + 3 * period)
+    kept(floors, series, first)
+    stub.last_quote = first + 3 * period + 1
+    lo, hi = first + period, first + 2 * period
+
+    response = post_bars(client, series.value, CLOCK.to_utc(lo), CLOCK.to_utc(hi))
+
+    assert response.json == ok([])
+    assert stub.windows("copy_rates_range")[-1] == (timeframe, hi, stub.last_quote)
+
+
+def test_the_read_after_an_empty_window_of_a_symbol_without_a_quote_ends_at_the_servers_clock(
+    client, stub, floors, monkeypatch
+):
+    first = broker(2025, 7, 14, 10)
+    stub.rates[H1] = rates(first, first + 3 * HOUR)
+    kept(floors, Series.H1, first)
+    present = first + 3 * HOUR + 30 * MINUTE
+    monkeypatch.setattr(time, "time", lambda: float(CLOCK.to_utc(present)))
+    lo, hi = first + HOUR, first + 2 * HOUR
+
+    response = post_bars(client, "H1", lo - EDT, hi - EDT)
+
+    assert response.json == ok([])
+    assert stub.windows("copy_rates_range")[-1] == (H1, hi, present)
+
+
 # ── The live edge ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "day", [(2025, 11, 1), (2025, 10, 15)], ids=["before-rollback", "ordinary"]
+)
+def test_an_h4_window_past_the_last_quote_is_answered_empty(client, stub, floors, day):
+    opened = broker(*day, 12)
+    stub.rates[mirror.TIMEFRAME_H4] = rates(opened)
+    kept(floors, Series.H4, opened)
+    stub.last_quote = broker(*day, 15)
+    start = utc(*day, 12, 30)
+
+    response = post_bars(client, Series.H4, start, start + MINUTE)
+
+    assert (response.status_code, response.json) == (HTTPStatus.OK, ok([]))
+
+
+@pytest.mark.parametrize(
+    "day", [(2025, 11, 1), (2025, 10, 15)], ids=["before-rollback", "ordinary"]
+)
+def test_a_tick_window_past_the_last_quote_is_answered_empty(client, stub, floors, day):
+    opened = broker(*day, 12) * 1000
+    stub.ticks = ticks(opened)
+    kept(floors, Series.TICKS, opened)
+    stub.last_quote = broker(*day, 15)
+    start = utc(*day, 12, 30)
+
+    response = post_ticks(client, start, start + MINUTE)
+
+    assert (response.status_code, response.json) == (HTTPStatus.OK, ok([]))
 
 
 def a_friday_of_ticks() -> list[int]:
@@ -727,14 +871,14 @@ def test_an_empty_weekday_window_before_the_last_quote_with_nothing_after_it_ans
     response = post_bars(client, "H1", lo - EDT, lo + 3 * HOUR - EDT)
 
     assert response.status_code == 503
-    # The window, the kept floor measured again, the last quote, and the span after the window.
+    # The window, the kept floor measured again, the last quote, and the read after the window.
     assert stub.names()[2:] == [
         "copy_rates_range",
         "copy_rates_range",
         "symbol_info_tick",
         "copy_rates_range",
     ]
-    assert stub.windows("copy_rates_range")[-1] == (H1, lo + 3 * HOUR, lo + 3 * HOUR + H1_SPAN)
+    assert stub.windows("copy_rates_range")[-1] == (H1, lo + 3 * HOUR, stub.last_quote)
 
 
 def test_a_window_ending_now_answers_its_ticks_up_to_the_last_quote(client, stub):
@@ -1052,6 +1196,18 @@ def test_a_symbol_the_terminal_cannot_select_fails_with_its_error(client, stub):
     assert stub.names() == ["symbol_select"]
 
 
+def test_the_unverified_clock_gate_answers_with_retry_after(client, stub, clock_status):
+    clock_status.clear()
+
+    response = post_bars(client, "H1", 1_752_570_000, 1_752_573_600)
+
+    assert (response.status_code, response.headers.get("Retry-After"), response.json) == (
+        503,
+        "5",
+        UNVERIFIED,
+    )
+
+
 def test_the_history_routes_are_unavailable_while_the_clock_is_not_verified(
     client, stub, clock_status
 ):
@@ -1257,6 +1413,354 @@ def test_a_floor_in_a_repeated_hour_an_answer_warned_of_adds_no_warning(
     ]
 
 
+# ── The close ─────────────────────────────────────────────────────────────────
+
+# Bars as the terminal stamps them, by their broker open, and the close measured for each in true
+# UTC: a frame on the broker day's grid closes at the next grid open, an hour more or less than its
+# period across New York's changes; a finer frame a period after its open.
+CLOSES = [
+    pytest.param(Series.W1, broker(2025, 11, 2), utc(2025, 11, 8, 22), id="W1-169h"),
+    pytest.param(Series.W1, broker(2026, 3, 8), utc(2026, 3, 14, 21), id="W1-167h"),
+    pytest.param(Series.W1, broker(2025, 10, 26), utc(2025, 11, 1, 21), id="W1-168h"),
+    pytest.param(Series.D1, broker(2025, 11, 2), utc(2025, 11, 2, 22), id="D1-25h"),
+    pytest.param(Series.D1, broker(2026, 3, 8), utc(2026, 3, 8, 21), id="D1-23h"),
+    pytest.param(Series.H12, broker(2025, 11, 2), utc(2025, 11, 2, 10), id="H12-13h"),
+    pytest.param(Series.H12, broker(2026, 3, 8), utc(2026, 3, 8, 9), id="H12-11h"),
+    pytest.param(Series.H4, broker(2025, 11, 2, 8), utc(2025, 11, 2, 10), id="H4-5h"),
+    pytest.param(Series.H4, broker(2026, 3, 8, 8), utc(2026, 3, 8, 9), id="H4-3h"),
+    pytest.param(Series.H4, broker(2025, 11, 2, 12), utc(2025, 11, 2, 14), id="H4-4h"),
+    pytest.param(Series.H1, broker(2025, 11, 2, 8), utc(2025, 11, 2, 6), id="H1-first-pass"),
+    pytest.param(Series.M1, broker(2025, 11, 2, 8), utc(2025, 11, 2, 5, 1), id="M1-first-pass"),
+]
+
+
+@pytest.mark.parametrize(("series", "opened", "closed"), CLOSES)
+def test_a_bar_is_stamped_at_its_real_close(
+    connection, stub, floors, later, series, opened, closed
+):
+    stub.rates[BAR_TIMEFRAME[series]] = rates(opened)
+    kept(floors, series, opened)
+    eurusd = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    bar_type = venue_bar_type(eurusd, BAR_TIMEFRAME[series])
+    start = CLOCK.to_utc(opened)
+
+    rows = history_client.bars(connection, "EURUSD", wire.Series(series.value), start, start)
+
+    assert [venue_bar(row, bar_type, eurusd).ts_event for row in rows] == [closed * 1_000_000_000]
+
+
+# ── The skipped hour ──────────────────────────────────────────────────────────
+
+# Broker 09:00 on 2026-03-08 is New York's skipped 02:00; the broker's clock moved some minutes
+# after New York's, so the terminal holds stamps in it.
+SKIPPED = broker(2026, 3, 8, 9)
+
+
+def skipped_hour_warning(where: str, field: str, epoch: int) -> str:
+    return (
+        f"{where}: {field} {epoch} is in the hour the broker's clock skips, read at the offset "
+        "before the change"
+    )
+
+
+def skipped_hours_warnings(caplog) -> list[str]:
+    return [message for message in repeated_hours_warnings(caplog) if "skips" in message]
+
+
+def test_an_epoch_in_the_skipped_hour_reads_at_the_offset_before_the_change_with_a_warning(
+    client, stub, later, caplog
+):
+    stub.ticks = ticks(SKIPPED * 1000, (SKIPPED + MINUTE) * 1000)
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
+
+    answer = mirror_ticks(client, utc(2026, 3, 8, 6, 59), utc(2026, 3, 8, 7, 2))
+
+    assert [row["time"] for row in answer.json["result"]] == [
+        utc(2026, 3, 8, 7),
+        utc(2026, 3, 8, 7, 1),
+    ]
+    assert skipped_hours_warnings(caplog) == [
+        skipped_hour_warning("copy_ticks_range", "ticks.time", SKIPPED)
+    ]
+
+
+def test_a_window_over_bars_stamped_in_the_skipped_hour_answers_them_in_time_order(
+    client, stub, floors, later, caplog
+):
+    stamped = [
+        broker(2026, 3, 8, 8, 59),
+        *(broker(2026, 3, 8, 9, minute) for minute in range(11)),
+        broker(2026, 3, 8, 10, 11),
+        broker(2026, 3, 8, 10, 12),
+    ]
+    stub.rates[M1] = rates(*stamped)
+    kept(floors, Series.M1, stamped[0])
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
+
+    response = post_bars(client, "M1", utc(2026, 3, 8, 6, 59), utc(2026, 3, 8, 7, 12))
+
+    assert response.status_code == 200
+    assert [row["time"] for row in response.json["result"]] == [
+        utc(2026, 3, 8, 6, 59) + minute * MINUTE for minute in range(14)
+    ]
+    assert len(skipped_hours_warnings(caplog)) == 1
+
+
+# On a symbol that trades weekends the H1 bar stamped broker 09:00 on 2026-03-08 holds the eleven
+# minutes before the broker's clock moved, and the one stamped 10:00 the forty-nine after: both open
+# at 07:00Z and close at 08:00Z.
+SPRING_H1 = {
+    broker(2026, 3, 8, 8): (1.10, 1.12, 1.09, 1.11, 600, 2),
+    SKIPPED: (1.11, 1.13, 1.10, 1.12, 110, 3),
+    broker(2026, 3, 8, 10): (1.12, 1.16, 1.11, 1.15, 490, 4),
+    broker(2026, 3, 8, 11): (1.15, 1.17, 1.14, 1.16, 600, 2),
+}
+
+
+def spring_h1(*stamps: int) -> np.ndarray:
+    return np.array([(stamp, *SPRING_H1[stamp], 0) for stamp in stamps], dtype=RATES)
+
+
+def spring_h1_json(stamp: int, opened: int) -> dict[str, object]:
+    bar_open, high, low, close, tick_volume, spread = SPRING_H1[stamp]
+    return {
+        "time": opened,
+        "open": bar_open,
+        "high": high,
+        "low": low,
+        "close": close,
+        "tick_volume": tick_volume,
+        "spread": spread,
+        "real_volume": 0,
+        "time_close": opened + HOUR,
+    }
+
+
+def dropped_bar_warning(epoch: int) -> str:
+    return (
+        f"copy_rates_range: rates.time {epoch} opens in the true-UTC period of the bar before it "
+        "and is dropped"
+    )
+
+
+def dropped_bar_warnings(caplog) -> list[str]:
+    return [message for message in repeated_hours_warnings(caplog) if "dropped" in message]
+
+
+def test_of_two_bars_converting_to_one_period_the_first_is_answered_with_one_warning(
+    client, stub, floors, later, caplog
+):
+    stub.rates[H1] = spring_h1(*SPRING_H1)
+    kept(floors, Series.H1, broker(2026, 3, 8, 8))
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
+
+    response = post_bars(client, "H1", utc(2026, 3, 8, 6), utc(2026, 3, 8, 8))
+
+    assert response.json == ok(
+        [
+            spring_h1_json(broker(2026, 3, 8, 8), utc(2026, 3, 8, 6)),
+            spring_h1_json(SKIPPED, utc(2026, 3, 8, 7)),
+            spring_h1_json(broker(2026, 3, 8, 11), utc(2026, 3, 8, 8)),
+        ]
+    )
+    assert dropped_bar_warnings(caplog) == [dropped_bar_warning(broker(2026, 3, 8, 10))]
+
+
+def test_a_bar_after_the_skipped_hour_no_bar_was_stamped_in_is_answered(
+    client, stub, floors, later, caplog
+):
+    stub.rates[H1] = spring_h1(
+        broker(2026, 3, 8, 8), broker(2026, 3, 8, 10), broker(2026, 3, 8, 11)
+    )
+    kept(floors, Series.H1, broker(2026, 3, 8, 8))
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.repeated_hours")
+
+    response = post_bars(client, "H1", utc(2026, 3, 8, 6), utc(2026, 3, 8, 8))
+
+    assert response.json == ok(
+        [
+            spring_h1_json(broker(2026, 3, 8, 8), utc(2026, 3, 8, 6)),
+            spring_h1_json(broker(2026, 3, 8, 10), utc(2026, 3, 8, 7)),
+            spring_h1_json(broker(2026, 3, 8, 11), utc(2026, 3, 8, 8)),
+        ]
+    )
+    assert repeated_hours_warnings(caplog) == []
+
+
+# ── Windows about a clock change ──────────────────────────────────────────────
+
+# On 2025-11-02 the broker's 08:00–08:59 runs twice and its bars read as the first pass,
+# 05:00–05:59Z; a window's end in the second pass, 06:00–06:59Z, still holds them.
+AUTUMN_MINUTES = [broker(2025, 11, 2, 8, minute) for minute in range(55, 60)]
+
+
+def test_a_minute_window_ending_in_the_repeated_hours_second_pass_answers_its_first_pass_bars(
+    client, stub, floors
+):
+    stub.rates[M1] = rates(*AUTUMN_MINUTES, broker(2025, 11, 2, 9, 1))
+    kept(floors, Series.M1, AUTUMN_MINUTES[0])
+
+    response = post_bars(client, "M1", utc(2025, 11, 2, 5, 57), utc(2025, 11, 2, 6, 0) + 29)
+
+    assert [row["time"] for row in response.json["result"]] == [
+        utc(2025, 11, 2, 5, 57),
+        utc(2025, 11, 2, 5, 58),
+        utc(2025, 11, 2, 5, 59),
+    ]
+
+
+def test_a_tick_window_ending_in_the_repeated_hours_second_pass_answers_its_first_pass_ticks(
+    client, stub, floors
+):
+    stub.ticks = ticks(*(t * 1000 for t in AUTUMN_MINUTES), broker(2025, 11, 2, 9, 1) * 1000)
+    kept(floors, Series.TICKS, AUTUMN_MINUTES[0] * 1000)
+
+    response = post_ticks(client, utc(2025, 11, 2, 5, 57), utc(2025, 11, 2, 6, 0) + 29)
+
+    assert [row["time"] for row in response.json["result"]] == [
+        utc(2025, 11, 2, 5, 57),
+        utc(2025, 11, 2, 5, 58),
+        utc(2025, 11, 2, 5, 59),
+    ]
+
+
+# Broker 08:10 and 08:40 on 2025-11-02 name 05:10Z and 06:10Z, and 05:40Z and 06:40Z.
+STRADDLED = [broker(2025, 11, 2, 8, 10), broker(2025, 11, 2, 8, 40)]
+
+
+def test_a_minute_window_straddling_the_rollback_answers_every_bar_either_pass_of_it_names(
+    client, stub, floors
+):
+    stub.rates[M1] = rates(*STRADDLED)
+    kept(floors, Series.M1, STRADDLED[0])
+
+    response = post_bars(client, "M1", utc(2025, 11, 2, 5, 30), utc(2025, 11, 2, 6, 30))
+
+    assert [row["time"] for row in response.json["result"]] == [
+        utc(2025, 11, 2, 5, 10),
+        utc(2025, 11, 2, 5, 40),
+    ]
+
+
+def test_a_tick_window_straddling_the_rollback_answers_every_tick_either_pass_of_it_names(
+    client, stub, floors
+):
+    stub.ticks = ticks(*(t * 1000 for t in STRADDLED))
+    kept(floors, Series.TICKS, STRADDLED[0] * 1000)
+
+    response = post_ticks(client, utc(2025, 11, 2, 5, 30), utc(2025, 11, 2, 6, 30))
+
+    assert [row["time"] for row in response.json["result"]] == [
+        utc(2025, 11, 2, 5, 10),
+        utc(2025, 11, 2, 5, 40),
+    ]
+
+
+# On 2026-03-08 the terminal holds stamps in the broker's skipped 09:00 hour, read at the offset
+# before the change, 07:00Z on; the broker's 10:00 reads 07:00Z too.
+SPRING_STAMPS = [
+    broker(2026, 3, 8, 8, 59),
+    *(broker(2026, 3, 8, 9, minute) for minute in range(11)),
+    broker(2026, 3, 8, 10, 11),
+    broker(2026, 3, 8, 10, 12),
+]
+
+
+def test_a_minute_window_inside_the_skipped_hours_reading_answers_the_bars_stamped_in_it(
+    client, stub, floors, later
+):
+    stub.rates[M1] = rates(*SPRING_STAMPS)
+    kept(floors, Series.M1, SPRING_STAMPS[0])
+
+    response = post_bars(client, "M1", utc(2026, 3, 8, 7, 3), utc(2026, 3, 8, 7, 5))
+
+    assert [row["time"] for row in response.json["result"]] == [
+        utc(2026, 3, 8, 7, 3),
+        utc(2026, 3, 8, 7, 4),
+        utc(2026, 3, 8, 7, 5),
+    ]
+
+
+def test_a_tick_window_inside_the_skipped_hours_reading_answers_the_ticks_stamped_in_it(
+    client, stub, floors, later
+):
+    stub.ticks = ticks(*(t * 1000 + 250 for t in SPRING_STAMPS))
+    kept(floors, Series.TICKS, SPRING_STAMPS[0] * 1000)
+
+    response = post_ticks(client, utc(2026, 3, 8, 7, 3), utc(2026, 3, 8, 7, 5))
+
+    assert [row["time_msc"] for row in response.json["result"]] == [
+        (utc(2026, 3, 8, 7, minute)) * 1000 + 250 for minute in (3, 4, 5)
+    ]
+
+
+@pytest.mark.parametrize(
+    "start, end, before, after, quote",
+    [
+        (
+            utc(2025, 11, 2, 5, 57),
+            utc(2025, 11, 2, 6) + 29,
+            broker(2025, 11, 2, 7, 59),
+            broker(2025, 11, 2, 8, 1),
+            broker(2025, 11, 2, 8, 30),
+        ),
+        (
+            utc(2026, 3, 8, 7, 3),
+            utc(2026, 3, 8, 7, 5),
+            broker(2026, 3, 8, 9, 2),
+            broker(2026, 3, 8, 9, 6),
+            broker(2026, 3, 8, 9, 30),
+        ),
+    ],
+    ids=["rollback", "skipped-hour"],
+)
+@pytest.mark.parametrize("series", [Series.M1, Series.TICKS])
+def test_a_gap_across_a_clock_change_excludes_seconds_between_its_preimages(
+    client, stub, floors, later, start, end, before, after, quote, series
+):
+    stub.last_quote = quote
+    if series is Series.TICKS:
+        stub.ticks = ticks(before * 1000, after * 1000)
+        kept(floors, series, before * 1000)
+        stub.script("copy_ticks_range", (ticks(), SUCCESS))
+        response = post_ticks(client, start, end)
+    else:
+        stub.rates[M1] = rates(before, after)
+        kept(floors, series, before)
+        stub.script("copy_rates_range", (rates(), SUCCESS))
+        response = post_bars(client, series, start, end)
+
+    assert (response.status_code, response.json) == (HTTPStatus.OK, ok([]))
+
+
+@pytest.mark.parametrize(
+    "start, last_quote",
+    [
+        (utc(2025, 11, 2, 6), broker(2025, 11, 2, 8, 10)),
+        (utc(2026, 3, 8, 7), broker(2026, 3, 8, 9, 10)),
+        (utc(2026, 3, 8, 7), broker(2026, 3, 8, 10, 10)),
+    ],
+    ids=["repeated-second-pass", "skipped-hour", "after-skipped-hour"],
+)
+@pytest.mark.parametrize("series", [Series.H4, Series.TICKS])
+def test_a_quote_inside_a_clock_change_preimage_keeps_an_empty_read_syncing(
+    client, stub, later, start, last_quote, series
+):
+    stub.last_quote = last_quote
+    end = start + 30 * MINUTE
+
+    if series is Series.TICKS:
+        response = post_ticks(client, start, end)
+    else:
+        response = post_bars(client, series, start, end)
+
+    assert (response.status_code, response.headers["Retry-After"], response.json) == (
+        HTTPStatus.SERVICE_UNAVAILABLE,
+        "5",
+        syncing(f"EURUSD {series} {start}..{end}: syncing"),
+    )
+
+
 # ── The client ────────────────────────────────────────────────────────────────
 
 
@@ -1269,7 +1773,7 @@ def test_the_client_answers_a_window_in_the_packages_types(remote, connection, s
         connection, "EURUSD", wire.Series.H1, floor - DAY - EDT, floor + HOUR - EDT
     )
 
-    assert answered.dtype == RATES
+    assert answered.dtype == np.dtype(list(wire.BARS.dtype))
     assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
     ranges = history_client.ranges(connection, "EURUSD")
     assert ranges == history_client.HistoryRanges(
@@ -1493,15 +1997,43 @@ def test_a_syncing_reply_carries_its_status_and_code_as_members_and_its_retry_af
     assert remote.last_error()[0] is wire.ServerCode.SYNCING
 
 
-def test_the_client_raises_server_unreachable_while_the_server_is_not_ready(
+def test_the_client_asks_again_after_the_unverified_clocks_retry_after_until_the_rows(
+    remote, connection, stub, floors, clock_status, monkeypatch
+):
+    floor = broker(2025, 7, 15, 12)
+    stub.rates[H1] = rates(floor, floor + HOUR)
+    kept(floors, Series.H1, floor)
+    verified = clock_status.read()
+    clock_status.clear()
+    slept = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        clock_status.set(verified)
+
+    monkeypatch.setattr(history_client, "time", types.SimpleNamespace(sleep=sleep))
+
+    answered = history_client.bars(
+        connection, "EURUSD", wire.Series.H1, floor - EDT, floor + HOUR - EDT
+    )
+
+    assert answered["time"].tolist() == [floor - EDT, floor + HOUR - EDT]
+    assert slept == [5]
+
+
+def test_the_client_raises_server_unreachable_once_cancelled_while_the_server_is_not_ready(
     remote, connection, stub, clock_status
 ):
     clock_status.clear()
+    cancel = threading.Event()
+    cancel.set()
 
     with pytest.raises(
         ServerUnreachable,
         match="^history/bars: server not ready — the broker clock is not verified$",
     ):
-        history_client.bars(connection, "EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600)
+        history_client.bars(
+            connection, "EURUSD", wire.Series.H1, 1_752_570_000, 1_752_573_600, cancel=cancel
+        )
     with pytest.raises(ServerUnreachable, match="^history/ranges: server not ready"):
-        history_client.ranges(connection, "EURUSD")
+        history_client.ranges(connection, "EURUSD", cancel=cancel)

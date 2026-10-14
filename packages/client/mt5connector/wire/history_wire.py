@@ -1,5 +1,6 @@
 """The history routes' vocabulary, shared by the server and its client: their paths, the series and
-their periods, the tick selections, and the codes the server answers beside the package's own."""
+their periods, a bar's row, the tick selections, and the codes the server answers beside the
+package's own."""
 
 from enum import IntEnum, StrEnum
 
@@ -107,6 +108,14 @@ BAR_TIMEFRAME: dict[Series, int] = {
     Series.D1: mirror.TIMEFRAME_D1,
     Series.W1: mirror.TIMEFRAME_W1,
 }
+
+
+# A bar as the bars route answers it and the hub pushes it: the package's MqlRates fields, its open
+# among them, and its close.
+BAR_CLOSE = "time_close"
+BARS = mirror.Array(
+    mirror.ArrayName.RATES, (*mirror.RATES.dtype, (BAR_CLOSE, "<i8")), mirror.RATES.epochs
+)
 
 
 TICK_FLAGS: dict[TickFlags, int] = {

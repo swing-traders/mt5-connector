@@ -482,17 +482,24 @@ def test_a_later_mismatch_exits(timeline_at, exits, caplog):
     ]
 
 
-def test_a_trade_server_time_its_zone_skips_exits(timeline_at, exits, caplog):
-    # 2025-03-09T09:30 on the broker's clock is New York's 02:30, which its spring change skips.
-    timeline = timeline_at(UTC_EPOCH)
+def test_a_trade_server_time_its_zone_skips_reads_at_the_offset_before_the_change(
+    timeline_at, exits, caplog
+):
+    # 2026-03-08T09:00 on the broker's clock is New York's 02:00, which its spring change skips; the
+    # broker's clock moves minutes after New York's.
+    skipped = calendar.timegm((2026, 3, 8, 9, 0, 0))
+    timeline = timeline_at(calendar.timegm((2026, 3, 8, 7, 0, 30)))
     check = clock_check(timeline)
-    for at in range(0, 31, 10):
-        timeline.arrive(at, sample(1_741_512_600 + at))
+    for at in range(0, 41, 10):
+        timeline.arrive(at, sample(skipped + at))
 
-    check.run()
+    run_to_its_end(check)
 
-    assert exits == [1]
-    assert messages(caplog, logging.CRITICAL) == ["broker clock: the verification failed"]
+    assert exits == []
+    assert messages(caplog, logging.INFO)[0].startswith(
+        "broker clock measured on EURUSD: trade server at 2026-03-08T07:00:30+00:00, -30 s from "
+        "the server clock"
+    )
 
 
 def test_the_clock_is_verified_once_the_terminal_has_been_connected_for_the_maximum_age(

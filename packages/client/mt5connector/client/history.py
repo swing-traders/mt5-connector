@@ -15,6 +15,9 @@ from mt5connector.client import remote_mt5
 from mt5connector.client.errors import ServerUnreachable
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import (
+    BAR_CLOSE,
+    BAR_PERIOD_S,
+    BARS,
     BARS_PATH,
     RANGES_PATH,
     TICKS_PATH,
@@ -57,15 +60,28 @@ def bars(
     end: int,
     cancel: threading.Event | None = None,
 ) -> np.ndarray | None:
-    """The bars opened in [start, end], true-UTC epoch seconds, each stamped at its open; None for a
-    failure, or when `cancel` is set while the server defers it, either leaving the connection's
-    last_error set."""
+    """The bars opened in [start, end], true-UTC epoch seconds, each with its open and its close;
+    None for a failure, or when `cancel` is set while the server defers it, either leaving the
+    connection's last_error set."""
     body = {"symbol": symbol, "timeframe": series.value, "start": start, "end": end}
     rows = _rows(connection, _BARS, BARS_PATH, body, cancel)
     if rows is None:
         return None
     else:
-        return remote_mt5.decode_array(_BARS, mirror.RATES, rows)
+        return remote_mt5.decode_array(_BARS, BARS, rows)
+
+
+def opens_closing(series: Series, first_close: int, last_close: int) -> tuple[int, int]:
+    """The opens, true-UTC seconds, between which every bar of `series` closing in [first_close,
+    last_close] opened: a bar opens before it closes, and within two of its periods, since a clock
+    change lengthens one only on the broker day's grid, by less than its period."""
+    return first_close - 2 * BAR_PERIOD_S[series], last_close - 1
+
+
+def closing(rows: np.ndarray, first_close: int, last_close: int) -> np.ndarray:
+    """The rows of the bars closing in [first_close, last_close]."""
+    closes = rows[BAR_CLOSE]
+    return rows[(closes >= first_close) & (closes <= last_close)]
 
 
 def ticks(
@@ -129,22 +145,27 @@ def _reply(
     json: dict[str, object] | None = None,
     params: dict[str, str] | None = None,
 ) -> remote_mt5.Reply:
-    """A route's answer, asked again each time the server defers it — the terminal syncing, or every
-    slot taken — after the delay that answer gives, until it answers otherwise or `cancel` is
-    set."""
+    """A route's answer, asked again each time the server defers it — the terminal syncing, every
+    slot taken, or the server not ready with a Retry-After — after the delay that answer gives,
+    until it answers otherwise or `cancel` is set; raises ServerUnreachable while it is still not
+    ready."""
     reply = connection.mt5.call_route(name, method, path, json=json, params=params)
     while _is_deferred(reply) and _waits_out(
         remote_mt5.retry_after_s(name, reply.retry_after), cancel
     ):
         reply = connection.mt5.call_route(name, method, path, json=json, params=params)
+    if remote_mt5.is_not_ready(reply):
+        raise remote_mt5.not_ready(name, reply)
     return reply
 
 
 def _is_deferred(reply: remote_mt5.Reply) -> bool:
-    return reply.status is HTTPStatus.SERVICE_UNAVAILABLE and reply.envelope["error"]["code"] in (
-        ServerCode.SYNCING,
-        ServerCode.BUSY,
-    )
+    if reply.status is not HTTPStatus.SERVICE_UNAVAILABLE:
+        return False
+    elif remote_mt5.is_not_ready(reply):
+        return reply.retry_after is not None
+    else:
+        return reply.envelope["error"]["code"] in (ServerCode.SYNCING, ServerCode.BUSY)
 
 
 def _waits_out(seconds: float, cancel: threading.Event | None) -> bool:

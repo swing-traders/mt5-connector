@@ -315,13 +315,16 @@ def test_the_repeated_hour_answers_its_first_occurrence_with_one_warning(client,
     ]
 
 
-def test_the_skipped_hour_is_a_server_error(client, stub):
+def test_the_skipped_hour_reads_at_the_offset_before_the_change(client, stub):
     # 2026-03-08 09:30 on the broker's clock is New York's skipped 02:30.
     stub.symbol_info_tick.return_value = _zeroed(mirror.StructName.TICK)._replace(
         time=calendar.timegm((2026, 3, 8, 9, 30, 0))
     )
     response = client.post("/mt5/symbol_info_tick", json={"symbol": "EURUSD"})
-    assert response.status_code == 500
+    assert (response.status_code, response.json["result"]["time"]) == (
+        200,
+        calendar.timegm((2026, 3, 8, 7, 30, 0)),
+    )
 
 
 def test_an_epoch_that_is_not_an_integer_is_a_server_error(client, stub):

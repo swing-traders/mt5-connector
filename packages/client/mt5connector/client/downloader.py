@@ -220,22 +220,31 @@ class MT5DataDownloader:
                 f"to {end}"
             )
             # The range names closes; the server serves bars by their open.
-            period = BAR_PERIOD_S[series]
-            first = int(start.timestamp()) - period
-            span = (ranges.maxbars - SPAN_MARGIN) * period
+            first_close = int(start.timestamp())
+            last_close = int(end.timestamp())
+            first, window_end = history.opens_closing(series, first_close, last_close)
+            span = (ranges.maxbars - SPAN_MARGIN) * BAR_PERIOD_S[series]
             windows = []
-            window_end = int(end.timestamp()) - period
             while window_end >= first:
                 window_start = max(first, window_end - span)
                 windows.append((window_start, window_end))
                 window_end = window_start - 1
+
+            def read(lo: int, hi: int) -> np.ndarray | None:
+                rows = history.bars(self._conn, result.symbol, series, lo, hi)
+                if rows is None:
+                    return None
+                else:
+                    return history.closing(rows, first_close, last_close)
+
             self._walk_back(
                 result,
                 series,
-                first,
+                # A floor opening at the range's start leaves out the bar that would close there.
+                first_close - 1,
                 windows,
                 _advertised_floor(ranges, series),
-                lambda lo, hi: history.bars(self._conn, result.symbol, series, lo, hi),
+                read,
                 lambda rows: [venue_bar(row, bar_type, instrument) for row in rows],
             )
 

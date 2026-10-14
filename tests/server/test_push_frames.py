@@ -1,6 +1,7 @@
 """The EA's tick, bar and trade-transaction frames as the hub passes them on: the struct fields
 verbatim, the subscription each reaches, and every epoch in true UTC."""
 
+import calendar
 import logging
 
 import pytest
@@ -80,7 +81,35 @@ def test_a_bars_open_reaches_its_subscribers_in_true_utc_under_its_series_name()
     passed = published(BAR, CLOCK, RepeatedHours())
 
     assert passed.subscription == Subscription(Stream.BARS, "EURUSD", Series.M1)
-    assert passed.frame == BAR | {"timeframe": "M1", "time": UTC_EPOCH}
+    assert passed.frame == BAR | {
+        "timeframe": "M1",
+        "time": UTC_EPOCH,
+        "time_close": UTC_EPOCH + 60,
+    }
+
+
+def broker(year, month, day, hour=0, minute=0):
+    return calendar.timegm((year, month, day, hour, minute, 0))
+
+
+@pytest.mark.parametrize(
+    ("timeframe", "opened", "closed"),
+    [
+        (mirror.TIMEFRAME_W1, broker(2025, 11, 2), calendar.timegm((2025, 11, 8, 22, 0, 0))),
+        (mirror.TIMEFRAME_W1, broker(2026, 3, 8), calendar.timegm((2026, 3, 14, 21, 0, 0))),
+        (mirror.TIMEFRAME_D1, broker(2025, 11, 2), calendar.timegm((2025, 11, 2, 22, 0, 0))),
+        (mirror.TIMEFRAME_D1, broker(2026, 3, 8), calendar.timegm((2026, 3, 8, 21, 0, 0))),
+        (mirror.TIMEFRAME_H4, broker(2025, 11, 2, 8), calendar.timegm((2025, 11, 2, 10, 0, 0))),
+        (mirror.TIMEFRAME_H4, broker(2026, 3, 8, 8), calendar.timegm((2026, 3, 8, 9, 0, 0))),
+        (mirror.TIMEFRAME_H1, broker(2025, 11, 2, 8), calendar.timegm((2025, 11, 2, 6, 0, 0))),
+        (mirror.TIMEFRAME_M1, BROKER_EPOCH, UTC_EPOCH + 60),
+    ],
+    ids=["W1-169h", "W1-167h", "D1-25h", "D1-23h", "H4-5h", "H4-3h", "H1-first-pass", "M1"],
+)
+def test_a_bar_reaches_its_subscribers_with_its_real_close(timeframe, opened, closed):
+    passed = published(BAR | {"timeframe": timeframe, "time": opened}, CLOCK, RepeatedHours())
+
+    assert passed.frame["time_close"] == closed
 
 
 def test_a_transactions_expirations_reach_its_subscribers_in_true_utc_and_zero_stays_zero():

@@ -10,10 +10,6 @@ _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 _SECOND = timedelta(seconds=1)
 
 
-class NonexistentWallTime(ValueError):
-    """Raised when a broker epoch names a wall time its zone skips."""
-
-
 @dataclass(frozen=True)
 class BrokerClock:
     """The broker's clock: the wall time of `tz` plus `offset`. Zero is the venue's "no time" and
@@ -24,7 +20,8 @@ class BrokerClock:
 
     def to_utc(self, broker_epoch: int) -> int:
         """The true-UTC epoch of a broker epoch in seconds; a repeated wall time reads as its first
-        occurrence."""
+        occurrence, and a skipped one at the offset before the change, the broker's clock moving
+        after the zone's."""
         if broker_epoch == 0:
             return 0
         else:
@@ -32,18 +29,21 @@ class BrokerClock:
 
     def to_utc_near(self, broker_epoch: int, utc_epoch: int) -> int:
         """The true-UTC epoch of a broker epoch in seconds; a repeated wall time reads as its
-        occurrence nearer the true-UTC `utc_epoch`."""
-        if broker_epoch == 0:
-            return 0
+        occurrence nearer the true-UTC `utc_epoch`, a skipped one as to_utc reads it."""
+        first, last = self.occurrences(broker_epoch)
+        if abs(last - utc_epoch) < abs(first - utc_epoch):
+            return last
         else:
-            # Both occurrences are one instant for a wall time the zone does not repeat.
-            local = self._local(broker_epoch)
-            first = (local - _EPOCH_UTC) // _SECOND
-            second = (local.replace(fold=1) - _EPOCH_UTC) // _SECOND
-            if abs(second - utc_epoch) < abs(first - utc_epoch):
-                return second
-            else:
-                return first
+            return first
+
+    def occurrences(self, broker_epoch: int) -> tuple[int, int]:
+        """The true-UTC epochs of a broker epoch in seconds at its first and its last occurrence:
+        one instant but for a wall time its zone repeats, and a skipped one as to_utc reads it."""
+        first = self.to_utc(broker_epoch)
+        if self.is_ambiguous(broker_epoch):
+            return first, (self._local(broker_epoch).replace(fold=1) - _EPOCH_UTC) // _SECOND
+        else:
+            return first, first
 
     def to_utc_msc(self, broker_epoch_msc: int) -> int:
         """The true-UTC epoch of a broker epoch in milliseconds."""
@@ -68,18 +68,18 @@ class BrokerClock:
 
     def is_ambiguous(self, broker_epoch: int) -> bool:
         """Whether a broker epoch in seconds names a wall time its zone repeats."""
+        # fold=0 takes the offset before a transition and fold=1 the one after, so the offset falls
+        # across a repeated wall time and rises across a skipped one.
         local = self._local(broker_epoch)
         return local.utcoffset() > local.replace(fold=1).utcoffset()
 
+    def is_skipped(self, broker_epoch: int) -> bool:
+        """Whether a broker epoch in seconds names a wall time its zone skips."""
+        local = self._local(broker_epoch)
+        return local.utcoffset() < local.replace(fold=1).utcoffset()
+
     def _local(self, broker_epoch: int) -> datetime:
-        """The zone's wall time a broker epoch names, at its first occurrence; raises
-        NonexistentWallTime for a wall time the zone skips."""
-        # fold=0 takes the offset before a transition and fold=1 the one after, so the offset rises
-        # across a skipped wall time and falls across a repeated one.
+        """The zone's wall time a broker epoch names, under the offset before any transition at
+        it."""
         wall = _EPOCH + timedelta(seconds=broker_epoch) - self.offset
-        local = wall.replace(tzinfo=self.tz)
-        if local.utcoffset() < local.replace(fold=1).utcoffset():
-            raise NonexistentWallTime(
-                f"broker epoch {broker_epoch} names {wall.isoformat()}, which {self.tz.key} skips"
-            )
-        return local
+        return wall.replace(tzinfo=self.tz)

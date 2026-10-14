@@ -68,8 +68,11 @@ def test_commissions_are_unavailable_while_the_clock_is_not_verified(client, clo
 
     response = client.get("/commissions/EURUSD")
 
-    assert (response.status_code, response.json) == (503, UNVERIFIED)
-    assert "Retry-After" not in response.headers
+    assert (response.status_code, response.headers["Retry-After"], response.json) == (
+        503,
+        "5",
+        UNVERIFIED,
+    )
 
 
 def test_sessions_are_unavailable_while_the_clock_is_not_verified(client, clock_status):
@@ -77,8 +80,11 @@ def test_sessions_are_unavailable_while_the_clock_is_not_verified(client, clock_
 
     response = client.get("/sessions/EURUSD")
 
-    assert (response.status_code, response.json) == (503, UNVERIFIED)
-    assert "Retry-After" not in response.headers
+    assert (response.status_code, response.headers["Retry-After"], response.json) == (
+        503,
+        "5",
+        UNVERIFIED,
+    )
 
 
 def test_answer_carries_the_last_error_read_after_the_call(client, stub):

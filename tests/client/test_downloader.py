@@ -34,14 +34,22 @@ def dt(year, month, day, hour=0, minute=0):
     return datetime(year, month, day, hour, minute, tzinfo=UTC)
 
 
-RATES = np.dtype(list(mirror.RATES.dtype))
+BARS = np.dtype([*mirror.RATES.dtype, ("time_close", "<i8")])
 TICKS = np.dtype(list(mirror.TICKS.dtype))
 HOUR = 3_600
 DAY = 86_400
 
 
 def rate_rows(*opens):
-    return np.array([(t, 1.085, 1.09, 1.08, 1.088, 1000, 2, 0) for t in opens], dtype=RATES)
+    """H1 bar rows as the bars route answers them, each closing an hour after its open."""
+    return closed_rows(*((t, t + HOUR) for t in opens))
+
+
+def closed_rows(*opens_and_closes):
+    return np.array(
+        [(t, 1.085, 1.09, 1.08, 1.088, 1000, 2, 0, closed) for t, closed in opens_and_closes],
+        dtype=BARS,
+    )
 
 
 def tick_rows(*times_msc):
@@ -67,7 +75,8 @@ class Server:
 
     def bars(self, connection, symbol, series, lo, hi):
         self.asked.append((symbol, series, lo, hi))
-        return self._answer(rate_rows(hi - HOUR, hi))
+        last = hi - hi % HOUR
+        return self._answer(rate_rows(last - HOUR, last))
 
     def ticks(self, connection, symbol, lo, hi):
         self.asked.append((symbol, lo, hi))
@@ -273,7 +282,8 @@ class TestDownloadResult:
 
 # The double's MaxBars of 111 lets a window span 100 H1 periods.
 SPAN = 100 * HOUR
-LAST_OPEN = int(dt(2024, 12, 31).timestamp()) - HOUR
+# The last open a range ending 2024-12-31T00:00Z reads: every bar closing by then opened before it.
+LAST_OPEN = int(dt(2024, 12, 31).timestamp()) - 1
 BAR_WINDOWS = [
     (LAST_OPEN - SPAN, LAST_OPEN),
     (LAST_OPEN - 2 * SPAN - 1, LAST_OPEN - SPAN - 1),
@@ -339,10 +349,38 @@ class TestDownloadBarsWalk:
 
         written = catalog.write_data.call_args_list[0][0][0]
         assert all(isinstance(bar, Bar) for bar in written)
+        end = int(dt(2024, 12, 31).timestamp())
         assert [bar.ts_event for bar in written] == [
-            LAST_OPEN * 1_000_000_000,
-            (LAST_OPEN + HOUR) * 1_000_000_000,
+            (end - HOUR) * 1_000_000_000,
+            end * 1_000_000_000,
         ]
+
+    def test_writes_the_bars_whose_real_closes_the_range_names_across_a_clock_change(
+        self, downloader, catalog, package
+    ):
+        # The week opened 2025-11-01T21:00Z runs 169 hours, to the next one's open.
+        weeks = [
+            (int(dt(2025, 11, 1, 21).timestamp()), int(dt(2025, 11, 8, 22).timestamp())),
+            (int(dt(2025, 11, 8, 22).timestamp()), int(dt(2025, 11, 15, 22).timestamp())),
+            (int(dt(2025, 11, 15, 22).timestamp()), int(dt(2025, 11, 22, 22).timestamp())),
+        ]
+
+        def bars(connection, symbol, series, lo, hi):
+            return closed_rows(*((t, closed) for t, closed in weeks if lo <= t <= hi))
+
+        ranges = HistoryRanges(
+            maxbars=111, series={Series.W1: SeriesRange(int(dt(2025, 1, 5).timestamp()), 0, 1)}
+        )
+        with (
+            patch("mt5connector.client.history.bars", side_effect=bars),
+            patch("mt5connector.client.history.ranges", return_value=ranges),
+        ):
+            downloader.download_bars(
+                "EURUSD", dt(2025, 11, 8, 21, 30), dt(2025, 11, 15, 23), mirror.TIMEFRAME_W1
+            )
+
+        written = [bar for call in catalog.write_data.call_args_list for bar in call[0][0]]
+        assert [bar.ts_event // 1_000_000_000 for bar in written] == [weeks[0][1], weeks[1][1]]
 
     def test_a_failed_window_is_an_error_and_the_walk_goes_on(self, downloader, catalog, package):
         server = Server(
@@ -353,7 +391,7 @@ class TestDownloadBarsWalk:
 
         assert len(server.asked) == 2
         assert result.errors == [
-            "Window 2024-12-26T19:00:00+00:00..2024-12-30T23:00:00+00:00 failed: "
+            "Window 2024-12-26T19:59:59+00:00..2024-12-30T23:59:59+00:00 failed: "
             "(-4, 'Terminal: Not found')"
         ]
         assert catalog.write_data.call_count == 1
