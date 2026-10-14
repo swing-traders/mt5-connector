@@ -83,7 +83,7 @@ def make_raw_rate(
     return arr[0]
 
 
-def make_config(ws_url=None, venue=MT5_VENUE):
+def make_config(ws_url="ws://127.0.0.1:9000", venue=MT5_VENUE):
     from mt5connector.client.config import MT5Config
 
     return MT5Config(
@@ -150,7 +150,7 @@ def make_client(
     instrument=None,
     client_class=MT5DataClient,
     nt_handlers=False,
-    ws_url=None,
+    ws_url="ws://127.0.0.1:9000",
     venue=MT5_VENUE,
 ):
     """Build a fully wired MT5DataClient with real NautilusTrader components, its handlers recorded

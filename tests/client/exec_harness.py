@@ -116,7 +116,7 @@ def config(**fields) -> MT5Config:
         password="p",
         server="Broker-Demo",
         server_url="http://127.0.0.1:5000",
-        **fields,
+        **{"ws_url": "ws://127.0.0.1:9000", **fields},
     )
 
 

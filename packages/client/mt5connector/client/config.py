@@ -57,7 +57,7 @@ class MT5Config:
     reconnect_max_attempts: int = RECONNECT_MAX_ATTEMPTS
     timeout_s: float = 10.0
 
-    # Required: defaulted only so that a config without it is refused as an MT5ConfigError.
+    # Required: defaulted only so that a config without one is refused as an MT5ConfigError.
     server_url: str | None = None
     ws_url: str | None = None
 
@@ -107,12 +107,11 @@ class MT5Config:
         server = _endpoint("server_url", self.server_url)
         if server.scheme not in set(HttpScheme) or not server.hostname:
             raise MT5ConfigError("MT5Config.server_url is no http or https URL with a host")
-        if self.ws_url is None:
-            self.ws_url = derive_ws_url(self.server_url)
-        else:
-            ws = _endpoint("ws_url", self.ws_url)
-            if ws.scheme not in set(WebSocketScheme) or not ws.hostname:
-                raise MT5ConfigError("MT5Config.ws_url is no ws or wss URL with a host")
+        if not self.ws_url:
+            raise MT5ConfigError("MT5Config.ws_url cannot be empty.")
+        ws = _endpoint("ws_url", self.ws_url)
+        if ws.scheme not in set(WebSocketScheme) or not ws.hostname:
+            raise MT5ConfigError("MT5Config.ws_url is no ws or wss URL with a host")
 
     @property
     def exec_poll_interval_s(self) -> float:
@@ -138,15 +137,3 @@ def _endpoint(name: str, url: str) -> ParseResult:
     if port is not None and not 1 <= port <= 65535:
         raise MT5ConfigError(f"MT5Config.{name} port {port} is not in 1-65535")
     return parsed
-
-
-def derive_ws_url(server_url: str) -> str:
-    """Derive the WebSocket hub URL from the REST server URL (port 9000)."""
-    p = urlparse(server_url)
-    # The netloc's host keeps an IPv6 address's brackets, which `hostname` strips.
-    host = p.netloc.rpartition("@")[2]
-    if host.startswith("["):
-        host = host[: host.index("]") + 1]
-    else:
-        host = host.partition(":")[0]
-    return urlunparse((WebSocketScheme.WS, f"{host}:9000", p.path, "", "", ""))

@@ -131,10 +131,10 @@ print(info.currency, info.balance)
 
 ## Configuration
 
-The adapter's own configuration goes through `MT5Config`; its required fields are your account credentials and the MT5 server's URL. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
+The adapter's own configuration goes through `MT5Config`; its required fields are your account credentials and the MT5 server's two URLs, its HTTP API's (`server_url`) and its WebSocket push hub's (`ws_url`), both supplied by the application that embeds the client. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
 
 - without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
-- with a `ws_url` that is not a `ws` or `wss` URL naming a host;
+- without a `ws_url`, or with one that is not a `ws` or `wss` URL naming a host;
 - with either URL malformed, or naming a port outside 1–65535;
 - with a `venue` that is not a NautilusTrader `Venue`, or whose name is neither `MT5` nor `MT5_` followed by 1 to 8 capital letters or digits — NautilusTrader reads an account id's issuer as the text before its first hyphen, so a venue cannot carry one.
 
@@ -150,6 +150,7 @@ config = MT5Config(
     password   = "your_password",
     server     = "Exness-MT5Trial9",  # broker server name
     server_url = "http://127.0.0.1:5000",  # the MT5 server's HTTP API
+    ws_url     = "ws://127.0.0.1:9000",    # the MT5 server's WebSocket push hub
 )
 ```
 
@@ -162,12 +163,10 @@ config = MT5Config(
     password = "your_password",
     server   = "Exness-MT5Trial9",
     server_url = "http://127.0.0.1:5000",
+    ws_url     = "ws://127.0.0.1:9000",
 
     # The NautilusTrader venue the account's instruments, clients and account id carry
     venue = Venue("MT5"),          # default: MT5
-
-    # The WebSocket push hub (default: derived from server_url, on port 9000)
-    ws_url = "ws://127.0.0.1:9000",
 
     # How often the execution client checks its terminal session and reports an owed account
     exec_poll_interval_ms = 250,   # default: 250ms
@@ -198,6 +197,7 @@ config = MT5Config(
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
     server_url = os.environ["MT5_SERVER_URL"],
+    ws_url     = os.environ["MT5_WS_URL"],
 )
 ```
 
@@ -261,6 +261,7 @@ config = MT5Config(
     account=12345678, password="your_password",
     server="Exness-MT5Trial9",
     server_url="http://127.0.0.1:5000",
+    ws_url="ws://127.0.0.1:9000",
 )
 
 conn     = MT5Connection(config)
@@ -325,6 +326,7 @@ mt5_config = MT5Config(
     password = os.environ["MT5_PASSWORD"],
     server   = os.environ["MT5_SERVER"],
     server_url = os.environ["MT5_SERVER_URL"],
+    ws_url     = os.environ["MT5_WS_URL"],
 )
 
 traded   = frozenset({InstrumentId.from_str("EURUSDm.MT5")})
@@ -367,7 +369,7 @@ The adapter runs against `mt5-connector-server`: an HTTP server under the termin
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
-- `MT5Config` requires the server's `server_url`, an `http` or `https` URL, and derives its `ws_url` (WebSocket) from the same host on port 9000 unless one is given; a given `ws_url` must be a `ws` or `wss` URL naming a host, and a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
+- `MT5Config` requires the server's `server_url`, an `http` or `https` URL naming a host, and the hub's `ws_url`, a `ws` or `wss` URL naming a host; a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
 - Each `MT5Connection` calls its server through its own transport, `connection.mt5`: a `RemoteMT5` of the shim `mt5connector.client.remote_mt5` on the config's `server_url`, built with the connection and closed by its `disconnect()`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
 - A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
 - Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.

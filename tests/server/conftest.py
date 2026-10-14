@@ -148,7 +148,13 @@ def connection(served):
     """A client connection to the served app, never logged in: what its history reads and its
     transport's calls reach is the app."""
     connection = MT5Connection(
-        MT5Config(account=12345678, password="p", server="MT5_ALPHA", server_url=served)
+        MT5Config(
+            account=12345678,
+            password="p",
+            server="MT5_ALPHA",
+            server_url=served,
+            ws_url="ws://127.0.0.1:9000",
+        )
     )
     yield connection
     connection.mt5.close_session()

@@ -100,13 +100,14 @@ class TestSuccessfulConnect:
         conn.connect()
         conn.ensure_connected()
 
-    def test_a_config_of_the_credentials_and_the_server_url_alone_connects(self, mock_mt5):
+    def test_a_config_of_the_credentials_and_the_two_urls_alone_connects(self, mock_mt5):
         conn = MT5Connection(
             MT5Config(
                 account=12345678,
                 password="test_password",
                 server="Exness-MT5Trial1",
                 server_url="http://127.0.0.1:5000",
+                ws_url="ws://127.0.0.1:9000",
             )
         )
         conn.connect()
@@ -720,6 +721,7 @@ def secret_config() -> MT5Config:
         password=PASSWORD,
         server=SERVER,
         server_url="http://127.0.0.1:5000",
+        ws_url="ws://127.0.0.1:9000",
         reconnect_initial_delay_s=0,
         reconnect_max_attempts=1,
     )

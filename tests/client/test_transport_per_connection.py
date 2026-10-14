@@ -133,6 +133,7 @@ def connected():
                 password="p",
                 server=terminal.server,
                 server_url=terminal.url,
+                ws_url="ws://127.0.0.1:9000",
                 venue=Venue(terminal.server),
             )
         )
