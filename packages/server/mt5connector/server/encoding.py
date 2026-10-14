@@ -8,9 +8,14 @@ import numpy as np
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
+from mt5connector.server.wire.history_wire import BAR_CLOSE, BAR_PERIOD_S, Series
 
 _TRADE_REQUEST = mirror.STRUCTS[mirror.StructName.TRADE_REQUEST]
+_COPY_RATES_RANGE = mirror.FUNCTIONS[mirror.FunctionName.COPY_RATES_RANGE]
 _HOUR_S = 3_600
+_BROKER_DAY_GRID = frozenset(
+    {Series.H2, Series.H3, Series.H4, Series.H6, Series.H8, Series.H12, Series.D1, Series.W1}
+)
 
 
 class ShapeError(Exception):
@@ -37,7 +42,41 @@ def encode(
         encoded = _plain(value)
     for hour, (field, epoch) in answer.ambiguous.items():
         repeated_hours.warn(function.name, field, epoch, hour)
+    for hour, (field, epoch) in answer.skipped.items():
+        repeated_hours.warn_skipped(function.name, field, epoch, hour)
     return encoded
+
+
+def encode_bars(
+    series: Series, rates: np.ndarray, clock: BrokerClock, repeated_hours: RepeatedHours
+) -> list[dict[str, object]]:
+    """The JSON rows of a bar answer: the package's rates as encode() answers them, each with its
+    close. Of two bars opening at one true-UTC second, the first is answered and the other dropped,
+    as the terminal keeps the first pass of a repeated hour."""
+    encoded = encode(_COPY_RATES_RANGE, rates, clock, repeated_hours)
+    answered = []
+    for row, broker_open in zip(encoded, rates["time"].tolist(), strict=True):
+        if answered and answered[-1]["time"] == row["time"]:
+            repeated_hours.warn_dropped_bar(
+                _COPY_RATES_RANGE.name,
+                f"{mirror.RATES.name}.time",
+                broker_open,
+                broker_open // _HOUR_S,
+            )
+        else:
+            row[BAR_CLOSE] = bar_close(clock, series, broker_open)
+            answered.append(row)
+    return answered
+
+
+def bar_close(clock: BrokerClock, series: Series, broker_open: int) -> int:
+    """The true-UTC close of a bar of `series` opened at broker epoch `broker_open`: a frame on the
+    broker day's grid closes at the next grid open on the broker's clock, a finer one a period of
+    real time after its open."""
+    if series in _BROKER_DAY_GRID:
+        return clock.to_utc(broker_open + BAR_PERIOD_S[series])
+    else:
+        return clock.to_utc(broker_open) + BAR_PERIOD_S[series]
 
 
 def package_arguments(
@@ -88,13 +127,15 @@ def _broker_request(request: dict[str, object], clock: BrokerClock) -> dict[str,
 
 
 class _Answer:
-    """One answer's encoding; remembers the first epoch it read in each of the broker's repeated
-    hours."""
+    """One answer's encoding; remembers the first epoch it read in each of the broker's repeated and
+    skipped hours."""
 
     def __init__(self, clock: BrokerClock) -> None:
         self._clock = clock
         # The field and epoch of the first epoch read in each repeated broker hour, by the hour.
         self.ambiguous: dict[int, tuple[str, int]] = {}
+        # The same, for each broker hour the clock skips.
+        self.skipped: dict[int, tuple[str, int]] = {}
 
     def struct(self, struct: mirror.Struct, value: tuple) -> dict[str, object]:
         if len(value) != len(struct.fields):
@@ -138,6 +179,8 @@ class _Answer:
         hour = seconds // _HOUR_S
         if value != 0 and hour not in self.ambiguous and self._clock.is_ambiguous(seconds):
             self.ambiguous[hour] = (field, value)
+        elif value != 0 and hour not in self.skipped and self._clock.is_skipped(seconds):
+            self.skipped[hour] = (field, value)
         return utc
 
 

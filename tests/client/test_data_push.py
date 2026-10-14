@@ -2,6 +2,7 @@
 reconnect missed read back once."""
 
 import asyncio
+import calendar
 import threading
 from decimal import Decimal
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -35,7 +36,7 @@ from mt5connector.client.data import MT5DataClient
 from mt5connector.client.errors import MT5InstrumentError, ServerUnreachable
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import mirror
-from mt5connector.wire.history_wire import Series
+from mt5connector.wire.history_wire import BAR_PERIOD_S, Series
 from mt5connector.wire.push_wire import Stream, Subscription
 
 EURUSD = InstrumentId.from_str("EURUSD.MT5")
@@ -49,7 +50,7 @@ W1_BID = BarType.from_str("EURUSD.MT5-1-WEEK-BID-EXTERNAL")
 # 2025-03-02T22:00Z and 2025-03-09T21:00Z.
 WEEK_BEFORE = 1_740_952_800
 WEEK_AFTER = 1_741_554_000
-RATES = np.dtype(list(mirror.RATES.dtype))
+BARS = np.dtype([*mirror.RATES.dtype, ("time_close", "<i8")])
 
 
 def instrument():
@@ -196,7 +197,8 @@ def tick(bid, ask, time_msc=NINE * 1000 + 123):
     }
 
 
-def bar(open_time, timeframe="M1", **prices):
+def bar(open_time, timeframe="M1", **fields):
+    """A bar frame as the hub pushes it, closing a period after its open unless `fields` say."""
     return {
         "v": 1,
         "type": "bar",
@@ -210,11 +212,8 @@ def bar(open_time, timeframe="M1", **prices):
         "tick_volume": 42,
         "spread": 12,
         "real_volume": 0,
-    } | prices
-
-
-def rate_rows(*opens):
-    return np.array([(t, 1.085, 1.0852, 1.0849, 1.0851, 42, 12, 0) for t in opens], dtype=RATES)
+        "time_close": open_time + BAR_PERIOD_S[Series(timeframe)],
+    } | fields
 
 
 async def settle():
@@ -318,7 +317,7 @@ async def test_a_tick_of_a_symbol_not_loaded_is_refused():
 # ── Bars ─────────────────────────────────────────────────────────────────────
 
 
-async def test_a_pushed_bar_is_the_venue_bar_stamped_at_its_open_plus_its_interval():
+async def test_a_pushed_bar_is_the_venue_bar_at_the_venues_prices_and_close():
     c = Client(NINE + 1)
     await c.client._subscribe_bars(bars(M5_BID))
 
@@ -347,8 +346,8 @@ async def test_a_bar_of_a_series_not_subscribed_hands_nothing():
 
 
 class History:
-    """The history route's bars: each read blocks until a test releases it, then answers the opens
-    of `opens` its window holds."""
+    """The history route's bars, each closing a period after its open: each read blocks until a test
+    releases it, then answers the opens of `opens` its window holds."""
 
     def __init__(self, *opens):
         self.opens = opens
@@ -360,7 +359,34 @@ class History:
         self.reads.append((symbol, series, start, end))
         self.gates.append(gate)
         gate.wait(5)
-        return rate_rows(*(opened for opened in self.opens if start <= opened <= end))
+        return closed_rows(
+            *((t, t + BAR_PERIOD_S[series]) for t in self.opens if start <= t <= end)
+        )
+
+
+# The broker's weekly bars either side of New York's 2025 autumn change: the first opened
+# 2025-11-01T21:00Z and closed 169 hours later, 2025-11-08T22:00Z, where the second opened.
+AUTUMN_WEEK = calendar.timegm((2025, 11, 1, 21, 0, 0))
+AUTUMN_CLOSE = calendar.timegm((2025, 11, 8, 22, 0, 0))
+NEXT_CLOSE = calendar.timegm((2025, 11, 15, 22, 0, 0))
+
+
+def closed_rows(*opens_and_closes):
+    return np.array(
+        [(t, 1.085, 1.0852, 1.0849, 1.0851, 42, 12, 0, closed) for t, closed in opens_and_closes],
+        dtype=BARS,
+    )
+
+
+class ClosedHistory(History):
+    """The history route's bars, each with its close, answered as History answers."""
+
+    def __call__(self, connection, symbol, series, start, end, cancel):
+        gate = threading.Event()
+        self.reads.append((symbol, series, start, end))
+        self.gates.append(gate)
+        gate.wait(5)
+        return closed_rows(*((t, closed) for t, closed in self.opens if start <= t <= end))
 
 
 async def until(condition):
@@ -393,7 +419,7 @@ async def test_after_a_reconnect_the_first_pushed_bar_bounds_one_read_of_the_bar
         history.gates[0].set()
         await until(lambda: len(c.bars()) == 7)
 
-    assert history.reads == [("EURUSD", Series.M1, NINE + 1, NINE + 299)]
+    assert history.reads == [("EURUSD", Series.M1, NINE - 59, NINE + 299)]
     assert held == [NINE]
     assert opens(c) == [NINE + 60 * minute for minute in range(7)]
 
@@ -442,14 +468,14 @@ async def test_a_second_reconnect_during_a_read_back_leaves_the_last_read_to_han
         await until(lambda: len(c.bars()) == 5)
 
     assert history.reads == [
-        ("EURUSD", Series.M1, NINE + 1, NINE + 119),
-        ("EURUSD", Series.M1, NINE + 1, NINE + 239),
+        ("EURUSD", Series.M1, NINE - 59, NINE + 119),
+        ("EURUSD", Series.M1, NINE - 59, NINE + 239),
     ]
     assert after_the_first == [NINE]
     assert opens(c) == [NINE, NINE + 60, NINE + 120, NINE + 180, NINE + 240]
 
 
-async def test_a_reconnect_with_no_bar_missed_reads_an_empty_window_and_hands_no_bar_twice():
+async def test_a_reconnect_with_no_bar_missed_reads_nothing_and_hands_no_bar_twice():
     c = Client(NINE + 30)
     await c.client._subscribe_bars(bars(M1_BID))
     c.at(NINE + 60)
@@ -460,11 +486,9 @@ async def test_a_reconnect_with_no_bar_missed_reads_an_empty_window_and_hands_no
         c.push.reconnect()
         c.at(NINE + 120)
         c.push.deliver(bar(NINE + 60))
-        await until(lambda: history.reads)
-        history.gates[0].set()
         await until(lambda: len(c.bars()) == 2)
 
-    assert history.reads == [("EURUSD", Series.M1, NINE + 1, NINE + 59)]
+    assert history.reads == []
     assert opens(c) == [NINE, NINE + 60]
 
 
@@ -480,7 +504,7 @@ async def test_a_failed_read_back_is_an_error_and_the_held_bars_go_on():
         await until(lambda: c.bars())
 
     history_bars.assert_called_once_with(
-        c.client._conn, "EURUSD", Series.M1, NINE - 29, NINE + 179, cancel=ANY
+        c.client._conn, "EURUSD", Series.M1, NINE - 89, NINE + 179, cancel=ANY
     )
     assert opens(c) == [NINE + 180]
     assert len(c.client._log.error.call_args_list) == 1
@@ -504,10 +528,10 @@ async def test_a_read_back_the_server_does_not_answer_is_an_error_and_the_held_b
     assert len(c.client._log.error.call_args_list) == 1
 
 
-async def test_the_read_back_takes_every_bar_opened_before_the_first_pushed_one_across_dst():
+async def test_the_read_back_takes_every_bar_closing_by_the_first_pushed_ones_open_across_dst():
     c = Client(WEEK_BEFORE + 3_600)
     await c.client._subscribe_bars(bars(W1_BID))
-    history = History(WEEK_BEFORE, WEEK_AFTER)
+    history = ClosedHistory((WEEK_BEFORE, WEEK_AFTER), (WEEK_AFTER, WEEK_AFTER + 604_800))
 
     with patch("mt5connector.client.history.bars", side_effect=history):
         c.at(WEEK_AFTER + 60)
@@ -518,4 +542,42 @@ async def test_the_read_back_takes_every_bar_opened_before_the_first_pushed_one_
         history.gates[0].set()
         await until(lambda: len(c.bars()) == 2)
 
-    assert [item.ts_event // SECOND_NS - 604_800 for item in c.bars()] == [WEEK_BEFORE, WEEK_AFTER]
+    assert [item.ts_event // SECOND_NS for item in c.bars()] == [WEEK_AFTER, WEEK_AFTER + 604_800]
+
+
+async def test_a_pushed_bar_is_stamped_at_the_close_its_frame_carries():
+    c = Client(AUTUMN_WEEK + 86_400)
+    await c.client._subscribe_bars(bars(W1_BID))
+
+    c.at(AUTUMN_CLOSE + 60)
+    c.push.deliver(bar(AUTUMN_WEEK, "W1") | {"time_close": AUTUMN_CLOSE})
+
+    (pushed,) = c.bars()
+    assert pushed.ts_event == pushed.ts_init == AUTUMN_CLOSE * SECOND_NS
+
+
+async def test_a_bar_closing_after_the_subscription_is_handed_however_long_it_ran():
+    c = Client(AUTUMN_CLOSE - 1_800)
+    await c.client._subscribe_bars(bars(W1_BID))
+
+    c.at(AUTUMN_CLOSE + 86_400)
+    c.push.deliver(bar(AUTUMN_WEEK, "W1") | {"time_close": AUTUMN_CLOSE})
+
+    assert [item.ts_event for item in c.bars()] == [AUTUMN_CLOSE * SECOND_NS]
+
+
+async def test_the_read_back_takes_the_bar_forming_at_the_subscription_across_the_autumn_change():
+    c = Client(AUTUMN_CLOSE - 1_800)
+    await c.client._subscribe_bars(bars(W1_BID))
+    history = ClosedHistory((AUTUMN_WEEK, AUTUMN_CLOSE), (AUTUMN_CLOSE, NEXT_CLOSE))
+
+    with patch("mt5connector.client.history.bars", side_effect=history):
+        c.at(AUTUMN_CLOSE + 60)
+        c.push.reconnect()
+        c.at(NEXT_CLOSE + 60)
+        c.push.deliver(bar(AUTUMN_CLOSE, "W1") | {"time_close": NEXT_CLOSE})
+        await until(lambda: history.reads)
+        history.gates[0].set()
+        await until(lambda: len(c.bars()) == 2)
+
+    assert [item.ts_event // SECOND_NS for item in c.bars()] == [AUTUMN_CLOSE, NEXT_CLOSE]

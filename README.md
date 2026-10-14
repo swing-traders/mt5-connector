@@ -243,7 +243,7 @@ The provider also answers what a consumer discovers its settlement currencies by
 
 The downloader walks back from `end`, one request per window, until `start` or the floor `/history/ranges` advertises for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
 
-- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at its close — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
+- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at the close the server answers for it — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
 - ticks one UTC day at a time, both sizes of each the instrument's largest order.
 
 A window the server answers with a failure, or leaves unanswered, is recorded among the result's errors and the walk goes on; any other error reading it raises.
@@ -384,8 +384,8 @@ The shim raises `ServerUnreachable` when the server cannot be reached or answers
 
 `mt5connector.client.history` calls the server's history routes on the transport of the connection each read is handed as its first argument, with no read timeout:
 
-- `bars(connection, symbol, series, start, end)` and `ticks(connection, symbol, start, end)` answer the rows as the package's arrays, and `ranges(connection, symbol)` the advertised floors and `maxbars`.
-- On a 503 — the window not proven yet, or every slot taken — each waits its `Retry-After` and asks again, with no deadline of its own, until the server answers otherwise or the `cancel` event it was handed is set.
+- `bars(connection, symbol, series, start, end)` and `ticks(connection, symbol, start, end)` answer the rows as the package's arrays, each bar with its `time_close`, and `ranges(connection, symbol)` the advertised floors and `maxbars`.
+- On a 503 — the window not proven yet, every slot taken, or the server not ready with a `Retry-After` — each waits that delay and asks again, with no deadline of its own, until the server answers otherwise or the `cancel` event it was handed is set. A not-ready answer still standing then raises `ServerUnreachable`, as the shim does.
 - They answer `None` for a failure, a 400 among them, and for a cancellation, with the connection's `mt5.last_error()` set to the pair the server last answered.
 
 ---

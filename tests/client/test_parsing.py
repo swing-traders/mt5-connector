@@ -23,6 +23,7 @@ from mt5connector.client.parsing import (
 )
 from mt5connector.client.sessions import parse_sessions
 from mt5connector.wire import mirror
+from mt5connector.wire.history_wire import BARS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -53,22 +54,12 @@ def make_rate(
     spread=2,
     real_volume=0,
     time_s=1700000000,
+    time_close=1700003600,
 ):
-    """Build a numpy structured array row matching mt5.copy_rates_range() output."""
-    dtype = np.dtype(
-        [
-            ("time", np.int64),
-            ("open", np.float64),
-            ("high", np.float64),
-            ("low", np.float64),
-            ("close", np.float64),
-            ("tick_volume", np.int64),
-            ("spread", np.int32),
-            ("real_volume", np.int64),
-        ]
-    )
+    """A bar row as the bars route answers it: an MqlRates row and the bar's close."""
     arr = np.array(
-        [(time_s, open_, high, low, close, tick_volume, spread, real_volume)], dtype=dtype
+        [(time_s, open_, high, low, close, tick_volume, spread, real_volume, time_close)],
+        dtype=np.dtype(list(BARS.dtype)),
     )
     return arr[0]
 
@@ -231,9 +222,10 @@ class TestVenueBar:
         )
         assert result.bar_type == bar_type
 
-    def test_a_bar_is_stamped_at_its_close_in_event_and_init(self, eurusd):
+    def test_a_bar_is_stamped_at_the_close_its_row_carries_in_event_and_init(self, eurusd):
         bar_type = venue_bar_type(eurusd, mirror.TIMEFRAME_M1)
-        result = venue_bar(make_rate(time_s=1_752_570_000), bar_type, eurusd)
+        row = make_rate(time_s=1_752_570_000, time_close=1_752_570_060)
+        result = venue_bar(row, bar_type, eurusd)
         assert (result.ts_event, result.ts_init) == (1_752_570_060 * 1_000_000_000,) * 2
 
 

@@ -147,8 +147,9 @@ class RemoteMT5:
         params: dict[str, str] | None = None,
     ) -> Reply:
         """Calls one of the server's own routes and sets last_error to the pair its envelope
-        carries. No read timeout bounds it: a cold history read holds the terminal as long as the
-        package's own call takes."""
+        carries, if any: a refusal while the server is not ready carries none. No read timeout
+        bounds it: a cold history read holds the terminal as long as the package's own call
+        takes."""
         return self._exchange(name, method, path, None, json=json, params=params)
 
     def commission_schedule(self, symbol: str) -> dict:
@@ -321,6 +322,8 @@ class RemoteMT5:
         )
         if reply.envelope["ok"]:
             return _decode(function, reply.envelope["result"])
+        elif is_not_ready(reply):
+            raise not_ready(function.name, reply)
         elif (
             reply.status is HTTPStatus.SERVICE_UNAVAILABLE
             and reply.envelope["error"]["code"] is ServerCode.BUSY
@@ -341,7 +344,7 @@ class RemoteMT5:
         json: dict[str, object] | None = None,
         params: dict[str, str] | None = None,
     ) -> Reply:
-        """The server's reply to a request, its last_error recorded as this object's."""
+        """The server's reply to a request, the last_error it carries recorded as this object's."""
         try:
             response = self._session.request(
                 method,
@@ -353,11 +356,23 @@ class RemoteMT5:
         except requests.RequestException as exc:
             raise _unanswered(name, exc) from exc
         envelope = _envelope(name, response)
-        code, message = envelope["last_error"]
-        self._last_error = (code, message)
+        if "last_error" in envelope:
+            code, message = envelope["last_error"]
+            self._last_error = (code, message)
         return Reply(
             HTTPStatus(response.status_code), envelope, response.headers.get("Retry-After")
         )
+
+
+def is_not_ready(reply: Reply) -> bool:
+    """Whether the server refused the request while it is not ready: HTTP 503 with no last_error,
+    the terminal never asked."""
+    return reply.status is HTTPStatus.SERVICE_UNAVAILABLE and "last_error" not in reply.envelope
+
+
+def not_ready(name: str, reply: Reply) -> ServerUnreachable:
+    """The error for a request the server refused while it is not ready."""
+    return ServerUnreachable(f"{name}: server not ready — {reply.envelope['error']['message']}")
 
 
 def retry_after_s(name: str, retry_after: str | None) -> int:
@@ -389,8 +404,8 @@ def _read_timeout_s(function: mirror.Function, body: dict[str, object]) -> float
 
 
 def _envelope(name: str, response: requests.Response) -> dict:
-    """The response's envelope; raises ServerUnreachable for the server refusing the request before
-    serving it, ResponseLost for any other answer outside the contract."""
+    """The response's envelope — an answer, a failure, or the server's refusal while it is not
+    ready; raises ResponseLost for any other answer outside the contract."""
     if response.status_code not in _ENVELOPE_STATUSES:
         raise ResponseLost(f"{name}: HTTP {response.status_code}")
     try:
@@ -402,7 +417,7 @@ def _envelope(name: str, response: requests.Response) -> dict:
     elif _is_error(envelope):
         return _with_server_code(envelope)
     elif response.status_code == HTTPStatus.SERVICE_UNAVAILABLE and _is_server_failure(envelope):
-        raise ServerUnreachable(f"{name}: server not ready — {envelope['error']['message']}")
+        return envelope
     else:
         raise ResponseLost(f"{name}: HTTP {response.status_code} body is not an envelope")
 

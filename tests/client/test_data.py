@@ -2,6 +2,7 @@
 tests/client/test_data_push.py's."""
 
 import asyncio
+import calendar
 import threading
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -13,6 +14,7 @@ from nautilus_trader.common.component import LiveClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.messages import DataResponse, RequestInstrument, RequestInstruments
+from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
@@ -364,12 +366,12 @@ class TestSubscribeQuoteTicks:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-RATES = np.dtype(list(mirror.RATES.dtype))
 TICKS = np.dtype(list(mirror.TICKS.dtype))
 
 
 def rate_rows(*opens):
-    return np.array([(t, 1.085, 1.09, 1.08, 1.088, 1000, 2, 0) for t in opens], dtype=RATES)
+    """M1 bar rows as the bars route answers them, each closing a minute after its open."""
+    return closed_rows(*((t, t + 60) for t in opens))
 
 
 def tick_rows(*times_msc):
@@ -385,6 +387,32 @@ def minute_bars_request(first_close, last_close):
     request.end = last_close * 1_000_000_000
     request.id = "req-bars"
     return request
+
+
+def week_bars_request(first_close, last_close):
+    request = minute_bars_request(first_close, last_close)
+    request.bar_type = BarType.from_str("EURUSDm.MT5-1-WEEK-LAST-EXTERNAL")
+    return request
+
+
+# The broker's weekly bars about New York's 2025 autumn change, each as its open and its close: the
+# week opened 2025-11-01T21:00Z runs 169 hours.
+AUTUMN_WEEK = calendar.timegm((2025, 11, 1, 21, 0, 0))
+AUTUMN_CLOSE = calendar.timegm((2025, 11, 8, 22, 0, 0))
+NEXT_CLOSE = calendar.timegm((2025, 11, 15, 22, 0, 0))
+AUTUMN_WEEKS = [
+    (AUTUMN_WEEK - 604_800, AUTUMN_WEEK),
+    (AUTUMN_WEEK, AUTUMN_CLOSE),
+    (AUTUMN_CLOSE, NEXT_CLOSE),
+]
+BARS = np.dtype([*mirror.RATES.dtype, ("time_close", "<i8")])
+
+
+def closed_rows(*opens_and_closes):
+    return np.array(
+        [(t, 1.085, 1.09, 1.08, 1.088, 1000, 2, 0, closed) for t, closed in opens_and_closes],
+        dtype=BARS,
+    )
 
 
 def ticks_request(start, end):
@@ -472,12 +500,13 @@ class TestRequestBars:
     @pytest.mark.asyncio
     async def test_asks_the_server_for_the_opens_of_the_closes_requested(self, recorded):
         c0, c1 = 1_752_570_060, 1_752_570_300
-        rows = rate_rows(*range(c0 - 60, c1, 60))
+        rows = rate_rows(*range(c0 - 120, c1, 60))
         with patch("mt5connector.client.history.bars", return_value=rows) as bars:
             await recorded._request_bars(minute_bars_request(c0, c1))
 
+        # Every bar closing in the request opened from two periods before its first close on.
         bars.assert_called_once_with(
-            recorded._conn, "EURUSDm", Series.M1, c0 - 60, c1 - 60, cancel=ANY
+            recorded._conn, "EURUSDm", Series.M1, c0 - 120, c1 - 1, cancel=ANY
         )
         delivered = recorded._handle_bars.call_args[0][1]
         assert [bar.ts_event for bar in delivered] == [
@@ -542,6 +571,27 @@ class TestRequestBars:
         assert recorded._handle_bars.call_args[0][0] == request.bar_type
         [bar] = recorded._handle_bars.call_args[0][1]
         assert bar.bar_type == request.bar_type
+
+    @pytest.mark.parametrize(
+        ("first_close", "last_close", "closes"),
+        [
+            (AUTUMN_CLOSE, NEXT_CLOSE - 1_800, [AUTUMN_CLOSE]),
+            (AUTUMN_WEEK, AUTUMN_CLOSE - 1_800, [AUTUMN_WEEK]),
+        ],
+        ids=["the-169h-bar-closing-at-the-start", "the-169h-bar-still-open-at-the-end"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_request_answers_the_bars_whose_real_closes_it_names(
+        self, recorded, first_close, last_close, closes
+    ):
+        def served(connection, symbol, series, start, end, cancel):
+            return closed_rows(*((t, c) for t, c in AUTUMN_WEEKS if start <= t <= end))
+
+        with patch("mt5connector.client.history.bars", side_effect=served):
+            await recorded._request_bars(week_bars_request(first_close, last_close))
+
+        delivered = recorded._handle_bars.call_args[0][1]
+        assert [bar.ts_event for bar in delivered] == [close * 1_000_000_000 for close in closes]
 
     @pytest.mark.parametrize("step", ["1-SECOND", "2-DAY", "1-MONTH"])
     @pytest.mark.asyncio

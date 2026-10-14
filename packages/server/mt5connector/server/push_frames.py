@@ -3,10 +3,11 @@ structs and passed on to consumers with every epoch in true UTC."""
 
 from dataclasses import dataclass
 
+from mt5connector.server.encoding import bar_close
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
-from mt5connector.server.wire.history_wire import BAR_TIMEFRAME, Series
+from mt5connector.server.wire.history_wire import BAR_CLOSE, BAR_TIMEFRAME, Series
 from mt5connector.server.wire.push_wire import (
     RESULT_FIELDS,
     TRANSACTION_EPOCHS,
@@ -43,8 +44,8 @@ def published(
     frame: dict[str, object], clock: BrokerClock, repeated_hours: RepeatedHours
 ) -> Published:
     """The tick, bar or trade-transaction frame an EA published, as its consumers receive it: its
-    struct fields verbatim, every epoch in true UTC, and a bar's timeframe by its series name.
-    Raises FrameError naming what breaks the shape, and for a frame of any other kind."""
+    struct fields verbatim, every epoch in true UTC, and a bar's timeframe by its series name and
+    its close. Raises FrameError naming what breaks the shape, and for a frame of any other kind."""
     kind = frame.get("type")
     conversion = _Conversion(clock, repeated_hours)
     if kind == FrameType.TICK:
@@ -61,6 +62,7 @@ def published(
         symbol = frame["symbol"]
         passed = frame | {"timeframe": series.value}
         passed |= conversion.epochs(mirror.RATES.epochs, frame, kind)
+        passed[BAR_CLOSE] = bar_close(clock, series, frame["time"])
     elif kind == FrameType.TRADE_TRANSACTION:
         hold(frame, (*_ENVELOPE, "transaction", "request", "result"), kind)
         hold(frame["transaction"], TRANSACTION_FIELDS, f"{kind}: transaction")
@@ -110,6 +112,8 @@ class _Conversion:
                 seconds = value // 1000
             if value != 0 and self._clock.is_ambiguous(seconds):
                 self._repeated_hours.warn(where, name, value, seconds // _HOUR_S)
+            elif value != 0 and self._clock.is_skipped(seconds):
+                self._repeated_hours.warn_skipped(where, name, value, seconds // _HOUR_S)
         return converted
 
 

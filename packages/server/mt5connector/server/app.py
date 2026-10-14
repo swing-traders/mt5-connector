@@ -176,7 +176,7 @@ def create_app(
     concurrency = _Concurrency(workers)
     app = Flask(__name__, static_folder=None)
     app.json.sort_keys = False
-    app.before_request(_clock_gate(clock_status))
+    app.before_request(_clock_gate(clock_status, retry_s))
     for function in mirror.FUNCTIONS.values():
         app.add_url_rule(
             f"/mt5/{function.name}",
@@ -253,10 +253,11 @@ def create_app(
     return app
 
 
-def _clock_gate(clock_status: ClockStatus) -> Callable:
+def _clock_gate(clock_status: ClockStatus, retry_s: int) -> Callable:
     def gate():
         if request.endpoint not in _UNGATED and clock_status.read() is None:
-            return _clock_unverified(), HTTPStatus.SERVICE_UNAVAILABLE
+            headers = {"Retry-After": str(retry_s)}
+            return _clock_unverified(), HTTPStatus.SERVICE_UNAVAILABLE, headers
 
     return gate
 

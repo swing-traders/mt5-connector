@@ -6,8 +6,8 @@ frame last told it; the spawner; the chart requests held for symbols no EA publi
 spawner was sent; the spawner's reason for each chart it failed to open, standing until that chart
 opens or its symbol's EA says hello; when each symbol was last in use, and the symbols whose charts
 the spawner was told to close; each consumer's subscriptions and its queue of frames not yet sent;
-and the repeated broker hours warned of. Nothing is persisted, and nothing is replayed to a consumer
-that reconnects."""
+the true-UTC open of the last bar fanned out of each series; and the broker hours warned of. Nothing
+is persisted, and nothing is replayed to a consumer that reconnects."""
 
 import asyncio
 import http.client
@@ -55,6 +55,7 @@ QUEUE_BOUND = 10_000
 OVERFLOW = 4008
 _RELAY_TIMEOUT_S = 5
 _IDLE_SWEEP_S = 5
+_HOUR_S = 3_600
 _LOOPBACK = "127.0.0.1"
 _PUBLISHED = frozenset({FrameType.TICK, FrameType.BAR, FrameType.TRADE_TRANSACTION})
 _RELAYED = frozenset({FrameType.SERVER_TIME, FrameType.COMMISSIONS, FrameType.SESSIONS})
@@ -106,6 +107,7 @@ class Hub:
         self._close_sent: set[str] = set()
         self._consumers: dict[object, _Consumer] = {}
         self._repeated_hours = RepeatedHours()
+        self._bar_opens: dict[Subscription, int] = {}
         self._closing: set[asyncio.Task] = set()
 
     async def handler(self, ws) -> None:
@@ -309,15 +311,29 @@ class Hub:
         ea = self._eas[ws]
         if self._publishers.get(ea.symbol) is ws:
             passed = published(frame, self._clock, self._repeated_hours)
-            if passed.symbol == ea.symbol or (passed.symbol == "" and ws is self._spawner):
-                await self._fan_out(passed)
-            else:
+            if not (passed.symbol == ea.symbol or (passed.symbol == "" and ws is self._spawner)):
                 logger.warning(
                     "dropping a %s frame for %r from the EA for %s",
                     frame["type"],
                     passed.symbol,
                     ea.symbol,
                 )
+            elif passed.subscription.stream is Stream.BARS:
+                await self._publish_bar(passed, frame["time"])
+            else:
+                await self._fan_out(passed)
+
+    async def _publish_bar(self, passed: Published, broker_open: int) -> None:
+        """Fans a bar out unless the last bar of its series fanned out opened at the same true-UTC
+        second; that first bar keeps the period, as the bars route answers it."""
+        opened = passed.frame["time"]
+        if self._bar_opens.get(passed.subscription) == opened:
+            self._repeated_hours.warn_dropped_bar(
+                FrameType.BAR, "time", broker_open, broker_open // _HOUR_S
+            )
+        else:
+            self._bar_opens[passed.subscription] = opened
+            await self._fan_out(passed)
 
     async def _fan_out(self, passed: Published) -> None:
         raw = json.dumps(passed.frame)

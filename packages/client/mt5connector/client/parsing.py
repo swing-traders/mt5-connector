@@ -18,7 +18,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from mt5connector.client.currencies import base_currency, venue_currency
 from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.wire import mirror
-from mt5connector.wire.history_wire import Series, bar_series
+from mt5connector.wire.history_wire import BAR_CLOSE, Series, bar_series
 
 if TYPE_CHECKING:
     from mt5connector.client.connection import AccountSnapshot
@@ -306,9 +306,9 @@ def mark_at_mid(quote: QuoteTick) -> MarkPriceUpdate:
 
 
 def venue_bar(rates, bar_type: BarType, instrument: InstrumentAny) -> Bar:
-    """A venue bar of `bar_type` from an MqlRates row stamped at its open, stamped at its close:
-    the open plus the bar's interval, its prices and tick volume as the venue counts them."""
-    ts_event = int(rates["time"]) * 1_000_000_000 + bar_type.spec.get_interval_ns()
+    """A venue bar of `bar_type` from a bar row the server answered, stamped at the close the row
+    carries, its prices and tick volume as the venue counts them."""
+    ts_event = int(rates[BAR_CLOSE]) * 1_000_000_000
     return Bar(
         bar_type=bar_type,
         open=instrument.make_price(rates["open"]),

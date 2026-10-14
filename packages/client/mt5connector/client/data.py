@@ -2,8 +2,8 @@
 venue bars pushed over the hub, and its history read over HTTP.
 
 State: the symbols whose quotes and whose marks NT subscribes, which share one tick stream; per
-venue bar type, the earliest open the next bar handed to NT may have, and from a reconnect until the
-bars it missed are read back, the bars pushed since."""
+venue bar type, the earliest close the next bar handed to NT may have, and from a reconnect until
+the bars it missed are read back, the bars pushed since."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ from mt5connector.client.parsing import (
     venue_series,
 )
 from mt5connector.client.push import PushClient
-from mt5connector.wire.history_wire import BAR_PERIOD_S, Series
+from mt5connector.wire.history_wire import BAR_CLOSE, Series
 from mt5connector.wire.push_wire import FrameType, Stream, Subscription
 
 if TYPE_CHECKING:
@@ -96,7 +96,7 @@ class MT5DataClient(LiveMarketDataClient):
         )
         self._quote_symbols: set[str] = set()
         self._mark_symbols: set[str] = set()
-        self._next_opens: dict[BarType, int] = {}
+        self._next_closes: dict[BarType, int] = {}
         self._recoveries: dict[BarType, _Recovery] = {}
         self._read_backs: set[asyncio.Task] = set()
 
@@ -154,15 +154,14 @@ class MT5DataClient(LiveMarketDataClient):
         """Subscribes a venue bar type's series; a bar that closed before the subscription is the
         history's to serve."""
         subscription = _bar_subscription(command.bar_type)
-        now_s = self._clock.timestamp_ns() // 1_000_000_000
-        self._next_opens[command.bar_type] = now_s - BAR_PERIOD_S[subscription.timeframe] + 1
+        self._next_closes[command.bar_type] = self._clock.timestamp_ns() // 1_000_000_000 + 1
         await self._push.subscribe(subscription)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
         subscription = _bar_subscription(command.bar_type)
-        self._next_opens.pop(command.bar_type, None)
+        self._next_closes.pop(command.bar_type, None)
         self._recoveries.pop(command.bar_type, None)
-        if subscription not in {_bar_subscription(bar_type) for bar_type in self._next_opens}:
+        if subscription not in {_bar_subscription(bar_type) for bar_type in self._next_closes}:
             await self._push.unsubscribe(subscription)
 
     # ── The push channel ──────────────────────────────────────────────────────
@@ -179,7 +178,7 @@ class MT5DataClient(LiveMarketDataClient):
             self._handle_data(mark_at_mid(quote))
         elif kind == FrameType.BAR:
             pushed = Subscription(Stream.BARS, frame["symbol"], Series(frame["timeframe"]))
-            for bar_type in list(self._next_opens):
+            for bar_type in list(self._next_closes):
                 if _bar_subscription(bar_type) == pushed:
                     self._on_pushed_bar(bar_type, frame)
         else:
@@ -202,19 +201,20 @@ class MT5DataClient(LiveMarketDataClient):
                 task.add_done_callback(self._read_backs.discard)
 
     def _emit_bar(self, bar_type: BarType, rates) -> None:
-        """Hands NT a venue bar of `bar_type` unless one at or after its open was handed already."""
-        next_open = self._next_opens.get(bar_type)
-        opened = int(rates["time"])
-        if next_open is not None and opened >= next_open:
+        """Hands NT a venue bar of `bar_type` unless one closing at or after its close was handed
+        already, or it closed before the subscription."""
+        next_close = self._next_closes.get(bar_type)
+        closed = int(rates[BAR_CLOSE])
+        if next_close is not None and closed >= next_close:
             instrument = self._instrument(bar_type.instrument_id.symbol.value)
             self._handle_data(venue_bar(rates, bar_type, instrument))
-            self._next_opens[bar_type] = opened + 1
+            self._next_closes[bar_type] = closed + 1
 
     def _on_push_reconnect(self) -> None:
         """Starts every venue bar type's recovery before the channel subscribes it again, keeping
         the bars an earlier recovery still holds: the hub may restore a subscription only after a
         bar has closed, so the first bar pushed afterwards is what bounds the bars missed."""
-        for bar_type in self._next_opens:
+        for bar_type in self._next_closes:
             earlier = self._recoveries.get(bar_type)
             if earlier is None:
                 self._recoveries[bar_type] = _Recovery()
@@ -222,18 +222,16 @@ class MT5DataClient(LiveMarketDataClient):
                 self._recoveries[bar_type] = _Recovery(held=earlier.held)
 
     async def _read_back(self, bar_type: BarType, recovery: _Recovery, pushed_open: int) -> None:
-        """Reads once the bars of `bar_type` opened from the next one owed until `pushed_open`, the
-        first pushed after the reconnect, and hands NT them and then the bars the recovery holds —
-        unless a later reconnect superseded the recovery, whose own read covers them all."""
+        """Reads once the bars of `bar_type` closing from the next one owed until `pushed_open`, the
+        open of the first pushed after the reconnect, and hands NT them and then the bars the
+        recovery holds — unless a later reconnect superseded the recovery, whose own read covers
+        them all."""
         # None once NT unsubscribes the bar type.
-        first_open = self._next_opens.get(bar_type)
-        # Not the pushed open less the interval: a broker day or week spans an hour more or less of
-        # UTC across a DST change.
-        last_open = pushed_open - 1
+        first_close = self._next_closes.get(bar_type)
         rows = ()
         try:
-            if first_open is not None and first_open <= last_open:
-                rows = await self._missed_bars(bar_type, first_open, last_open)
+            if first_close is not None and first_close <= pushed_open:
+                rows = await self._missed_bars(bar_type, first_close, pushed_open)
         finally:
             if self._recoveries.get(bar_type) is recovery:
                 del self._recoveries[bar_type]
@@ -242,11 +240,13 @@ class MT5DataClient(LiveMarketDataClient):
                 for frame in recovery.held:
                     self._emit_bar(bar_type, frame)
 
-    async def _missed_bars(self, bar_type: BarType, first_open: int, last_open: int):
-        """The bars of `bar_type` opened from `first_open` through `last_open` as the history serves
-        them; none, with an error logged, when the read fails or the server does not answer."""
+    async def _missed_bars(self, bar_type: BarType, first_close: int, last_close: int):
+        """The bars of `bar_type` closing from `first_close` through `last_close` as the history
+        serves them; none, with an error logged, when the read fails or the server does not
+        answer."""
         series = _bar_subscription(bar_type).timeframe
         symbol = bar_type.instrument_id.symbol.value
+        first_open, last_open = history.opens_closing(series, first_close, last_close)
         try:
             rows = await _read_in_thread(
                 history.bars, self._conn, symbol, series, first_open, last_open
@@ -257,12 +257,12 @@ class MT5DataClient(LiveMarketDataClient):
             failure = exc
         if rows is None:
             self._log.error(
-                f"MT5DataClient: {bar_type} bars opened {_iso(first_open)}..{_iso(last_open)} "
+                f"MT5DataClient: {bar_type} bars closing {_iso(first_close)}..{_iso(last_close)} "
                 f"not read back: {failure}"
             )
             return ()
         else:
-            return rows
+            return history.closing(rows, first_close, last_close)
 
     def _instrument(self, symbol: str) -> InstrumentAny:
         """The loaded instrument of a venue symbol; raises MT5InstrumentError for one the provider
@@ -381,13 +381,9 @@ class MT5DataClient(LiveMarketDataClient):
         # The request names closes; the server serves bars by their open.
         first_close = _epoch_s(request.start)
         last_close = self._end_s(request.end)
+        first_open, last_open = history.opens_closing(series, first_close, last_close)
         rows = await _read_in_thread(
-            history.bars,
-            self._conn,
-            symbol,
-            series,
-            first_close - BAR_PERIOD_S[series],
-            last_close - BAR_PERIOD_S[series],
+            history.bars, self._conn, symbol, series, first_open, last_open
         )
         if rows is None:
             self._log.error(
@@ -395,7 +391,10 @@ class MT5DataClient(LiveMarketDataClient):
                 f"{_iso(first_close)}..{_iso(last_close)} failed: {self._conn.mt5.last_error()}"
             )
         else:
-            bars = [venue_bar(row, request.bar_type, instrument) for row in rows]
+            bars = [
+                venue_bar(row, request.bar_type, instrument)
+                for row in history.closing(rows, first_close, last_close)
+            ]
             self._handle_bars(
                 request.bar_type, bars, request.id, request.start, request.end, request.params
             )
