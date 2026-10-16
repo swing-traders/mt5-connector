@@ -32,7 +32,6 @@ from mt5connector.server.ws_server import SERVER_TIME_RELAY_PATH, Hub, post_to
 IDLE_S = 900
 PUBLISHER = ChartRole.PUBLISHER
 SPAWNER = ChartRole.SPAWNER
-HISTORY = ChartRole.HISTORY
 
 
 def ticks_of(symbol):
@@ -281,7 +280,8 @@ async def test_a_second_ea_for_a_served_role_and_symbol_is_told_it_is_a_duplicat
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     hub, server, port, _ = await run_hub()
     first = await publisher(port)
-    history = await FakeEa.connect(port, HISTORY, "EURUSD")
+    # The spawner on a chart of the same symbol serves another role.
+    spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD"))
     await first.received()
@@ -294,7 +294,7 @@ async def test_a_second_ea_for_a_served_role_and_symbol_is_told_it_is_a_duplicat
     assert isinstance(await consumer.received(), binary.Ticks)
     (warning,) = warnings(caplog)
     assert warning.startswith("refusing a second publisher EA for EURUSD from ")
-    await close_all(server, consumer, first, history)
+    await close_all(server, consumer, first, spawner)
 
 
 async def test_a_refused_duplicates_frames_are_dropped_silently(caplog):
@@ -450,25 +450,25 @@ async def test_a_failed_chart_clears_on_its_eas_hello_and_a_use_after_the_ea_lef
     spawner = Peer()
     xyz = Peer()
     tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"))
-    hub.use_chart((HISTORY, "XYZ"))
-    spawner.put_ea(binary.ChartFailed(HISTORY, "XYZ", 4301))
+    hub.use_chart((PUBLISHER, "XYZ"))
+    spawner.put_ea(binary.ChartFailed(PUBLISHER, "XYZ", 4301))
     await settle()
-    failed = hub.use_chart((HISTORY, "XYZ"))
+    failed = hub.use_chart((PUBLISHER, "XYZ"))
 
     tasks.append(asyncio.create_task(hub.handler(xyz)))
-    xyz.put_ea(binary.EaHello(HISTORY, "XYZ"))
+    xyz.put_ea(binary.EaHello(PUBLISHER, "XYZ"))
     await settle()
-    served = hub.use_chart((HISTORY, "XYZ"))
+    served = hub.use_chart((PUBLISHER, "XYZ"))
     await xyz.close()
     await settle()
-    again = hub.use_chart((HISTORY, "XYZ"))
+    again = hub.use_chart((PUBLISHER, "XYZ"))
 
     assert (failed, served, again) == (
         ChartState.FAILED,
         ChartState.PUBLISHED,
         ChartState.REQUESTED,
     )
-    assert sent_to_ea(spawner) == [binary.OpenChart(HISTORY, "XYZ")] * 2
+    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
     await _closed(tasks, spawner)
 
 
@@ -498,12 +498,12 @@ def clock(monkeypatch):
 
 async def test_the_spawner_is_told_to_close_each_chart_out_of_use_for_the_idle_period(clock):
     hub = Hub(CLOCK, lambda path, body: None, settings())
-    spawner, usdjpy, history, xauusd, consumer = Peer(), Peer(), Peer(), Peer(), Peer()
+    spawner, usdjpy, gbpusd, xauusd, consumer = Peer(), Peer(), Peer(), Peer(), Peer()
     tasks = await _spawning(
         hub,
         (spawner, SPAWNER, "EURUSD"),
         (usdjpy, PUBLISHER, "USDJPY"),
-        (history, HISTORY, "USDJPY"),
+        (gbpusd, PUBLISHER, "GBPUSD"),
         (xauusd, PUBLISHER, "XAUUSD"),
     )
     tasks.append(asyncio.create_task(hub.handler(consumer)))
@@ -521,9 +521,9 @@ async def test_the_spawner_is_told_to_close_each_chart_out_of_use_for_the_idle_p
 
     assert early == []
     assert sorted(sent_to_ea(spawner), key=str) == sorted(
-        [binary.CloseChart(HISTORY, "USDJPY"), binary.CloseChart(PUBLISHER, "USDJPY")], key=str
+        [binary.CloseChart(PUBLISHER, "GBPUSD"), binary.CloseChart(PUBLISHER, "USDJPY")], key=str
     )
-    await _closed(tasks, spawner, usdjpy, history, xauusd, consumer)
+    await _closed(tasks, spawner, usdjpy, gbpusd, xauusd, consumer)
 
 
 async def test_a_touch_moves_a_charts_idle_deadline(clock):

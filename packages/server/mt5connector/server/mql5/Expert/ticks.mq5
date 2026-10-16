@@ -1,59 +1,31 @@
-//+------------------------------------------------------------------+
-//|                                                       ticks.mq5  |
-//|  Publishes its chart symbol's trade transactions, the ticks and  |
-//|  closed bars the hub wants of it, its commission schedule, its   |
-//|  trading sessions and the trade server's time to the WS hub; the |
-//|  spawner also opens and closes the charts the hub asks it to     |
-//+------------------------------------------------------------------+
+// The EA inside the terminal, in the role its chart's template sets: the spawner serves the
+// account, relays the trade server's time and opens and closes the charts the hub asks for; a
+// publisher serves its symbol's ticks, closed bars, transactions, reads and trade commands. Every
+// frame it sends and reads is the hub protocol's binary one.
 #property script_show_inputs
 
-//+------------------------------------------------------------------+
-//| I N P U T S                                                      |
-//+------------------------------------------------------------------+
+#include <MQL5Book/ws/wsclient.mqh>
+#include <hub_wire.mqh>
+
+input ENUM_CHART_ROLE Role = ROLE_PUBLISHER;
 input string Server = "ws://127.0.0.1:9000/";
 input int ReconnectIntervalSec = 3;
 input int RelaySeconds = 5;
-input int PollMilliseconds = 250;
-input bool Spawner = false;
+input int PollMilliseconds = 16;
+// The template the spawner applies to a chart it opens for a publisher.
 input string ChartTemplate = "ticks.tpl";
 // The whole time from a dead connection's last pong to the hub dropping it, while the hub's writes
 // to it drain: the hub's ping interval, ping timeout and close timeout together.
 input int HubPingTimeoutSec = 50;
 
-#include <MQL5Book/AutoPtr.mqh>
-#include <MQL5Book/ws/wsclient.mqh>
-#include <JAson.mqh>
-
-#define PROTOCOL_VERSION 1
 // The most new ticks one read takes; the next read resumes where it stopped.
 #define TICK_BATCH 1000
 // How often the spawner tries again to take a symbol whose chart it closed out of Market Watch
 // while open positions or pending orders hold it.
 #define HELD_DESELECT_SECONDS 900
-
-// The kinds of the frames the EA sends and reads, and the role it declares.
-enum ENUM_FRAME_KIND
-{
-    FRAME_HELLO,
-    FRAME_WANTED,
-    FRAME_OPEN_CHART,
-    FRAME_CLOSE_CHART,
-    FRAME_CHART_OPENED,
-    FRAME_CHART_FAILED,
-    FRAME_CHART_KEPT,
-    FRAME_DUPLICATE,
-    FRAME_TICK,
-    FRAME_BAR,
-    FRAME_TRADE_TRANSACTION,
-    FRAME_SERVER_TIME,
-    FRAME_COMMISSIONS,
-    FRAME_SESSIONS
-};
-
-enum ENUM_ROLE
-{
-    ROLE_EA
-};
+// The REQUEST transactions a publisher keeps for the outcomes call, the latest first.
+#define OUTCOME_RING 1000
+#define DAY_SECONDS 86400
 
 // The two session schedules a symbol states per weekday.
 enum ENUM_SESSION_KIND
@@ -68,15 +40,25 @@ enum ENUM_TICK_CURSOR_STATE
     CURSOR_COUNT_PENDING,
     CURSOR_READY
 };
+
+// A REQUEST transaction a publisher published: its request id, and its three structs as the
+// trade_transaction frame and an outcome carry them.
+struct Outcome
+{
+    uint requestId;
+    uchar record[];
+};
+
 WebSocketClient<Hybi> *wss = NULL;
 bool g_helloSent = false;
 datetime g_lastReconnect = 0;
 ulong g_lastRelay = 0;
 // Set once the EA has asked for its chart to close: it reads, publishes and reconnects no more.
 bool g_closing = false;
-// When the hub first refused the spawner's hello as a duplicate since it last took one, by
-// GetTickCount64; zero once the hub takes its hello.
+// When the hub first refused the spawner's hello as a duplicate, by GetTickCount64; zero once a
+// connection that said hello ends unrefused. A refused connection sets g_refused.
 ulong g_firstRefusal = 0;
+bool g_refused = false;
 
 // Whether the hub wants the symbol's ticks, with the time_msc of the last tick consumed, how many
 // consumed ticks share that millisecond, and whether that count is complete: until it is, the EA
@@ -91,8 +73,9 @@ ENUM_TICK_CURSOR_STATE g_tickCursorState = CURSOR_COUNT_PENDING;
 ENUM_TIMEFRAMES g_barTimeframes[];
 datetime g_barOpens[];
 
-// The charts the spawner opened, each with the symbol it was opened for.
+// The charts the spawner opened, each with the role and symbol it was opened for.
 long g_openedCharts[];
+ENUM_CHART_ROLE g_openedRoles[];
 string g_openedSymbols[];
 
 // The symbols whose charts the spawner closed that are still in Market Watch, each with when to try
@@ -101,206 +84,97 @@ string g_deselectSymbols[];
 ulong g_deselectAt[];
 bool g_deselectHeld[];
 
-//+------------------------------------------------------------------+
-//| JSON values                                                      |
-//+------------------------------------------------------------------+
-string Quote(const string value)
+// The publisher's outcome log, a ring: g_outcomeNext is the slot the next transaction takes.
+Outcome g_outcomes[OUTCOME_RING];
+int g_outcomesHeld = 0;
+int g_outcomeNext = 0;
+
+// ── Frames to the hub ────────────────────────────────────────────────────────────────────────────
+
+// Sends a frame while connected; a frame holding a string too long for its length prefix is not
+// sent.
+void Send(BinaryWriter &frame)
 {
-    string quoted = "\"";
-    const int length = StringLen(value);
-    for (int i = 0; i < length; i++)
+    if (frame.failed)
     {
-        const ushort c = StringGetCharacter(value, i);
-        if (c == '"')
-            quoted += "\\\"";
-        else if (c == '\\')
-            quoted += "\\\\";
-        else if (c < 0x20)
-            quoted += StringFormat("\\u%04x", c);
-        else
-            quoted += ShortToString(c);
+        Print("ticks: a frame holding a string too long for the protocol is not sent");
     }
-    return quoted + "\"";
-}
-
-string Number(const double value)
-{
-    // Seventeen significant digits read back as the same double; JSON has no NaN or infinity.
-    if (!MathIsValidNumber(value))
-        return "null";
-    return StringFormat("%.17g", value);
-}
-
-string Unsigned(const ulong value)
-{
-    return StringFormat("%I64u", value);
-}
-
-string Boolean(const bool value)
-{
-    if (value)
-        return "true";
-    else
-        return "false";
-}
-
-//+------------------------------------------------------------------+
-//| The protocol's names                                             |
-//+------------------------------------------------------------------+
-string FrameName(const ENUM_FRAME_KIND kind)
-{
-    string name = "";
-    switch (kind)
+    else if (wss.isConnected())
     {
-    case FRAME_HELLO:
-        name = "hello";
-        break;
-    case FRAME_WANTED:
-        name = "wanted";
-        break;
-    case FRAME_OPEN_CHART:
-        name = "open_chart";
-        break;
-    case FRAME_CLOSE_CHART:
-        name = "close_chart";
-        break;
-    case FRAME_CHART_OPENED:
-        name = "chart_opened";
-        break;
-    case FRAME_CHART_FAILED:
-        name = "chart_failed";
-        break;
-    case FRAME_CHART_KEPT:
-        name = "chart_kept";
-        break;
-    case FRAME_DUPLICATE:
-        name = "duplicate";
-        break;
-    case FRAME_TICK:
-        name = "tick";
-        break;
-    case FRAME_BAR:
-        name = "bar";
-        break;
-    case FRAME_TRADE_TRANSACTION:
-        name = "trade_transaction";
-        break;
-    case FRAME_SERVER_TIME:
-        name = "server_time";
-        break;
-    case FRAME_COMMISSIONS:
-        name = "commissions";
-        break;
-    case FRAME_SESSIONS:
-        name = "sessions";
-        break;
+        // The library waits on every send to a lost connection; the first lost send tells
+        // isConnected.
+        uchar bytes[];
+        frame.Take(bytes);
+        wss.send(bytes);
     }
-    return name;
 }
 
-string RoleName(const ENUM_ROLE role)
-{
-    string name = "";
-    switch (role)
-    {
-    case ROLE_EA:
-        name = "ea";
-        break;
-    }
-    return name;
-}
-
-string Envelope(const ENUM_FRAME_KIND kind)
-{
-    return "\"v\":" + IntegerToString(PROTOCOL_VERSION) + ",\"type\":" + Quote(FrameName(kind));
-}
-
-void Send(const string frame)
-{
-    // The library waits on every send to a lost connection; the first lost send tells isConnected.
-    if (wss.isConnected())
-        wss.send(frame);
-}
-
-//+------------------------------------------------------------------+
-//| Announce this EA, its symbol and whether it is the spawner, to   |
-//| the hub (once per connect)                                       |
-//+------------------------------------------------------------------+
 void SendHello()
 {
-    if (g_helloSent || wss == NULL || !wss.isConnected())
-        return;
-    Send("{" + Envelope(FRAME_HELLO)
-             + ",\"role\":" + Quote(RoleName(ROLE_EA))
-             + ",\"symbol\":" + Quote(_Symbol)
-             + ",\"spawner\":" + Boolean(Spawner)
-             + "}");
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_HELLO, 0, 0);
+    frame.String(HUB_ROLE_EA);
+    frame.String(ChartRoleName(Role));
+    frame.String(_Symbol);
+    frame.Seal(0);
+    Send(frame);
     g_helloSent = true;
-    Print("Hello Send");
+    PrintFormat("ticks: hello sent as the %s of '%s'", ChartRoleName(Role), _Symbol);
 }
 
-//+------------------------------------------------------------------+
-//| Relay the trade server's time to the server through the hub      |
-//+------------------------------------------------------------------+
 void SendServerTime()
 {
-    Send("{" + Envelope(FRAME_SERVER_TIME)
-             + ",\"symbol\":" + Quote(_Symbol)
-             + ",\"trade_server\":" + IntegerToString((long)TimeTradeServer())
-             + ",\"current\":" + IntegerToString((long)TimeCurrent())
-             + ",\"gmt\":" + IntegerToString((long)TimeGMT())
-             + ",\"connected\":" + IntegerToString(TerminalInfoInteger(TERMINAL_CONNECTED))
-             + "}");
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_SERVER_TIME, 0, 0);
+    frame.String(_Symbol);
+    frame.I64((long)TimeTradeServer());
+    frame.I64((long)TimeCurrent());
+    frame.I64((long)TimeGMT());
+    frame.U8((uchar)TerminalInfoInteger(TERMINAL_CONNECTED));
+    frame.Seal(0);
+    Send(frame);
 }
 
-//+------------------------------------------------------------------+
-//| Relay the symbol's commission rules, their enums by name         |
-//+------------------------------------------------------------------+
+// The symbol's commission rules, their enums by name
 void SendCommissions()
 {
     MqlCommission rules[];
     ResetLastError();
     const int ret = SymbolInfoCommissions(_Symbol, rules);
     const int error = GetLastError();
-    string frame = "{" + Envelope(FRAME_COMMISSIONS)
-                   + ",\"symbol\":" + Quote(_Symbol)
-                   + ",\"ret\":" + IntegerToString(ret)
-                   + ",\"last_error\":" + IntegerToString(error)
-                   + ",\"rules\":[";
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_COMMISSIONS, 0, 0);
+    frame.String(_Symbol);
+    frame.I32(ret);
+    frame.I32(error);
+    frame.U16((ushort)ArraySize(rules));
     for (int i = 0; i < ArraySize(rules); i++)
     {
-        if (i > 0)
-            frame += ",";
-        frame += "{\"currency\":" + Quote(rules[i].currency)
-                 + ",\"mode_range\":" + Quote(EnumToString(rules[i].mode_range))
-                 + ",\"mode_charge\":" + Quote(EnumToString(rules[i].mode_charge))
-                 + ",\"mode_entry\":" + Quote(EnumToString(rules[i].mode_entry))
-                 + ",\"mode_direction\":" + Quote(EnumToString(rules[i].mode_direction))
-                 + ",\"mode_profit\":" + Quote(EnumToString(rules[i].mode_profit))
-                 + ",\"tiers\":[";
+        frame.String(rules[i].currency);
+        frame.String(EnumToString(rules[i].mode_range));
+        frame.String(EnumToString(rules[i].mode_charge));
+        frame.String(EnumToString(rules[i].mode_entry));
+        frame.String(EnumToString(rules[i].mode_direction));
+        frame.String(EnumToString(rules[i].mode_profit));
+        frame.U16((ushort)ArraySize(rules[i].tiers));
         for (int j = 0; j < ArraySize(rules[i].tiers); j++)
         {
-            if (j > 0)
-                frame += ",";
-            frame += "{\"mode\":" + Quote(EnumToString(rules[i].tiers[j].mode))
-                     + ",\"volume_type\":" + Quote(EnumToString(rules[i].tiers[j].volume_type))
-                     + ",\"value\":" + Number(rules[i].tiers[j].value)
-                     + ",\"min_value\":" + Number(rules[i].tiers[j].min_value)
-                     + ",\"max_value\":" + Number(rules[i].tiers[j].max_value)
-                     + ",\"range_from\":" + Number(rules[i].tiers[j].range_from)
-                     + ",\"range_to\":" + Number(rules[i].tiers[j].range_to)
-                     + ",\"currency\":" + Quote(rules[i].tiers[j].currency)
-                     + "}";
+            frame.String(EnumToString(rules[i].tiers[j].mode));
+            frame.String(EnumToString(rules[i].tiers[j].volume_type));
+            frame.F64(rules[i].tiers[j].value);
+            frame.F64(rules[i].tiers[j].min_value);
+            frame.F64(rules[i].tiers[j].max_value);
+            frame.F64(rules[i].tiers[j].range_from);
+            frame.F64(rules[i].tiers[j].range_to);
+            frame.String(rules[i].tiers[j].currency);
         }
-        frame += "]}";
     }
-    Send(frame + "]}");
+    frame.Seal(0);
+    Send(frame);
 }
 
-//+------------------------------------------------------------------+
-//| Read one session of the symbol's quote or trade schedule on a    |
-//| weekday                                                          |
-//+------------------------------------------------------------------+
+// ── The symbol's quote and trade sessions ────────────────────────────────────────────────────────
+
 bool ReadSession(const ENUM_SESSION_KIND kind, const ENUM_DAY_OF_WEEK day, const uint index,
                  datetime &opens, datetime &closes)
 {
@@ -317,151 +191,698 @@ bool ReadSession(const ENUM_SESSION_KIND kind, const ENUM_DAY_OF_WEEK day, const
     return found;
 }
 
-//+------------------------------------------------------------------+
-//| The symbol's quote or trade schedule, Sunday first: per weekday  |
-//| each session's [from, to] as the terminal gives them, seconds    |
-//| from 00:00                                                       |
-//+------------------------------------------------------------------+
-string SessionWeek(const ENUM_SESSION_KIND kind)
+// The schedule's sessions, Sunday first: each weekday's count, and every session's [from, to] as
+// the terminal gives them, seconds from 00:00, all the week's in order.
+void ReadWeek(const ENUM_SESSION_KIND kind, int &counts[], datetime &froms[], datetime &tos[])
 {
-    string week = "[";
+    ArrayResize(counts, 7);
     for (int day = SUNDAY; day <= SATURDAY; day++)
     {
-        if (day > SUNDAY)
-            week += ",";
-        week += "[";
         datetime opens = 0;
         datetime closes = 0;
         uint index = 0;
         while (ReadSession(kind, (ENUM_DAY_OF_WEEK)day, index, opens, closes))
         {
-            if (index > 0)
-                week += ",";
-            week += "[" + IntegerToString((long)opens) + "," + IntegerToString((long)closes) + "]";
+            const int n = ArraySize(froms);
+            ArrayResize(froms, n + 1);
+            ArrayResize(tos, n + 1);
+            froms[n] = opens;
+            tos[n] = closes;
             index++;
         }
-        week += "]";
+        counts[day - SUNDAY] = (int)index;
     }
-    return week + "]";
 }
 
-//+------------------------------------------------------------------+
-//| Relay the symbol's quote and trade sessions per weekday, and the |
-//| error the reads left                                             |
-//+------------------------------------------------------------------+
+void WriteWeek(BinaryWriter &frame, const int &counts[], const datetime &froms[],
+               const datetime &tos[])
+{
+    int next = 0;
+    for (int day = 0; day < ArraySize(counts); day++)
+    {
+        frame.U16((ushort)counts[day]);
+        for (int k = 0; k < counts[day]; k++)
+        {
+            frame.I32((int)froms[next]);
+            frame.I32((int)tos[next]);
+            next++;
+        }
+    }
+}
+
+// Relays the symbol's quote and trade sessions per weekday, and the error their reads left.
 void SendSessions()
 {
+    int quoteCounts[];
+    datetime quoteFroms[];
+    datetime quoteTos[];
+    int tradeCounts[];
+    datetime tradeFroms[];
+    datetime tradeTos[];
     ResetLastError();
-    const string quoteWeek = SessionWeek(SESSION_QUOTE);
-    const string tradeWeek = SessionWeek(SESSION_TRADE);
+    ReadWeek(SESSION_QUOTE, quoteCounts, quoteFroms, quoteTos);
+    ReadWeek(SESSION_TRADE, tradeCounts, tradeFroms, tradeTos);
     const int error = GetLastError();
-    Send("{" + Envelope(FRAME_SESSIONS)
-             + ",\"symbol\":" + Quote(_Symbol)
-             + ",\"quote\":" + quoteWeek
-             + ",\"trade\":" + tradeWeek
-             + ",\"last_error\":" + IntegerToString(error)
-             + "}");
-}
-
-//+------------------------------------------------------------------+
-//| Publish one tick, the MqlTick fields verbatim                    |
-//+------------------------------------------------------------------+
-void SendTick(const MqlTick &tick)
-{
-    Send("{" + Envelope(FRAME_TICK)
-             + ",\"symbol\":" + Quote(_Symbol)
-             + ",\"time\":" + IntegerToString((long)tick.time)
-             + ",\"bid\":" + Number(tick.bid)
-             + ",\"ask\":" + Number(tick.ask)
-             + ",\"last\":" + Number(tick.last)
-             + ",\"volume\":" + Unsigned(tick.volume)
-             + ",\"time_msc\":" + IntegerToString(tick.time_msc)
-             + ",\"flags\":" + IntegerToString(tick.flags)
-             + ",\"volume_real\":" + Number(tick.volume_real)
-             + "}");
-}
-
-//+------------------------------------------------------------------+
-//| Publish one closed bar, the MqlRates fields verbatim             |
-//+------------------------------------------------------------------+
-void SendBar(const ENUM_TIMEFRAMES timeframe, const MqlRates &rates)
-{
-    Send("{" + Envelope(FRAME_BAR)
-             + ",\"symbol\":" + Quote(_Symbol)
-             + ",\"timeframe\":" + IntegerToString((int)timeframe)
-             + ",\"time\":" + IntegerToString((long)rates.time)
-             + ",\"open\":" + Number(rates.open)
-             + ",\"high\":" + Number(rates.high)
-             + ",\"low\":" + Number(rates.low)
-             + ",\"close\":" + Number(rates.close)
-             + ",\"tick_volume\":" + IntegerToString(rates.tick_volume)
-             + ",\"spread\":" + IntegerToString(rates.spread)
-             + ",\"real_volume\":" + IntegerToString(rates.real_volume)
-             + "}");
-}
-
-//+------------------------------------------------------------------+
-//| Publish one trade transaction, its three structs verbatim and    |
-//| their enums as integers                                          |
-//+------------------------------------------------------------------+
-void SendTransaction(const MqlTradeTransaction &trans,
-                     const MqlTradeRequest &request,
-                     const MqlTradeResult &result)
-{
-    string frame = "{" + Envelope(FRAME_TRADE_TRANSACTION);
-    frame += ",\"transaction\":{\"deal\":" + Unsigned(trans.deal)
-             + ",\"order\":" + Unsigned(trans.order)
-             + ",\"symbol\":" + Quote(trans.symbol)
-             + ",\"type\":" + IntegerToString((int)trans.type)
-             + ",\"order_type\":" + IntegerToString((int)trans.order_type)
-             + ",\"order_state\":" + IntegerToString((int)trans.order_state)
-             + ",\"deal_type\":" + IntegerToString((int)trans.deal_type)
-             + ",\"time_type\":" + IntegerToString((int)trans.time_type)
-             + ",\"time_expiration\":" + IntegerToString((long)trans.time_expiration)
-             + ",\"price\":" + Number(trans.price)
-             + ",\"price_trigger\":" + Number(trans.price_trigger)
-             + ",\"price_sl\":" + Number(trans.price_sl)
-             + ",\"price_tp\":" + Number(trans.price_tp)
-             + ",\"volume\":" + Number(trans.volume)
-             + ",\"position\":" + Unsigned(trans.position)
-             + ",\"position_by\":" + Unsigned(trans.position_by)
-             + "}";
-    frame += ",\"request\":{\"action\":" + IntegerToString((int)request.action)
-             + ",\"magic\":" + Unsigned(request.magic)
-             + ",\"order\":" + Unsigned(request.order)
-             + ",\"symbol\":" + Quote(request.symbol)
-             + ",\"volume\":" + Number(request.volume)
-             + ",\"price\":" + Number(request.price)
-             + ",\"stoplimit\":" + Number(request.stoplimit)
-             + ",\"sl\":" + Number(request.sl)
-             + ",\"tp\":" + Number(request.tp)
-             + ",\"deviation\":" + Unsigned(request.deviation)
-             + ",\"type\":" + IntegerToString((int)request.type)
-             + ",\"type_filling\":" + IntegerToString((int)request.type_filling)
-             + ",\"type_time\":" + IntegerToString((int)request.type_time)
-             + ",\"expiration\":" + IntegerToString((long)request.expiration)
-             + ",\"comment\":" + Quote(request.comment)
-             + ",\"position\":" + Unsigned(request.position)
-             + ",\"position_by\":" + Unsigned(request.position_by)
-             + "}";
-    frame += ",\"result\":{\"retcode\":" + IntegerToString(result.retcode)
-             + ",\"deal\":" + Unsigned(result.deal)
-             + ",\"order\":" + Unsigned(result.order)
-             + ",\"volume\":" + Number(result.volume)
-             + ",\"price\":" + Number(result.price)
-             + ",\"bid\":" + Number(result.bid)
-             + ",\"ask\":" + Number(result.ask)
-             + ",\"comment\":" + Quote(result.comment)
-             + ",\"request_id\":" + IntegerToString(result.request_id)
-             + ",\"retcode_external\":" + IntegerToString(result.retcode_external)
-             + "}}";
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_SESSIONS, 0, 0);
+    frame.String(_Symbol);
+    WriteWeek(frame, quoteCounts, quoteFroms, quoteTos);
+    WriteWeek(frame, tradeCounts, tradeFroms, tradeTos);
+    frame.I32(error);
+    frame.Seal(0);
     Send(frame);
 }
 
-//+------------------------------------------------------------------+
-//| The symbol a transaction is of: its request's for a request      |
-//| transaction, whose own symbol MQL5 leaves unfilled               |
-//+------------------------------------------------------------------+
+// The relay cadence, by role
+void Relay()
+{
+    g_lastRelay = GetTickCount64();
+    switch (Role)
+    {
+    case ROLE_SPAWNER:
+        SendServerTime();
+        break;
+    case ROLE_PUBLISHER:
+        SendCommissions();
+        SendSessions();
+        break;
+    }
+}
+
+void SendBar(const ENUM_TIMEFRAMES timeframe, const MqlRates &rates)
+{
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_BAR, 0, 0);
+    frame.String(_Symbol);
+    frame.I32((int)timeframe);
+    frame.Rates(rates);
+    frame.Seal(0);
+    Send(frame);
+}
+
+// ── The spawner's answers to the hub's chart frames ──────────────────────────────────────────────
+
+void SendChartOpened(const ENUM_CHART_ROLE role, const string symbol)
+{
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_CHART_OPENED, 0, 0);
+    frame.String(ChartRoleName(role));
+    frame.String(symbol);
+    frame.Seal(0);
+    Send(frame);
+}
+
+void SendChartFailed(const ENUM_CHART_ROLE role, const string symbol, const int error)
+{
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_CHART_FAILED, 0, 0);
+    frame.String(ChartRoleName(role));
+    frame.String(symbol);
+    frame.I32(error);
+    frame.Seal(0);
+    Send(frame);
+}
+
+void SendChartKept(const ENUM_CHART_ROLE role, const string symbol, const int positions,
+                   const int orders)
+{
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_CHART_KEPT, 0, 0);
+    frame.String(ChartRoleName(role));
+    frame.String(symbol);
+    frame.I32(positions);
+    frame.I32(orders);
+    frame.Seal(0);
+    Send(frame);
+}
+
+// Tells the hub this EA is about to wait on a request for at most `boundSeconds`
+void SendBusy(const ulong requestId, const uint boundSeconds)
+{
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_BUSY, 0, requestId);
+    frame.U32(boundSeconds);
+    frame.Seal(0);
+    Send(frame);
+}
+
+// ── Requests: each answered once, by its result in parts or an error ─────────────────────────────
+
+// A request's arguments by their index in its call, as the hub sent them.
+class RequestArguments
+{
+private:
+    bool m_has[HUB_ARGUMENTS_MAX];
+    long m_integers[HUB_ARGUMENTS_MAX];
+    string m_strings[HUB_ARGUMENTS_MAX];
+
+    // A u32 count, then each request id as a u32; a count past the bytes left does not fit.
+    bool ReadIds(BinaryReader &reader)
+    {
+        const uint count = reader.U32();
+        const bool fits = !reader.failed && count <= (uint)reader.Remaining() / 4;
+        if (fits)
+        {
+            ArrayResize(ids, (int)count);
+            for (uint i = 0; i < count; i++)
+                ids[i] = reader.U32();
+        }
+        return fits;
+    }
+
+    bool ReadValue(const ENUM_HUB_ARGUMENT type, const int index, BinaryReader &reader)
+    {
+        bool fits = true;
+        switch (type)
+        {
+        case HUB_ARGUMENT_INTEGER:
+        case HUB_ARGUMENT_EPOCH:
+            m_integers[index] = reader.I64();
+            break;
+        case HUB_ARGUMENT_STRING:
+            m_strings[index] = reader.String();
+            break;
+        case HUB_ARGUMENT_BOOL:
+            m_integers[index] = reader.U8();
+            fits = m_integers[index] <= 1;
+            break;
+        case HUB_ARGUMENT_TRADE_REQUEST:
+            ReadTradeRequest(reader, request);
+            break;
+        case HUB_ARGUMENT_REQUEST_IDS:
+            fits = ReadIds(reader);
+            break;
+        default:
+            // A type the EA reads no argument of.
+            fits = false;
+            break;
+        }
+        return fits && !reader.failed;
+    }
+
+public:
+    MqlTradeRequest request;
+    uint ids[];
+
+    RequestArguments()
+    {
+        for (int i = 0; i < HUB_ARGUMENTS_MAX; i++)
+        {
+            m_has[i] = false;
+            m_integers[i] = 0;
+            m_strings[i] = "";
+        }
+        ZeroMemory(request);
+    }
+
+    // Reads `count` arguments of the call, each its index, ascending, and its value; false for
+    // arguments out of the call's layout.
+    bool Read(const ENUM_HUB_CALL call, const uint count, BinaryReader &reader)
+    {
+        bool fits = true;
+        int last = -1;
+        for (uint k = 0; k < count && fits; k++)
+        {
+            const int index = reader.U8();
+            ENUM_HUB_ARGUMENT type = HUB_ARGUMENT_INTEGER;
+            if (reader.failed || index <= last || !HubArgumentType(call, index, type))
+            {
+                fits = false;
+            }
+            else
+            {
+                last = index;
+                m_has[index] = true;
+                fits = ReadValue(type, index, reader);
+            }
+        }
+        return fits && reader.Done();
+    }
+
+    bool Has(const int index) const { return m_has[index]; }
+    long Integer(const int index) const { return m_integers[index]; }
+    string String(const int index) const { return m_strings[index]; }
+    bool Bool(const int index) const { return m_integers[index] != 0; }
+};
+
+// A request's answer, built by its call's handler: its result's records back to back in rows, each
+// ending at its offset in ends; or, once failed, why and the MQL5 error the call met.
+class Answer
+{
+public:
+    BinaryWriter rows;
+    int ends[];
+    bool failed;
+    string message;
+    int error;
+
+    Answer() : failed(false), message(""), error(0) {}
+
+    // Marks the end of the record just written to rows.
+    void Record()
+    {
+        const int n = ArraySize(ends);
+        ArrayResize(ends, n + 1, 64);
+        ends[n] = rows.Size();
+    }
+
+    void Fail(const string why, const int mql5Error)
+    {
+        failed = true;
+        message = why;
+        error = mql5Error;
+    }
+};
+
+void SendPart(const ulong requestId, const uint part, const bool last, const int lastError,
+              BinaryWriter &rows, const int start, const int end, const int records)
+{
+    ushort flags = HUB_FLAG_OK;
+    if (last)
+        flags = HUB_FLAG_OK | HUB_FLAG_LAST;
+    uchar bytes[];
+    rows.Slice(start, end - start, bytes);
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_ANSWER, flags, requestId);
+    frame.U32(part);
+    frame.I32(lastError);
+    frame.Bytes(bytes, 0, ArraySize(bytes));
+    frame.Seal((uint)records);
+    Send(frame);
+}
+
+// Answers a request once: its records in parts of at most HUB_PART_BYTES result bytes, numbered
+// from 0 and the last flagged, each carrying the MQL5 error the call left; or the error it met.
+void SendAnswer(const ulong requestId, Answer &answer, const int lastError)
+{
+    if (answer.rows.failed)
+        answer.Fail("a record holds a string too long for the protocol", 0);
+    if (answer.failed)
+    {
+        BinaryWriter frame;
+        frame.Begin(HUB_FRAME_ANSWER, HUB_FLAG_LAST, requestId);
+        frame.U32(0);
+        frame.I32(answer.error);
+        frame.U8((uchar)HUB_ERROR_EA_ERROR);
+        frame.String(answer.message);
+        frame.Seal(0);
+        Send(frame);
+    }
+    else
+    {
+        const int records = ArraySize(answer.ends);
+        uint part = 0;
+        // The first record of the part being gathered, and its first byte.
+        int first = 0;
+        int start = 0;
+        for (int i = 0; i < records; i++)
+        {
+            if (i > first && answer.ends[i] - start > HUB_PART_BYTES)
+            {
+                SendPart(requestId, part, false, lastError, answer.rows, start,
+                         answer.ends[i - 1], i - first);
+                part++;
+                start = answer.ends[i - 1];
+                first = i;
+            }
+        }
+        int end = 0;
+        if (records > 0)
+            end = answer.ends[records - 1];
+        SendPart(requestId, part, true, lastError, answer.rows, start, end, records - first);
+    }
+}
+
+// ── The spawner's calls: the account ─────────────────────────────────────────────────────────────
+
+void AnswerSymbols(RequestArguments &arguments, Answer &answer)
+{
+    if (arguments.String(HUB_ARG_SYMBOLS_GET_GROUP) != "")
+    {
+        answer.Fail("a group filter is not served", ERR_FUNCTION_NOT_ALLOWED);
+    }
+    else
+    {
+        // Every symbol the terminal knows, in Market Watch or not.
+        const int total = SymbolsTotal(false);
+        for (int i = 0; i < total; i++)
+        {
+            WriteSymbolInfo(answer.rows, SymbolName(i, false));
+            answer.Record();
+        }
+    }
+}
+
+void AnswerPositions(RequestArguments &arguments, Answer &answer)
+{
+    if (arguments.String(HUB_ARG_POSITIONS_GET_GROUP) != "")
+    {
+        answer.Fail("a group filter is not served", ERR_FUNCTION_NOT_ALLOWED);
+    }
+    else
+    {
+        const bool bySymbol = arguments.Has(HUB_ARG_POSITIONS_GET_SYMBOL);
+        const bool byTicket = arguments.Has(HUB_ARG_POSITIONS_GET_TICKET);
+        const string symbol = arguments.String(HUB_ARG_POSITIONS_GET_SYMBOL);
+        const ulong ticket = (ulong)arguments.Integer(HUB_ARG_POSITIONS_GET_TICKET);
+        const int total = PositionsTotal();
+        for (int i = 0; i < total; i++)
+        {
+            // Each selects the position for the writer.
+            const string held = PositionGetSymbol(i);
+            const ulong heldTicket = PositionGetTicket(i);
+            if (heldTicket > 0 && (!bySymbol || held == symbol)
+                && (!byTicket || heldTicket == ticket))
+            {
+                WritePosition(answer.rows);
+                answer.Record();
+            }
+        }
+    }
+}
+
+void AnswerOrders(RequestArguments &arguments, Answer &answer)
+{
+    if (arguments.String(HUB_ARG_ORDERS_GET_GROUP) != "")
+    {
+        answer.Fail("a group filter is not served", ERR_FUNCTION_NOT_ALLOWED);
+    }
+    else
+    {
+        const bool bySymbol = arguments.Has(HUB_ARG_ORDERS_GET_SYMBOL);
+        const bool byTicket = arguments.Has(HUB_ARG_ORDERS_GET_TICKET);
+        const string symbol = arguments.String(HUB_ARG_ORDERS_GET_SYMBOL);
+        const ulong ticket = (ulong)arguments.Integer(HUB_ARG_ORDERS_GET_TICKET);
+        const int total = OrdersTotal();
+        for (int i = 0; i < total; i++)
+        {
+            // Selects the order for the writer.
+            const ulong held = OrderGetTicket(i);
+            if (held > 0 && (!bySymbol || OrderGetString(ORDER_SYMBOL) == symbol)
+                && (!byTicket || held == ticket))
+            {
+                WriteOrder(answer.rows);
+                answer.Record();
+            }
+        }
+    }
+}
+
+// The orders of the history a query names: one by its ticket, every one of a position, or those of
+// a window on the broker's clock.
+void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
+{
+    if (arguments.String(HUB_ARG_HISTORY_ORDERS_GET_GROUP) != "")
+    {
+        answer.Fail("a group filter is not served", ERR_FUNCTION_NOT_ALLOWED);
+    }
+    else if (arguments.Has(HUB_ARG_HISTORY_ORDERS_GET_TICKET))
+    {
+        // A ticket the history does not hold answers no record, its error the answer's.
+        const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_TICKET);
+        if (HistoryOrderSelect(ticket))
+        {
+            WriteHistoryOrder(answer.rows, ticket);
+            answer.Record();
+        }
+    }
+    else if (arguments.Has(HUB_ARG_HISTORY_ORDERS_GET_POSITION))
+    {
+        if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_POSITION)))
+            AnswerSelectedOrders(answer);
+        else
+            answer.Fail("HistorySelectByPosition failed", GetLastError());
+    }
+    else
+    {
+        if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_DATE_FROM),
+                          (datetime)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_DATE_TO)))
+            AnswerSelectedOrders(answer);
+        else
+            answer.Fail("HistorySelect failed", GetLastError());
+    }
+}
+
+void AnswerSelectedOrders(Answer &answer)
+{
+    const int total = HistoryOrdersTotal();
+    for (int i = 0; i < total; i++)
+    {
+        const ulong ticket = HistoryOrderGetTicket(i);
+        if (ticket > 0)
+        {
+            WriteHistoryOrder(answer.rows, ticket);
+            answer.Record();
+        }
+    }
+}
+
+// The deals of the history a query names: those of the order its ticket names, every one of a
+// position, or those of a window on the broker's clock.
+void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
+{
+    if (arguments.String(HUB_ARG_HISTORY_DEALS_GET_GROUP) != "")
+    {
+        answer.Fail("a group filter is not served", ERR_FUNCTION_NOT_ALLOWED);
+    }
+    else if (arguments.Has(HUB_ARG_HISTORY_DEALS_GET_TICKET))
+    {
+        // The package's ticket here is an order's, which its deals carry as DEAL_ORDER; the whole
+        // history is selected to find them.
+        const ulong order = (ulong)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_TICKET);
+        if (HistorySelect(0, TimeTradeServer() + DAY_SECONDS))
+            AnswerSelectedDeals(answer, true, order);
+        else
+            answer.Fail("HistorySelect failed", GetLastError());
+    }
+    else if (arguments.Has(HUB_ARG_HISTORY_DEALS_GET_POSITION))
+    {
+        if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_POSITION)))
+            AnswerSelectedDeals(answer, false, 0);
+        else
+            answer.Fail("HistorySelectByPosition failed", GetLastError());
+    }
+    else
+    {
+        if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_FROM),
+                          (datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_TO)))
+            AnswerSelectedDeals(answer, false, 0);
+        else
+            answer.Fail("HistorySelect failed", GetLastError());
+    }
+}
+
+// The deals the history selected, those of the order `order` alone when `byOrder`.
+void AnswerSelectedDeals(Answer &answer, const bool byOrder, const ulong order)
+{
+    const int total = HistoryDealsTotal();
+    for (int i = 0; i < total; i++)
+    {
+        const ulong ticket = HistoryDealGetTicket(i);
+        if (ticket > 0 && (!byOrder || (ulong)HistoryDealGetInteger(ticket, DEAL_ORDER) == order))
+        {
+            WriteDeal(answer.rows, ticket);
+            answer.Record();
+        }
+    }
+}
+
+void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &answer)
+{
+    switch (call)
+    {
+    case HUB_CALL_ACCOUNT_INFO:
+        WriteAccountInfo(answer.rows);
+        answer.Record();
+        break;
+    case HUB_CALL_TERMINAL_INFO:
+        WriteTerminalInfo(answer.rows);
+        answer.Record();
+        break;
+    case HUB_CALL_SYMBOLS_TOTAL:
+        answer.rows.I64(SymbolsTotal(false));
+        answer.Record();
+        break;
+    case HUB_CALL_SYMBOLS_GET:
+        AnswerSymbols(arguments, answer);
+        break;
+    case HUB_CALL_POSITIONS_GET:
+        AnswerPositions(arguments, answer);
+        break;
+    case HUB_CALL_ORDERS_GET:
+        AnswerOrders(arguments, answer);
+        break;
+    case HUB_CALL_HISTORY_ORDERS_GET:
+        AnswerHistoryOrders(arguments, answer);
+        break;
+    case HUB_CALL_HISTORY_DEALS_GET:
+        AnswerHistoryDeals(arguments, answer);
+        break;
+    default:
+        answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
+        break;
+    }
+}
+
+// ── The publisher's calls: its symbol ────────────────────────────────────────────────────────────
+
+void AnswerSymbolSelect(RequestArguments &arguments, Answer &answer)
+{
+    // The package's enable defaults to true.
+    bool enable = true;
+    if (arguments.Has(HUB_ARG_SYMBOL_SELECT_ENABLE))
+        enable = arguments.Bool(HUB_ARG_SYMBOL_SELECT_ENABLE);
+    if (SymbolSelect(arguments.String(HUB_ARG_SYMBOL_SELECT_SYMBOL), enable))
+        answer.rows.U8(1);
+    else
+        answer.rows.U8(0);
+    answer.Record();
+}
+
+void AnswerSymbolInfo(RequestArguments &arguments, Answer &answer)
+{
+    const string symbol = arguments.String(HUB_ARG_SYMBOL_INFO_SYMBOL);
+    bool custom = false;
+    if (SymbolExist(symbol, custom))
+    {
+        WriteSymbolInfo(answer.rows, symbol);
+        answer.Record();
+    }
+    else
+    {
+        answer.Fail("SymbolExist found no such symbol", GetLastError());
+    }
+}
+
+void AnswerSymbolInfoTick(RequestArguments &arguments, Answer &answer)
+{
+    MqlTick tick;
+    if (SymbolInfoTick(arguments.String(HUB_ARG_SYMBOL_INFO_TICK_SYMBOL), tick))
+    {
+        answer.rows.Tick(tick);
+        answer.Record();
+    }
+    else
+    {
+        answer.Fail("SymbolInfoTick failed", GetLastError());
+    }
+}
+
+// Sends the request as it came; the answer means sent, and the REQUEST transaction carrying its
+// request_id is the venue's verdict. A request the terminal refuses itself is answered with the
+// result that says why.
+void AnswerOrderSend(RequestArguments &arguments, Answer &answer)
+{
+    MqlTradeResult result;
+    ZeroMemory(result);
+    if (!OrderSendAsync(arguments.request, result))
+        PrintFormat("ticks: '%s' the terminal refused a trade request: error %d", _Symbol,
+                    GetLastError());
+    WriteTradeResult(answer.rows, result);
+    answer.Record();
+}
+
+// The outcome log's slot holding the request id's transaction, or -1.
+int OutcomeSlot(const uint requestId)
+{
+    for (int age = 0; age < g_outcomesHeld; age++)
+    {
+        const int slot = (g_outcomeNext - 1 - age + OUTCOME_RING) % OUTCOME_RING;
+        if (g_outcomes[slot].requestId == requestId)
+            return slot;
+    }
+    return -1;
+}
+
+// Each request id's transaction the outcome log holds, in the order asked; an id it no longer
+// holds answers nothing.
+void AnswerOutcomes(RequestArguments &arguments, Answer &answer)
+{
+    for (int i = 0; i < ArraySize(arguments.ids); i++)
+    {
+        const int slot = OutcomeSlot(arguments.ids[i]);
+        if (slot >= 0)
+        {
+            answer.rows.Bytes(g_outcomes[slot].record, 0, ArraySize(g_outcomes[slot].record));
+            answer.Record();
+        }
+    }
+}
+
+void ServeSymbol(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &answer)
+{
+    switch (call)
+    {
+    case HUB_CALL_SYMBOL_SELECT:
+        AnswerSymbolSelect(arguments, answer);
+        break;
+    case HUB_CALL_SYMBOL_INFO:
+        AnswerSymbolInfo(arguments, answer);
+        break;
+    case HUB_CALL_SYMBOL_INFO_TICK:
+        AnswerSymbolInfoTick(arguments, answer);
+        break;
+    case HUB_CALL_ORDER_SEND:
+        AnswerOrderSend(arguments, answer);
+        break;
+    case HUB_CALL_OUTCOMES:
+        AnswerOutcomes(arguments, answer);
+        break;
+    case HUB_CALL_COPY_RATES_RANGE:
+    case HUB_CALL_COPY_RATES_FROM:
+    case HUB_CALL_COPY_TICKS_RANGE:
+    case HUB_CALL_COPY_TICKS_FROM:
+        answer.Fail("history reads are not served", ERR_FUNCTION_NOT_ALLOWED);
+        break;
+    default:
+        answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
+        break;
+    }
+}
+
+// Serve one request and answer it once
+void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
+{
+    Answer answer;
+    int lastError = 0;
+    const ushort code = reader.U16();
+    if (reader.failed)
+    {
+        answer.Fail("a request out of its layout", ERR_INVALID_PARAMETER);
+    }
+    else if (!HubServes(Role, (ENUM_HUB_CALL)code))
+    {
+        answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
+    }
+    else
+    {
+        RequestArguments arguments;
+        if (!arguments.Read((ENUM_HUB_CALL)code, count, reader))
+        {
+            answer.Fail("arguments out of the call's layout", ERR_INVALID_PARAMETER);
+        }
+        else
+        {
+            ResetLastError();
+            switch (Role)
+            {
+            case ROLE_SPAWNER:
+                ServeAccount((ENUM_HUB_CALL)code, arguments, answer);
+                break;
+            case ROLE_PUBLISHER:
+                ServeSymbol((ENUM_HUB_CALL)code, arguments, answer);
+                break;
+            }
+            lastError = GetLastError();
+        }
+    }
+    SendAnswer(requestId, answer, lastError);
+}
+
+// ── Transactions, as the trade_transaction frame and an outcome carry them ───────────────────────
+
+// The symbol a transaction is of: its request's for a request transaction, whose own symbol MQL5
+// leaves unfilled.
 string TransactionSymbol(const MqlTradeTransaction &trans, const MqlTradeRequest &request)
 {
     if (trans.type == TRADE_TRANSACTION_REQUEST)
@@ -470,9 +891,17 @@ string TransactionSymbol(const MqlTradeTransaction &trans, const MqlTradeRequest
         return trans.symbol;
 }
 
-//+------------------------------------------------------------------+
-//| The wanted streams                                               |
-//+------------------------------------------------------------------+
+void RecordOutcome(const uint requestId, BinaryWriter &frame)
+{
+    g_outcomes[g_outcomeNext].requestId = requestId;
+    frame.Slice(HUB_HEADER_SIZE, frame.Size() - HUB_HEADER_SIZE, g_outcomes[g_outcomeNext].record);
+    g_outcomeNext = (g_outcomeNext + 1) % OUTCOME_RING;
+    if (g_outcomesHeld < OUTCOME_RING)
+        g_outcomesHeld++;
+}
+
+// ── The wanted streams ───────────────────────────────────────────────────────────────────────────
+
 int BarIndex(const ENUM_TIMEFRAMES timeframe)
 {
     for (int i = 0; i < ArraySize(g_barTimeframes); i++)
@@ -488,10 +917,7 @@ void ClearWanted()
     ArrayFree(g_barOpens);
 }
 
-//+------------------------------------------------------------------+
-//| Count the ticks of the cursor's millisecond: ready only when the |
-//| read answered every one of them                                  |
-//+------------------------------------------------------------------+
+// Count the ticks of the cursor's millisecond: ready only when the read answered every one of them
 ENUM_TICK_CURSOR_STATE CountCursor(const long cursorMsc, int &cursorCount)
 {
     MqlTick ticks[];
@@ -511,10 +937,8 @@ ENUM_TICK_CURSOR_STATE CountCursor(const long cursorMsc, int &cursorCount)
     }
 }
 
-//+------------------------------------------------------------------+
-//| The tick cursor of newly wanted ticks: the symbol's latest tick, |
-//| so ticks from before the hub wanted them are never published     |
-//+------------------------------------------------------------------+
+// The tick cursor of newly wanted ticks: the symbol's latest tick, so ticks from before the hub
+// wanted them are never published
 void StartCursor()
 {
     MqlTick last;
@@ -529,95 +953,160 @@ void StartCursor()
                     g_tickCursorMsc, GetLastError());
 }
 
-//+------------------------------------------------------------------+
-//| Take the hub's wanted frame for the symbol: start the tick       |
-//| cursor when its ticks become wanted, keep the opens of the       |
-//| timeframes that stay wanted, start the new ones                  |
-//+------------------------------------------------------------------+
-void ApplyWanted(CJAVal &frame)
+// Take the hub's wanted streams for the symbol: start the tick cursor when its ticks become wanted,
+// keep the opens of the timeframes that stay wanted, start the new ones
+void ApplyWanted(const bool wantTicks, const ENUM_TIMEFRAMES &timeframes[])
 {
-    const bool wantTicks = frame["ticks"].ToBool();
     if (wantTicks && !g_wantTicks)
         StartCursor();
     g_wantTicks = wantTicks;
 
     ENUM_TIMEFRAMES barTimeframes[];
     datetime barOpens[];
-    for (int i = 0; i < frame["timeframes"].Size(); i++)
+    for (int i = 0; i < ArraySize(timeframes); i++)
     {
-        const ENUM_TIMEFRAMES timeframe = (ENUM_TIMEFRAMES)frame["timeframes"][i].ToInt();
-        const int known = BarIndex(timeframe);
+        const int known = BarIndex(timeframes[i]);
         const int n = ArraySize(barTimeframes);
         ArrayResize(barTimeframes, n + 1);
         ArrayResize(barOpens, n + 1);
-        barTimeframes[n] = timeframe;
+        barTimeframes[n] = timeframes[i];
         if (known >= 0)
             barOpens[n] = g_barOpens[known];
         else
-            barOpens[n] = iTime(_Symbol, timeframe, 0);
+            barOpens[n] = iTime(_Symbol, timeframes[i], 0);
     }
     ArraySwap(g_barTimeframes, barTimeframes);
     ArraySwap(g_barOpens, barOpens);
-    PrintFormat("ticks: '%s' wanted: ticks %s, %d bar streams", _Symbol, Boolean(g_wantTicks),
+    PrintFormat("ticks: '%s' wanted: ticks %s, %d bar streams", _Symbol, (string)g_wantTicks,
                 ArraySize(g_barTimeframes));
 }
 
-//+------------------------------------------------------------------+
-//| The spawner's charts                                             |
-//+------------------------------------------------------------------+
-void SendChartOpened(const string name)
+// ── The spawner's charts ─────────────────────────────────────────────────────────────────────────
+
+// The comment an EA sets on its chart, by which the spawner finds the chart of a role and symbol.
+string Marker(const ENUM_CHART_ROLE role)
 {
-    Send("{" + Envelope(FRAME_CHART_OPENED) + ",\"symbol\":" + Quote(name) + "}");
+    return MQLInfoString(MQL_PROGRAM_NAME) + " " + ChartRoleName(role);
 }
 
-// A chart_failed or chart_kept frame, which carries the spawner's reason.
-void SendChartReason(const ENUM_FRAME_KIND kind, const string name, const string reason)
+// The open positions and pending orders the account holds on the symbol.
+void CountHoldings(const string symbol, int &positions, int &orders)
 {
-    Send("{" + Envelope(kind)
-             + ",\"symbol\":" + Quote(name)
-             + ",\"reason\":" + Quote(reason)
-             + "}");
-}
-
-// The open positions and pending orders the account holds on the symbol; empty when it holds none.
-string HoldingReason(const string name)
-{
-    int positions = 0;
+    positions = 0;
+    orders = 0;
     for (int i = PositionsTotal() - 1; i >= 0; i--)
-        if (PositionGetSymbol(i) == name)
+        if (PositionGetSymbol(i) == symbol)
             positions++;
-    int orders = 0;
     for (int i = OrdersTotal() - 1; i >= 0; i--)
-        if (OrderGetTicket(i) > 0 && OrderGetString(ORDER_SYMBOL) == name)
+        if (OrderGetTicket(i) > 0 && OrderGetString(ORDER_SYMBOL) == symbol)
             orders++;
-    if (positions == 0 && orders == 0)
-        return "";
-    else
-        return StringFormat("open positions: %d, pending orders: %d", positions, orders);
 }
 
-int DeselectIndex(const string name)
+// The chart of the symbol whose comment marks the role, its EA running or gone; -1 when none.
+long MarkedChart(const ENUM_CHART_ROLE role, const string symbol)
 {
-    for (int i = 0; i < ArraySize(g_deselectSymbols); i++)
-        if (g_deselectSymbols[i] == name)
+    long chart = ChartFirst();
+    while (chart != -1)
+    {
+        if (ChartSymbol(chart) == symbol && ChartGetString(chart, CHART_COMMENT) == Marker(role))
+            return chart;
+        chart = ChartNext(chart);
+    }
+    return -1;
+}
+
+bool RunsThisEa(const long chart)
+{
+    string expert;
+    return ChartGetString(chart, CHART_EXPERT_NAME, expert)
+           && expert == MQLInfoString(MQL_PROGRAM_NAME);
+}
+
+// A chart of the symbol other than `closed` that is open, or -1 when none is.
+long OtherChart(const string symbol, const long closed)
+{
+    long chart = ChartFirst();
+    while (chart != -1)
+    {
+        if (chart != closed && ChartSymbol(chart) == symbol)
+            return chart;
+        chart = ChartNext(chart);
+    }
+    return -1;
+}
+
+// The index of the chart the spawner opened for the role and symbol, or -1.
+int OpenedIndex(const ENUM_CHART_ROLE role, const string symbol)
+{
+    for (int i = 0; i < ArraySize(g_openedCharts); i++)
+        if (g_openedRoles[i] == role && g_openedSymbols[i] == symbol)
             return i;
     return -1;
 }
 
-void KeepDeselecting(const string name)
+void RememberOpened(const long chart, const ENUM_CHART_ROLE role, const string symbol)
 {
-    const int n = ArraySize(g_deselectSymbols);
-    ArrayResize(g_deselectSymbols, n + 1);
-    ArrayResize(g_deselectAt, n + 1);
-    ArrayResize(g_deselectHeld, n + 1);
-    g_deselectSymbols[n] = name;
-    g_deselectAt[n] = 0;
-    g_deselectHeld[n] = false;
+    const int n = ArraySize(g_openedCharts);
+    ArrayResize(g_openedCharts, n + 1);
+    ArrayResize(g_openedRoles, n + 1);
+    ArrayResize(g_openedSymbols, n + 1);
+    g_openedCharts[n] = chart;
+    g_openedRoles[n] = role;
+    g_openedSymbols[n] = symbol;
 }
 
-void ForgetDeselect(const string name)
+void ForgetOpened(const long chart)
 {
-    const int index = DeselectIndex(name);
+    for (int i = ArraySize(g_openedCharts) - 1; i >= 0; i--)
+    {
+        if (g_openedCharts[i] == chart)
+        {
+            ArrayRemove(g_openedCharts, i, 1);
+            ArrayRemove(g_openedRoles, i, 1);
+            ArrayRemove(g_openedSymbols, i, 1);
+        }
+    }
+}
+
+// Forgets the charts the spawner opened that are closed: a closed chart's symbol reads empty.
+void ForgetClosedCharts()
+{
+    for (int i = ArraySize(g_openedCharts) - 1; i >= 0; i--)
+    {
+        if (ChartSymbol(g_openedCharts[i]) != g_openedSymbols[i])
+        {
+            ArrayRemove(g_openedCharts, i, 1);
+            ArrayRemove(g_openedRoles, i, 1);
+            ArrayRemove(g_openedSymbols, i, 1);
+        }
+    }
+}
+
+int DeselectIndex(const string symbol)
+{
+    for (int i = 0; i < ArraySize(g_deselectSymbols); i++)
+        if (g_deselectSymbols[i] == symbol)
+            return i;
+    return -1;
+}
+
+void KeepDeselecting(const string symbol)
+{
+    if (DeselectIndex(symbol) < 0)
+    {
+        const int n = ArraySize(g_deselectSymbols);
+        ArrayResize(g_deselectSymbols, n + 1);
+        ArrayResize(g_deselectAt, n + 1);
+        ArrayResize(g_deselectHeld, n + 1);
+        g_deselectSymbols[n] = symbol;
+        g_deselectAt[n] = 0;
+        g_deselectHeld[n] = false;
+    }
+}
+
+void ForgetDeselect(const string symbol)
+{
+    const int index = DeselectIndex(symbol);
     if (index >= 0)
     {
         ArrayRemove(g_deselectSymbols, index, 1);
@@ -626,11 +1115,8 @@ void ForgetDeselect(const string name)
     }
 }
 
-//+------------------------------------------------------------------+
-//| Take out of Market Watch each symbol whose chart the spawner     |
-//| closed, once the terminal lets it; while positions or orders     |
-//| hold one, it is tried again only every HELD_DESELECT_SECONDS     |
-//+------------------------------------------------------------------+
+// Take out of Market Watch each symbol whose chart the spawner closed, once the terminal lets it;
+// while positions or orders hold one, it is tried again only every HELD_DESELECT_SECONDS
 void RetryDeselects()
 {
     const ulong now = GetTickCount64();
@@ -638,229 +1124,187 @@ void RetryDeselects()
     {
         if (now >= g_deselectAt[i])
         {
-            const string name = g_deselectSymbols[i];
-            const string holding = HoldingReason(name);
-            if (holding != "")
+            const string symbol = g_deselectSymbols[i];
+            int positions = 0;
+            int orders = 0;
+            CountHoldings(symbol, positions, orders);
+            if (positions > 0 || orders > 0)
             {
                 if (!g_deselectHeld[i])
-                    PrintFormat("ticks: '%s' stays in Market Watch: %s", name, holding);
+                    PrintFormat("ticks: '%s' stays in Market Watch: %d open positions, %d "
+                                "pending orders", symbol, positions, orders);
                 g_deselectHeld[i] = true;
                 g_deselectAt[i] = now + (ulong)HELD_DESELECT_SECONDS * 1000;
             }
-            else if (SymbolSelect(name, false))
+            else if (SymbolSelect(symbol, false))
             {
-                PrintFormat("ticks: took '%s' out of Market Watch", name);
-                ForgetDeselect(name);
+                PrintFormat("ticks: took '%s' out of Market Watch", symbol);
+                ForgetDeselect(symbol);
             }
         }
     }
 }
 
-// Forgets the charts the spawner opened that are closed: a closed chart's symbol reads empty.
-void ForgetClosedCharts()
+// Takes the symbol out of Market Watch once no chart of it but `closed` is open; the terminal may
+// still count a chart just closed open, so a refused deselect is tried again.
+void Deselect(const string symbol, const long closed)
 {
-    long charts[];
-    string symbols[];
-    for (int i = 0; i < ArraySize(g_openedCharts); i++)
+    if (OtherChart(symbol, closed) >= 0)
     {
-        if (ChartSymbol(g_openedCharts[i]) == g_openedSymbols[i])
-        {
-            const int n = ArraySize(charts);
-            ArrayResize(charts, n + 1);
-            ArrayResize(symbols, n + 1);
-            charts[n] = g_openedCharts[i];
-            symbols[n] = g_openedSymbols[i];
-        }
+        PrintFormat("ticks: '%s' stays in Market Watch for its other chart", symbol);
     }
-    ArraySwap(g_openedCharts, charts);
-    ArraySwap(g_openedSymbols, symbols);
-}
-
-// Whether a chart of the symbol runs this EA, or one the spawner opened for it is open: the
-// template's EA loads only once the chart has processed the queued template.
-bool ChartServes(const string name)
-{
-    for (int i = 0; i < ArraySize(g_openedSymbols); i++)
-        if (g_openedSymbols[i] == name)
-            return true;
-    long chart = ChartFirst();
-    while (chart != -1)
+    else if (SymbolSelect(symbol, false))
     {
-        string expert;
-        if (ChartSymbol(chart) == name
-            && ChartGetString(chart, CHART_EXPERT_NAME, expert)
-            && expert == MQLInfoString(MQL_PROGRAM_NAME))
-            return true;
-        chart = ChartNext(chart);
-    }
-    return false;
-}
-
-// The chart of the symbol that runs this EA, other than this EA's own, or -1 when none does.
-long PublisherChart(const string name)
-{
-    long chart = ChartFirst();
-    while (chart != -1)
-    {
-        string expert;
-        if (chart != ChartID()
-            && ChartSymbol(chart) == name
-            && ChartGetString(chart, CHART_EXPERT_NAME, expert)
-            && expert == MQLInfoString(MQL_PROGRAM_NAME))
-            return chart;
-        chart = ChartNext(chart);
-    }
-    return -1;
-}
-
-// Takes the symbol out of Market Watch; the terminal may still count a chart just closed open, so a
-// refused deselect is tried again.
-void Deselect(const string name)
-{
-    if (SymbolSelect(name, false))
-    {
-        PrintFormat("ticks: took '%s' out of Market Watch", name);
+        PrintFormat("ticks: took '%s' out of Market Watch", symbol);
     }
     else
     {
-        PrintFormat("ticks: '%s' leaves Market Watch once allowed", name);
-        KeepDeselecting(name);
+        PrintFormat("ticks: '%s' leaves Market Watch once allowed", symbol);
+        KeepDeselecting(symbol);
     }
 }
 
-//+------------------------------------------------------------------+
-//| Open an M1 chart of the symbol with the EA's template, unless a  |
-//| chart already serves it, and tell the hub whether one does       |
-//+------------------------------------------------------------------+
-void OpenChart(const string name)
+// Have a chart of the role and symbol open, and tell the hub whether one is: a chart whose EA is
+// gone takes its template again, and a chart the spawner opened is loading its EA, so the open is
+// idempotent
+void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
 {
     ForgetClosedCharts();
-    // Empty while a chart serves the symbol.
-    string failure = "";
-    if (ChartServes(name))
+    const long marked = MarkedChart(role, symbol);
+    // The MQL5 call that failed, empty while a chart of the role and symbol is open, and its error.
+    string failing = "";
+    int error = 0;
+    if (marked >= 0 && RunsThisEa(marked))
     {
-        PrintFormat("ticks: a '%s' chart already serves it", name);
+        PrintFormat("ticks: the %s chart of '%s' already runs", ChartRoleName(role), symbol);
     }
-    else if (!SymbolSelect(name, true))
+    else if (marked >= 0)
     {
-        failure = StringFormat("SymbolSelect failed with error %d", GetLastError());
-    }
-    else
-    {
-        const long chart = ChartOpen(name, PERIOD_M1);
-        if (chart == 0)
+        ResetLastError();
+        if (ChartApplyTemplate(marked, ChartTemplate))
         {
-            failure = StringFormat("ChartOpen returned 0 with error %d", GetLastError());
-        }
-        else if (!ChartApplyTemplate(chart, ChartTemplate))
-        {
-            failure = StringFormat("ChartApplyTemplate %s failed with error %d", ChartTemplate,
-                                   GetLastError());
-            ChartClose(chart);
+            RememberOpened(marked, role, symbol);
+            PrintFormat("ticks: the %s chart of '%s' takes its template again", ChartRoleName(role),
+                        symbol);
         }
         else
         {
-            const int n = ArraySize(g_openedCharts);
-            ArrayResize(g_openedCharts, n + 1);
-            ArrayResize(g_openedSymbols, n + 1);
-            g_openedCharts[n] = chart;
-            g_openedSymbols[n] = name;
-            PrintFormat("ticks: opened a '%s' chart", name);
+            failing = "ChartApplyTemplate";
+            error = GetLastError();
         }
     }
-    if (failure == "")
+    else if (OpenedIndex(role, symbol) >= 0)
     {
-        ForgetDeselect(name);
-        SendChartOpened(name);
+        PrintFormat("ticks: the %s chart of '%s' is loading its EA", ChartRoleName(role), symbol);
     }
     else
     {
-        PrintFormat("ticks: cannot open a '%s' chart: %s", name, failure);
-        SendChartReason(FRAME_CHART_FAILED, name, failure);
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Close the symbol's chart, then take the symbol out of Market     |
-//| Watch, which the terminal refuses while a chart of it is open or |
-//| it has open positions; a symbol with open positions or pending   |
-//| orders keeps its chart, and the hub is told                      |
-//+------------------------------------------------------------------+
-void CloseOpenedChart(const string name)
-{
-    ForgetClosedCharts();
-    int index = -1;
-    for (int i = 0; i < ArraySize(g_openedSymbols); i++)
-        if (g_openedSymbols[i] == name)
-            index = i;
-    const string holding = HoldingReason(name);
-    if (holding != "")
-    {
-        PrintFormat("ticks: keeping the '%s' chart open: %s", name, holding);
-        SendChartReason(FRAME_CHART_KEPT, name, holding);
-    }
-    else if (index < 0)
-    {
-        // A publisher that predates this spawner runs on a chart it did not open.
-        const long chart = PublisherChart(name);
-        if (chart < 0)
+        ResetLastError();
+        if (!SymbolSelect(symbol, true))
         {
-            PrintFormat("ticks: no '%s' chart runs this EA", name);
-            Deselect(name);
-        }
-        else if (!ChartClose(chart))
-        {
-            PrintFormat("ticks: ChartClose of the '%s' chart failed: %d", name, GetLastError());
+            failing = "SymbolSelect";
+            error = GetLastError();
         }
         else
         {
-            PrintFormat("ticks: closed the '%s' chart", name);
-            Deselect(name);
+            const long chart = ChartOpen(symbol, PERIOD_M1);
+            if (chart == 0)
+            {
+                failing = "ChartOpen";
+                error = GetLastError();
+            }
+            else if (!ChartApplyTemplate(chart, ChartTemplate))
+            {
+                failing = "ChartApplyTemplate";
+                error = GetLastError();
+                ChartClose(chart);
+            }
+            else
+            {
+                RememberOpened(chart, role, symbol);
+                PrintFormat("ticks: opened the %s chart of '%s'", ChartRoleName(role), symbol);
+            }
         }
     }
-    else if (!ChartClose(g_openedCharts[index]))
+    if (failing == "")
     {
-        PrintFormat("ticks: ChartClose of the '%s' chart failed: %d", name, GetLastError());
+        ForgetDeselect(symbol);
+        SendChartOpened(role, symbol);
     }
     else
     {
-        ArrayRemove(g_openedCharts, index, 1);
-        ArrayRemove(g_openedSymbols, index, 1);
-        PrintFormat("ticks: closed the '%s' chart", name);
-        Deselect(name);
+        PrintFormat("ticks: cannot open the %s chart of '%s': %s failed with error %d",
+                    ChartRoleName(role), symbol, failing, error);
+        SendChartFailed(role, symbol, error);
     }
 }
 
-//+------------------------------------------------------------------+
-//| Close this EA's chart, which unloads the EA                      |
-//+------------------------------------------------------------------+
+// Close the chart of the role and symbol, then take the symbol out of Market Watch once no chart of
+// it is open; while the account holds positions or pending orders on the symbol the chart stays,
+// and the hub is told
+void CloseChart(const ENUM_CHART_ROLE role, const string symbol)
+{
+    ForgetClosedCharts();
+    int positions = 0;
+    int orders = 0;
+    CountHoldings(symbol, positions, orders);
+    // The chart the spawner opened for the role and symbol, or one that predates it.
+    long chart = MarkedChart(role, symbol);
+    const int opened = OpenedIndex(role, symbol);
+    if (opened >= 0)
+        chart = g_openedCharts[opened];
+    if (positions > 0 || orders > 0)
+    {
+        PrintFormat("ticks: keeping the %s chart of '%s' open: %d open positions, %d pending "
+                    "orders", ChartRoleName(role), symbol, positions, orders);
+        SendChartKept(role, symbol, positions, orders);
+    }
+    else if (chart < 0)
+    {
+        PrintFormat("ticks: no %s chart of '%s' is open", ChartRoleName(role), symbol);
+        Deselect(symbol, -1);
+    }
+    else if (!ChartClose(chart))
+    {
+        PrintFormat("ticks: ChartClose of the %s chart of '%s' failed: %d", ChartRoleName(role),
+                    symbol, GetLastError());
+    }
+    else
+    {
+        ForgetOpened(chart);
+        PrintFormat("ticks: closed the %s chart of '%s'", ChartRoleName(role), symbol);
+        Deselect(symbol, chart);
+    }
+}
+
+// Close this EA's chart, which unloads the EA
 void CloseOwnChart()
 {
-    PrintFormat("ticks: another EA publishes '%s'; closing this chart", _Symbol);
+    PrintFormat("ticks: another EA serves the %s of '%s'; closing this chart", ChartRoleName(Role),
+                _Symbol);
     if (ChartClose(0))
         g_closing = true;
     else
         PrintFormat("ticks: ChartClose failed: %d", GetLastError());
 }
 
-//+------------------------------------------------------------------+
-//| The hub refused this EA's hello: another EA publishes its symbol |
-//+------------------------------------------------------------------+
+// The hub refused this EA's hello: another EA serves its role and symbol
 void OnDuplicate()
 {
     const ulong now = GetTickCount64();
-    if (!Spawner)
+    g_refused = true;
+    if (Role != ROLE_SPAWNER)
     {
         CloseOwnChart();
     }
     else if (g_firstRefusal == 0)
     {
-        // The publisher may be this terminal's own earlier connection, which the hub drops at most
+        // The spawner may be this terminal's own earlier connection, which the hub drops at most
         // HubPingTimeoutSec after its last pong while its writes to it drain; the reconnect then
         // says hello again.
         g_firstRefusal = now;
-        PrintFormat("ticks: another EA publishes '%s'; saying hello again every %d s for %d s",
-                    _Symbol, ReconnectIntervalSec, HubPingTimeoutSec);
+        PrintFormat("ticks: another EA serves the spawner; saying hello again every %d s for %d s",
+                    ReconnectIntervalSec, HubPingTimeoutSec);
     }
     else if (now - g_firstRefusal >= (ulong)HubPingTimeoutSec * 1000)
     {
@@ -868,50 +1312,97 @@ void OnDuplicate()
     }
 }
 
-//+------------------------------------------------------------------+
-//| Handle one frame from the hub                                    |
-//+------------------------------------------------------------------+
-void OnHubFrame(const string text)
+// Frames from the hub
+void OnWanted(const uint count, BinaryReader &reader)
 {
-    CJAVal frame;
-    if (!frame.Deserialize(text) || frame["v"].ToInt() != PROTOCOL_VERSION)
+    const string symbol = reader.String();
+    const uchar ticks = reader.U8();
+    ENUM_TIMEFRAMES timeframes[];
+    if (!reader.failed && count <= (uint)reader.Remaining() / 4)
     {
-        Print("ticks: a hub frame of another version: ", text);
+        ArrayResize(timeframes, (int)count);
+        for (uint i = 0; i < count; i++)
+            timeframes[i] = (ENUM_TIMEFRAMES)reader.I32();
+    }
+    if (!reader.Done() || ArraySize(timeframes) != (int)count || ticks > 1)
+        Print("ticks: a wanted frame out of its layout");
+    else if (Role != ROLE_PUBLISHER)
+        Print("ticks: a wanted frame to an EA that publishes no stream");
+    else if (symbol != _Symbol)
+        PrintFormat("ticks: a wanted frame for '%s', not '%s'", symbol, _Symbol);
+    else
+        ApplyWanted(ticks == 1, timeframes);
+}
+
+// An open_chart or close_chart frame, which the hub sends the spawner.
+void OnChartFrame(const ENUM_HUB_FRAME kind, BinaryReader &reader)
+{
+    const string roleName = reader.String();
+    const string symbol = reader.String();
+    ENUM_CHART_ROLE role = ROLE_PUBLISHER;
+    if (!reader.Done() || !ChartRoleNamed(roleName, role) || symbol == "")
+        Print("ticks: a chart frame out of its layout");
+    else if (Role != ROLE_SPAWNER)
+        Print("ticks: a chart frame to an EA that is not the spawner");
+    else if (role == ROLE_SPAWNER)
+        PrintFormat("ticks: a chart frame for the spawner's chart of '%s', which the startup "
+                    "script alone opens", symbol);
+    else if (kind == HUB_FRAME_OPEN_CHART)
+        OpenChart(role, symbol);
+    else
+        CloseChart(role, symbol);
+}
+
+void OnDuplicateFrame(BinaryReader &reader)
+{
+    const string roleName = reader.String();
+    const string symbol = reader.String();
+    ENUM_CHART_ROLE role = ROLE_PUBLISHER;
+    if (!reader.Done() || !ChartRoleNamed(roleName, role))
+        Print("ticks: a duplicate frame out of its layout");
+    else if (role != Role || symbol != _Symbol)
+        PrintFormat("ticks: a duplicate frame for the %s of '%s'", roleName, symbol);
+    else
+        OnDuplicate();
+}
+
+void OnHubFrame(const uchar &data[])
+{
+    BinaryReader reader;
+    reader.Load(data);
+    HubHeader header;
+    if (!reader.Header(header) || header.flags != 0)
+    {
+        PrintFormat("ticks: a hub frame out of the protocol, %d bytes", ArraySize(data));
     }
     else
     {
-        const string kind = frame["type"].ToStr();
-        const string target = frame["symbol"].ToStr();
-        // The hub sends these to the spawner, naming the chart's symbol.
-        const bool spawnerFrame = kind == FrameName(FRAME_OPEN_CHART)
-                                  || kind == FrameName(FRAME_CLOSE_CHART);
-        // The hub addresses these to the EA of the symbol they name.
-        const bool addressed = kind == FrameName(FRAME_WANTED)
-                               || kind == FrameName(FRAME_DUPLICATE);
-        if (spawnerFrame && !Spawner)
-            Print("ticks: a spawner's frame to an EA that is not the spawner: ", text);
-        else if (kind == FrameName(FRAME_OPEN_CHART))
-            OpenChart(target);
-        else if (kind == FrameName(FRAME_CLOSE_CHART))
-            CloseOpenedChart(target);
-        else if (addressed && target != _Symbol)
-            Print("ticks: a hub frame for another symbol: ", text);
-        else if (kind == FrameName(FRAME_WANTED))
+        switch (header.kind)
         {
-            // The hub tells an EA its wanted frame once it takes its hello.
-            g_firstRefusal = 0;
-            ApplyWanted(frame);
+        case HUB_FRAME_REQUEST:
+            OnRequest(header.correlation, header.count, reader);
+            break;
+        case HUB_FRAME_WANTED:
+            OnWanted(header.count, reader);
+            break;
+        case HUB_FRAME_OPEN_CHART:
+        case HUB_FRAME_CLOSE_CHART:
+            OnChartFrame((ENUM_HUB_FRAME)header.kind, reader);
+            break;
+        case HUB_FRAME_DUPLICATE:
+            OnDuplicateFrame(reader);
+            break;
+        case HUB_FRAME_ERROR:
+            PrintFormat("ticks: the hub refused a frame: %s", reader.String());
+            break;
+        default:
+            PrintFormat("ticks: a hub frame of kind %d, which no EA reads", header.kind);
+            break;
         }
-        else if (kind == FrameName(FRAME_DUPLICATE))
-            OnDuplicate();
-        else
-            Print("ticks: a hub frame of an unknown kind: ", text);
     }
 }
 
-//+------------------------------------------------------------------+
-//| Read what the hub sent                                           |
-//+------------------------------------------------------------------+
+// Read what the hub sent
 void ReadHub()
 {
     // The library answers a ping and acknowledges a close only while it reads, and it reads nothing
@@ -919,15 +1410,15 @@ void ReadHub()
     IWebSocketMessage *msg = wss.readMessage(false);
     while (msg != NULL)
     {
-        OnHubFrame(msg.getString());
+        uchar data[];
+        msg.getData(data);
         delete msg;
+        OnHubFrame(data);
         msg = wss.readMessage(false);
     }
 }
 
-//+------------------------------------------------------------------+
-//| Publish the symbol's ticks since its cursor                      |
-//+------------------------------------------------------------------+
+// Publish the symbol's ticks since its cursor, a batch per frame
 void PublishCursorTicks()
 {
     // The read starts at the cursor's millisecond, so it takes the ticks of it already consumed on
@@ -937,12 +1428,17 @@ void PublishCursorTicks()
                                  (uint)(g_tickCursorCount + TICK_BATCH));
     if (copied < 0)
         PrintFormat("ticks: CopyTicks '%s' failed: %d", _Symbol, GetLastError());
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_TICK, 0, 0);
+    frame.String(_Symbol);
+    uint published = 0;
     int atCursor = 0;
     for (int i = 0; i < copied; i++)
     {
         if (ticks[i].time_msc != g_tickCursorMsc)
         {
-            SendTick(ticks[i]);
+            frame.Tick(ticks[i]);
+            published++;
             g_tickCursorMsc = ticks[i].time_msc;
             g_tickCursorCount = 1;
             atCursor = 1;
@@ -952,17 +1448,21 @@ void PublishCursorTicks()
             atCursor++;
             if (atCursor > g_tickCursorCount)
             {
-                SendTick(ticks[i]);
+                frame.Tick(ticks[i]);
+                published++;
                 g_tickCursorCount = atCursor;
             }
         }
     }
+    if (published > 0)
+    {
+        frame.Seal(published);
+        Send(frame);
+    }
 }
 
-//+------------------------------------------------------------------+
-//| Publish the symbol's ticks since its cursor while they are       |
-//| wanted, once the cursor's count is complete                      |
-//+------------------------------------------------------------------+
+// Publish the symbol's ticks since its cursor while they are wanted, once the cursor's count is
+// complete
 void PublishTicks()
 {
     if (g_wantTicks && g_tickCursorState == CURSOR_COUNT_PENDING)
@@ -976,10 +1476,7 @@ void PublishTicks()
         PublishCursorTicks();
 }
 
-//+------------------------------------------------------------------+
-//| Publish the bar that closed for every wanted timeframe whose     |
-//| forming bar moved on                                             |
-//+------------------------------------------------------------------+
+// Publish the bar that closed for every wanted timeframe whose forming bar moved on
 void PublishBars()
 {
     for (int b = 0; b < ArraySize(g_barTimeframes); b++)
@@ -1009,40 +1506,47 @@ void PublishBars()
     }
 }
 
-//+------------------------------------------------------------------+
-//| The relay cadence: the server time, and the symbol's commission  |
-//| schedule and trading sessions                                    |
-//+------------------------------------------------------------------+
-void Relay()
-{
-    g_lastRelay = GetTickCount64();
-    SendServerTime();
-    SendCommissions();
-    SendSessions();
-}
-
-//+------------------------------------------------------------------+
-//| Connect to the hub again; it tells a reconnected EA what it      |
-//| wants, so nothing missed while away is published                 |
-//+------------------------------------------------------------------+
+// Connect to the hub again; it tells a reconnected publisher what it wants, so nothing missed while
+// away is published
 void Reconnect()
 {
     g_lastReconnect = TimeLocal();
-    Print("Reconnecting");
+    // A connection that said hello and ended unrefused was taken: the spawner's next refusal is a
+    // first one.
+    if (g_helloSent && !g_refused)
+        g_firstRefusal = 0;
     g_helloSent = false;
+    g_refused = false;
     ClearWanted();
+    Print("Reconnecting");
     if (!wss.open())
         Print("Failed to reconnect to server");
     else
         SendHello();
 }
 
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
+// Whether MqlTick and MqlRates pack to the sizes the protocol carries them at.
+bool PodsPackToTheProtocol()
+{
+    MqlTick tick;
+    MqlRates rates;
+    ZeroMemory(tick);
+    ZeroMemory(rates);
+    uchar tickBytes[];
+    uchar ratesBytes[];
+    StructToCharArray(tick, tickBytes);
+    StructToCharArray(rates, ratesBytes);
+    const bool packed = ArraySize(tickBytes) == HUB_TICK_SIZE
+                        && ArraySize(ratesBytes) == HUB_RATES_SIZE;
+    if (!packed)
+        PrintFormat("ticks: MqlTick packs to %d bytes and MqlRates to %d, not %d and %d",
+                    ArraySize(tickBytes), ArraySize(ratesBytes), HUB_TICK_SIZE, HUB_RATES_SIZE);
+    return packed;
+}
+
 int OnInit()
 {
-    Print("ticks EA initializing");
+    PrintFormat("ticks EA initializing as the %s of '%s'", ChartRoleName(Role), _Symbol);
     if (RelaySeconds < 1)
     {
         Print("RelaySeconds ", RelaySeconds, " is not positive");
@@ -1058,8 +1562,12 @@ int OnInit()
         Print("HubPingTimeoutSec ", HubPingTimeoutSec, " is not positive");
         return INIT_PARAMETERS_INCORRECT;
     }
+    if (!PodsPackToTheProtocol())
+        return INIT_FAILED;
+    if (!ChartSetString(0, CHART_COMMENT, Marker(Role)))
+        PrintFormat("ticks: the chart's role marker is not set: %d", GetLastError());
     // The timer fires whether or not the market ticks, so the EA reconnects, reads the hub and
-    // relays the server time while the market is closed too.
+    // relays while the market is closed too.
     if (!EventSetMillisecondTimer(PollMilliseconds))
     {
         Print("EventSetMillisecondTimer failed: ", GetLastError());
@@ -1080,9 +1588,6 @@ int OnInit()
     return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
     EventKillTimer();
@@ -1096,9 +1601,6 @@ void OnDeinit(const int reason)
     Print("Deinitialization");
 }
 
-//+------------------------------------------------------------------+
-//| Timer event handler                                              |
-//+------------------------------------------------------------------+
 void OnTimer()
 {
     if (g_closing)
@@ -1113,38 +1615,49 @@ void OnTimer()
     {
         // The terminal queues no tick event while one is queued or handled, so a tick that arrives
         // then is read from the cursor here, at the latest one poll interval on.
-        PublishTicks();
-        PublishBars();
+        if (Role == ROLE_PUBLISHER)
+        {
+            PublishTicks();
+            PublishBars();
+        }
         if (GetTickCount64() - g_lastRelay >= (ulong)RelaySeconds * 1000)
             Relay();
     }
 }
 
-//+------------------------------------------------------------------+
-//| onTick method is called every tick                               |
-//+------------------------------------------------------------------+
 void OnTick()
 {
     if (g_closing)
         return;
     ReadHub();
-    if (!g_closing && wss.isConnected())
+    if (!g_closing && wss.isConnected() && Role == ROLE_PUBLISHER)
     {
         PublishTicks();
         PublishBars();
     }
 }
 
-//+------------------------------------------------------------------+
-//| Every trade transaction of the symbol, as it arrives; the        |
-//| spawner's also every one that names no symbol                    |
-//+------------------------------------------------------------------+
+// Every trade transaction of the publisher's symbol, as it arrives, a REQUEST transaction also into
+// the outcome log; the spawner's every one that names no symbol
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-    // Every EA receives the account's whole stream; the symbol filter sends each transaction once.
-    const string name = TransactionSymbol(trans, request);
-    if (!g_closing && wss.isConnected() && (name == _Symbol || (name == "" && Spawner)))
-        SendTransaction(trans, request, result);
+    // Every EA receives the account's whole stream; the symbol filter publishes each transaction
+    // once.
+    const string symbol = TransactionSymbol(trans, request);
+    const bool publisher = Role == ROLE_PUBLISHER && symbol == _Symbol;
+    const bool spawner = Role == ROLE_SPAWNER && symbol == "";
+    if (!g_closing && (publisher || spawner))
+    {
+        BinaryWriter frame;
+        frame.Begin(HUB_FRAME_TRADE_TRANSACTION, 0, 0);
+        WriteTradeTransaction(frame, trans);
+        WriteTradeRequest(frame, request);
+        WriteTradeResult(frame, result);
+        frame.Seal(0);
+        if (publisher && trans.type == TRADE_TRANSACTION_REQUEST)
+            RecordOutcome(result.request_id, frame);
+        Send(frame);
+    }
 }

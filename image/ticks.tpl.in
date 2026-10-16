@@ -66,11 +66,11 @@ name=ticks
 path=Experts\ticks.ex5
 expertmode=5
 <inputs>
+Role=@ROLE@
 Server=ws://127.0.0.1:@HUB_PORT@
 ReconnectIntervalSec=3
 RelaySeconds=5
-PollMilliseconds=250
-Spawner=@SPAWNER@
+PollMilliseconds=16
 ChartTemplate=ticks.tpl
 HubPingTimeoutSec=50
 </inputs>

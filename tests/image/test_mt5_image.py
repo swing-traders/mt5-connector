@@ -56,8 +56,8 @@ _TERMINAL_KEY = "HKCU\\Software\\MetaQuotes Software"
 _WRITTEN_VALUE = "mt5-image-test-written-by-a-run"
 _SCRIPTS = "/mt5-image-test"
 # A file the terminal never writes, and its baked copy.
-_INCLUDE = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Include/JAson.mqh"
-_BAKED_INCLUDE = "/opt/mt5-baked/terminal/MQL5/Include/JAson.mqh"
+_INCLUDE = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Include/hub_codec.mqh"
+_BAKED_INCLUDE = "/opt/mt5-baked/terminal/MQL5/Include/hub_codec.mqh"
 # Overwrites the first byte of "$1" with another, then gives "$1" the timestamp of "$2".
 _REWRITE_IN_PLACE = """
 first=$(head -c 1 "$1")

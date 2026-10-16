@@ -25,7 +25,7 @@ from mt5connector.client.errors import (
     ServerUnreachable,
     Syncing,
 )
-from mt5connector.client.hub import HubSession, Outcomes
+from mt5connector.client.hub import HubSession
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import ErrorKind, Sender
 from mt5connector.wire.history_wire import Series
@@ -613,42 +613,146 @@ async def test_an_order_carries_its_whole_request_and_resolves_with_the_result_t
     await hub_session.disconnect()
 
 
-async def test_a_reconnect_asks_the_outcomes_of_the_commands_no_request_transaction_settled(hub):
+def request_transaction(
+    request_id, symbol="EURUSD", retcode=mirror.TRADE_RETCODE_INVALID_EXPIRATION
+):
+    """The REQUEST transaction that settles a command: its venue's verdict under its request id."""
+    return binary.TradeTransaction(
+        zeroed(binary.TRADE_TRANSACTION, type=TransactionType.REQUEST),
+        zeroed(binary.TRADE_REQUEST, symbol=symbol),
+        zeroed(binary.TRADE_RESULT, retcode=retcode, request_id=request_id),
+    )
+
+
+async def send_orders(hub, hub_session, orders):
+    """Has the session send each (request id, symbol) order, answered sent."""
+    for sent_count, (request_id, symbol) in enumerate(orders, start=1):
+        order = asyncio.create_task(hub_session.order_send({"symbol": symbol}))
+        requests = await asked(hub, sent_count)
+        await hub.answer(requests[-1], sent(request_id))
+        await asyncio.wait_for(order, 1)
+
+
+def outcomes_asked(requests) -> dict[str, tuple[binary.Request, tuple]]:
+    """Each outcomes request by its symbol, with the request ids it asks."""
+    asked_by_symbol = {}
+    for request in requests:
+        arguments = calls.decode_arguments(calls.CALLS[Call.OUTCOMES], request)
+        asked_by_symbol[arguments["symbol"]] = (request, arguments["request_ids"])
+    return asked_by_symbol
+
+
+async def test_a_reconnect_hands_each_outcome_the_publisher_holds_as_its_transaction(hub):
     owner = Owner()
     hub_session = session(hub, owner)
     await hub_session.connect()
-    for request_id, symbol in ((41, "EURUSD"), (42, "EURUSD"), (43, "XAUUSD"), (44, "EURUSD")):
-        order = asyncio.create_task(hub_session.order_send({"symbol": symbol}))
-        requests = await asked(hub, request_id - 40)
-        await hub.answer(requests[-1], sent(request_id))
-        await asyncio.wait_for(order, 1)
-    settled = binary.TradeTransaction(
-        zeroed(binary.TRADE_TRANSACTION, type=TransactionType.REQUEST),
-        zeroed(binary.TRADE_REQUEST, symbol="EURUSD"),
-        zeroed(binary.TRADE_RESULT, retcode=10009, request_id=42),
+    await send_orders(
+        hub, hub_session, ((41, "EURUSD"), (42, "EURUSD"), (43, "XAUUSD"), (44, "EURUSD"))
     )
-    await hub.push(settled)
+    await hub.push(request_transaction(42))
     await eventually(lambda: owner.frames)
 
     await hub.connections[0].close()
-    outcomes = await asked(hub, 2, connection=1)
-    by_symbol = {}
-    asked_ids = {}
-    for request in outcomes:
-        arguments = calls.decode_arguments(calls.CALLS[Call.OUTCOMES], request)
-        by_symbol[arguments["symbol"]] = request
-        asked_ids[arguments["symbol"]] = arguments["request_ids"]
-    await hub.answer(by_symbol["EURUSD"], [sent(41, 10009)])
-    await hub.answer(by_symbol["XAUUSD"], [])
-    await eventually(lambda: len(owner.frames) == 3)
+    asked_by_symbol = outcomes_asked(await asked(hub, 2, connection=1))
+    await hub.answer(
+        asked_by_symbol["EURUSD"][0], [request_transaction(41, retcode=mirror.TRADE_RETCODE_DONE)]
+    )
+    await hub.answer(asked_by_symbol["XAUUSD"][0], [])
+    await eventually(lambda: len(owner.frames) == 2 and owner.log.warning.call_count == 2)
 
-    assert asked_ids == {"EURUSD": (41, 44), "XAUUSD": (43,)}
-    handed = sorted(owner.frames[1:], key=lambda frame: frame.symbol)
-    assert [(frame.symbol, [r.request_id for r in frame.results]) for frame in handed] == [
-        ("EURUSD", [41]),
-        ("XAUUSD", []),
+    assert {symbol: ids for symbol, (_, ids) in asked_by_symbol.items()} == {
+        "EURUSD": (41, 44),
+        "XAUUSD": (43,),
+    }
+    assert owner.frames == [
+        request_transaction(42),
+        request_transaction(41, retcode=mirror.TRADE_RETCODE_DONE),
     ]
-    assert all(isinstance(frame, Outcomes) for frame in handed)
+    await hub.connections[1].close()
+    await eventually(lambda: len(hub.received) == 3 and len(hub.received[2]) >= 1)
+    await asyncio.sleep(0.1)
+    assert hub.requests(connection=2) == []
+    await hub_session.disconnect()
+
+
+async def test_an_outcome_the_publisher_no_longer_holds_is_dropped_with_one_warning(hub):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    await send_orders(hub, hub_session, ((41, "EURUSD"), (44, "EURUSD")))
+
+    await hub.connections[0].close()
+    ((request, _),) = outcomes_asked(await asked(hub, 1, connection=1)).values()
+    await hub.answer(request, [])
+    await eventually(lambda: owner.log.warning.called)
+
+    assert [call.args[0] for call in owner.log.warning.call_args_list] == [
+        "hub session: the publisher of EURUSD holds no outcome of requests 41, 44; dropped"
+    ]
+    assert owner.frames == []
+    await hub_session.disconnect()
+
+
+async def test_a_connect_after_a_disconnect_asks_the_outcomes_of_the_commands_outstanding(hub):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    await send_orders(hub, hub_session, ((41, "EURUSD"),))
+    await hub_session.disconnect()
+
+    await hub_session.connect()
+    ((request, ids),) = outcomes_asked(await asked(hub, 1, connection=1)).values()
+    await hub.answer(request, [request_transaction(41)])
+    await eventually(lambda: owner.frames)
+
+    assert ids == (41,)
+    assert owner.frames == [request_transaction(41)]
+    await hub_session.disconnect()
+    await hub_session.connect()
+    await eventually(lambda: len(hub.received) == 3 and len(hub.received[2]) >= 1)
+    await asyncio.sleep(0.1)
+    assert hub.requests(connection=2) == []
+    await hub_session.disconnect()
+
+
+async def test_an_outcome_whose_transaction_arrived_meanwhile_is_not_handed_twice(hub):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    await send_orders(hub, hub_session, ((41, "EURUSD"),))
+
+    await hub.connections[0].close()
+    ((request, _),) = outcomes_asked(await asked(hub, 1, connection=1)).values()
+    await hub.push(request_transaction(41))
+    await eventually(lambda: owner.frames)
+    await hub.answer(request, [request_transaction(41)])
+    await asyncio.sleep(0.1)
+
+    assert owner.frames == [request_transaction(41)]
+    assert not owner.log.warning.called
+    await hub_session.disconnect()
+
+
+async def test_a_command_its_transaction_settles_before_its_sender_resumes_is_not_asked_again(hub):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    order = asyncio.create_task(hub_session.order_send({"symbol": "EURUSD"}))
+    (request,) = await asked(hub)
+    count, body = calls.write_result(calls.CALLS[Call.ORDER_SEND], sent(41))
+
+    # The answer and the transaction that settles it, both taken before the sender resumes.
+    hub_session._on_message(
+        binary.encode(binary.Answer(request.request_id, 0, True, 0, count, body))
+    )
+    hub_session._on_message(binary.encode(request_transaction(41)))
+    await asyncio.wait_for(order, 1)
+    await hub.connections[0].close()
+    await eventually(lambda: len(hub.received) == 2 and len(hub.received[1]) >= 1)
+    await asyncio.sleep(0.1)
+
+    assert hub.requests(connection=1) == []
+    assert owner.frames == [request_transaction(41)]
     await hub_session.disconnect()
 
 

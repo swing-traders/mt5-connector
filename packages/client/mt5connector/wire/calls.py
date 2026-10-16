@@ -23,6 +23,9 @@ HISTORY_DEADLINE_S = 45.0
 BUSY_MARGIN_S = 10.0
 # How long a deferred request waits before it is asked again, by default.
 RETRY_AFTER_S = 5.0
+# The most result bytes an EA's answer part carries, which keeps its frame within the hub's 1 MiB
+# message limit.
+PART_BYTES = 1_000_000
 
 _TICKS = np.dtype(list(mirror.TICKS.dtype))
 _RATES = np.dtype(list(mirror.RATES.dtype))
@@ -86,10 +89,12 @@ class Shape(StrEnum):
     RANGES = "ranges"
     SCHEDULE = "schedule"
     SESSIONS = "sessions"
+    # Records of the three structs one OnTradeTransaction call receives, back to back.
+    TRANSACTIONS = "transactions"
 
 
 # The shapes of a result of rows, which alone travels in parts.
-_ROWS = frozenset({Shape.STRUCTS, Shape.TICKS, Shape.RATES})
+_ROWS = frozenset({Shape.STRUCTS, Shape.TICKS, Shape.RATES, Shape.TRANSACTIONS})
 
 
 class Wait(StrEnum):
@@ -232,36 +237,36 @@ CALLS: dict[Call, Row] = {
         _package(
             Call.COPY_RATES_RANGE,
             mirror.FunctionName.COPY_RATES_RANGE,
-            ChartRole.HISTORY,
+            ChartRole.PUBLISHER,
             Wait.HISTORY,
         ),
         _package(
             Call.COPY_RATES_FROM,
             mirror.FunctionName.COPY_RATES_FROM,
-            ChartRole.HISTORY,
+            ChartRole.PUBLISHER,
             Wait.HISTORY,
         ),
         _package(
             Call.COPY_TICKS_RANGE,
             mirror.FunctionName.COPY_TICKS_RANGE,
-            ChartRole.HISTORY,
+            ChartRole.PUBLISHER,
             Wait.HISTORY,
         ),
         _package(
             Call.COPY_TICKS_FROM,
             mirror.FunctionName.COPY_TICKS_FROM,
-            ChartRole.HISTORY,
+            ChartRole.PUBLISHER,
             Wait.HISTORY,
         ),
         # The hub answers it from the floors it holds and the MaxBars of a terminal_info it asks.
         Row(Call.RANGES, (_SYMBOL,), Shape.RANGES, None, Wait.READ),
+        # A publisher answers each request id its outcome log holds with its REQUEST transaction.
         Row(
             Call.OUTCOMES,
             (_SYMBOL, Argument("request_ids", ArgType.REQUEST_IDS, required=True)),
-            Shape.STRUCTS,
+            Shape.TRANSACTIONS,
             ChartRole.PUBLISHER,
             Wait.READ,
-            binary.TRADE_RESULT,
         ),
         Row(Call.COMMISSION_SCHEDULE, (_SYMBOL,), Shape.SCHEDULE, None, Wait.READ),
         Row(Call.TRADING_SESSIONS, (_SYMBOL,), Shape.SESSIONS, None, Wait.READ),
@@ -422,7 +427,7 @@ def read_ea_result(row: Row, answer: binary.Answer) -> tuple[object, FloorFact |
     reader = Reader(answer.result)
     value = _read_value(row, reader, answer.count, binary.Sender.EA)
     fact = None
-    if row.role is ChartRole.HISTORY and answer.last:
+    if row.wait is Wait.HISTORY and answer.last:
         at = reader.offset
         facts = reader.u8("floors")
         if facts == 1:
@@ -478,6 +483,10 @@ def write_result(row: Row, value: object) -> tuple[int, bytes]:
     elif row.shape is Shape.SCHEDULE:
         count = 1
         binary.write_schedule(writer, value)
+    elif row.shape is Shape.TRANSACTIONS:
+        count = len(value)
+        for transaction in value:
+            binary.write_transaction(writer, transaction)
     else:
         count = 1
         binary.write_sessions(writer, value)
@@ -487,7 +496,7 @@ def write_result(row: Row, value: object) -> tuple[int, bytes]:
 def joined(row: Row, parts: list[object]) -> object:
     """A result from the values of its answer's parts, in order: the rows of every part, or the one
     part of a single-record shape."""
-    if row.shape is Shape.STRUCTS:
+    if row.shape is Shape.STRUCTS or row.shape is Shape.TRANSACTIONS:
         return tuple(record for part in parts for record in part)
     elif row.shape is Shape.TICKS or row.shape is Shape.RATES:
         return np.concatenate(parts)
@@ -498,7 +507,8 @@ def joined(row: Row, parts: list[object]) -> object:
 
 
 def typed(row: Row, value: object) -> object:
-    """A result as a session hands it back: a struct as its record type, rows as numpy arrays."""
+    """A result as a session hands it back: a struct as its record type, rows as numpy arrays,
+    transactions as the frames a live one arrives as."""
     if row.shape is Shape.STRUCT:
         return STRUCT_TYPES[row.layout.name](**value)
     elif row.shape is Shape.STRUCTS:
@@ -542,6 +552,8 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
     elif row.shape is Shape.SCHEDULE:
         _one(row, count)
         return binary.read_schedule(reader)
+    elif row.shape is Shape.TRANSACTIONS:
+        return [binary.read_transaction(reader) for _ in range(count)]
     else:
         _one(row, count)
         return binary.read_sessions(reader)

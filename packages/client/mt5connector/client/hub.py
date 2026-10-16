@@ -4,12 +4,12 @@ hub keeps nothing for a consumer that left.
 
 State: the subscriptions wanted, in the order they were first wanted; the next op id and request id;
 each request in flight with its call, its answer's parts so far, its deadline and the future its
-caller awaits; each command sent and not yet settled, by its MQL5 request id, with its symbol; the
-reconnects NT's client has made, and the one the last hello greeted. An op or a request waits for
-its connection's hello, which the hub needs before any other frame. A change of the wanted set and
-the resend hold one lock across their sends, so the hub receives them in the order the set changed.
-A request in flight when NT's client reconnects fails at once: the hub answers nothing asked on a
-connection that left."""
+caller awaits; each command sent and not yet settled, by its MQL5 request id, with its symbol, kept
+across a disconnect; the reconnects NT's client has made, and the one the last hello greeted. An op
+or a request waits for its connection's hello, which the hub needs before any other frame. A change
+of the wanted set and the resend hold one lock across their sends, so the hub receives them in the
+order the set changed. A request in flight when NT's client reconnects fails at once: the hub
+answers nothing asked on a connection that left."""
 
 from __future__ import annotations
 
@@ -70,20 +70,14 @@ class Answered:
     last_error: int
 
 
-@dataclass(frozen=True)
-class Outcomes:
-    """The final results of commands sent before a reconnect, re-asked by their request ids."""
-
-    symbol: str
-    results: tuple
-
-
 @dataclass
 class _InFlight:
     row: calls.Row
     future: asyncio.Future
     timer: asyncio.TimerHandle
     parts: list = field(default_factory=list)
+    # An order_send's symbol, under which its answer that it was sent leaves it outstanding.
+    symbol: str | None = None
 
 
 def _session_call(row: calls.Row) -> Callable:
@@ -134,7 +128,7 @@ class HubSession:
         self,
         config: MT5Config,
         loop: asyncio.AbstractEventLoop,
-        on_frame: Callable[[binary.Ticks | binary.Bar | binary.TradeTransaction | Outcomes], None],
+        on_frame: Callable[[binary.Ticks | binary.Bar | binary.TradeTransaction], None],
         on_reconnect: Callable[[], None] | None,
         log: Logger,
     ) -> None:
@@ -156,8 +150,9 @@ class HubSession:
         self._tasks: set[asyncio.Task] = set()
 
     async def connect(self) -> None:
-        """Connects to the hub, says hello and subscribes everything wanted; NT's client reconnects
-        with backoff from then on. Raises RuntimeError on a connected session."""
+        """Connects to the hub, says hello, subscribes everything wanted and asks the outcomes of
+        the commands still outstanding; NT's client reconnects with backoff from then on. Raises
+        RuntimeError on a connected session."""
         if self._ws is not None:
             raise RuntimeError("hub session: already connected")
         config = WebSocketConfig(
@@ -175,6 +170,7 @@ class HubSession:
             post_reconnection=self._on_reconnected_off_loop,
         )
         await self._send_wanted()
+        self._track(self._loop.create_task(self._ask_outstanding()))
 
     async def disconnect(self) -> None:
         """Closes the connection, failing every request in flight; the subscriptions stay wanted.
@@ -226,12 +222,11 @@ class HubSession:
         self._next_request_id += 1
         timer = self._loop.call_later(_DEADLINES[row.wait] + _MARGIN_S, self._expired, request_id)
         flight = _InFlight(row, self._loop.create_future(), timer)
+        if call is calls.Call.ORDER_SEND:
+            flight.symbol = arguments["request"]["symbol"]
         self._in_flight[request_id] = flight
         await self._send(binary.encode(binary.Request(request_id, call, count, body)))
-        answered = await flight.future
-        if call is calls.Call.ORDER_SEND and answered.result.retcode == mirror.TRADE_RETCODE_PLACED:
-            self._outstanding[answered.result.request_id] = arguments["request"]["symbol"]
-        return answered
+        return await flight.future
 
     async def deferring(self, call: calls.Call, **arguments: object) -> Answered:
         """The answer to a call, asked again after the delay each deferring answer gives until it is
@@ -337,6 +332,13 @@ class HubSession:
             else:
                 if answer.last:
                     self._end(answer.request_id)
+                    # Outstanding before the next frame is taken: it may be the transaction that
+                    # settles the command.
+                    if (
+                        flight.row.call is calls.Call.ORDER_SEND
+                        and answered.result.retcode == mirror.TRADE_RETCODE_PLACED
+                    ):
+                        self._outstanding[answered.result.request_id] = flight.symbol
                     if not flight.future.done():
                         flight.future.set_result(answered)
 
@@ -370,7 +372,7 @@ class HubSession:
         if frame.transaction["type"] == TransactionType.REQUEST:
             self._outstanding.pop(frame.result["request_id"], None)
 
-    def _handed(self, frame: binary.Ticks | binary.Bar | binary.TradeTransaction | Outcomes):
+    def _handed(self, frame: binary.Ticks | binary.Bar | binary.TradeTransaction):
         """Hands the owner a frame, logging one it fails on, so the stream goes on."""
         try:
             self._on_frame(frame)
@@ -391,12 +393,17 @@ class HubSession:
         self._log.info("hub session: reconnected, subscribing again what is wanted")
         if self._on_reconnect is not None:
             self._on_reconnect()
-        task = self._loop.create_task(self._resume())
+        self._track(self._loop.create_task(self._resume()))
+
+    def _track(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def _resume(self) -> None:
         await self._send_wanted()
+        await self._ask_outstanding()
+
+    async def _ask_outstanding(self) -> None:
         symbols: dict[str, list[int]] = {}
         for request_id, symbol in self._outstanding.items():
             symbols.setdefault(symbol, []).append(request_id)
@@ -405,8 +412,10 @@ class HubSession:
         )
 
     async def _ask_outcomes(self, symbol: str, request_ids: tuple[int, ...]) -> None:
-        """Asks the final results of a symbol's unsettled commands and hands them to the owner; a
-        command no answer settles stays outstanding for the next reconnect."""
+        """Asks the publisher of a symbol for the REQUEST transactions of its unsettled commands and
+        hands the owner each one that settles a command still outstanding, as a live one arrives;
+        the commands the publisher holds no transaction of are dropped with one warning. A command
+        whose outcomes go unanswered stays outstanding for the next connect."""
         try:
             answered = await self.deferring(
                 calls.Call.OUTCOMES, symbol=symbol, request_ids=request_ids
@@ -414,9 +423,25 @@ class HubSession:
         except (HubAnswerError, ResponseLost) as failure:
             self._log.error(f"hub session: the outcomes of {symbol} were not answered: {failure}")
         else:
-            for result in answered.result:
-                self._outstanding.pop(result.request_id, None)
-            self._handed(Outcomes(symbol, answered.result))
+            held = {transaction.result["request_id"] for transaction in answered.result}
+            for transaction in answered.result:
+                # A live transaction may have settled the command while its outcome was asked.
+                if transaction.result["request_id"] in self._outstanding:
+                    self._settle(transaction)
+                    self._handed(transaction)
+            dropped = [
+                request_id
+                for request_id in request_ids
+                if request_id not in held and request_id in self._outstanding
+            ]
+            for request_id in dropped:
+                self._outstanding.pop(request_id, None)
+            if dropped:
+                ids = ", ".join(str(request_id) for request_id in dropped)
+                self._log.warning(
+                    f"hub session: the publisher of {symbol} holds no outcome of requests {ids}; "
+                    "dropped"
+                )
 
 
 def _fail(flight: _InFlight, failure: Exception) -> None:

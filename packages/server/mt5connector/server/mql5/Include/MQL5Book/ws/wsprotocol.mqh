@@ -2,7 +2,8 @@
 //|                                                   wsprotocol.mqh |
 //|                             Copyright 2020-2022, MetaQuotes Ltd. |
 //|                                             https://www.mql5.com |
-//| Modified for mt5-connector: a pong echoes the ping's raw bytes.  |
+//| Modified for mt5-connector: a pong echoes the ping's raw bytes,  |
+//| and the handshake prints nothing.                                |
 //+------------------------------------------------------------------+
 #include "wstools.mqh"
 #include "wsframe.mqh"
@@ -195,7 +196,6 @@ public:
       // wait for response with headers
       const int len = readPacketFromNet(buffer, true);
       string response = CharArrayToString(buffer, 0, WHOLE_ARRAY, CP_UTF8);
-      PrintFormat("Buffer: '%s'", response);
       if(len == 0) return false;
       const int end = StringFind(response, CRLFCRLF);
       if(ArraySize(buffer) > end + StringLen(CRLFCRLF))
@@ -204,8 +204,6 @@ public:
          StringSetLength(response, end);
       }
       WsTools::parseHeaders(response, headers); // re-fill headers from responce
-      Print("Headers: ");
-      ArrayPrint(headers);
       
       if(deflate) adjustCompression(); // look for "Sec-WebSocket-Extensions: permessage-deflate"
       owner.onConnected();

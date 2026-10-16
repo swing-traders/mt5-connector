@@ -68,7 +68,7 @@ WEEK = [[[64_800, 0]]] + [[[0, 61_140], [64_800, 0]]] * 4 + [[[0, 61_020]], []]
     [
         binary.EaHello(ChartRole.SPAWNER, "EURUSD"),
         binary.ChartOpened(ChartRole.PUBLISHER, "US500#"),
-        binary.ChartFailed(ChartRole.HISTORY, "XYZ", 4301),
+        binary.ChartFailed(ChartRole.PUBLISHER, "XYZ", 4301),
         binary.ChartKept(ChartRole.PUBLISHER, "USDJPY", 1, 2),
         binary.Ticks("EURUSD", (TICK, TICK | {"bid": 1.08501})),
         binary.RatesBar("EURUSD", mirror.TIMEFRAME_H1, RATES),
@@ -111,7 +111,7 @@ def test_each_frame_an_ea_sends_decodes_as_the_ea_packs_it(sent):
 
 
 def test_an_eas_hello_is_read_as_its_first_frame():
-    hello = binary.EaHello(ChartRole.HISTORY, "EURUSD")
+    hello = binary.EaHello(ChartRole.PUBLISHER, "EURUSD")
 
     assert binary.decode_hello(encode_ea(hello)) == hello
 
@@ -121,7 +121,7 @@ def test_an_eas_hello_is_read_as_its_first_frame():
     [
         binary.Wanted("EURUSD", True, (mirror.TIMEFRAME_M1, mirror.TIMEFRAME_H1)),
         binary.Wanted("EURUSD", False, ()),
-        binary.OpenChart(ChartRole.HISTORY, "EURUSD"),
+        binary.OpenChart(ChartRole.PUBLISHER, "EURUSD"),
         binary.CloseChart(ChartRole.PUBLISHER, "EURUSD"),
         binary.Duplicate(ChartRole.SPAWNER, "EURUSD"),
         binary.Request(5, 13, 2, b"\x00\x06\x00EURUSD\x01\x01\x00\x00\x00\x00\x00\x00\x00"),

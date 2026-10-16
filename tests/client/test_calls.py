@@ -7,7 +7,7 @@ import pytest
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import CodecError, Writer
 from mt5connector.wire.history_wire import BARS, FloorOrigin, Series
-from mt5connector.wire.push_wire import ChartRole
+from mt5connector.wire.push_wire import ChartRole, TransactionType
 
 Call = calls.Call
 ArgType = calls.ArgType
@@ -24,19 +24,19 @@ SPAWNER_CALLS = {
     Call.HISTORY_ORDERS_GET,
     Call.HISTORY_DEALS_GET,
 }
-PUBLISHER_CALLS = {
-    Call.SYMBOL_SELECT,
-    Call.SYMBOL_INFO,
-    Call.SYMBOL_INFO_TICK,
-    Call.ORDER_SEND,
-    Call.OUTCOMES,
-}
 HISTORY_CALLS = {
     Call.COPY_RATES_RANGE,
     Call.COPY_RATES_FROM,
     Call.COPY_TICKS_RANGE,
     Call.COPY_TICKS_FROM,
 }
+PUBLISHER_CALLS = {
+    Call.SYMBOL_SELECT,
+    Call.SYMBOL_INFO,
+    Call.SYMBOL_INFO_TICK,
+    Call.ORDER_SEND,
+    Call.OUTCOMES,
+} | HISTORY_CALLS
 HUB_CALLS = {Call.RANGES, Call.COMMISSION_SCHEDULE, Call.TRADING_SESSIONS}
 
 
@@ -96,7 +96,6 @@ def test_each_call_is_served_by_the_role_the_design_gives_it():
     assert served == {
         ChartRole.SPAWNER: SPAWNER_CALLS,
         ChartRole.PUBLISHER: PUBLISHER_CALLS,
-        ChartRole.HISTORY: HISTORY_CALLS,
         None: HUB_CALLS,
     }
 
@@ -176,7 +175,7 @@ def test_a_calls_arguments_travel_by_their_wire_types(call, arguments):
         (Call.HISTORY_ORDERS_GET, calls.Shape.STRUCTS, "TradeOrder"),
         (Call.HISTORY_DEALS_GET, calls.Shape.STRUCTS, "TradeDeal"),
         (Call.ORDER_SEND, calls.Shape.STRUCT, "MqlTradeResult"),
-        (Call.OUTCOMES, calls.Shape.STRUCTS, "MqlTradeResult"),
+        (Call.OUTCOMES, calls.Shape.TRANSACTIONS, None),
         (Call.SYMBOL_INFO_TICK, calls.Shape.TICK, None),
         (Call.COPY_TICKS_RANGE, calls.Shape.TICKS, None),
         (Call.COPY_RATES_FROM, calls.Shape.RATES, None),
@@ -359,16 +358,61 @@ def test_a_struct_result_round_trips_and_comes_back_as_its_record_type():
 
 
 def test_struct_rows_in_parts_join_in_order():
-    row = calls.CALLS[Call.OUTCOMES]
+    row = calls.CALLS[Call.POSITIONS_GET]
     first = zeroed(row.layout)
     parts = [
-        calls.read_hub_result(row, _answer(Call.OUTCOMES, [first | {"request_id": 1}], last=False)),
-        calls.read_hub_result(row, _answer(Call.OUTCOMES, [first | {"request_id": 2}], part=1)),
+        calls.read_hub_result(
+            row, _answer(Call.POSITIONS_GET, [first | {"ticket": 1}], last=False)
+        ),
+        calls.read_hub_result(row, _answer(Call.POSITIONS_GET, [first | {"ticket": 2}], part=1)),
     ]
 
     records = calls.typed(row, calls.joined(row, parts))
 
-    assert [record.request_id for record in records] == [1, 2]
+    assert [record.ticket for record in records] == [1, 2]
+
+
+def outcome(
+    request_id: int, retcode=mirror.TRADE_RETCODE_INVALID_EXPIRATION
+) -> binary.TradeTransaction:
+    """A REQUEST transaction as a publisher's outcome log holds it."""
+    return binary.TradeTransaction(
+        zeroed(binary.TRADE_TRANSACTION, type=TransactionType.REQUEST),
+        zeroed(
+            binary.TRADE_REQUEST,
+            action=mirror.TRADE_ACTION_PENDING,
+            symbol="EURUSD",
+            volume=0.01,
+            expiration=60,
+        ),
+        zeroed(binary.TRADE_RESULT, retcode=retcode, request_id=request_id, comment="expiration"),
+    )
+
+
+def test_outcomes_travel_as_the_transactions_they_hold_and_join_across_parts():
+    row = calls.CALLS[Call.OUTCOMES]
+    parts = [
+        calls.read_hub_result(row, _answer(Call.OUTCOMES, [outcome(1)], last=False)),
+        calls.read_hub_result(row, _answer(Call.OUTCOMES, [outcome(2), outcome(3)], part=1)),
+        calls.read_hub_result(row, _answer(Call.OUTCOMES, [], part=2)),
+    ]
+
+    held = calls.typed(row, calls.joined(row, parts))
+
+    assert held == (outcome(1), outcome(2), outcome(3))
+
+
+def test_an_eas_outcomes_are_read_as_the_three_structs_of_each_transaction_back_to_back():
+    row = calls.CALLS[Call.OUTCOMES]
+    writer = Writer()
+    for request_id in (7, 9):
+        binary.write_record(writer, binary.TRADE_TRANSACTION, outcome(request_id).transaction)
+        binary.write_record(writer, binary.TRADE_REQUEST, outcome(request_id).request)
+        binary.write_record(writer, binary.TRADE_RESULT, outcome(request_id).result)
+
+    held, fact = calls.read_ea_result(row, binary.Answer(1, 0, True, 0, 2, writer.payload()))
+
+    assert (held, fact) == ([outcome(7), outcome(9)], None)
 
 
 def test_tick_rows_in_parts_join_into_one_array():

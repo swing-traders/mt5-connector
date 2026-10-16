@@ -2,6 +2,7 @@
 //|                                                     wsclient.mqh |
 //|                             Copyright 2020-2022, MetaQuotes Ltd. |
 //|                                             https://www.mql5.com |
+//| Modified for mt5-connector: a message is queued unprinted.       |
 //+------------------------------------------------------------------+
 #include <MQL5Book/URL.mqh>
 #include "wsframe.mqh";
@@ -97,8 +98,7 @@ public:
    }
 
    void onMessage(IWebSocketMessage *msg) override
-   { // NB: message can be binary, logging as string is just for informing you
-      Print(" > Message ", url, " " , msg.getString());
+   {
       WsTools::push(messages, msg);
    }
     

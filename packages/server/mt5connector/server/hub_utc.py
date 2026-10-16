@@ -141,19 +141,27 @@ def published(
         subscription = Subscription(Stream.BARS, frame.symbol, series)
         passed = Published(subscription, frame.symbol, binary.Bar(frame.symbol, series, bar))
     else:
-        where = binary.FrameKind.TRADE_TRANSACTION.name.lower()
         # MQL5 fills only the type of a request transaction; its request carries the rest.
         if frame.transaction["type"] == TransactionType.REQUEST:
             symbol = frame.request["symbol"]
         else:
             symbol = frame.transaction["symbol"]
-        transaction = binary.TradeTransaction(
-            conversion.record(TRANSACTION_EPOCHS, frame.transaction, f"{where}.transaction"),
-            conversion.record(binary.TRADE_REQUEST.epochs, frame.request, f"{where}.request"),
-            frame.result,
+        transaction = _transaction(
+            conversion, frame, binary.FrameKind.TRADE_TRANSACTION.name.lower()
         )
         passed = Published(Subscription(Stream.TRADE_TRANSACTIONS), symbol, transaction)
     return passed
+
+
+def _transaction(
+    conversion: Conversion, frame: binary.TradeTransaction, where: str
+) -> binary.TradeTransaction:
+    """A transaction with its own and its request's epochs in true UTC."""
+    return binary.TradeTransaction(
+        conversion.record(TRANSACTION_EPOCHS, frame.transaction, f"{where}.transaction"),
+        conversion.record(binary.TRADE_REQUEST.epochs, frame.request, f"{where}.request"),
+        frame.result,
+    )
 
 
 def broker_arguments(
@@ -222,6 +230,8 @@ class Results:
             converted = conversion.rows(mirror.TICKS.epochs, kept, where)
         elif self._row.shape is calls.Shape.RATES:
             converted = self._bars(self._in_window(value, value["time"]), conversion, where)
+        elif self._row.shape is calls.Shape.TRANSACTIONS:
+            converted = [_transaction(conversion, transaction, where) for transaction in value]
         else:
             converted = value
         return converted

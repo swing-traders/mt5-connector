@@ -30,11 +30,10 @@ class Role(StrEnum):
 
 class ChartRole(StrEnum):
     """What an EA serves, as its chart's template sets it: the spawner the account and the charts, a
-    publisher its symbol's streams, reads and commands, a history EA its symbol's history."""
+    publisher its symbol's streams, reads, history and commands."""
 
     SPAWNER = "spawner"
     PUBLISHER = "publisher"
-    HISTORY = "history"
 
 
 class ChartState(StrEnum):
@@ -140,25 +139,25 @@ class CommissionProfitMode(StrEnum):
     LOSS = "SYMBOL_COMMISSION_PROFIT_LOSS"
 
 
-# MqlTradeTransaction's members with their MQL5 types, from the reference's MqlTradeTransaction
-# page, and those holding an epoch on the broker's clock.
+# MqlTradeTransaction's members with their MQL5 types and the MQL5 field each is read by, from the
+# reference's MqlTradeTransaction page, and those holding an epoch on the broker's clock.
 TRANSACTION_MEMBERS = (
-    mirror.Member("deal", mirror.MqlType.ULONG),
-    mirror.Member("order", mirror.MqlType.ULONG),
-    mirror.Member("symbol", mirror.MqlType.STRING),
-    mirror.Member("type", mirror.MqlType.ENUM_TRADE_TRANSACTION_TYPE),
-    mirror.Member("order_type", mirror.MqlType.ENUM_ORDER_TYPE),
-    mirror.Member("order_state", mirror.MqlType.ENUM_ORDER_STATE),
-    mirror.Member("deal_type", mirror.MqlType.ENUM_DEAL_TYPE),
-    mirror.Member("time_type", mirror.MqlType.ENUM_ORDER_TYPE_TIME),
-    mirror.Member("time_expiration", mirror.MqlType.DATETIME),
-    mirror.Member("price", mirror.MqlType.DOUBLE),
-    mirror.Member("price_trigger", mirror.MqlType.DOUBLE),
-    mirror.Member("price_sl", mirror.MqlType.DOUBLE),
-    mirror.Member("price_tp", mirror.MqlType.DOUBLE),
-    mirror.Member("volume", mirror.MqlType.DOUBLE),
-    mirror.Member("position", mirror.MqlType.ULONG),
-    mirror.Member("position_by", mirror.MqlType.ULONG),
+    mirror.Member("deal", mirror.MqlType.ULONG, "deal"),
+    mirror.Member("order", mirror.MqlType.ULONG, "order"),
+    mirror.Member("symbol", mirror.MqlType.STRING, "symbol"),
+    mirror.Member("type", mirror.MqlType.ENUM_TRADE_TRANSACTION_TYPE, "type"),
+    mirror.Member("order_type", mirror.MqlType.ENUM_ORDER_TYPE, "order_type"),
+    mirror.Member("order_state", mirror.MqlType.ENUM_ORDER_STATE, "order_state"),
+    mirror.Member("deal_type", mirror.MqlType.ENUM_DEAL_TYPE, "deal_type"),
+    mirror.Member("time_type", mirror.MqlType.ENUM_ORDER_TYPE_TIME, "time_type"),
+    mirror.Member("time_expiration", mirror.MqlType.DATETIME, "time_expiration"),
+    mirror.Member("price", mirror.MqlType.DOUBLE, "price"),
+    mirror.Member("price_trigger", mirror.MqlType.DOUBLE, "price_trigger"),
+    mirror.Member("price_sl", mirror.MqlType.DOUBLE, "price_sl"),
+    mirror.Member("price_tp", mirror.MqlType.DOUBLE, "price_tp"),
+    mirror.Member("volume", mirror.MqlType.DOUBLE, "volume"),
+    mirror.Member("position", mirror.MqlType.ULONG, "position"),
+    mirror.Member("position_by", mirror.MqlType.ULONG, "position_by"),
 )
 TRANSACTION_EPOCHS = {"time_expiration": mirror.EpochUnit.SECONDS}
 

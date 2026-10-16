@@ -111,8 +111,7 @@ The hub (`mt5connector.server.ws_server`, port `MT5_HUB_PORT`) is the one endpoi
 | Role | What its EA serves |
 |---|---|
 | `spawner` | the account: its reads (account, open positions and orders, deal and order history, the symbol list, terminal facts), the charts the hub requests, the server-time relay and the transactions that name no symbol |
-| `publisher` | one symbol: its ticks, closed bars and transactions, its reads, its trade commands and their outcomes, and its commission schedule and trading sessions |
-| `history` | one symbol's history reads: bars and ticks |
+| `publisher` | one symbol: its ticks, closed bars and transactions, its reads and history reads, its trade commands and their outcomes, and its commission schedule and trading sessions |
 
 - The hub addresses an EA by its role and symbol, the spawner by its role alone. The first EA to say hello for a role and symbol serves it; the hub answers a later one `duplicate`, closes it, and logs a warning. A refused duplicate's frames are dropped silently.
 - The hub keeps no event store and replays nothing: a consumer that reconnects subscribes again and receives what is published from then on.
@@ -179,19 +178,19 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 | `history_orders_get` | 10 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeOrder` rows | read |
 | `history_deals_get` | 11 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeDeal` rows | read |
 | `order_send` | 12 | publisher of the request's `symbol` | `request` | `MqlTradeResult` | command |
-| `copy_rates_range` | 13 | history | `symbol`, `timeframe`, `date_from`, `date_to` | bars | history |
-| `copy_rates_from` | 14 | history | `symbol`, `timeframe`, `date_from`, `count` | bars | history |
-| `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags` | `MqlTick` rows | history |
-| `copy_ticks_from` | 16 | history | `symbol`, `date_from`, `count`, `flags` | `MqlTick` rows | history |
+| `copy_rates_range` | 13 | publisher | `symbol`, `timeframe`, `date_from`, `date_to` | bars | history |
+| `copy_rates_from` | 14 | publisher | `symbol`, `timeframe`, `date_from`, `count` | bars | history |
+| `copy_ticks_range` | 15 | publisher | `symbol`, `date_from`, `date_to`, `flags` | `MqlTick` rows | history |
+| `copy_ticks_from` | 16 | publisher | `symbol`, `date_from`, `count`, `flags` | `MqlTick` rows | history |
 | `ranges` | 17 | the hub | `symbol` | the terminal's `maxbars` (int64), then each floor held: `series`, `floor`, `measured_at`, `generation` (int64) | read |
-| `outcomes` | 18 | publisher | `symbol`, `request_ids` | `MqlTradeResult` rows | read |
+| `outcomes` | 18 | publisher | `symbol`, `request_ids` | per request id its outcome log holds, the `MqlTradeTransaction`, `MqlTradeRequest` and `MqlTradeResult` of its `REQUEST` transaction, back to back | read |
 | `commission_schedule` | 19 | the hub | `symbol` | the schedule, laid out as a `commissions` frame's after its symbol | read |
 | `trading_sessions` | 20 | the hub | `symbol` | the sessions, laid out as a `sessions` frame's after its symbol | read |
 
 - Arguments travel by the inventory's parameter kinds: integers as int64, floats as float64, strings as `str`, a boolean as u8, a time as int64 epoch seconds, `request` as an `MqlTradeRequest` record, `request_ids` as a u32 count and each id as a u32. A required argument missing, an argument out of the call's order or of the wrong type, or a history query in none of its call forms is a frame the hub cannot handle; a session refuses it before sending. A bar read of a timeframe no series serves is refused too.
 - `last_error` is the MQL5 `GetLastError()` the EA read after the call, folded into every answer; the hub's own answers carry 0.
 - A result of rows travels in parts, numbered from 0, the last flagged; an EA's part carries at most 1,000,000 result bytes, which keeps its frame within the hub's 1 MiB message limit; an EA's last part of a history read carries a floor fact after its rows — a u8 count, 0 or 1, and for 1 the floor (int64 on the broker's clock, seconds for bars and milliseconds for ticks) and what set it, `stub` or `coarse`. The hub keeps that floor for `ranges` and passes the rows on without it.
-- `order_send` is served through `OrderSendAsync`: its answer, the `MqlTradeResult` with its `request_id` and retcode 10008, means sent; the final result arrives as the `REQUEST` transaction carrying the same `request_id`, and `outcomes` answers the final results a publisher holds of the request ids it is asked.
+- `order_send` is served through `OrderSendAsync`: its answer, the `MqlTradeResult` with its `request_id` and retcode 10008, means sent; the venue's verdict arrives as the `REQUEST` transaction carrying the same `request_id`. A publisher keeps the last 1,000 `REQUEST` transactions of its symbol, and `outcomes` answers those of the request ids it is asked; an id it no longer holds is absent from the answer.
 - `ranges` answers the floors the hub holds for the symbol, in true UTC, beside the `maxbars` of a `terminal_info` the hub asks the spawner for it; `commission_schedule` and `trading_sessions` answer the latest relay of the symbol's publisher.
 
 ### Every request ends
@@ -232,15 +231,25 @@ Every request is answered once, by a result or an error, and nothing comes after
 
 ### The EA
 
-The EA, `ticks.mq5`, sends JSON text frames, which the hub refuses as text; what it does inside the terminal:
+The EA, `ticks.mq5`, is one program in two roles, the `Role` its chart's template sets, and every frame it sends and reads is binary:
 
-- It publishes one `trade_transaction` frame per `OnTradeTransaction` call whose symbol is its own, in the order the calls arrive, whatever the magic; the spawner also each one that names no symbol, such as a pending order's delete or modify sent without one. Every EA receives the account's whole transaction stream, so the filter publishes each transaction once; a transaction of a symbol no chart publishes, naming one, reaches the hub zero times.
-- While the hub wants its ticks it publishes them from its tick database — `COPY_TICKS_INFO`, the ticks that change the bid or the ask — from the moment they are wanted, read at every tick and again on its timer, since the terminal queues no tick event while one is queued or handled. It publishes the bar that closed for each wanted timeframe, found on its timer and its ticks when the forming bar's open moves.
-- Every `RelaySeconds` it sends `server_time`, and its symbol's commission schedule and trading sessions.
-- It reads the hub on its timer and on every tick, so the vendored library answers the hub's pings and acknowledges a close. While disconnected it reconnects every `ReconnectIntervalSec` on `TimeLocal()`, and it publishes no ticks or bars until the reconnected hub wants them again.
-- On `duplicate` it closes its own chart, which unloads it. The spawner instead keeps its chart and says hello again on each reconnect, since the publisher may be its own terminal's earlier connection, which the hub drops at most 50 s after its last pong while its writes to it drain; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
-- The spawner, on `open_chart`, selects the symbol and opens an M1 chart of it with the template `ChartTemplate`, unless a chart of the symbol already runs this EA or a chart it opened for the symbol is still open — the template's EA loads only once the chart has processed the template. It answers `chart_opened`, or `chart_failed` naming the call that failed — `SymbolSelect`, `ChartOpen` or `ChartApplyTemplate` — and its error.
-- The spawner, on `close_chart`, first counts the account's open positions and pending orders on the symbol: while it holds any, the chart stays and the spawner answers `chart_kept`. Otherwise it closes the symbol's chart — the one it opened, or for a publisher that predates it, the chart of the symbol running the EA — then takes the symbol out of Market Watch, and deselects it all the same when it finds no such chart. The terminal refuses that while a chart of the symbol is open or it has open positions, so a refused deselect is tried again on each timer tick until it succeeds or the symbol's chart opens again, and only every 15 minutes, logged once, while positions or orders hold the symbol.
+- Its half of the protocol is `Include/hub_wire.mqh`, which the image's build writes from the installed wheel's wire inventory with `python -m mt5connector.server.mql5gen <path>`: the header's constants, the frame, error and call codes, the chart roles, the calls each role serves with their arguments, and a writer of every struct an EA sends — and a reader of the trade request — each member read by the MQL5 property `mirror.py` names for it, in the inventory's order.
+- `Include/hub_codec.mqh` packs and reads the fields: little-endian numbers, a `str` as its u16 byte count and UTF-8 bytes, `MqlTick` and `MqlRates` by `StructToCharArray`, whose 60-byte packing the EA checks at start, failing its init otherwise.
+
+What it does inside the terminal:
+
+- **Every EA** says hello with its role and symbol, and marks its chart with its role in the chart's comment, `ticks publisher` for a publisher. It reads the hub on its timer, every `PollMilliseconds`, and on every tick, so the vendored library answers the hub's pings and acknowledges a close. While disconnected it reconnects every `ReconnectIntervalSec` on `TimeLocal()`, and a publisher publishes no ticks or bars until the reconnected hub wants them again.
+- **Requests** are answered once each, under their correlation id, in the order they arrive: a result's records in parts as [Calls](#calls) lays them out, each part carrying the `GetLastError()` the call left; or `ea_error` with the error the call met. No call a spawner or a publisher serves waits beyond a local read, so neither sends `busy`.
+  - A call its role does not serve, and a `group` filter, are answered `ea_error` with `ERR_FUNCTION_NOT_ALLOWED` (4014); arguments out of the call's layout with `ERR_INVALID_PARAMETER` (4003).
+  - The spawner serves `account_info`, `terminal_info`, `symbols_total` and `symbols_get`, every symbol the terminal knows, in Market Watch or not; `positions_get` and `orders_get` by `symbol`, by `ticket`, by both, or every one with neither; and `history_orders_get` and `history_deals_get` by `ticket`, else by `position`, else by window — as the package reads them, `history_deals_get`'s `ticket` names an order and answers every deal of it. An order ticket the history does not hold answers no record, the selection's error its `last_error`.
+  - A publisher serves `symbol_select`, `symbol_info`, `symbol_info_tick`, `order_send` and `outcomes`, and answers the four history reads `ea_error` with `ERR_FUNCTION_NOT_ALLOWED`.
+- **Commands.** A publisher sends an `order_send`'s `MqlTradeRequest` as it came through `OrderSendAsync` and answers the `MqlTradeResult` at once: retcode 10008 and a `request_id` mean sent, and a request the terminal refuses itself answers with the retcode, comment and error that say why. The venue's verdict is the `REQUEST` transaction carrying that `request_id`, which the publisher publishes and keeps in its outcome log of the last 1,000, connected or not.
+- **Transactions.** A publisher publishes one `trade_transaction` frame per `OnTradeTransaction` call whose symbol is its own, in the order the calls arrive, whatever the magic; the spawner each one that names no symbol, such as a pending order's delete or modify sent without one. Every EA receives the account's whole transaction stream, so the filter publishes each transaction once; a transaction of a symbol no chart publishes, naming one, reaches the hub zero times.
+- **Ticks and bars.** While the hub wants a publisher's ticks it publishes them from its tick database — `COPY_TICKS_INFO`, the ticks that change the bid or the ask — from the moment they are wanted, read at every tick and again on its timer, since the terminal queues no tick event while one is queued or handled; each read's new ticks travel in one `tick` frame. It publishes the bar that closed for each wanted timeframe, found on its timer and its ticks when the forming bar's open moves.
+- **Relays.** Every `RelaySeconds` the spawner sends `server_time`, and a publisher its symbol's commission schedule and trading sessions.
+- **Duplicates.** On `duplicate` an EA closes its own chart, which unloads it. The spawner instead keeps its chart and says hello again on each reconnect, since the EA served may be its own terminal's earlier connection, which the hub drops at most 50 s after its last pong while its writes to it drain; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
+- **Charts.** The spawner and the publisher of its own symbol are two charts. The spawner, on `open_chart` for a publisher's symbol, answers `chart_opened` when a chart of the symbol marked with the role runs the EA, or when a chart it opened for them is still loading its EA — a template's EA loads only once the chart has processed the template. A marked chart whose EA is gone takes the template `ChartTemplate` again. Otherwise it selects the symbol and opens an M1 chart of it with `ChartTemplate`. A failure is answered `chart_failed` with the failing call's error — `SymbolSelect`, `ChartOpen` or `ChartApplyTemplate`, which its log names.
+- The spawner, on `close_chart`, first counts the account's open positions and pending orders on the symbol: while it holds any, the chart stays and the spawner answers `chart_kept`. Otherwise it closes the chart of the role and symbol — the one it opened, or one its comment marks — then takes the symbol out of Market Watch once no other chart of it is open, and all the same when it finds no such chart. The terminal refuses that while a chart of the symbol is open or it has open positions, so a refused deselect is tried again on each timer tick until it succeeds or a chart of the symbol opens again, and only every 15 minutes, logged once, while positions or orders hold the symbol.
 
 ---
 
@@ -402,19 +411,20 @@ The wheel carries their source; `python -c "import mt5connector.server, pathlib;
 |---|---|
 | `Expert/ticks.mq5` | `Experts\ticks.mq5` |
 | `Scripts/ticks_setup.mq5` | `Scripts\ticks_setup.mq5` |
-| `Include/JAson.mqh` | `Include\JAson.mqh` |
+| `Include/hub_codec.mqh` | `Include\hub_codec.mqh` |
 | `Include/MQL5Book/` | `Include\MQL5Book\` |
+| — | `Include\hub_wire.mqh`, which `python -m mt5connector.server.mql5gen <path>` writes from the wire inventory |
 
 Both sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `Experts\ticks.ex5` and `Scripts\ticks_setup.ex5`. Under Wine, MetaEditor has these quirks:
 
 - Its name is `MetaEditor64.exe`, capital M and E, on a volume that is case-sensitive.
 - It honours only the last `/compile:` argument of an invocation: each source is compiled by its own.
-- It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5`, with the `Include\` tree beside it — and the `.ex5` copied into place.
+- It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5` — and the `.ex5` copied into place. An `#include <...>` resolves in the terminal's `MQL5\Include\`, so the includes are placed there first.
 - A clean compile writes `0 errors, 0 warnings` to its `/log:` file; a missing `.ex5` is a failed compile.
 
-The image's build places and compiles them with `image/install-ea.sh`, from the wheel in the Windows Python, under Xvfb. It fails unless both `.ex5` appear and each `/log:` file's `Result:` line reads `0 errors, 0 warnings`, and its log prints both lines.
+The image's build places and compiles them with `image/install-ea.sh`, from the wheel in the Windows Python, under Xvfb, after generating `hub_wire.mqh` with the Linux Python's copy of the same wheel; its log names the generated file. It fails unless both `.ex5` appear and each `/log:` file's `Result:` line reads `0 errors, 0 warnings`, and its log prints both lines.
 
-On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on, which the server's start checks the broker lists, and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA for that symbol.
+On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on, which the server's start checks the broker lists, and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with `ticks.tpl`, which attaches the EA as that symbol's publisher.
 
 - The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's included.
 - A chart the spawner opens on demand that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
@@ -425,7 +435,7 @@ On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on,
 
 #### The chart template
 
-Two templates attach the EA: `ticks_spawner.tpl`, with `Spawner=true`, and `ticks.tpl`, with `Spawner=false`. Each goes in `MQL5\Profiles\Templates\` and in `Profiles\Templates\`, the two places a template applied by bare name is looked for, and must be in the form the terminal saves templates in:
+Two templates attach the EA, one per role: `ticks_spawner.tpl` with `Role=0`, and `ticks.tpl` with `Role=1` for a publisher — an enum input takes its value, `ENUM_CHART_ROLE`'s in `hub_wire.mqh`. Each goes in `MQL5\Profiles\Templates\` and in `Profiles\Templates\`, the two places a template applied by bare name is looked for, and must be in the form the terminal saves templates in:
 
 - UTF-16LE with a byte-order mark (`FF FE`), and CRLF line ends;
 - a root `<chart>` section — its symbol and period are ignored, the chart keeps its own;
@@ -437,11 +447,11 @@ name=ticks
 path=Experts\ticks.ex5
 expertmode=5
 <inputs>
+Role=1
 Server=ws://127.0.0.1:9000
 ReconnectIntervalSec=3
 RelaySeconds=5
-PollMilliseconds=250
-Spawner=false
+PollMilliseconds=16
 ChartTemplate=ticks.tpl
 HubPingTimeoutSec=50
 </inputs>
@@ -450,12 +460,12 @@ HubPingTimeoutSec=50
 
 | EA input | Meaning |
 |---|---|
+| `Role` | the EA's role: `0` the spawner, which opens and closes the charts the hub asks for, `1` a publisher |
 | `Server` | the hub's URL, `ws://127.0.0.1:<MT5_HUB_PORT>` |
 | `ReconnectIntervalSec` | the fewest seconds between two attempts to reach the hub while the EA is not connected |
-| `RelaySeconds` | the interval between server-time frames, and the symbol's commission schedule and trading sessions. It must stay below `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, or the clock never verifies |
-| `PollMilliseconds` | the EA's timer: the interval between reads of the hub, of the symbol's ticks and closed bars, and of the connection; the terminal fires it no faster than every 10–16 ms |
-| `Spawner` | `true` in `ticks_spawner.tpl`, `false` in `ticks.tpl`: whether the EA opens and closes the charts the hub asks for |
-| `ChartTemplate` | the template the spawner applies to a chart it opens, `ticks.tpl` |
+| `RelaySeconds` | the interval between the spawner's server-time frames, and a publisher's commission schedules and trading sessions. It must stay below `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, or the clock never verifies |
+| `PollMilliseconds` | the EA's timer: the interval between reads of the hub, of the symbol's ticks and closed bars, and of the connection, and so the longest a request waits for its read; the terminal fires it no faster than every 10–16 ms, which `16` matches |
+| `ChartTemplate` | the template the spawner applies to a chart it opens for a publisher, `ticks.tpl` |
 | `HubPingTimeoutSec` | how long after its first refusal the spawner, answered `duplicate`, says hello again before it closes its chart: the longest the hub takes to drop a dead connection while its writes to it drain, `50` s — its 10 s ping interval, its 30 s ping timeout and the 10 s close timeout of its WebSocket server |
 
 <details>
@@ -530,11 +540,11 @@ name=ticks
 path=Experts\ticks.ex5
 expertmode=5
 <inputs>
+Role=1
 Server=ws://127.0.0.1:9000
 ReconnectIntervalSec=3
 RelaySeconds=5
-PollMilliseconds=250
-Spawner=false
+PollMilliseconds=16
 ChartTemplate=ticks.tpl
 HubPingTimeoutSec=50
 </inputs>
@@ -566,7 +576,7 @@ fixed_height=-1
 
 </details>
 
-The image's build writes both templates from `image/ticks.tpl.in`, filling in the hub's port and `Spawner`.
+The image's build writes both templates from `image/ticks.tpl.in`, filling in the hub's port and `Role`.
 
 #### The allowlist
 

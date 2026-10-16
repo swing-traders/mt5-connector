@@ -602,6 +602,21 @@ def read_pod(reader: Reader, layout_: struct.Struct, array: mirror.Array) -> dic
     return dict(zip(array.names, reader.unpack(layout_, array.name), strict=True))
 
 
+def write_transaction(writer: Writer, transaction: TradeTransaction) -> None:
+    """Packs the three structs one OnTradeTransaction call receives, back to back."""
+    write_record(writer, TRADE_TRANSACTION, transaction.transaction)
+    write_record(writer, TRADE_REQUEST, transaction.request)
+    write_record(writer, TRADE_RESULT, transaction.result)
+
+
+def read_transaction(reader: Reader) -> TradeTransaction:
+    return TradeTransaction(
+        read_record(reader, TRADE_TRANSACTION),
+        read_record(reader, TRADE_REQUEST),
+        read_record(reader, TRADE_RESULT),
+    )
+
+
 # ── The commission and sessions bodies ───────────────────────────────────────
 
 _RULE_NAMES = (
@@ -744,9 +759,7 @@ def encode(frame: Frame) -> bytes:
         write_pod(writer, BAR, BARS, frame.bar)
     elif isinstance(frame, TradeTransaction):
         kind = FrameKind.TRADE_TRANSACTION
-        write_record(writer, TRADE_TRANSACTION, frame.transaction)
-        write_record(writer, TRADE_REQUEST, frame.request)
-        write_record(writer, TRADE_RESULT, frame.result)
+        write_transaction(writer, frame)
     elif isinstance(frame, Request):
         kind = FrameKind.REQUEST
         correlation = frame.request_id
@@ -862,11 +875,7 @@ def _payload(
             raise CodecError(f"offset {reader.offset}: a bar of the {series} series")
         frame = Bar(symbol, series, read_pod(reader, BAR, BARS))
     elif kind is FrameKind.TRADE_TRANSACTION:
-        frame = TradeTransaction(
-            read_record(reader, TRADE_TRANSACTION),
-            read_record(reader, TRADE_REQUEST),
-            read_record(reader, TRADE_RESULT),
-        )
+        frame = read_transaction(reader)
     elif kind is FrameKind.SERVER_TIME:
         frame = ServerTime(
             _symbol(reader),

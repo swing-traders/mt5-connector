@@ -11,7 +11,7 @@ import pytest
 from mt5connector.wire import binary, mirror
 from mt5connector.wire.binary import CodecError, ErrorKind, FrameKind, Sender
 from mt5connector.wire.history_wire import Series
-from mt5connector.wire.push_wire import Stream, Subscription
+from mt5connector.wire.push_wire import ChartRole, Stream, Subscription
 
 # Each struct's members that travel, in the package's order, with the MQL5 accessor family the
 # property-types table reads each by — integer, double, string — and its members declared bool.
@@ -363,7 +363,7 @@ def test_a_consumers_hello_is_read_as_its_first_frame():
     [
         (binary.Wanted("EURUSD", True, (1, 16385)), Sender.HUB),
         (binary.OpenChart("publisher", "EURUSD"), Sender.HUB),
-        (binary.CloseChart("history", "EURUSD"), Sender.HUB),
+        (binary.CloseChart(ChartRole.PUBLISHER, "EURUSD"), Sender.HUB),
         (binary.Duplicate("spawner", "EURUSD"), Sender.HUB),
         (binary.Request(1, 1, 0, b""), Sender.HUB),
     ],
