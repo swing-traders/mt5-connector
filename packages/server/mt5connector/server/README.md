@@ -168,7 +168,7 @@ The repository's `Dockerfile` builds one image that runs the terminal, the HTTP 
 | Component | Where it is pinned |
 |---|---|
 | the base, `mambaorg/micromamba` on Debian 13 | by tag in the final stage's `FROM` |
-| WineHQ stable, amd64 and i386 | `ARG VERSION_WINE` |
+| WineHQ devel, amd64 and i386 | `ARG VERSION_WINE` |
 | wine-mono | `image/artifacts.txt` |
 | the Windows Python, python.org's x64 installer, at `C:\Python` | `image/artifacts.txt` |
 | the Linux Python, the base environment at `/opt/conda` | `environment.yml` |
@@ -244,7 +244,7 @@ The credentials reach the processes as environment variables at start; the image
 | the HTTP server | the Windows Python, under Wine in the terminal's prefix: the `MetaTrader5` package it drives the terminal through is Windows-only | `mt5-connector-server`, or `python -m mt5connector.server.app` |
 | the hub | the image's Linux Python | `mt5-connector-hub`, or `python -m mt5connector.server.ws_server` |
 
-- Both Pythons install the one wheel of `mt5-connector-server` the build makes from the checkout. Its dependencies pin `MetaTrader5` on Windows alone, `numpy` at 2.2.1 because later releases crash under Wine, and `tzdata` because the Windows Python has no zone database. The hub imports none of these, but installing the distribution brings them all, and numpy 2.2.1 publishes wheels for CPython 3.10 to 3.13 only.
+- Both Pythons install the one wheel of `mt5-connector-server` the build makes from the checkout. Its dependencies pin `MetaTrader5` on Windows alone and `tzdata` because the Windows Python has no zone database. The hub imports neither, but installing the distribution brings them both.
 - The hub posts every relayed server time, commission schedule and trading sessions to `127.0.0.1`, the server posts the symbols it reads to the hub's chart route on `127.0.0.1`, and each accepts those routes from `127.0.0.1` alone: the two share a loopback.
 - At start the server initializes the terminal named by `MT5_TERMINAL_PATH` with the account's login, password and server, and exits non-zero when that fails.
 - Once the terminal reports itself connected with the broker's symbol list loaded, the server asks it for the definition of `MT5_SPAWNER_SYMBOL`, and exits non-zero with `spawner symbol <symbol> is not listed at the broker` when it has none: the startup script never runs on a chart without a symbol, so no EA would ever relay.
@@ -520,7 +520,6 @@ The build also:
 - `image/artifacts.txt` lists every file the download stage fetches, one per line as `<name> <url> <sha256>`: its URL carries the version, its hash pins the bytes, and nothing else states that version. One build step fetches them all and checks every hash, so a changed upstream file fails the build.
 - A downloaded artifact is bumped by editing its row's URL and `sha256sum` and nothing else. The WineHQ packages are bumped by `VERSION_WINE` alone.
 - `image/requirements-wine.txt` is a pip `--require-hashes` file, binary wheels only: the server's dependency closure for the Windows Python, every package at its version with the hash of its `cp313` `win_amd64` wheel or its pure wheel. A change to the server's dependencies, or to the Windows Python's minor version, updates it in the same change.
-- numpy is held at `2.2.1` by the server's own pin: later releases crash on import under Wine 10.0, calling `ucrtbase.dll.crealf`, which Wine 10.0 does not implement.
 
 ### The terminal build
 
@@ -530,7 +529,7 @@ The build starts the installed terminal once with `/portable`, waits up to 180 s
 podman run --rm --entrypoint cat mt5-connector-server /home/mt5/.terminal-build
 ```
 
-`mt5setup.exe` is a web installer: its own bytes are pinned, but it installs whatever terminal build MetaQuotes currently serves, so two builds from identical inputs can carry different terminal builds. Nothing stops the terminal's own update check: it never applies an update by itself, so the build an image baked is the one it runs. The installer exits 1 after a successful install, so the build checks the terminal's first start rather than the installer's exit code; without network access it hangs instead of failing, so the build gives it 600 s and fails the step when that runs out.
+`mt5setup.exe` is a web installer: its own bytes are pinned, but it installs whatever terminal build MetaQuotes currently serves, so two builds from identical inputs can carry different terminal builds. Nothing stops the terminal's own update check: it never applies an update by itself, so the build an image baked is the one it runs. The installer exits 1 after a successful install, so the build checks the terminal's first start rather than the installer's exit code; without network access, or with a terminal that cannot start, it hangs instead of failing and ignores a termination signal, so the build kills it after 600 s and fails the step.
 
 The files the build downloads itself and the Windows Python's packages are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend both projects build with, resolve at build time as `environment.yml` and the two `pyproject.toml` files declare them.
 
