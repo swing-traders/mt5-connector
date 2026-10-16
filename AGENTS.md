@@ -298,7 +298,7 @@ The design documents itself in-repo: `packages/server/mt5connector/server/` modu
 - **The bootstrap gate.** While the clock is not verified against a fresh server-time sample the EA relayed from a terminal connected without a break for one sample max-age, every route but `/health` and the relays — the server time's, the commission schedules' and the trading sessions' — answers 503 with the failure envelope and `Retry-After`, and `/health` answers 503 itself; health reads that verification state and never calls the terminal. The relay routes accept loopback callers only. A missed bootstrap window, a verified mismatch, or a spawner symbol the terminal has no definition of once connected with its symbol list loaded exits the server process.
 - **One worker is always free.** Every call that can reach the terminal or the hub — the mirror routes, the three history routes and the commission and sessions reads — takes a slot from a pool one smaller than the worker count (`MT5_API_THREADS`, at least 2), without waiting, and a read's publisher check runs inside its slot; a call that finds none is refused at once with the busy code and `Retry-After`, never queued on a worker. `/health` and the relays take no slot. The worker count is set from the peak `/health` reports, with a margin, so normal operation never refuses.
 - **No authentication.** The API and the hub trust their network. The image publishes no host port, loopback included, so both are reachable on the container network alone; publishing one is a design change.
-- **Two Pythons, one distribution.** The Flask app runs under Wine's Windows Python (the terminal's package is Windows-only) and the hub under a Linux Python; both install `mt5-connector-server`, whose `pyproject.toml` declares every server dependency: `MetaTrader5` under the Windows marker, `numpy` held at 2.2.1, `tzdata` pinned because the Windows Python has no system zone database.
+- **Two Pythons, one distribution.** The Flask app runs under Wine's Windows Python (the terminal's package is Windows-only) and the hub under a Linux Python; both install `mt5-connector-server`, whose `pyproject.toml` declares every server dependency: `MetaTrader5` under the Windows marker, `tzdata` pinned because the Windows Python has no system zone database.
 - **The image contract lives in the server's README.** A change to a setting, an entry point, the EA's inputs, what the terminal needs or how the image builds and boots updates its "What the image provides" section in the same change.
 
 ---
@@ -397,7 +397,6 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 - **The WebRequest/socket allowlist lives in memory** and is wiped by any terminal restart; the `setup.ini` `WebRequestUrl` key is MT4-only and MT5 ignores it. The image re-adds `127.0.0.1` after each start, and clicking OK re-initialises attached EAs.
 - **`MetaTrader5.initialize()` blocks on an IPC timeout without an account.**
-- **The Windows Python's `numpy` is held at 2.2.1**: later releases crash under Wine 10.
 - **The terminal never updates itself**; its update dialog is harmless and nothing prevents it.
 
 ---

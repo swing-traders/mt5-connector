@@ -2,7 +2,7 @@
 # server under the Windows Python and its push hub under the environment's Linux Python, headless.
 # Build context: the repository root. The Wine apt version is the one version held here; every
 # downloaded artifact is versioned by its row in image/artifacts.txt.
-ARG VERSION_WINE=10.0.0.0~trixie-1
+ARG VERSION_WINE=11.19~trixie-1
 
 FROM docker.io/library/debian:trixie-slim AS fetch
 
@@ -31,7 +31,7 @@ LABEL org.opencontainers.image.source=https://github.com/swing-traders/mt5-conne
 USER root
 COPY --from=fetch /artifacts/winehq.key /etc/apt/keyrings/winehq-archive.key
 
-# WineHQ's wine-stable hard-depends on its i386 half. rsync restores the terminal's baked state at
+# WineHQ's wine-devel hard-depends on its i386 half. rsync restores the terminal's baked state at
 # every start.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && dpkg --add-architecture i386 \
@@ -47,10 +47,10 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         > /etc/apt/sources.list.d/winehq.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        winehq-stable="$VERSION_WINE" \
-        wine-stable="$VERSION_WINE" \
-        wine-stable-amd64="$VERSION_WINE" \
-        wine-stable-i386="$VERSION_WINE" \
+        winehq-devel="$VERSION_WINE" \
+        wine-devel="$VERSION_WINE" \
+        wine-devel-amd64="$VERSION_WINE" \
+        wine-devel-i386="$VERSION_WINE" \
         xvfb \
         xauth \
         fonts-liberation \
@@ -93,13 +93,14 @@ RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
             -r Z:/artifacts/requirements-wine.txt; \
         wineserver -w'
 
-# The web installer fetches whatever terminal build is current. It exits 1 after a successful
-# install, so the first start is the success check; offline it hangs instead of failing. The history
-# store ships empty, so the volume mounted on it starts with nothing from the image.
+# The web installer fetches whatever terminal is current. It exits 1 after a successful install, so
+# the first start is the success check. When it cannot finish, offline or with a terminal that
+# cannot start, it hangs and ignores SIGTERM, so the bound kills it. The history store ships empty,
+# so the volume mounted on it starts with nothing from the image.
 RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
     xvfb-run -a sh -c ' \
-        timeout 600 wine /artifacts/mt5setup.exe /auto; \
-        if [ $? -eq 124 ]; then \
+        timeout -s KILL 600 wine /artifacts/mt5setup.exe /auto; \
+        if [ $? -eq 137 ]; then \
             wineserver -k; \
             echo "mt5setup.exe: no exit within 600s" >&2; \
             exit 1; \
