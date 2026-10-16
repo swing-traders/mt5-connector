@@ -1,5 +1,5 @@
 """Commission schedules the terminal's EAs relay from SymbolInfoCommissions, kept per symbol, and
-the shape of the frame that relays one.
+the shape of the body that relays one.
 
 State: the outcome of the latest relay for each symbol, its schedule or the refusal of its frame. An
 absent symbol has never been relayed, a successful empty schedule confirms no rule, and a refusal
@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from mt5connector.server.wire.push_wire import (
-    PROTOCOL_VERSION,
     CommissionChargeMode,
     CommissionDirectionMode,
     CommissionEntryMode,
@@ -17,10 +16,9 @@ from mt5connector.server.wire.push_wire import (
     CommissionProfitMode,
     CommissionRangeMode,
     CommissionVolumeType,
-    FrameType,
 )
 
-_FRAME_FIELDS = ("v", "type", "symbol", "ret", "last_error", "rules")
+_FRAME_FIELDS = ("symbol", "ret", "last_error", "rules")
 _RULE_FIELDS = (
     "currency",
     "mode_range",
@@ -105,16 +103,12 @@ class CommissionStore:
 
 
 def commissions_refusal(frame: object, symbol: str) -> str | None:
-    """Why a body relayed for `symbol` is not its commissions frame, or None when it is."""
+    """Why a body relayed for `symbol` is not its commission schedule, or None when it is."""
     if not isinstance(frame, dict):
         return "request body is not a JSON object"
     refusal = _fields_refusal(frame, _FRAME_FIELDS, "")
     if refusal is not None:
         return refusal
-    elif not (_is_integer(frame["v"]) and frame["v"] == PROTOCOL_VERSION):
-        return f"unsupported frame version: {frame['v']!r}"
-    elif frame["type"] != FrameType.COMMISSIONS:
-        return f"not a {FrameType.COMMISSIONS} frame: {frame['type']!r}"
     elif not (isinstance(frame["symbol"], str) and frame["symbol"]):
         return f"not a symbol: {frame['symbol']!r}"
     elif frame["symbol"] != symbol:
@@ -132,7 +126,7 @@ def commissions_refusal(frame: object, symbol: str) -> str | None:
 
 
 def commission_schedule(frame: dict) -> CommissionSchedule:
-    """The schedule a commissions frame carries, each name as the member it names; the frame is one
+    """The schedule a relayed body carries, each name as the member it names; the body is one
     commissions_refusal accepts."""
     rules = []
     for rule in frame["rules"]:

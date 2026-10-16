@@ -1,12 +1,12 @@
-"""A double of the client's push channel, handing each frame a test delivers to its owner, and the
+"""A double of the client's hub session, handing each frame a test delivers to its owner, and the
 frames the hub pushes."""
 
-from mt5connector.wire import mirror
-from mt5connector.wire.push_wire import RESULT_FIELDS, TRANSACTION_FIELDS, TransactionType
+from mt5connector.wire import binary, mirror
+from mt5connector.wire.push_wire import TransactionType
 
 
-class PushDouble:
-    """Stands in for PushClient, taking its constructor's arguments."""
+class SessionDouble:
+    """Stands in for HubSession, taking its constructor's arguments."""
 
     def __init__(self, config, loop, on_frame, on_reconnect, log):
         self.on_frame = on_frame
@@ -30,30 +30,37 @@ class PushDouble:
             self.wanted.remove(subscription)
 
     def deliver(self, frame):
-        """Hands the frame to the owner as the channel does, logging one the owner fails on."""
+        """Hands the frame to the owner as the session does, logging one the owner fails on."""
         try:
             self.on_frame(frame)
         except Exception as exc:
-            self.log.exception(f"push: a {frame['type']} frame failed", exc)
+            self.log.exception(f"hub session: a {type(frame).__name__} frame failed", exc)
 
     def reconnect(self):
         self.on_reconnect()
 
 
+def zeroed(layout: binary.Layout) -> dict[str, object]:
+    """A record of the layout with every member zero, as MQL5 initialises a struct."""
+    record = {}
+    for member in layout.members:
+        if member.declared is mirror.MqlType.STRING:
+            record[member.name] = ""
+        elif member.declared is mirror.MqlType.DOUBLE:
+            record[member.name] = 0.0
+        else:
+            record[member.name] = 0
+    return record
+
+
 def transaction_frame(kind: TransactionType, request=None, result=None, **transaction):
-    """A trade_transaction frame of `kind` with the transaction's other fields empty, and the
-    request and result the EA passes with it, empty unless given."""
-    empty_request = {name: 0 for name in mirror.STRUCTS[mirror.StructName.TRADE_REQUEST].fields}
-    empty_request |= {"symbol": "", "comment": ""}
-    empty_result = {name: 0 for name in RESULT_FIELDS} | {"comment": ""}
-    fields = {name: 0 for name in TRANSACTION_FIELDS} | {"symbol": ""}
-    return {
-        "v": 1,
-        "type": "trade_transaction",
-        "transaction": fields | {"type": int(kind)} | transaction,
-        "request": empty_request | (request or {}),
-        "result": empty_result | (result or {}),
-    }
+    """A trade transaction of `kind` with its other members zero, and the request and result the EA
+    passes with it, zero unless given."""
+    return binary.TradeTransaction(
+        zeroed(binary.TRADE_TRANSACTION) | {"type": int(kind)} | transaction,
+        zeroed(binary.TRADE_REQUEST) | (request or {}),
+        zeroed(binary.TRADE_RESULT) | (result or {}),
+    )
 
 
 def deal_added(deal):

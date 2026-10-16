@@ -38,6 +38,7 @@ from nautilus_trader.model.identifiers import ClientId
 from mt5connector.client import history
 from mt5connector.client.currencies import register_venue_currency
 from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.hub import HubSession
 from mt5connector.client.parsing import (
     InstrumentAny,
     mark_at_mid,
@@ -46,9 +47,9 @@ from mt5connector.client.parsing import (
     venue_bar,
     venue_series,
 )
-from mt5connector.client.push import PushClient
-from mt5connector.wire.history_wire import BAR_CLOSE, Series
-from mt5connector.wire.push_wire import FrameType, Stream, Subscription
+from mt5connector.wire import binary
+from mt5connector.wire.history_wire import BAR_CLOSE
+from mt5connector.wire.push_wire import Stream, Subscription
 
 if TYPE_CHECKING:
     import numpy as np
@@ -67,7 +68,7 @@ class _Recovery:
 
 
 class MT5DataClient(LiveMarketDataClient):
-    """Streams an MT5 terminal's market data into NautilusTrader over the hub's push channel."""
+    """Streams an MT5 terminal's market data into NautilusTrader over the hub session."""
 
     def __init__(
         self,
@@ -91,7 +92,7 @@ class MT5DataClient(LiveMarketDataClient):
         self._conn = connection
         self._config = config
         self._provider = instrument_provider
-        self._push = PushClient(
+        self._hub = HubSession(
             config, loop, self._on_push_frame, self._on_push_reconnect, self._log
         )
         self._quote_symbols: set[str] = set()
@@ -102,8 +103,8 @@ class MT5DataClient(LiveMarketDataClient):
 
     async def _connect(self) -> None:
         """Loads what the instrument provider's config names, hands NT every instrument the provider
-        holds and connects the push channel; raises MT5ConfigError for a config that names nothing
-        to load."""
+        holds and connects the hub session; raises MT5ConfigError for a config that names nothing to
+        load."""
         self._conn.ensure_connected()
         await self._provider.initialize()
         instruments = self._provider.list_all()
@@ -111,17 +112,17 @@ class MT5DataClient(LiveMarketDataClient):
         for instrument in instruments:
             self._handle_data(instrument)
             self._log.info(f"MT5DataClient: loaded instrument {instrument.raw_symbol}")
-        await self._push.connect()
+        await self._hub.connect()
         self._log.info(
-            f"MT5DataClient: connected, the push channel at {self._config.ws_display_url}"
+            f"MT5DataClient: connected, the hub session at {self._config.ws_display_url}"
         )
 
     async def _disconnect(self) -> None:
-        """Disconnects the push channel; what NT subscribes stays wanted for the next connect."""
+        """Disconnects the hub session; what NT subscribes stays wanted for the next connect."""
         for task in self._read_backs:
             task.cancel()
         self._recoveries.clear()
-        await self._push.disconnect()
+        await self._hub.disconnect()
         self._log.info("MT5DataClient: disconnected")
 
     # ── Quotes and marks ──────────────────────────────────────────────────────
@@ -129,24 +130,24 @@ class MT5DataClient(LiveMarketDataClient):
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         symbol = command.instrument_id.symbol.value
         self._quote_symbols.add(symbol)
-        await self._push.subscribe(Subscription(Stream.TICKS, symbol))
+        await self._hub.subscribe(Subscription(Stream.TICKS, symbol))
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         symbol = command.instrument_id.symbol.value
         self._quote_symbols.discard(symbol)
         if symbol not in self._mark_symbols:
-            await self._push.unsubscribe(Subscription(Stream.TICKS, symbol))
+            await self._hub.unsubscribe(Subscription(Stream.TICKS, symbol))
 
     async def _subscribe_mark_prices(self, command: SubscribeMarkPrices) -> None:
         symbol = command.instrument_id.symbol.value
         self._mark_symbols.add(symbol)
-        await self._push.subscribe(Subscription(Stream.TICKS, symbol))
+        await self._hub.subscribe(Subscription(Stream.TICKS, symbol))
 
     async def _unsubscribe_mark_prices(self, command: UnsubscribeMarkPrices) -> None:
         symbol = command.instrument_id.symbol.value
         self._mark_symbols.discard(symbol)
         if symbol not in self._quote_symbols:
-            await self._push.unsubscribe(Subscription(Stream.TICKS, symbol))
+            await self._hub.unsubscribe(Subscription(Stream.TICKS, symbol))
 
     # ── Venue bars ────────────────────────────────────────────────────────────
 
@@ -155,34 +156,33 @@ class MT5DataClient(LiveMarketDataClient):
         history's to serve."""
         subscription = _bar_subscription(command.bar_type)
         self._next_closes[command.bar_type] = self._clock.timestamp_ns() // 1_000_000_000 + 1
-        await self._push.subscribe(subscription)
+        await self._hub.subscribe(subscription)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
         subscription = _bar_subscription(command.bar_type)
         self._next_closes.pop(command.bar_type, None)
         self._recoveries.pop(command.bar_type, None)
         if subscription not in {_bar_subscription(bar_type) for bar_type in self._next_closes}:
-            await self._push.unsubscribe(subscription)
+            await self._hub.unsubscribe(subscription)
 
-    # ── The push channel ──────────────────────────────────────────────────────
+    # ── The hub session ──────────────────────────────────────────────────────
 
-    def _on_push_frame(self, frame: dict) -> None:
-        """Hands NT a pushed tick as a quote tick and a mark at its mid, and a pushed bar as the
+    def _on_push_frame(self, frame: object) -> None:
+        """Hands NT each pushed tick as a quote tick and a mark at its mid, and a pushed bar as the
         venue bar of every bar type subscribed to its series."""
-        kind = FrameType(frame["type"])
-        if kind == FrameType.TICK:
-            quote = quote_tick_from_frame(
-                frame, self._instrument(frame["symbol"]), self._clock.timestamp_ns()
-            )
-            self._handle_data(quote)
-            self._handle_data(mark_at_mid(quote))
-        elif kind == FrameType.BAR:
-            pushed = Subscription(Stream.BARS, frame["symbol"], Series(frame["timeframe"]))
+        if isinstance(frame, binary.Ticks):
+            instrument = self._instrument(frame.symbol)
+            for tick in frame.ticks:
+                quote = quote_tick_from_frame(tick, instrument, self._clock.timestamp_ns())
+                self._handle_data(quote)
+                self._handle_data(mark_at_mid(quote))
+        elif isinstance(frame, binary.Bar):
+            pushed = Subscription(Stream.BARS, frame.symbol, frame.series)
             for bar_type in list(self._next_closes):
                 if _bar_subscription(bar_type) == pushed:
-                    self._on_pushed_bar(bar_type, frame)
+                    self._on_pushed_bar(bar_type, frame.bar)
         else:
-            raise ValueError(f"a {kind} frame on the data channel")
+            raise ValueError(f"a {type(frame).__name__} frame on the data channel")
 
     def _on_pushed_bar(self, bar_type: BarType, frame: dict) -> None:
         """Hands NT a pushed bar, or holds it while the bar type recovers from a reconnect; the

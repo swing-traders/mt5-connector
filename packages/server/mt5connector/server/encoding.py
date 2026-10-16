@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 
+from mt5connector.server.eras import Eras
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
@@ -67,6 +68,15 @@ def encode_bars(
             row[BAR_CLOSE] = bar_close(clock, series, broker_open)
             answered.append(row)
     return answered
+
+
+def bar_closes(eras: Eras, series: Series, broker_opens: np.ndarray) -> np.ndarray:
+    """The true-UTC close bar_close gives each bar of `series` opened at the broker epochs
+    `broker_opens`."""
+    if series in _BROKER_DAY_GRID:
+        return eras.to_utc(broker_opens + BAR_PERIOD_S[series])
+    else:
+        return eras.to_utc(broker_opens) + BAR_PERIOD_S[series]
 
 
 def bar_close(clock: BrokerClock, series: Series, broker_open: int) -> int:

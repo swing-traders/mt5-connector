@@ -16,7 +16,7 @@ from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, O
 from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
-from push_double import order_left, request_done, transaction_frame
+from session_double import order_left, request_done, transaction_frame
 from venue_doubles import account_info, send_result, trade_deal
 
 from mt5connector.client import errors, execution
@@ -74,7 +74,7 @@ async def test_connect_logs_the_push_channel_without_its_credentials(exec_shim):
     await h.client._disconnect()
 
     assert not any("SYNTHETIC_SECRET" in str(call) for call in h.client.recorded_log.mock_calls)
-    assert "connected, the push channel at wss://127.0.0.1:9000/push" in h.logged(LogLevel.INFO)
+    assert "connected, the hub session at wss://127.0.0.1:9000/push" in h.logged(LogLevel.INFO)
 
 
 # ── The ticket index ─────────────────────────────────────────────────────────
@@ -603,7 +603,7 @@ async def test_a_transaction_no_event_follows_from_reads_nothing_and_emits_nothi
 async def test_a_transaction_of_a_type_mql5_does_not_name_is_refused(exec_shim):
     h = await connected(exec_shim)
 
-    h.push.deliver(transaction_frame(TransactionType.REQUEST) | {"transaction": {"type": 11}})
+    h.push.deliver(transaction_frame(11))
 
     assert h.names() == []
     (failed,) = h.client.recorded_log.exception.call_args_list

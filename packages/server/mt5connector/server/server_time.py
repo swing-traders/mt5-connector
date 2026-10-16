@@ -8,9 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from mt5connector.server.wire.push_wire import PROTOCOL_VERSION, FrameType
-
-_FIELDS = ("v", "type", "symbol", "trade_server", "current", "gmt", "connected")
+_FIELDS = ("symbol", "trade_server", "current", "gmt", "connected")
 _EPOCH_FIELDS = ("trade_server", "current", "gmt")
 
 
@@ -71,7 +69,7 @@ class ServerTimeSink:
 
 
 def server_time_refusal(frame: object) -> str | None:
-    """Why a relayed body is not a server_time frame, or None when it is."""
+    """Why a relayed body is not a server-time sample, or None when it is."""
     if not isinstance(frame, dict):
         return "request body is not a JSON object"
     missing = [name for name in _FIELDS if name not in frame]
@@ -81,10 +79,6 @@ def server_time_refusal(frame: object) -> str | None:
         return f"missing field: {', '.join(missing)}"
     elif unknown:
         return f"unknown field: {', '.join(unknown)}"
-    elif not (_is_integer(frame["v"]) and frame["v"] == PROTOCOL_VERSION):
-        return f"unsupported frame version: {frame['v']!r}"
-    elif frame["type"] != FrameType.SERVER_TIME:
-        return f"not a {FrameType.SERVER_TIME} frame: {frame['type']!r}"
     elif not (isinstance(frame["symbol"], str) and frame["symbol"]):
         return f"not a symbol: {frame['symbol']!r}"
     elif not_epochs:
@@ -96,7 +90,7 @@ def server_time_refusal(frame: object) -> str | None:
 
 
 def server_time_sample(frame: dict) -> ServerTimeSample:
-    """The sample a server_time frame carries; the frame is one server_time_refusal accepts."""
+    """The sample a relayed body carries; the body is one server_time_refusal accepts."""
     return ServerTimeSample(
         symbol=frame["symbol"],
         trade_server=frame["trade_server"],

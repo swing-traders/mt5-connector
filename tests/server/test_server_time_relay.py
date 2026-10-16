@@ -15,8 +15,6 @@ from mt5connector.server.server_time import ServerTimeSample, ServerTimeSink
 from mt5connector.server.sessions import SessionStore
 
 FRAME = {
-    "v": 1,
-    "type": "server_time",
     "symbol": "EURUSD",
     "trade_server": 1_752_580_800,
     "current": 1_752_580_798,
@@ -78,9 +76,6 @@ def test_a_frame_missing_its_trade_server_time_is_refused(client, server_times):
     [
         ([1], "request body is not a JSON object"),
         (FRAME | {"tick": 1}, "unknown field: tick"),
-        (FRAME | {"v": 2}, "unsupported frame version: 2"),
-        (FRAME | {"v": True}, "unsupported frame version: True"),
-        (FRAME | {"type": "hello"}, "not a server_time frame: 'hello'"),
         (FRAME | {"symbol": ""}, "not a symbol: ''"),
         (FRAME | {"trade_server": "1752580800"}, "not an integer epoch: trade_server"),
         (FRAME | {"current": 1.5, "gmt": None}, "not an integer epoch: current, gmt"),
@@ -90,9 +85,6 @@ def test_a_frame_missing_its_trade_server_time_is_refused(client, server_times):
     ids=[
         "array",
         "unknown-field",
-        "version-2",
-        "version-bool",
-        "hello",
         "empty-symbol",
         "string-epoch",
         "float-and-null-epochs",

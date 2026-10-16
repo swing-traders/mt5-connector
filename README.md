@@ -44,7 +44,7 @@ The repository ships two distributions, versioned together: one release builds b
 | Distribution | Import packages | Installs into | Carries |
 |---|---|---|---|
 | `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the remote backend, the history client and the downloader, and the wire vocabulary |
-| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the push hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
+| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
 
 `mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
 
@@ -131,7 +131,7 @@ print(info.currency, info.balance)
 
 ## Configuration
 
-The adapter's own configuration goes through `MT5Config`; its required fields are your account credentials and the MT5 server's two URLs, its HTTP API's (`server_url`) and its WebSocket push hub's (`ws_url`), both supplied by the application that embeds the client. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
+The adapter's own configuration goes through `MT5Config`; its required fields are your account credentials and the MT5 server's two URLs, its HTTP API's (`server_url`) and its WebSocket hub's (`ws_url`), both supplied by the application that embeds the client. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
 
 - without a `server_url`, or with one that is not an `http` or `https` URL naming a host;
 - without a `ws_url`, or with one that is not a `ws` or `wss` URL naming a host;
@@ -150,7 +150,7 @@ config = MT5Config(
     password   = "your_password",
     server     = "Exness-MT5Trial9",  # broker server name
     server_url = "http://127.0.0.1:5000",  # the MT5 server's HTTP API
-    ws_url     = "ws://127.0.0.1:9000",    # the MT5 server's WebSocket push hub
+    ws_url     = "ws://127.0.0.1:9000",    # the MT5 server's WebSocket hub
 )
 ```
 
@@ -176,7 +176,7 @@ config = MT5Config(
     account_refresh_seconds = 10,  # the longest the account goes unreported between events
     history_lookback_mins   = 60,  # the venue history read when NT names no window, and at connect
 
-    # Reconnection: the terminal session's, and the push channel's backoff (which never gives up)
+    # Reconnection: the terminal session's, and the hub session's backoff (which never gives up)
     reconnect_initial_delay_s = 1.0,
     reconnect_max_delay_s     = 60.0,
     reconnect_max_attempts    = 20,
@@ -342,7 +342,7 @@ node = TradingNode(
 node.add_data_client_factory("MT5", MT5LiveDataClientFactory)
 node.add_exec_client_factory("MT5", MT5LiveExecClientFactory)
 node.build()  # builds the clients, connecting to the MT5 server
-node.run()    # connects the clients: each loads what its config names, and the push channels start
+node.run()    # connects the clients: each loads what its config names, and the hub sessions start
 ```
 
 ### Bar types
@@ -364,19 +364,20 @@ The adapter runs against `mt5-connector-server`: an HTTP server under the termin
 ```
 ┌─ your bot (Linux) ─────────────────┐      ┌─ beside the MT5 terminal ──────┐
 │  mt5-connector-client              │      │  HTTP API    :5000             │
-│   └─ PushClient                    │──────│  WS push hub :9000             │
-│      (ticks, bars, transactions)   │      │  MT5 terminal                  │
+│   └─ HubSession                    │──────│  WS hub :9000                  │
+│      (streams and calls)           │      │  MT5 terminal                  │
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
 - `MT5Config` requires the server's `server_url`, an `http` or `https` URL naming a host, and the hub's `ws_url`, a `ws` or `wss` URL naming a host; a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
 - Each `MT5Connection` calls its server through its own transport, `connection.mt5`: a `RemoteMT5` of the shim `mt5connector.client.remote_mt5` on the config's `server_url`, built with the connection and closed by its `disconnect()`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
 - A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
-- Each client consumes the hub's pushes through `mt5connector.client.push`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the client says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
+- Each client holds a hub session, `mt5connector.client.hub.HubSession`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the session says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
+- A session also asks the hub's calls: `request(call, **arguments)`, or the method named after each call with its arguments, answers `Answered(result, last_error)` — a struct as its record type, rows as numpy arrays — once every part of the answer arrived, and raises the `HubAnswerError` of its error kind (`Syncing`, `NotReady` and `NoPublisher` carry `retry_after_s`); `deferring(call, **arguments)` asks again after each deferring answer's delay until it is answered otherwise or its caller cancels. A request unanswered past the hub's deadline and a margin, or in flight when the connection drops, raises `ResponseLost`. A frame of the hub's the session cannot decode is logged as an error: an answer fails the request it answers with `ProtocolError`, a frame whose header breaks fails every request in flight with it, and a stream frame fails nothing. An `order_send` answered sent stays outstanding until its `REQUEST` transaction reaches the session; a reconnect asks the outcomes of the outstanding ones and hands them to the owner as `Outcomes`.
   - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. Its history requests answer quote ticks sized the same way, and the venue's bars as the bar type requested. After a reconnect it holds the bars pushed until the first one arrives, then reads back over HTTP, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
   - The execution client subscribes the account's trade transactions: a `DEAL_ADD` is a fill, read from the venue's history by its ticket; an `ORDER_DELETE` or `HISTORY_ADD` ends the order the venue cancelled, expired or rejected; a `TRADE_TRANSACTION_REQUEST` links the ticket of an order whose submit got no answer through its comment's digest, and accepts it. A transaction naming a ticket the client cannot resolve is left to NautilusTrader's reconciliation, never booked as an external order.
-  - Each symbol's EA publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
-- The execution client polls nothing for events: what the push channel misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop checks the terminal session and reports the account.
+  - Each symbol's publisher publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
+- The execution client polls nothing for events: what the hub session misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop checks the terminal session and reports the account.
 - The account state carries the login's margin as one account-level margin balance in the account currency: the margin the venue states as used as initial, and the maintenance floor as maintenance.
 - There is no authentication: the server trusts its network. Its image publishes no host port, loopback included, so the API and the hub are reachable on the container network alone.
 
@@ -447,21 +448,27 @@ mt5-connector/
 │   │       │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
 │   │       │   ├── providers.py     # MT5InstrumentProvider
 │   │       │   ├── sessions.py      # the relayed trading sessions an instrument's info carries
-│   │       │   ├── push.py          # the hub's push channel on NT's WebSocketClient
+│   │       │   ├── hub.py           # the hub session on NT's WebSocketClient: streams and calls
 │   │       │   └── remote_mt5.py    # the HTTP shim generated from the inventory
 │   │       └── wire/
 │   │           ├── mirror.py        # the inventory of the pinned MetaTrader5 package
 │   │           ├── broker_clock.py  # broker wall-clock time ↔ true UTC
 │   │           ├── history_wire.py  # the history routes' paths, series and answer states
-│   │           └── push_wire.py     # the push protocol's version, frames, roles and streams
+│   │           ├── push_wire.py     # the hub protocol's roles, streams and MQL5 names
+│   │           ├── binary.py        # the hub protocol's binary frames
+│   │           └── calls.py         # the hub's call registry and its arguments' and results' codecs
 │   └── server/                   # mt5-connector-server
 │       ├── pyproject.toml
 │       └── mt5connector/
 │           └── server/
 │               ├── README.md        # the server's API and what its image provides
 │               ├── app.py           # the HTTP server (mt5-connector-server)
-│               ├── ws_server.py     # the push hub (mt5-connector-hub)
-│               ├── push_frames.py   # the EA's frames, held to their structs and converted to UTC
+│               ├── ws_server.py     # the hub (mt5-connector-hub)
+│               ├── hub_requests.py  # the hub's pending requests and their deadlines
+│               ├── hub_gate.py      # the hub's clock gate
+│               ├── hub_health.py    # the hub's /health
+│               ├── hub_utc.py       # the hub's conversion of every epoch to and from true UTC
+│               ├── floors.py        # the history floors measured per series
 │               ├── wire -> ../../../client/mt5connector/wire
 │               └── mql5/            # the EA, its startup script and their includes
 └── tests/                        # full test suite (no live MT5 required; the image tier runs the image)

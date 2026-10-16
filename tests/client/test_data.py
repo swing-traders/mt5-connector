@@ -19,7 +19,7 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from push_double import PushDouble
+from session_double import SessionDouble
 from venue_doubles import account_info, relayed_sessions, symbol_info
 
 from mt5connector.client import data
@@ -175,7 +175,7 @@ def make_client(
     cache = TestComponentStubs.cache()
     clock = LiveClock()
 
-    with patch.object(data, "PushClient", PushDouble):
+    with patch.object(data, "HubSession", SessionDouble):
         client = client_class(
             loop=loop,
             connection=conn,
@@ -273,7 +273,7 @@ class TestConnect:
         await c._disconnect()
         assert not any("SYNTHETIC_SECRET" in str(call) for call in c.recorded_log.mock_calls)
         c.recorded_log.info.assert_any_call(
-            "MT5DataClient: connected, the push channel at ws://127.0.0.1:9000/push"
+            "MT5DataClient: connected, the hub session at ws://127.0.0.1:9000/push"
         )
 
     @pytest.mark.asyncio
@@ -299,7 +299,7 @@ class TestConnect:
         c, conn, prov, loop = make_client()
         await c._connect()
         c._handle_data.assert_called()
-        assert c._push.connected
+        assert c._hub.connected
         await c._disconnect()
 
 
@@ -318,8 +318,8 @@ class TestDisconnect:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await c._subscribe_quote_ticks(cmd)
         await c._disconnect()
-        assert not c._push.connected
-        assert c._push.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        assert not c._hub.connected
+        assert c._hub.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -334,7 +334,7 @@ class TestSubscribeQuoteTicks:
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
-        assert client._push.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        assert client._hub.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_symbols(self, client):
@@ -342,7 +342,7 @@ class TestSubscribeQuoteTicks:
             cmd = MagicMock()
             cmd.instrument_id.symbol.value = sym
             await client._subscribe_quote_ticks(cmd)
-        assert client._push.wanted == [
+        assert client._hub.wanted == [
             Subscription(Stream.TICKS, sym) for sym in ["EURUSDm", "XAUUSDm", "BTCUSDm"]
         ]
 
@@ -352,7 +352,7 @@ class TestSubscribeQuoteTicks:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
         await client._unsubscribe_quote_ticks(cmd)
-        assert client._push.wanted == []
+        assert client._hub.wanted == []
 
     @pytest.mark.asyncio
     async def test_unsubscribe_non_subscribed_does_not_raise(self, client):
@@ -777,7 +777,7 @@ def served_client(transport, provider_config: InstrumentProviderConfig):
     provider = MT5InstrumentProvider(
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
     )
-    with patch.object(data, "PushClient", PushDouble):
+    with patch.object(data, "HubSession", SessionDouble):
         client = MT5DataClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -813,7 +813,7 @@ class TestInstrumentsNtNames:
 
         assert handed_ids(client) == ["EURUSD.MT5", "GBPUSD.MT5"]
         assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
-        assert client._push.connected
+        assert client._hub.connected
         await client._disconnect()
 
     @pytest.mark.asyncio
@@ -841,7 +841,7 @@ class TestInstrumentsNtNames:
 
         assert provider.list_all() == []
         client._handle_data.assert_not_called()
-        assert not client._push.connected
+        assert not client._hub.connected
 
     @pytest.mark.asyncio
     async def test_a_symbol_no_config_named_is_loaded_and_answered_on_request(self, terminal):

@@ -36,8 +36,6 @@ TRADE = [
     [],
 ]
 FRAME = {
-    "v": 1,
-    "type": "sessions",
     "symbol": "XAUUSD.a",
     "quote": QUOTE,
     "trade": TRADE,

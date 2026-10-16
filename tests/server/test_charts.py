@@ -24,8 +24,6 @@ NOT_LISTED = "SymbolSelect failed with error 4301"
 
 def sample(symbol: str) -> dict[str, object]:
     return {
-        "v": 1,
-        "type": "server_time",
         "symbol": symbol,
         "trade_server": 1_752_580_800,
         "current": 1_752_580_798,
@@ -36,8 +34,6 @@ def sample(symbol: str) -> dict[str, object]:
 
 def commissions_frame(symbol: str) -> dict[str, object]:
     return {
-        "v": 1,
-        "type": "commissions",
         "symbol": symbol,
         "ret": 0,
         "last_error": 0,

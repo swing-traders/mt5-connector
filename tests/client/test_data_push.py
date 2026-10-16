@@ -1,4 +1,4 @@
-"""The data client's push consumption: its streams, a pushed tick and bar as NT data, and the bars a
+"""The data client's streams over the hub session: a pushed tick and bar as NT data, and the bars a
 reconnect missed read back once."""
 
 import asyncio
@@ -27,7 +27,7 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from push_double import PushDouble
+from session_double import SessionDouble
 
 from mt5connector.client import data
 from mt5connector.client.config import MT5Config
@@ -35,7 +35,7 @@ from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
 from mt5connector.client.errors import MT5InstrumentError, ServerUnreachable
 from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.wire import mirror
+from mt5connector.wire import binary, mirror
 from mt5connector.wire.history_wire import BAR_PERIOD_S, Series
 from mt5connector.wire.push_wire import Stream, Subscription
 
@@ -106,7 +106,7 @@ class Client:
             server_url="http://127.0.0.1:5000",
             ws_url="ws://127.0.0.1:9000",
         )
-        with patch.object(data, "PushClient", PushDouble):
+        with patch.object(data, "HubSession", SessionDouble):
             self.client = RecordedDataClient(
                 asyncio.get_running_loop(),
                 MagicMock(),
@@ -117,7 +117,7 @@ class Client:
                 config,
             )
         self.client._handle_data = MagicMock()
-        self.push = self.client._push
+        self.push = self.client._hub
 
     def handed(self) -> list:
         return [call.args[0] for call in self.client._handle_data.call_args_list]
@@ -181,11 +181,9 @@ def unbars(bar_type):
     )
 
 
-def tick(bid, ask, time_msc=NINE * 1000 + 123):
-    return {
-        "v": 1,
-        "type": "tick",
-        "symbol": "EURUSD",
+def tick(bid, ask, time_msc=NINE * 1000 + 123, symbol="EURUSD"):
+    """A tick frame as the hub pushes it."""
+    fields = {
         "time": time_msc // 1000,
         "bid": bid,
         "ask": ask,
@@ -195,15 +193,13 @@ def tick(bid, ask, time_msc=NINE * 1000 + 123):
         "flags": 6,
         "volume_real": 0.0,
     }
+    return binary.Ticks(symbol, (fields,))
 
 
 def bar(open_time, timeframe="M1", **fields):
     """A bar frame as the hub pushes it, closing a period after its open unless `fields` say."""
-    return {
-        "v": 1,
-        "type": "bar",
-        "symbol": "EURUSD",
-        "timeframe": timeframe,
+    series = Series(timeframe)
+    record = {
         "time": open_time,
         "open": 1.085,
         "high": 1.0852,
@@ -212,8 +208,9 @@ def bar(open_time, timeframe="M1", **fields):
         "tick_volume": 42,
         "spread": 12,
         "real_volume": 0,
-        "time_close": open_time + BAR_PERIOD_S[Series(timeframe)],
-    } | fields
+        "time_close": open_time + BAR_PERIOD_S[series],
+    }
+    return binary.Bar("EURUSD", series, record | fields)
 
 
 async def settle():
@@ -306,7 +303,7 @@ async def test_a_mid_between_two_ticks_of_the_grid_is_kept_at_full_precision():
 async def test_a_tick_of_a_symbol_not_loaded_is_refused():
     c = Client(NINE + 1)
 
-    c.push.deliver(tick(1.085, 1.0852) | {"symbol": "XAUUSD"})
+    c.push.deliver(tick(1.085, 1.0852, symbol="XAUUSD"))
 
     assert c.handed() == []
     (failed,) = c.client._log.exception.call_args_list
@@ -550,7 +547,7 @@ async def test_a_pushed_bar_is_stamped_at_the_close_its_frame_carries():
     await c.client._subscribe_bars(bars(W1_BID))
 
     c.at(AUTUMN_CLOSE + 60)
-    c.push.deliver(bar(AUTUMN_WEEK, "W1") | {"time_close": AUTUMN_CLOSE})
+    c.push.deliver(bar(AUTUMN_WEEK, "W1", time_close=AUTUMN_CLOSE))
 
     (pushed,) = c.bars()
     assert pushed.ts_event == pushed.ts_init == AUTUMN_CLOSE * SECOND_NS
@@ -561,7 +558,7 @@ async def test_a_bar_closing_after_the_subscription_is_handed_however_long_it_ra
     await c.client._subscribe_bars(bars(W1_BID))
 
     c.at(AUTUMN_CLOSE + 86_400)
-    c.push.deliver(bar(AUTUMN_WEEK, "W1") | {"time_close": AUTUMN_CLOSE})
+    c.push.deliver(bar(AUTUMN_WEEK, "W1", time_close=AUTUMN_CLOSE))
 
     assert [item.ts_event for item in c.bars()] == [AUTUMN_CLOSE * SECOND_NS]
 
@@ -575,7 +572,7 @@ async def test_the_read_back_takes_the_bar_forming_at_the_subscription_across_th
         c.at(AUTUMN_CLOSE + 60)
         c.push.reconnect()
         c.at(NEXT_CLOSE + 60)
-        c.push.deliver(bar(AUTUMN_CLOSE, "W1") | {"time_close": NEXT_CLOSE})
+        c.push.deliver(bar(AUTUMN_CLOSE, "W1", time_close=NEXT_CLOSE))
         await until(lambda: history.reads)
         history.gates[0].set()
         await until(lambda: len(c.bars()) == 2)

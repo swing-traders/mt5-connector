@@ -1,5 +1,5 @@
 """Trading sessions the terminal's EAs relay from SymbolInfoSessionQuote and SymbolInfoSessionTrade,
-kept per symbol, and the shape of the frame that relays them.
+kept per symbol, and the shape of the body that relays them.
 
 State: the outcome of the latest relay for each symbol, its sessions or the refusal of its frame. An
 absent symbol has never been relayed, and a refusal stands until a later relay is accepted. Nothing
@@ -8,9 +8,8 @@ is persisted."""
 from dataclasses import dataclass
 
 from mt5connector.server.commissions import RelayRefusal
-from mt5connector.server.wire.push_wire import PROTOCOL_VERSION, FrameType
 
-_FRAME_FIELDS = ("v", "type", "symbol", "quote", "trade", "last_error")
+_FRAME_FIELDS = ("symbol", "quote", "trade", "last_error")
 _WEEKS = ("quote", "trade")
 # ENUM_DAY_OF_WEEK, SUNDAY to SATURDAY.
 _DAYS = 7
@@ -44,7 +43,7 @@ class SessionStore:
 
 
 def sessions_refusal(frame: object, symbol: str) -> str | None:
-    """Why a body relayed for `symbol` is not its sessions frame, or None when it is."""
+    """Why a body relayed for `symbol` is not its trading sessions, or None when it is."""
     if not isinstance(frame, dict):
         return "request body is not a JSON object"
     missing = [name for name in _FRAME_FIELDS if name not in frame]
@@ -53,10 +52,6 @@ def sessions_refusal(frame: object, symbol: str) -> str | None:
         return f"missing field: {', '.join(missing)}"
     elif unknown:
         return f"unknown field: {', '.join(unknown)}"
-    elif not (_is_integer(frame["v"]) and frame["v"] == PROTOCOL_VERSION):
-        return f"unsupported frame version: {frame['v']!r}"
-    elif frame["type"] != FrameType.SESSIONS:
-        return f"not a {FrameType.SESSIONS} frame: {frame['type']!r}"
     elif not (isinstance(frame["symbol"], str) and frame["symbol"]):
         return f"not a symbol: {frame['symbol']!r}"
     elif frame["symbol"] != symbol:
@@ -68,7 +63,7 @@ def sessions_refusal(frame: object, symbol: str) -> str | None:
 
 
 def trading_sessions(frame: dict) -> TradingSessions:
-    """The sessions a sessions frame carries; the frame is one sessions_refusal accepts."""
+    """The sessions a relayed body carries; the body is one sessions_refusal accepts."""
     return TradingSessions(
         quote=_week(frame["quote"]),
         trade=_week(frame["trade"]),

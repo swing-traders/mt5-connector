@@ -86,10 +86,10 @@ from mt5connector.client.errors import (
     MT5OrderError,
     ResponseLost,
 )
+from mt5connector.client.hub import HubSession
 from mt5connector.client.parsing import InstrumentAny, finite_decimal
-from mt5connector.client.push import PushClient
-from mt5connector.wire import mirror
-from mt5connector.wire.push_wire import FrameType, Stream, Subscription, TransactionType
+from mt5connector.wire import binary, mirror
+from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
 if TYPE_CHECKING:
     from nautilus_trader.model.orders import Order
@@ -375,7 +375,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._config = config
         self._provider = instrument_provider
         self._magic = magic_for(self.trader_id)
-        self._push = PushClient(config, loop, self._on_push_frame, None, self._log)
+        self._hub = HubSession(config, loop, self._on_push_frame, None, self._log)
         self._account_task: asyncio.Task | None = None
         self._client_order_ids: dict[int, ClientOrderId] = {}
         self._tickets: dict[ClientOrderId, int] = {}
@@ -425,16 +425,16 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 ) from exc
         self._refresh_account()
         self._account_unanswered = False
-        await self._push.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
-        await self._push.connect()
+        await self._hub.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+        await self._hub.connect()
         self._account_task = self._loop.create_task(
             self._account_loop(),
             name="MT5LiveExecutionClient._account_loop",
         )
-        self._log.info(f"connected, the push channel at {self._config.ws_display_url}")
+        self._log.info(f"connected, the hub session at {self._config.ws_display_url}")
 
     async def _disconnect(self) -> None:
-        """Stops the account loop and the push channel and drops the client's view of the venue;
+        """Stops the account loop and the hub session and drops the client's view of the venue;
         raises RuntimeError on a client never connected."""
         if self._account_task is None:
             raise RuntimeError("execution client: not connected")
@@ -444,7 +444,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         except asyncio.CancelledError:
             pass
         self._account_task = None
-        await self._push.disconnect()
+        await self._hub.disconnect()
         self._client_order_ids.clear()
         self._tickets.clear()
         self._seen_deals.clear()
@@ -528,15 +528,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     self._account_unanswered = False
                     self._log.info("account report: the server answers again")
 
-    # ── The push channel ──────────────────────────────────────────────────────
+    # ── The hub session ──────────────────────────────────────────────────────
 
-    def _on_push_frame(self, frame: dict) -> None:
+    def _on_push_frame(self, frame: object) -> None:
         """Feeds a pushed trade transaction to the entry point its type names, as it arrives."""
-        kind = FrameType(frame["type"])
-        if kind == FrameType.TRADE_TRANSACTION:
-            self._on_transaction(frame["transaction"], frame["request"], frame["result"])
+        if isinstance(frame, binary.TradeTransaction):
+            self._on_transaction(frame.transaction, frame.request, frame.result)
         else:
-            raise ValueError(f"a {kind} frame on the execution channel")
+            raise ValueError(f"a {type(frame).__name__} frame on the execution channel")
 
     def _on_transaction(self, transaction: dict, request: dict, result: dict) -> None:
         """A deal the venue added fills its order, an order the venue deleted or moved to its

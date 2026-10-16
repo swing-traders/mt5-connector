@@ -1,15 +1,20 @@
-"""The push hub: each symbol's EA's frames fanned out to their subscribers in true UTC, its relays
-to the HTTP server, and the charts the spawner opens and closes for the symbols in use.
+"""The hub, the one endpoint the EAs and the consumers connect to: each publisher's frames fanned
+out to their subscribers in true UTC, the relays the EAs send kept and handed to the HTTP server,
+every request a consumer asks routed to the EA of its call's role or answered by the hub, the clock
+gate, /health, and the charts the spawner opens and closes for the roles and symbols in use.
 
-State: the connections that said hello and their roles; each symbol's publishing EA and the wanted
-frame last told it; the spawner; the chart requests held for symbols no EA publishes, and those the
-spawner was sent; the spawner's reason for each chart it failed to open, standing until that chart
-opens or its symbol's EA says hello; when each symbol was last in use, and the symbols whose charts
-the spawner was told to close; each consumer's subscriptions and its queue of frames not yet sent;
-the true-UTC open of the last bar fanned out of each series; and the broker hours warned of. Nothing
-is persisted, and nothing is replayed to a consumer that reconnects."""
+State: the connections that said hello — each consumer's subscriptions, each EA's chart role and
+symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
+wanted frame last told each publisher; the spawner; the chart requests held for a role and symbol no
+EA serves, and those the spawner was sent; the spawner's reason for each chart it failed to open,
+standing until that chart opens or its EA says hello; when each chart was last in use, and those the
+spawner was told to close; the true-UTC open of the last bar fanned out of each series; the latest
+commission schedule and trading sessions relayed for each symbol; the floors learned from history
+answers; the pending requests and the clock gate. Nothing is persisted, and nothing is replayed to a
+consumer that reconnects."""
 
 import asyncio
+import dataclasses
 import http.client
 import json
 import logging
@@ -28,94 +33,127 @@ from websockets.exceptions import ConnectionClosed
 from websockets.frames import CloseCode
 from websockets.http11 import Request, Response
 
-from mt5connector.server.push_frames import Published, hold, published
+from mt5connector.server.commissions import (
+    CommissionStore,
+    RelayRefusal,
+    commission_schedule,
+    commissions_refusal,
+)
+from mt5connector.server.floors import FloorStore
+from mt5connector.server.hub_gate import ClockGate
+from mt5connector.server.hub_health import health
+from mt5connector.server.hub_requests import Pending, Requests
+from mt5connector.server.hub_utc import Conversion, Results, broker_arguments, published
 from mt5connector.server.repeated_hours import RepeatedHours
+from mt5connector.server.sessions import SessionStore, sessions_refusal, trading_sessions
 from mt5connector.server.settings import HubSettings, read_hub_settings
+from mt5connector.server.wire import binary, calls, mirror
+from mt5connector.server.wire.binary import ErrorKind
 from mt5connector.server.wire.broker_clock import BrokerClock
-from mt5connector.server.wire.history_wire import BAR_TIMEFRAME
+from mt5connector.server.wire.history_wire import BAR_TIMEFRAME, Series, bar_series
 from mt5connector.server.wire.push_wire import (
     CHARTS_PATH,
     CLOSE_TIMEOUT_S,
+    HEALTH_PATH,
     PING_INTERVAL_S,
     PING_TIMEOUT_INTERVALS,
-    PROTOCOL_VERSION,
+    ChartRole,
     ChartState,
-    FrameType,
-    Role,
     Stream,
     Subscription,
-    subscription_of,
 )
 
 SERVER_TIME_RELAY_PATH = "/relay/server_time"
 COMMISSIONS_RELAY_PATH = "/relay/commissions"
 SESSIONS_RELAY_PATH = "/relay/sessions"
-# The most frames a consumer's queue holds; the next one closes it with the overflow code.
-QUEUE_BOUND = 10_000
 OVERFLOW = 4008
 _RELAY_TIMEOUT_S = 5
 _IDLE_SWEEP_S = 5
 _HOUR_S = 3_600
 _LOOPBACK = "127.0.0.1"
-_PUBLISHED = frozenset({FrameType.TICK, FrameType.BAR, FrameType.TRADE_TRANSACTION})
-_RELAYED = frozenset({FrameType.SERVER_TIME, FrameType.COMMISSIONS, FrameType.SESSIONS})
-_OPS = frozenset({FrameType.SUBSCRIBE, FrameType.UNSUBSCRIBE})
-_CHART_ANSWERS = frozenset({FrameType.CHART_OPENED, FrameType.CHART_FAILED, FrameType.CHART_KEPT})
-_EA_HELLO = ("v", "type", "role", "symbol", "spawner")
-_CHART_OPENED = ("v", "type", "symbol")
-_CHART_REASON = ("v", "type", "symbol", "reason")
-_ADAPTER_HELLO = ("v", "type", "role")
+_TERMINAL_INFO = calls.CALLS[calls.Call.TERMINAL_INFO]
+_RANGES = calls.CALLS[calls.Call.RANGES]
 
 logger = logging.getLogger(__name__)
+
+ChartKey = tuple[ChartRole, str]
+
+
+@dataclass
+class _Outbound:
+    """A connection's frames not yet sent, and the task sending them in the order queued."""
+
+    queue: asyncio.Queue
+    sender: asyncio.Task
 
 
 @dataclass
 class _Consumer:
-    """A consumer of the hub."""
-
-    queue: asyncio.Queue
-    sender: asyncio.Task
+    outbound: _Outbound
     subscriptions: set[Subscription] = field(default_factory=set)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Ea:
-    """An EA that said hello: its chart's symbol, and whether it opens the charts the hub
-    requests."""
-
+    chart_role: ChartRole
     symbol: str
-    spawner: bool
+    outbound: _Outbound
+
+    @property
+    def key(self) -> tuple[ChartRole, str | None]:
+        """What the EA serves: its chart's role, and its symbol but for the spawner, which serves
+        the account."""
+        if self.chart_role is ChartRole.SPAWNER:
+            return ChartRole.SPAWNER, None
+        else:
+            return self.chart_role, self.symbol
 
 
 class Hub:
-    """Routes each symbol's EA's frames to the consumers subscribed to them, and has the spawner
-    keep a chart open for each symbol in use."""
+    """Routes each publisher's frames to their subscribers and each request to the EA serving it,
+    and has the spawner keep a chart open for each role and symbol in use."""
 
-    def __init__(self, clock: BrokerClock, relay: Callable[[str, dict], None], *, idle_s: int):
+    def __init__(
+        self, clock: BrokerClock, relay: Callable[[str, dict], None], settings: HubSettings
+    ) -> None:
         self._clock = clock
         self._relay = relay
-        self._idle_s = idle_s
-        self._roles: dict[object, Role] = {}
-        self._eas: dict[object, _Ea] = {}
-        self._publishers: dict[str, object] = {}
-        self._told: dict[str, dict] = {}
-        self._spawner: object | None = None
-        self._requested: set[str] = set()
-        self._sent: set[str] = set()
-        self._failed: dict[str, str] = {}
-        self._used: dict[str, float] = {}
-        self._close_sent: set[str] = set()
+        self._settings = settings
+        self._gate = ClockGate(
+            clock,
+            max_age_s=settings.clock_sample_max_age_seconds,
+            check_s=settings.clock_check_seconds,
+            bootstrap_s=settings.clock_bootstrap_seconds,
+        )
+        self._requests = Requests(expire=self._expired)
         self._consumers: dict[object, _Consumer] = {}
-        self._repeated_hours = RepeatedHours()
+        self._eas: dict[object, _Ea] = {}
+        self._served: dict[tuple[ChartRole, str | None], object] = {}
+        self._told: dict[str, binary.Wanted] = {}
+        self._spawner: object | None = None
+        self._requested: set[ChartKey] = set()
+        self._sent: set[ChartKey] = set()
+        self._failed: dict[ChartKey, str] = {}
+        self._used: dict[ChartKey, float] = {}
+        self._close_sent: set[ChartKey] = set()
         self._bar_opens: dict[Subscription, int] = {}
+        self._commissions = CommissionStore()
+        self._sessions = SessionStore()
+        self._floors = FloorStore()
+        self._repeated_hours = RepeatedHours()
         self._closing: set[asyncio.Task] = set()
 
+    def start(self) -> None:
+        """Arms the clock gate's bootstrap window."""
+        self._gate.start()
+
     async def handler(self, ws) -> None:
-        """Serves one connection until it closes; a frame the hub cannot handle is answered with an
-        error frame and closes it."""
+        """Serves one connection until it closes; a frame the hub cannot handle is answered with a
+        refusal and closes it."""
+        keepalive = asyncio.create_task(self._keepalive(ws))
         try:
             async for raw in ws:
-                await self._on_frame(ws, raw)
+                self._on_frame(ws, raw)
         except ConnectionClosed as closed:
             logger.info("connection %s closed: %s", ws.remote_address, closed)
         except Exception as failure:
@@ -126,13 +164,23 @@ class Hub:
             )
             await self._refuse(ws, str(failure))
         finally:
-            await self._drop(ws)
+            keepalive.cancel()
+            self._drop(ws)
 
     async def process_request(self, connection, request: Request) -> Response | None:
-        """Answers the chart route — a POST from loopback naming a symbol in its path — over plain
-        HTTP; any other request goes on to the WebSocket handshake."""
+        """Answers /health, and the chart route — a POST from loopback naming a symbol in its path —
+        over plain HTTP; any other request goes on to the WebSocket handshake."""
         prefix = f"{CHARTS_PATH}/"
-        if not request.path.startswith(prefix):
+        if request.path == HEALTH_PATH and request.method == HTTPMethod.GET:
+            labels = {ws: (ea.chart_role.value, ea.symbol) for ws, ea in self._eas.items()}
+            status, body = health(
+                self._gate, self._spawner is not None, self._requests.all(), labels
+            )
+            return _json(connection, status, body)
+        elif request.path == HEALTH_PATH:
+            message = f"{request.method} is not GET"
+            return _json(connection, HTTPStatus.METHOD_NOT_ALLOWED, {"ok": False, "error": message})
+        elif not request.path.startswith(prefix):
             return None
         raw = request.path.removeprefix(prefix)
         if connection.remote_address[0] != _LOOPBACK:
@@ -144,304 +192,223 @@ class Hub:
         else:
             refusal = None
         if refusal is None:
-            symbol = unquote(raw)
-            state = await self.use_chart(symbol)
+            key = (ChartRole.PUBLISHER, unquote(raw))
+            state = self.use_chart(key)
             body = {"ok": True, "result": state}
             if state == ChartState.FAILED:
-                body["reason"] = self._failed[symbol]
+                body["reason"] = self._failed[key]
             return _json(connection, HTTPStatus.OK, body)
         else:
             status, message = refusal
             return _json(connection, status, {"ok": False, "error": message})
 
-    async def use_chart(self, symbol: str) -> ChartState:
-        """Records a use of the symbol, and requests its chart while no EA publishes it and the
-        spawner has not failed to open it."""
-        self._used[symbol] = time.monotonic()
-        if symbol in self._publishers:
+    def use_chart(self, key: ChartKey) -> ChartState:
+        """Records a use of the chart of a role and symbol, and requests it while no EA serves it
+        and the spawner has not failed to open it."""
+        self._used[key] = time.monotonic()
+        if key in self._served:
             return ChartState.PUBLISHED
-        elif symbol in self._failed:
+        elif key in self._failed:
             return ChartState.FAILED
         else:
-            await self._request_chart(symbol)
+            self._request_chart(key)
             return ChartState.REQUESTED
 
-    async def close_idle_charts(self) -> None:
-        """Tells the spawner to close the chart of each symbol out of use for the idle period, once
-        per spawner connection; the spawner's own chart never closes."""
-        spawner = self._spawner
-        if spawner is None:
-            return
-        now = time.monotonic()
-        for symbol, ws in sorted(self._publishers.items()):
-            # Each send yields: the sweep ends with its spawner's connection, and passes over a
-            # publisher that left since it began.
-            if self._spawner is not spawner:
-                break
-            elif (
-                self._publishers.get(symbol) is ws
-                and ws is not spawner
-                and symbol not in self._close_sent
-                and not self._in_use(symbol, now)
-            ):
-                # Marked before the send: a chart_kept answering it may arrive before the send
-                # returns, and a drop or a spawner's hello meanwhile takes the mark back.
-                self._close_sent.add(symbol)
-                logger.info("%s out of use for %d s: closing its chart", symbol, self._idle_s)
-                await self._send(spawner, _addressed(FrameType.CLOSE_CHART, symbol))
+    def close_idle_charts(self) -> None:
+        """Tells the spawner to close each chart out of use for the idle period, once per spawner
+        connection; the spawner's own chart never closes."""
+        if self._spawner is not None:
+            now = time.monotonic()
+            for key in sorted(self._served, key=str):
+                chart_role, symbol = key
+                if (
+                    chart_role is not ChartRole.SPAWNER
+                    and key not in self._close_sent
+                    and not self._in_use(key, now)
+                ):
+                    self._close_sent.add(key)
+                    logger.info(
+                        "the %s chart of %s out of use for %d s: closing it",
+                        chart_role,
+                        symbol,
+                        self._settings.chart_idle_seconds,
+                    )
+                    self._to_ea(self._spawner, binary.CloseChart(chart_role, symbol))
 
-    async def _on_frame(self, ws, raw) -> None:
-        frame = json.loads(raw)
-        if not isinstance(frame, dict):
-            raise ValueError(f"not a JSON object: {frame!r}")
-        elif not (_is_integer(frame.get("v")) and frame["v"] == PROTOCOL_VERSION):
-            raise ValueError(f"unsupported frame version: {frame.get('v')!r}")
+    # ── Frames ────────────────────────────────────────────────────────────────
+
+    def _on_frame(self, ws, raw: str | bytes) -> None:
+        if isinstance(raw, str):
+            raise ValueError("a text frame")
+        elif ws in self._eas:
+            self._decoded(ws, raw, binary.Sender.EA)
+        elif ws in self._consumers:
+            self._decoded(ws, raw, binary.Sender.ADAPTER)
+        else:
+            self._hello(ws, binary.decode_hello(raw))
+
+    def _decoded(self, ws, raw: bytes, sender: binary.Sender) -> None:
         try:
-            kind = FrameType(frame.get("type"))
-        except ValueError:
-            logger.info("unknown kind %r", frame.get("type"))
+            frame = binary.decode(raw, sender)
+        except binary.UnknownKind as unknown:
+            logger.info("skipping a frame from %s: %s", ws.remote_address, unknown)
         else:
-            await self._on_kind(ws, kind, frame)
+            if sender is binary.Sender.EA:
+                self._on_ea_frame(ws, self._eas[ws], frame)
+            else:
+                self._on_consumer_frame(ws, self._consumers[ws], frame)
 
-    async def _on_kind(self, ws, kind: FrameType, frame: dict) -> None:
-        role = self._roles.get(ws)
-        if kind == FrameType.HELLO:
-            await self._hello(ws, role, frame)
-        elif kind in _OPS and role == Role.ADAPTER:
-            await self._op(ws, kind, frame)
-        elif kind in _PUBLISHED and role == Role.EA:
-            await self._publish(ws, frame)
-        elif kind in _RELAYED and role == Role.EA:
-            self._relay_frame(ws, kind, frame)
-        elif kind in _CHART_ANSWERS and role == Role.EA:
-            self._chart_answer(ws, kind, frame)
-        elif role is None:
-            raise ValueError(f"a {kind} frame before the connection's hello")
+    def _hello(self, ws, hello: binary.AdapterHello | binary.EaHello) -> None:
+        if isinstance(hello, binary.EaHello):
+            ea = _Ea(hello.chart_role, hello.symbol, self._outbound(ws))
+            self._eas[ws] = ea
+            self._ea_hello(ws, ea)
         else:
-            raise ValueError(f"a {kind} frame from an {role}")
+            logger.info("consumer connected: %s", ws.remote_address)
+            self._consumers[ws] = _Consumer(self._outbound(ws))
 
-    async def _hello(self, ws, role: Role | None, frame: dict) -> None:
-        if role is not None:
-            raise ValueError(f"a second hello from an {role}")
-        declared = Role(frame.get("role"))
-        if declared == Role.EA:
-            hold(frame, _EA_HELLO, FrameType.HELLO)
-            if not (isinstance(frame["symbol"], str) and frame["symbol"]):
-                raise ValueError(f"{FrameType.HELLO}: not a symbol: {frame['symbol']!r}")
-            elif not isinstance(frame["spawner"], bool):
-                raise ValueError(
-                    f"{FrameType.HELLO}: spawner is not a boolean: {frame['spawner']!r}"
-                )
-            await self._ea_hello(ws, _Ea(frame["symbol"], frame["spawner"]))
-        else:
-            hold(frame, _ADAPTER_HELLO, FrameType.HELLO)
-            self._roles[ws] = declared
-            logger.info("%s connected: %s", declared, ws.remote_address)
-            queue = asyncio.Queue(maxsize=QUEUE_BOUND)
-            sender = asyncio.create_task(self._send_queued(ws, queue))
-            self._consumers[ws] = _Consumer(queue, sender)
-
-    async def _ea_hello(self, ws, ea: _Ea) -> None:
-        """Takes an EA as its symbol's publisher, and as the spawner when it says it is one; an EA
-        for a symbol another EA publishes is told it is a duplicate and closed."""
-        self._roles[ws] = Role.EA
-        self._eas[ws] = ea
-        publisher = self._publishers.get(ea.symbol)
-        if publisher is not None:
+    def _ea_hello(self, ws, ea: _Ea) -> None:
+        """Takes an EA as the one serving its role and symbol, and as the spawner when its role is;
+        an EA for a role and symbol another EA serves is told it is a duplicate and closed."""
+        holder = self._served.get(ea.key)
+        if holder is not None:
             logger.warning(
-                "refusing a second EA for %s from %s: %s publishes it",
+                "refusing a second %s EA for %s from %s: %s serves it",
+                ea.chart_role,
                 ea.symbol,
                 ws.remote_address,
-                publisher.remote_address,
+                holder.remote_address,
             )
-            await self._send(ws, _addressed(FrameType.DUPLICATE, ea.symbol))
-            await ws.close(CloseCode.NORMAL_CLOSURE, "duplicate")
+            self._to_ea(ws, binary.Duplicate(ea.chart_role, ea.symbol))
+            self._close_later(ws, CloseCode.NORMAL_CLOSURE, "duplicate")
         else:
-            logger.info("EA for %s connected: %s", ea.symbol, ws.remote_address)
-            self._publishers[ea.symbol] = ws
-            self._used[ea.symbol] = time.monotonic()
-            self._requested.discard(ea.symbol)
-            self._sent.discard(ea.symbol)
-            self._failed.pop(ea.symbol, None)
-            self._told[ea.symbol] = self._wanted(ea.symbol)
-            await self._send(ws, self._told[ea.symbol])
-            if ea.spawner:
-                if self._spawner is not None:
-                    logger.warning(
-                        "the EA for %s replaces the EA for %s as the spawner",
-                        ea.symbol,
-                        self._eas[self._spawner].symbol,
-                    )
+            logger.info("%s EA for %s connected: %s", ea.chart_role, ea.symbol, ws.remote_address)
+            self._served[ea.key] = ws
+            if ea.chart_role is ChartRole.SPAWNER:
                 self._spawner = ws
                 self._sent.clear()
                 self._close_sent.clear()
-                for symbol in sorted(self._requested):
-                    # Each send yields: a symbol whose EA said hello meanwhile is passed over.
-                    if symbol not in self._publishers:
-                        await self._request_chart(symbol)
-
-    async def _op(self, ws, kind: FrameType, frame: dict) -> None:
-        """Applies a consumer's subscribe or unsubscribe and queues its ack ahead of any frame the
-        change routes to it; a subscription to a symbol no EA publishes requests its chart."""
-        if not _is_integer(frame.get("id")):
-            raise ValueError(f"not an op id: {frame.get('id')!r}")
-        subscription = subscription_of(frame)
-        # None while the hub closes it for overflow.
-        consumer = self._consumers.get(ws)
-        if consumer is not None:
-            if kind == FrameType.SUBSCRIBE:
-                consumer.subscriptions.add(subscription)
+                for key in sorted(self._requested):
+                    self._request_chart(key)
             else:
-                consumer.subscriptions.discard(subscription)
-            self._mark_used([subscription])
-            ack = {"v": PROTOCOL_VERSION, "type": FrameType.ACK, "id": frame["id"]}
-            self._enqueue(ws, consumer, json.dumps(ack))
-            await self._tell_publishers()
-            if (
-                kind == FrameType.SUBSCRIBE
-                and subscription.symbol is not None
-                and subscription.symbol not in self._publishers
-            ):
-                await self._request_chart(subscription.symbol)
+                self._used[ea.key] = time.monotonic()
+                self._requested.discard(ea.key)
+                self._sent.discard(ea.key)
+                self._failed.pop(ea.key, None)
+            if ea.chart_role is ChartRole.PUBLISHER:
+                self._told[ea.symbol] = self._wanted(ea.symbol)
+                self._to_ea(ws, self._told[ea.symbol])
 
-    async def _publish(self, ws, frame: dict) -> None:
-        """Fans a frame out to the consumers subscribed to it when the EA may send it: one of its
-        own symbol, or, from the current spawner, one of no symbol. A refused duplicate's frame is
+    def _on_ea_frame(self, ws, ea: _Ea, frame: binary.Frame) -> None:
+        """Takes a frame from an EA, by what its role sends; a refused duplicate's frames are
         dropped silently."""
-        ea = self._eas[ws]
-        if self._publishers.get(ea.symbol) is ws:
-            passed = published(frame, self._clock, self._repeated_hours)
-            if not (passed.symbol == ea.symbol or (passed.symbol == "" and ws is self._spawner)):
-                logger.warning(
-                    "dropping a %s frame for %r from the EA for %s",
-                    frame["type"],
-                    passed.symbol,
-                    ea.symbol,
-                )
-            elif passed.subscription.stream is Stream.BARS:
-                await self._publish_bar(passed, frame["time"])
-            else:
-                await self._fan_out(passed)
+        serving = self._served.get(ea.key) is ws
+        publisher = ea.chart_role is ChartRole.PUBLISHER
+        spawner = ea.chart_role is ChartRole.SPAWNER
+        if isinstance(frame, binary.EaHello):
+            raise ValueError(f"a second hello from the {ea.chart_role} EA for {ea.symbol}")
+        elif not serving:
+            pass
+        elif isinstance(frame, binary.Answer):
+            self._answer(ws, ea, frame)
+        elif isinstance(frame, binary.Busy):
+            self._busy(ws, ea, frame)
+        elif isinstance(frame, binary.Ticks | binary.RatesBar) and publisher:
+            self._publish(ea, frame)
+        elif isinstance(frame, binary.TradeTransaction) and (publisher or spawner):
+            self._publish(ea, frame)
+        elif isinstance(frame, binary.ServerTime) and spawner:
+            self._server_time(ea, frame)
+        elif isinstance(frame, binary.Commissions) and publisher:
+            self._relayed_commissions(ea, frame)
+        elif isinstance(frame, binary.Sessions) and publisher:
+            self._relayed_sessions(ea, frame)
+        elif (
+            isinstance(frame, binary.ChartOpened | binary.ChartFailed | binary.ChartKept)
+            and spawner
+        ):
+            self._chart_answer(frame)
+        else:
+            raise ValueError(f"a {type(frame).__name__} frame from a {ea.chart_role} EA")
 
-    async def _publish_bar(self, passed: Published, broker_open: int) -> None:
+    def _on_consumer_frame(self, ws, consumer: _Consumer, frame: binary.Frame) -> None:
+        if isinstance(frame, binary.AdapterHello):
+            raise ValueError("a second hello from a consumer")
+        elif isinstance(frame, binary.Subscribe | binary.Unsubscribe):
+            self._op(ws, consumer, frame)
+        else:
+            self._request(ws, frame)
+
+    def _op(self, ws, consumer: _Consumer, frame: binary.Subscribe | binary.Unsubscribe) -> None:
+        """Applies a consumer's subscribe or unsubscribe and queues its ack ahead of any frame the
+        change routes to it; a subscription to a symbol no publisher serves requests its chart."""
+        if isinstance(frame, binary.Subscribe):
+            consumer.subscriptions.add(frame.subscription)
+        else:
+            consumer.subscriptions.discard(frame.subscription)
+        self._mark_used([frame.subscription])
+        if self._enqueue(ws, consumer, binary.encode(binary.Ack(frame.op_id))):
+            self._tell_publishers()
+            symbol = frame.subscription.symbol
+            if isinstance(frame, binary.Subscribe) and symbol is not None:
+                key = (ChartRole.PUBLISHER, symbol)
+                if key not in self._served:
+                    self._request_chart(key)
+
+    # ── Streams ───────────────────────────────────────────────────────────────
+
+    def _publish(
+        self, ea: _Ea, frame: binary.Ticks | binary.RatesBar | binary.TradeTransaction
+    ) -> None:
+        """Fans a frame out to the consumers subscribed to it when the EA may send it: a publisher's
+        of its own symbol, or the spawner's transaction of no symbol."""
+        passed = published(frame, self._clock, self._repeated_hours)
+        own = ea.chart_role is ChartRole.PUBLISHER and passed.symbol == ea.symbol
+        if not (own or (passed.symbol == "" and ea.chart_role is ChartRole.SPAWNER)):
+            logger.warning(
+                "dropping a %s frame for %r from the %s EA for %s",
+                type(frame).__name__,
+                passed.symbol,
+                ea.chart_role,
+                ea.symbol,
+            )
+        elif isinstance(frame, binary.RatesBar):
+            self._publish_bar(passed.subscription, passed.frame, frame.rates["time"])
+        else:
+            self._fan_out(passed.subscription, binary.encode(passed.frame))
+
+    def _publish_bar(self, subscription: Subscription, bar: binary.Bar, broker_open: int) -> None:
         """Fans a bar out unless the last bar of its series fanned out opened at the same true-UTC
         second; that first bar keeps the period, as the bars route answers it."""
-        opened = passed.frame["time"]
-        if self._bar_opens.get(passed.subscription) == opened:
+        opened = bar.bar["time"]
+        if self._bar_opens.get(subscription) == opened:
             self._repeated_hours.warn_dropped_bar(
-                FrameType.BAR, "time", broker_open, broker_open // _HOUR_S
+                binary.FrameKind.BAR.name.lower(), "time", broker_open, broker_open // _HOUR_S
             )
         else:
-            self._bar_opens[passed.subscription] = opened
-            await self._fan_out(passed)
+            self._bar_opens[subscription] = opened
+            self._fan_out(subscription, binary.encode(bar))
 
-    async def _fan_out(self, passed: Published) -> None:
-        raw = json.dumps(passed.frame)
+    def _fan_out(self, subscription: Subscription, raw: bytes) -> None:
         overflowed = False
         for ws, consumer in list(self._consumers.items()):
-            if passed.subscription in consumer.subscriptions:
+            if subscription in consumer.subscriptions:
                 overflowed |= not self._enqueue(ws, consumer, raw)
         if overflowed:
-            await self._tell_publishers()
+            self._tell_publishers()
 
-    def _relay_frame(self, ws, kind: FrameType, frame: dict) -> None:
-        """Hands the server the EA's commission schedule or trading sessions, or a server-time
-        sample naming its own symbol, off the loop and not awaited, so a slow server never holds
-        back the stream."""
-        ea = self._eas[ws]
-        if self._publishers.get(ea.symbol) is ws:
-            loop = asyncio.get_running_loop()
-            # A schedule or sessions frame is posted under the EA's symbol, so the server records a
-            # refused frame against it.
-            if kind == FrameType.COMMISSIONS:
-                path = f"{COMMISSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}"
-                loop.run_in_executor(None, self._relay, path, frame)
-            elif kind == FrameType.SESSIONS:
-                path = f"{SESSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}"
-                loop.run_in_executor(None, self._relay, path, frame)
-            elif frame.get("symbol") == ea.symbol:
-                loop.run_in_executor(None, self._relay, SERVER_TIME_RELAY_PATH, frame)
-            else:
-                logger.warning(
-                    "dropping a %s frame for %r from the EA for %s",
-                    kind,
-                    frame.get("symbol"),
-                    ea.symbol,
-                )
-
-    def _chart_answer(self, ws, kind: FrameType, frame: dict) -> None:
-        """Takes the spawner's answer to an open_chart or a close_chart: records or clears the
-        failure to open a chart, or counts a chart it kept open in use for another idle period. A
-        refused duplicate's answer is dropped silently."""
-        if kind == FrameType.CHART_OPENED:
-            hold(frame, _CHART_OPENED, kind)
-        else:
-            hold(frame, _CHART_REASON, kind)
-            if not isinstance(frame["reason"], str):
-                raise ValueError(f"{kind}: reason is not a string: {frame['reason']!r}")
-        symbol = frame["symbol"]
-        if not (isinstance(symbol, str) and symbol):
-            raise ValueError(f"{kind}: not a symbol: {symbol!r}")
-        ea = self._eas[ws]
-        if self._publishers.get(ea.symbol) is ws:
-            if ws is not self._spawner:
-                logger.warning(
-                    "dropping a %s frame for %r from the EA for %s", kind, symbol, ea.symbol
-                )
-            elif kind == FrameType.CHART_OPENED:
-                logger.info("the spawner opened a chart of %s", symbol)
-                self._failed.pop(symbol, None)
-            elif kind == FrameType.CHART_FAILED:
-                logger.warning("the spawner cannot open a chart of %s: %s", symbol, frame["reason"])
-                self._failed[symbol] = frame["reason"]
-            else:
-                logger.info("the spawner keeps the chart of %s open: %s", symbol, frame["reason"])
-                self._used[symbol] = time.monotonic()
-                self._close_sent.discard(symbol)
-
-    def _enqueue(self, ws, consumer: _Consumer, raw: str) -> bool:
-        """Queues a frame for a consumer; whether its queue had room. A consumer whose queue is full
-        is closed with the overflow code."""
-        try:
-            consumer.queue.put_nowait(raw)
-        except asyncio.QueueFull:
-            logger.warning(
-                "closing consumer %s: %d frames queued and not sent", ws.remote_address, QUEUE_BOUND
-            )
-            del self._consumers[ws]
-            consumer.sender.cancel()
-            self._mark_used(consumer.subscriptions)
-            # Not awaited: the close waits on a peer that is not reading.
-            closing = asyncio.create_task(ws.close(OVERFLOW, "queue overflow"))
-            self._closing.add(closing)
-            closing.add_done_callback(self._closing.discard)
-            return False
-        else:
-            return True
-
-    async def _send_queued(self, ws, queue: asyncio.Queue) -> None:
-        """Sends a consumer the frames queued for it, in the order they were queued."""
-        try:
-            while True:
-                await ws.send(await queue.get())
-        except ConnectionClosed:
-            # The consumer's handler logs the close and drops it.
-            pass
-
-    async def _tell_publishers(self) -> None:
-        """Tells each symbol's EA its symbol's wanted frame when it differs from the one last
-        told."""
-        for symbol, ws in list(self._publishers.items()):
-            # Each send yields: a publisher that left since the loop began is passed over.
-            if self._publishers.get(symbol) is ws:
+    def _tell_publishers(self) -> None:
+        """Tells each publisher its symbol's wanted frame when it differs from the one last told."""
+        for (chart_role, symbol), ws in list(self._served.items()):
+            if chart_role is ChartRole.PUBLISHER:
                 wanted = self._wanted(symbol)
                 if wanted != self._told[symbol]:
                     self._told[symbol] = wanted
-                    await self._send(ws, wanted)
+                    self._to_ea(ws, wanted)
 
-    def _wanted(self, symbol: str) -> dict[str, object]:
-        """The wanted frame of a symbol: whether some consumer subscribes to its ticks, and the
-        timeframes whose bars some consumer subscribes to."""
+    def _wanted(self, symbol: str) -> binary.Wanted:
+        """Whether some consumer subscribes to the symbol's ticks, and the timeframes whose bars
+        some consumer subscribes to."""
         ticks = False
         timeframes = set()
         for consumer in self._consumers.values():
@@ -450,102 +417,477 @@ class Hub:
                     ticks = True
                 elif item.symbol == symbol and item.stream == Stream.BARS:
                     timeframes.add(BAR_TIMEFRAME[item.timeframe])
-        return _addressed(FrameType.WANTED, symbol) | {
-            "ticks": ticks,
-            "timeframes": sorted(timeframes),
-        }
+        return binary.Wanted(symbol, ticks, tuple(sorted(timeframes)))
 
-    async def _request_chart(self, symbol: str) -> None:
-        """Holds a chart request for a symbol no EA publishes until its EA says hello, sending it to
-        the spawner once per spawner connection."""
-        self._requested.add(symbol)
-        if self._spawner is not None and symbol not in self._sent:
-            self._sent.add(symbol)
-            await self._send(self._spawner, _addressed(FrameType.OPEN_CHART, symbol))
+    # ── Relays ────────────────────────────────────────────────────────────────
 
-    def _in_use(self, symbol: str, now: float) -> bool:
-        """Whether a consumer subscribes to the symbol, or it was used within the idle period."""
-        subscribed = any(
+    def _server_time(self, ea: _Ea, frame: binary.ServerTime) -> None:
+        """Takes the spawner's server-time sample naming its own symbol into the gate, and hands it
+        to the HTTP server."""
+        if frame.symbol == ea.symbol:
+            self._gate.write(frame)
+            body = {
+                "symbol": frame.symbol,
+                "trade_server": frame.trade_server,
+                "current": frame.current,
+                "gmt": frame.gmt,
+                "connected": int(frame.connected),
+            }
+            self._post(SERVER_TIME_RELAY_PATH, body)
+        else:
+            logger.warning(
+                "dropping a server-time sample for %r from the spawner for %s",
+                frame.symbol,
+                ea.symbol,
+            )
+
+    def _relayed_commissions(self, ea: _Ea, frame: binary.Commissions) -> None:
+        """Keeps a publisher's commission schedule under its own symbol, or the reason it is
+        refused, and hands it to the HTTP server under that symbol."""
+        body = {"symbol": frame.symbol} | frame.schedule
+        refusal = commissions_refusal(body, ea.symbol)
+        if refusal is None:
+            self._commissions.write(ea.symbol, commission_schedule(body))
+        else:
+            logger.warning("refusing the commission schedule for %s: %s", ea.symbol, refusal)
+            self._commissions.write(ea.symbol, RelayRefusal(refusal))
+        self._post(f"{COMMISSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}", body)
+
+    def _relayed_sessions(self, ea: _Ea, frame: binary.Sessions) -> None:
+        """Keeps a publisher's trading sessions under its own symbol, or the reason they are
+        refused, and hands them to the HTTP server under that symbol."""
+        body = {"symbol": frame.symbol} | frame.sessions
+        refusal = sessions_refusal(body, ea.symbol)
+        if refusal is None:
+            self._sessions.write(ea.symbol, trading_sessions(body))
+        else:
+            logger.warning("refusing the trading sessions for %s: %s", ea.symbol, refusal)
+            self._sessions.write(ea.symbol, RelayRefusal(refusal))
+        self._post(f"{SESSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}", body)
+
+    def _post(self, path: str, body: dict) -> None:
+        """Hands the server a relayed body off the loop and not awaited, so a slow server never
+        holds back the hub."""
+        asyncio.get_running_loop().run_in_executor(None, self._relay, path, body)
+
+    # ── Charts ────────────────────────────────────────────────────────────────
+
+    def _chart_answer(
+        self, frame: binary.ChartOpened | binary.ChartFailed | binary.ChartKept
+    ) -> None:
+        """Takes the spawner's answer to an open_chart or a close_chart: clears or records the
+        failure to open a chart, or counts a chart it kept open in use for another idle period."""
+        key = (frame.chart_role, frame.symbol)
+        if isinstance(frame, binary.ChartOpened):
+            logger.info("the spawner opened the %s chart of %s", frame.chart_role, frame.symbol)
+            self._failed.pop(key, None)
+        elif isinstance(frame, binary.ChartFailed):
+            reason = f"MQL5 error {frame.error}"
+            logger.warning(
+                "the spawner cannot open the %s chart of %s: %s",
+                frame.chart_role,
+                frame.symbol,
+                reason,
+            )
+            self._failed[key] = reason
+        else:
+            logger.info(
+                "the spawner keeps the %s chart of %s open: %d positions, %d pending orders",
+                frame.chart_role,
+                frame.symbol,
+                frame.positions,
+                frame.orders,
+            )
+            self._used[key] = time.monotonic()
+            self._close_sent.discard(key)
+
+    def _request_chart(self, key: ChartKey) -> None:
+        """Holds a chart request until its EA says hello, sending it to the spawner once per spawner
+        connection."""
+        self._requested.add(key)
+        if self._spawner is not None and key not in self._sent:
+            self._sent.add(key)
+            self._to_ea(self._spawner, binary.OpenChart(*key))
+
+    def _in_use(self, key: ChartKey, now: float) -> bool:
+        """Whether a consumer subscribes to the symbol of a publisher chart, a request waits on the
+        chart's EA, or the chart was used within the idle period."""
+        chart_role, symbol = key
+        subscribed = chart_role is ChartRole.PUBLISHER and any(
             item.symbol == symbol
             for consumer in self._consumers.values()
             for item in consumer.subscriptions
         )
-        return subscribed or now - self._used.get(symbol, -math.inf) < self._idle_s
+        ea = self._served.get(key)
+        waited_on = ea is not None and len(self._requests.of_ea(ea)) > 0
+        recent = now - self._used.get(key, -math.inf) < self._settings.chart_idle_seconds
+        return subscribed or waited_on or recent
 
     def _mark_used(self, subscriptions: Iterable[Subscription]) -> None:
         now = time.monotonic()
         for item in subscriptions:
             if item.symbol is not None:
-                self._used[item.symbol] = now
+                self._used[(ChartRole.PUBLISHER, item.symbol)] = now
 
-    async def _send(self, ws, frame: dict) -> None:
+    # ── Requests ──────────────────────────────────────────────────────────────
+
+    def _request(self, ws, frame: binary.Request) -> None:
+        """Routes a consumer's request: answered at once while the gate is shut, at the pending
+        bound, and with no EA to serve it; answered by the hub for a call it serves; else sent to
+        the EA of its call's role and symbol."""
         try:
-            await ws.send(json.dumps(frame))
-        except ConnectionClosed as closed:
-            logger.info(
-                "connection %s closed before a %s frame: %s",
-                ws.remote_address,
-                frame["type"],
-                closed,
+            call = calls.Call(frame.call)
+        except ValueError:
+            raise ValueError(f"request {frame.request_id}: unknown call {frame.call}") from None
+        row = calls.CALLS[call]
+        arguments = calls.decode_arguments(row, frame)
+        if row.shape is calls.Shape.RATES:
+            bar_series(arguments["timeframe"])
+        if self._gate.verification is None:
+            message = "the broker clock is not verified"
+            self._deferred(ws, frame.request_id, ErrorKind.NOT_READY, message)
+        elif self._requests.asked_by(ws) >= self._settings.pending_bound:
+            message = f"{self._settings.pending_bound} requests pending"
+            self._error(ws, frame.request_id, 0, ErrorKind.OVERFLOW, message)
+        elif call is calls.Call.COMMISSION_SCHEDULE:
+            self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._commissions)
+        elif call is calls.Call.TRADING_SESSIONS:
+            self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._sessions)
+        elif call is calls.Call.RANGES:
+            self._send(ws, frame.request_id, row, _TERMINAL_INFO, {}, arguments["symbol"])
+        else:
+            symbol = calls.routed_symbol(row, arguments)
+            self._send(ws, frame.request_id, row, row, arguments, symbol)
+
+    def _send(
+        self,
+        ws,
+        client_id: int,
+        asked: calls.Row,
+        served: calls.Row,
+        arguments: dict[str, object],
+        symbol: str | None,
+    ) -> None:
+        """Sends a request to the EA serving its role and symbol; with none, has the spawner open
+        its chart and defers it, or refuses it once that chart failed to open."""
+        if served.role is ChartRole.SPAWNER:
+            key = (ChartRole.SPAWNER, None)
+            state = None
+        else:
+            key = (served.role, symbol)
+            state = self.use_chart(key)
+        ea = self._served.get(key)
+        if ea is not None and self._eas[ea].outbound.queue.qsize() < self._settings.ea_queue_bound:
+            results = Results(served, arguments, self._clock, self._repeated_hours)
+            pending = self._requests.add(ws, client_id, asked, served, symbol, ea, results)
+            count, body = calls.encode_arguments(
+                served, broker_arguments(served, arguments, self._clock)
             )
+            self._to_ea(ea, binary.Request(pending.hub_id, served.call, count, body))
+        elif ea is not None:
+            message = f"{self._settings.ea_queue_bound} frames queued for the EA"
+            self._error(ws, client_id, 0, ErrorKind.OVERFLOW, message)
+        elif state is ChartState.FAILED:
+            message = f"the {served.role} chart of {symbol} failed to open: {self._failed[key]}"
+            self._error(ws, client_id, 0, ErrorKind.EA_ERROR, message)
+        elif served.role is ChartRole.SPAWNER:
+            self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no spawner is connected")
+        else:
+            message = f"no {served.role} EA for {symbol}; chart requested"
+            self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
+
+    def _relay_read(
+        self,
+        ws,
+        client_id: int,
+        row: calls.Row,
+        symbol: str,
+        store: CommissionStore | SessionStore,
+    ) -> None:
+        """Answers a commission schedule or trading sessions read from the latest relay for its
+        symbol, deferring it while no publisher serves the symbol or none was relayed."""
+        key = (ChartRole.PUBLISHER, symbol)
+        state = self.use_chart(key)
+        relay = store.read(symbol)
+        if state is ChartState.REQUESTED:
+            message = f"no publisher for {symbol}; chart requested"
+            self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
+        elif state is ChartState.FAILED:
+            message = f"the publisher chart of {symbol} failed to open: {self._failed[key]}"
+            self._error(ws, client_id, 0, ErrorKind.EA_ERROR, message)
+        elif relay is None:
+            message = f"no {row.call.name.lower()} relayed for {symbol}"
+            self._deferred(ws, client_id, ErrorKind.SYNCING, message)
+        elif isinstance(relay, RelayRefusal):
+            message = f"the {row.call.name.lower()} relay for {symbol} was refused: {relay.reason}"
+            self._error(ws, client_id, 0, ErrorKind.EA_ERROR, message)
+        else:
+            count, result = calls.write_result(row, dataclasses.asdict(relay))
+            self._to_consumer(ws, binary.Answer(client_id, 0, True, 0, count, result))
+
+    def _answer(self, ws, ea: _Ea, answer: binary.Answer) -> None:
+        """Passes an EA's answer part on to the consumer that asked, its results in true UTC; a part
+        for a request not pending on this EA is dropped with a warning."""
+        pending = self._requests.get(ws, answer.request_id)
+        if pending is None:
+            logger.warning(
+                "dropping an answer to request %d from the %s EA for %s: none is pending",
+                answer.request_id,
+                ea.chart_role,
+                ea.symbol,
+            )
+        elif answer.error is not None:
+            self._requests.remove(pending)
+            passed = dataclasses.replace(
+                answer, request_id=pending.client_id, part=pending.next_part
+            )
+            self._to_consumer(pending.consumer, passed)
+        elif answer.part != pending.next_part:
+            raise ValueError(
+                f"part {answer.part} of the answer to request {answer.request_id}, "
+                f"not {pending.next_part}"
+            )
+        else:
+            # Composed before the request leaves: a part the hub cannot pass on refuses its EA, and
+            # the request, still pending on it, is answered ea_gone.
+            value, fact = calls.read_ea_result(pending.served, answer)
+            if fact is not None:
+                self._learn_floor(pending, fact)
+            if pending.asked is pending.served:
+                count, result = calls.write_result(pending.served, pending.results.part(value))
+                passed = binary.Answer(
+                    pending.client_id, answer.part, answer.last, answer.last_error, count, result
+                )
+            else:
+                ranges = self._ranges(pending.symbol, value["maxbars"])
+                count, result = calls.write_result(_RANGES, ranges)
+                passed = binary.Answer(pending.client_id, 0, True, answer.last_error, count, result)
+            pending.next_part += 1
+            if answer.last:
+                self._requests.remove(pending)
+            self._to_consumer(pending.consumer, passed)
+
+    def _busy(self, ws, ea: _Ea, busy: binary.Busy) -> None:
+        """Moves a request's deadline and its EA's keepalive tolerance to the busy's bound, and
+        tells the consumer that asked."""
+        pending = self._requests.get(ws, busy.request_id)
+        if pending is None:
+            logger.warning(
+                "dropping a busy for request %d from the %s EA for %s: none is pending",
+                busy.request_id,
+                ea.chart_role,
+                ea.symbol,
+            )
+        else:
+            self._requests.busy(pending, busy.bound_s)
+            self._to_consumer(pending.consumer, binary.Busy(pending.client_id, busy.bound_s))
+
+    def _expired(self, pending: Pending) -> None:
+        ea = self._eas[pending.ea]
+        logger.error(
+            "request %d, %s, to the %s EA for %s went past its deadline unanswered",
+            pending.hub_id,
+            pending.served.call.name.lower(),
+            ea.chart_role,
+            ea.symbol,
+        )
+        message = f"the {ea.chart_role} EA for {ea.symbol} did not answer in time"
+        self._error(
+            pending.consumer, pending.client_id, pending.next_part, ErrorKind.TIMEOUT, message
+        )
+
+    def _learn_floor(self, pending: Pending, fact: calls.FloorFact) -> None:
+        if pending.served.shape is calls.Shape.TICKS:
+            series = Series.TICKS
+        else:
+            series = pending.results.series
+        self._floors.write(pending.symbol, series, fact.floor, int(time.time()), fact.origin)
+
+    def _ranges(self, symbol: str, maxbars: int) -> calls.Ranges:
+        """The terminal's MaxBars and every floor held for the symbol, in true UTC."""
+        conversion = Conversion(self._clock, self._repeated_hours)
+        floors = self._floors.of_symbol(symbol)
+        series = {}
+        for name in Series:
+            if name in floors:
+                floor = floors[name]
+                where = f"{symbol} {name}"
+                if name is Series.TICKS:
+                    utc_msc = conversion.utc(
+                        mirror.EpochUnit.MILLISECONDS, floor.value, where, "floor"
+                    )
+                    advertised = utc_msc // 1000
+                else:
+                    advertised = conversion.utc(
+                        mirror.EpochUnit.SECONDS, floor.value, where, "floor"
+                    )
+                series[name] = calls.SeriesRange(advertised, floor.measured_at, floor.generation)
+        return calls.Ranges(maxbars, series)
+
+    def _deferred(self, ws, client_id: int, kind: ErrorKind, message: str) -> None:
+        error = binary.AnswerError(kind, message, int(self._settings.retry_after_s * 1000))
+        self._to_consumer(ws, binary.Answer(client_id, 0, True, 0, error=error))
+
+    def _error(self, ws, client_id: int, part: int, kind: ErrorKind, message: str) -> None:
+        error = binary.AnswerError(kind, message)
+        self._to_consumer(ws, binary.Answer(client_id, part, True, 0, error=error))
+
+    # ── Sending ───────────────────────────────────────────────────────────────
+
+    def _outbound(self, ws) -> _Outbound:
+        queue = asyncio.Queue()
+        return _Outbound(queue, asyncio.create_task(self._send_queued(ws, queue)))
+
+    def _to_consumer(self, ws, frame: binary.Frame) -> None:
+        """Queues a frame for a consumer still connected."""
+        consumer = self._consumers.get(ws)
+        if consumer is not None:
+            self._enqueue(ws, consumer, binary.encode(frame))
+
+    def _enqueue(self, ws, consumer: _Consumer, raw: bytes) -> bool:
+        """Queues a frame for a consumer; whether its queue had room. A consumer whose queue is full
+        is closed with the overflow code."""
+        if consumer.outbound.queue.qsize() < self._settings.consumer_queue_bound:
+            consumer.outbound.queue.put_nowait(raw)
+            return True
+        else:
+            logger.warning(
+                "closing consumer %s: %d frames queued and not sent",
+                ws.remote_address,
+                self._settings.consumer_queue_bound,
+            )
+            self._drop(ws)
+            self._close_later(ws, OVERFLOW, "queue overflow")
+            return False
+
+    def _to_ea(self, ws, frame: binary.Frame) -> None:
+        """Queues a frame for an EA; an EA whose queue is full is closed with the overflow code."""
+        ea = self._eas.get(ws)
+        if ea is not None and ea.outbound.queue.qsize() < self._settings.ea_queue_bound:
+            ea.outbound.queue.put_nowait(binary.encode(frame))
+        elif ea is not None:
+            logger.warning(
+                "closing the %s EA for %s: %d frames queued and not sent",
+                ea.chart_role,
+                ea.symbol,
+                self._settings.ea_queue_bound,
+            )
+            self._drop(ws)
+            self._close_later(ws, OVERFLOW, "queue overflow")
+
+    async def _send_queued(self, ws, queue: asyncio.Queue) -> None:
+        """Sends a connection the frames queued for it, in the order they were queued."""
+        try:
+            while True:
+                await ws.send(await queue.get())
+        except ConnectionClosed:
+            # The connection's handler logs the close and drops it.
+            pass
+
+    def _close_later(self, ws, code: int, reason: str) -> None:
+        # Not awaited: the close waits on a peer that may not be reading.
+        closing = asyncio.create_task(ws.close(code, reason))
+        self._closing.add(closing)
+        closing.add_done_callback(self._closing.discard)
+
+    async def _keepalive(self, ws) -> None:
+        """Pings the connection every interval, one ping outstanding, and fails it once a pong is
+        overdue: past the ping timeout, or for an EA past its latest busy's bound when later."""
+        while True:
+            await asyncio.sleep(PING_INTERVAL_S)
+            try:
+                pong = await ws.ping()
+            except ConnectionClosed:
+                return
+            sent = time.monotonic()
+            while not pong.done():
+                deadline = sent + PING_INTERVAL_S * PING_TIMEOUT_INTERVALS
+                busy_until = self._requests.busy_until(ws)
+                if busy_until is not None:
+                    deadline = max(deadline, busy_until)
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.wait({pong}, timeout=remaining)
+                else:
+                    logger.warning("closing connection %s: its pong is overdue", ws.remote_address)
+                    self._drop(ws)
+                    self._close_later(ws, CloseCode.INTERNAL_ERROR, "keepalive ping timeout")
+                    return
 
     async def _refuse(self, ws, message: str) -> None:
-        """Answers a frame the hub cannot handle with an error frame, then closes the connection."""
-        await self._drop(ws)
-        await self._send(ws, {"v": PROTOCOL_VERSION, "type": FrameType.ERROR, "message": message})
+        """Answers a frame the hub cannot handle with a refusal, then closes the connection."""
+        self._drop(ws)
+        try:
+            await ws.send(binary.encode(binary.Refusal(message)))
+        except ConnectionClosed as closed:
+            logger.info("connection %s closed before its refusal: %s", ws.remote_address, closed)
         await ws.close(CloseCode.PROTOCOL_ERROR)
 
-    async def _drop(self, ws) -> None:
-        """Forgets a connection. A consumer's subscriptions leave the wanted frames with it; a
-        publishing EA leaves its symbol unpublished, and a symbol still in use has its chart
+    def _drop(self, ws) -> None:
+        """Forgets a connection. A consumer's subscriptions leave the wanted frames with it and its
+        pending requests are answered to no one; an EA that served its role and symbol leaves them
+        unserved, each of its pending requests answered ea_gone, and a chart still in use is
         requested again."""
-        self._roles.pop(ws, None)
         consumer = self._consumers.pop(ws, None)
         ea = self._eas.pop(ws, None)
         if consumer is not None:
-            consumer.sender.cancel()
+            consumer.outbound.sender.cancel()
+            self._requests.consumer_left(ws)
             self._mark_used(consumer.subscriptions)
-            await self._tell_publishers()
-        elif ea is not None and self._publishers.get(ea.symbol) is ws:
-            logger.info("EA for %s disconnected: %s", ea.symbol, ws.remote_address)
-            del self._publishers[ea.symbol]
-            del self._told[ea.symbol]
-            self._close_sent.discard(ea.symbol)
-            if ws is self._spawner:
-                self._spawner = None
-                self._sent.clear()
-                self._close_sent.clear()
-            if self._in_use(ea.symbol, time.monotonic()):
-                await self._request_chart(ea.symbol)
+            self._tell_publishers()
+        elif ea is not None:
+            ea.outbound.sender.cancel()
+            if self._served.get(ea.key) is ws:
+                logger.info(
+                    "%s EA for %s disconnected: %s", ea.chart_role, ea.symbol, ws.remote_address
+                )
+                del self._served[ea.key]
+                message = f"the {ea.chart_role} EA for {ea.symbol} left"
+                for pending in self._requests.of_ea(ws):
+                    self._requests.remove(pending)
+                    self._error(
+                        pending.consumer,
+                        pending.client_id,
+                        pending.next_part,
+                        ErrorKind.EA_GONE,
+                        message,
+                    )
+                if ea.chart_role is ChartRole.SPAWNER:
+                    self._spawner = None
+                    self._sent.clear()
+                    self._close_sent.clear()
+                else:
+                    self._close_sent.discard(ea.key)
+                    if ea.chart_role is ChartRole.PUBLISHER:
+                        del self._told[ea.symbol]
+                    if self._in_use(ea.key, time.monotonic()):
+                        self._request_chart(ea.key)
 
 
 def serve_hub(hub: Hub, host: str, port: int):
-    """The hub served on `host`:`port` with its chart route, pinging every peer at the protocol's
-    interval with one ping outstanding, failing a connection whose ping goes the ping timeout
-    without its pong, and dropping it within the close timeout; the ping and the close frame wait on
-    the hub's writes to the peer draining."""
+    """The hub served on `host`:`port` with its HTTP routes; the hub keeps every connection alive
+    itself, and drops one within the close timeout."""
     return serve(
         hub.handler,
         host,
         port,
         process_request=hub.process_request,
-        ping_interval=PING_INTERVAL_S,
-        ping_timeout=PING_INTERVAL_S * PING_TIMEOUT_INTERVALS,
+        ping_interval=None,
         close_timeout=CLOSE_TIMEOUT_S,
     )
 
 
 def post_to(base_url: str) -> Callable[[str, dict], None]:
-    """A relay that POSTs each frame as JSON to the route at its path under `base_url`, and logs a
+    """A relay that POSTs each body as JSON to the route at its path under `base_url`, and logs a
     failed post as a warning."""
-    # No proxy: the server refuses a relayed frame that does not arrive over loopback.
+    # No proxy: the server refuses a relayed body that does not arrive over loopback.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def post(path: str, frame: dict) -> None:
+    def post(path: str, body: dict) -> None:
         url = f"{base_url}{path}"
         request = urllib.request.Request(
             url,
-            data=json.dumps(frame).encode(),
+            data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -561,18 +903,19 @@ def post_to(base_url: str) -> Callable[[str, dict], None]:
 async def _serve(settings: HubSettings) -> None:
     clock = BrokerClock(settings.broker_tz, timedelta(hours=settings.broker_offset_hours))
     relay = post_to(f"http://127.0.0.1:{settings.api_port}")
-    hub = Hub(clock, relay, idle_s=settings.chart_idle_seconds)
+    hub = Hub(clock, relay, settings)
+    hub.start()
     async with serve_hub(hub, "0.0.0.0", settings.hub_port):
         while True:
             await asyncio.sleep(_IDLE_SWEEP_S)
-            await hub.close_idle_charts()
+            hub.close_idle_charts()
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = read_hub_settings(os.environ)
     logger.info(
-        "push hub on port %d, broker clock %s %+d h, charts closed after %d s out of use",
+        "hub on port %d, broker clock %s %+d h, charts closed after %d s out of use",
         settings.hub_port,
         settings.broker_tz.key,
         settings.broker_offset_hours,
@@ -581,19 +924,11 @@ def main() -> None:
     asyncio.run(_serve(settings))
 
 
-def _addressed(kind: FrameType, symbol: str) -> dict[str, object]:
-    return {"v": PROTOCOL_VERSION, "type": kind, "symbol": symbol}
-
-
 def _json(connection, status: HTTPStatus, body: dict[str, object]) -> Response:
     response = connection.respond(status, json.dumps(body))
     del response.headers["Content-Type"]
     response.headers["Content-Type"] = "application/json"
     return response
-
-
-def _is_integer(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 if __name__ == "__main__":

@@ -16,8 +16,6 @@ from mt5connector.wire.history_wire import ServerCode
 
 UNVERIFIED = {"ok": False, "error": {"code": -1, "message": "the broker clock is not verified"}}
 FRAME = {
-    "v": 1,
-    "type": "server_time",
     "symbol": "EURUSD",
     "trade_server": 1_752_580_800,
     "current": 1_752_580_798,

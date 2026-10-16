@@ -27,7 +27,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from push_double import PushDouble
+from session_double import SessionDouble
 from venue_doubles import account_info, relayed_sessions, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
@@ -95,7 +95,7 @@ def _client(
         "trade_allowed": terminal_trade_allowed,
     }
     clock = LiveClock()
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = MT5LiveExecutionClient(
             loop=loop,
             connection=conn,
@@ -243,7 +243,7 @@ async def test_a_non_hedging_account_fails_the_connect_naming_both_modes_before_
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
     assert client._account_task is None
-    assert not client._push.connected
+    assert not client._hub.connected
 
 
 async def test_a_hedging_account_connects(venue):
@@ -251,7 +251,7 @@ async def test_a_hedging_account_connects(venue):
     await client._connect()
     client.generate_account_state.assert_called_once()
     assert not client._account_task.done()
-    assert client._push.connected
+    assert client._hub.connected
     await _stop_account_loop(client)
 
 
@@ -267,14 +267,14 @@ async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue)
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
     assert client._account_task is None
-    assert not client._push.connected
+    assert not client._hub.connected
 
 
 async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(venue):
     client = _client(venue, account_info(trade_allowed=True), terminal_trade_allowed=True)
     await client._connect()
     assert not client._account_task.done()
-    assert client._push.connected
+    assert client._hub.connected
     await _stop_account_loop(client)
 
 
@@ -335,7 +335,7 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
         account_info(login=7654321, currency="EUR")
     )
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -522,7 +522,7 @@ def _served_client(transport, provider_config: InstrumentProviderConfig):
     provider = MT5InstrumentProvider(
         connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
     )
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -556,7 +556,7 @@ async def test_connect_refuses_a_provider_config_that_names_nothing(terminal, pr
     with pytest.raises(MT5ConfigError, match="instrument_provider"):
         await client._connect()
     assert provider.list_all() == []
-    assert not client._push.connected
+    assert not client._hub.connected
     client.generate_account_state.assert_not_called()
 
 

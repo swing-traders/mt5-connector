@@ -23,6 +23,11 @@ class ResponseLost(ServerUnreachable):
     back, so the server may have acted on it."""
 
 
+class ProtocolError(ServerUnreachable):
+    """Raised for a request whose answer, or a frame of the hub's no request can be told from,
+    breaks the hub protocol's layout."""
+
+
 class ServerBusy(MT5ConnectionError):
     """Raised when the remote MT5 server refuses a call because every slot of its cap is taken,
     carrying the delay its Retry-After gives."""
@@ -30,6 +35,55 @@ class ServerBusy(MT5ConnectionError):
     def __init__(self, message: str, retry_after_s: int) -> None:
         super().__init__(message)
         self.retry_after_s = retry_after_s
+
+
+class HubAnswerError(MT5ConnectionError):
+    """Raised for a request the hub or its EA answered without a result, carrying the MQL5 error the
+    answer folds in."""
+
+    def __init__(self, message: str, last_error: int) -> None:
+        super().__init__(message)
+        self.last_error = last_error
+
+
+class Deferred(HubAnswerError):
+    """Raised for a request the hub defers, carrying the delay before asking again."""
+
+    def __init__(self, message: str, last_error: int, retry_after_s: float) -> None:
+        super().__init__(message, last_error)
+        self.retry_after_s = retry_after_s
+
+
+class Syncing(Deferred):
+    """Raised for a history window the terminal's answers do not prove yet."""
+
+
+class NotReady(Deferred):
+    """Raised while the hub's broker clock is not verified."""
+
+
+class NoPublisher(Deferred):
+    """Raised while no EA serves the request's role and symbol and its chart is requested."""
+
+
+class InvalidWindow(HubAnswerError):
+    """Raised for a history window starting after the terminal's time."""
+
+
+class Overflow(HubAnswerError):
+    """Raised for a request a bounded queue had no room for."""
+
+
+class EaGone(HubAnswerError):
+    """Raised for a request whose EA left before answering it, so it may have acted on it."""
+
+
+class HubTimeout(HubAnswerError):
+    """Raised for a request its EA did not answer within the hub's deadline."""
+
+
+class EaError(HubAnswerError):
+    """Raised for a request its EA could not perform, with the MQL5 error it left."""
 
 
 class MT5LoginError(MT5Error):

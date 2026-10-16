@@ -1,4 +1,5 @@
-"""The hub's chart route over HTTP, and a read that has the spawner open a chart, end to end."""
+"""The hub's chart route over HTTP, and a read of the HTTP server that has the spawner open a chart,
+end to end."""
 
 import asyncio
 import json
@@ -8,51 +9,23 @@ from types import SimpleNamespace
 
 import pytest
 import requests
-import websockets
 from chart_posts import FRESH_S, RETRY_S, TOUCH_S
-from mirror_samples import BROKER_EPOCH, CLOCK
+from ea_wire import FakeEa, zeroed
+from hub_doubles import Consumer, settings
+from mirror_samples import CLOCK
 
 import mt5connector.client.history as history_client
 from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.server import charts
 from mt5connector.server.charts import HubError, Publishers, hub_charts
-from mt5connector.server.wire.push_wire import ChartState
+from mt5connector.server.wire import binary
+from mt5connector.server.wire.push_wire import ChartRole, ChartState, Stream, Subscription
 from mt5connector.server.ws_server import Hub, post_to, serve_hub
 from mt5connector.wire.history_wire import Series, ServerCode
 
-NOT_LISTED = "SymbolSelect failed with error 4301"
+NOT_LISTED = "MQL5 error 4301"
 FAILED = f"the chart of XYZ failed to open: {NOT_LISTED}"
-
-
-def sample(symbol: str) -> dict[str, object]:
-    return {
-        "v": 1,
-        "type": "server_time",
-        "symbol": symbol,
-        "trade_server": 1_752_580_800,
-        "current": 1_752_580_798,
-        "gmt": 1_752_570_000,
-        "connected": 1,
-    }
-
-
-def chart_failed(symbol: str) -> dict[str, object]:
-    return {"v": 1, "type": "chart_failed", "symbol": symbol, "reason": NOT_LISTED}
-
-
-def chart_opened(symbol: str) -> dict[str, object]:
-    return {"v": 1, "type": "chart_opened", "symbol": symbol}
-
-
-def commissions_frame(symbol: str) -> dict[str, object]:
-    return {
-        "v": 1,
-        "type": "commissions",
-        "symbol": symbol,
-        "ret": 0,
-        "last_error": 0,
-        "rules": [],
-    }
+PUBLISHER = ChartRole.PUBLISHER
 
 
 @pytest.fixture
@@ -77,8 +50,8 @@ def server_clock(monkeypatch):
 
 @pytest.fixture
 def publishers(hub_port, hub_posts):
-    """The server's view of the publishers, posting to a hub on `hub_port` and recording each
-    symbol it posts."""
+    """The server's view of the publishers, posting to a hub on `hub_port` and recording each symbol
+    it posts."""
     post = hub_charts(f"http://127.0.0.1:{hub_port}")
 
     def recorded(symbol):
@@ -88,74 +61,51 @@ def publishers(hub_port, hub_posts):
     return Publishers(recorded, fresh_s=FRESH_S, touch_s=TOUCH_S, retry_s=RETRY_S)
 
 
-async def _ea(port, symbol, spawner=False):
-    ws = await websockets.connect(f"ws://127.0.0.1:{port}")
-    hello = {"v": 1, "type": "hello", "role": "ea", "symbol": symbol, "spawner": spawner}
-    await ws.send(json.dumps(hello))
-    assert json.loads(await asyncio.wait_for(ws.recv(), 1))["type"] == "wanted"
-    return ws
+async def _serve(port, relay=None):
+    hub = Hub(CLOCK, relay or (lambda path, body: None), settings())
+    return await serve_hub(hub, "127.0.0.1", port)
 
 
-async def _nothing(ws):
+async def _nothing(ea: FakeEa):
     with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(ws.recv(), timeout=0.3)
+        await asyncio.wait_for(ea.ws.recv(), timeout=0.3)
 
 
-async def _received(ws):
-    return json.loads(await asyncio.wait_for(ws.recv(), 1))
+async def _transactions(port) -> Consumer:
+    consumer = await Consumer.connect(port)
+    await consumer.subscribed(1, Subscription(Stream.TRADE_TRANSACTIONS))
+    return consumer
 
 
-async def _ticks_of(port, *symbols):
-    """An adapter subscribed to the ticks of each symbol, its acks read."""
-    ws = await websockets.connect(f"ws://127.0.0.1:{port}")
-    await ws.send(json.dumps({"v": 1, "type": "hello", "role": "adapter"}))
-    for op_id, symbol in enumerate(symbols, start=1):
-        subscribe = {"v": 1, "type": "subscribe", "id": op_id, "stream": "ticks", "symbol": symbol}
-        await ws.send(json.dumps(subscribe))
-        assert await _received(ws) == {"v": 1, "type": "ack", "id": op_id}
-    return ws
-
-
-async def _answered(spawner, adapter, answer):
-    """Sends the spawner's chart answer, then a tick of its own symbol, which reaches the adapter
-    only once the hub has handled the answer before it."""
-    tick = {
-        "v": 1,
-        "type": "tick",
-        "symbol": "EURUSD",
-        "time": BROKER_EPOCH,
-        "bid": 1.085,
-        "ask": 1.08512,
-        "last": 0.0,
-        "volume": 0,
-        "time_msc": BROKER_EPOCH * 1000,
-        "flags": 6,
-        "volume_real": 0.0,
-    }
-    await spawner.send(json.dumps(answer))
-    await spawner.send(json.dumps(tick))
-    assert (await _received(adapter))["symbol"] == "EURUSD"
+async def _answered(spawner: FakeEa, consumer: Consumer, answer) -> None:
+    """Sends the spawner's chart answer, then a transaction naming no symbol, which reaches the
+    consumer only once the hub has handled the answer before it."""
+    unmarked = binary.TradeTransaction(
+        zeroed(binary.TRADE_TRANSACTION), zeroed(binary.TRADE_REQUEST), zeroed(binary.TRADE_RESULT)
+    )
+    await spawner.send(answer)
+    await spawner.send(unmarked)
+    assert await consumer.received() == unmarked
 
 
 def forbidden_sleep(seconds):
     raise AssertionError(f"slept {seconds} s")
 
 
-async def test_a_post_requests_the_chart_once_and_answers_published_once_the_ea_says_hello(
+async def test_a_post_requests_the_chart_once_and_answers_published_once_its_publisher_says_hello(
     hub_port,
 ):
-    server = await serve_hub(
-        Hub(CLOCK, lambda path, frame: None, idle_s=900), "127.0.0.1", hub_port
-    )
-    spawner = await _ea(hub_port, "EURUSD", spawner=True)
+    server = await _serve(hub_port)
+    spawner = await FakeEa.connect(hub_port, ChartRole.SPAWNER, "EURUSD")
     post = hub_charts(f"http://127.0.0.1:{hub_port}")
     loop = asyncio.get_running_loop()
 
     first = await loop.run_in_executor(None, post, "US500#")
-    opened = json.loads(await asyncio.wait_for(spawner.recv(), 1))
+    opened = await spawner.received()
     second = await loop.run_in_executor(None, post, "US500#")
     await _nothing(spawner)
-    us500 = await _ea(hub_port, "US500#")
+    us500 = await FakeEa.connect(hub_port, PUBLISHER, "US500#")
+    await us500.received()
     third = await loop.run_in_executor(None, post, "US500#")
 
     assert (first, second, third) == (
@@ -163,16 +113,14 @@ async def test_a_post_requests_the_chart_once_and_answers_published_once_the_ea_
         ChartState.REQUESTED,
         ChartState.PUBLISHED,
     )
-    assert opened == {"v": 1, "type": "open_chart", "symbol": "US500#"}
-    for ws in (spawner, us500):
-        await ws.close()
+    assert opened == binary.OpenChart(PUBLISHER, "US500#")
+    for ea in (spawner, us500):
+        await ea.close()
     server.close()
 
 
 async def test_a_request_other_than_a_post_naming_a_symbol_is_refused(hub_port):
-    server = await serve_hub(
-        Hub(CLOCK, lambda path, frame: None, idle_s=900), "127.0.0.1", hub_port
-    )
+    server = await _serve(hub_port)
     base = f"http://127.0.0.1:{hub_port}"
     loop = asyncio.get_running_loop()
 
@@ -196,7 +144,7 @@ async def test_a_request_other_than_a_post_naming_a_symbol_is_refused(hub_port):
 
 
 async def test_a_post_from_another_host_is_refused():
-    hub = Hub(CLOCK, lambda path, frame: None, idle_s=900)
+    hub = Hub(CLOCK, lambda path, body: None, settings())
     connection = SimpleNamespace(
         remote_address=("10.0.0.5", 50_000),
         respond=lambda status, text: SimpleNamespace(
@@ -218,27 +166,29 @@ def test_a_hub_that_does_not_answer_raises_hub_error(hub_port):
         hub_charts(f"http://127.0.0.1:{hub_port}")("USDJPY")
 
 
-async def test_a_read_has_the_spawner_open_the_chart_and_turns_200_once_its_ea_relays(
+async def test_a_read_has_the_spawner_open_the_chart_and_turns_200_once_its_publisher_relays(
     served, hub_port, hub_posts, server_clock
 ):
-    server = await serve_hub(Hub(CLOCK, post_to(served), idle_s=900), "127.0.0.1", hub_port)
-    spawner = await _ea(hub_port, "EURUSD", spawner=True)
+    server = await _serve(hub_port, post_to(served))
+    spawner = await FakeEa.connect(hub_port, ChartRole.SPAWNER, "EURUSD")
     loop = asyncio.get_running_loop()
 
     def read():
         return requests.get(f"{served}/commissions/USDJPY", timeout=5)
 
     first = await loop.run_in_executor(None, read)
-    opened = json.loads(await asyncio.wait_for(spawner.recv(), 1))
+    opened = await spawner.received()
     server_clock[0] = 1_001.0
     early = await loop.run_in_executor(None, read)
     posted_early = list(hub_posts)
     server_clock[0] = 1_005.0
     again = await loop.run_in_executor(None, read)
     await _nothing(spawner)
-    usdjpy = await _ea(hub_port, "USDJPY")
-    await usdjpy.send(json.dumps(sample("USDJPY")))
-    await usdjpy.send(json.dumps(commissions_frame("USDJPY")))
+    usdjpy = await FakeEa.connect(hub_port, PUBLISHER, "USDJPY")
+    await usdjpy.received()
+    await usdjpy.send(binary.Commissions("USDJPY", {"ret": 0, "last_error": 0, "rules": []}))
+    # The server's next post, a retry interval on, finds the publisher.
+    server_clock[0] = 1_010.0
     for _ in range(50):
         relayed = await loop.run_in_executor(None, read)
         if relayed.status_code == 200:
@@ -250,29 +200,28 @@ async def test_a_read_has_the_spawner_open_the_chart_and_turns_200_once_its_ea_r
             503,
             "no publisher for USDJPY; chart requested",
         )
-    assert opened == {"v": 1, "type": "open_chart", "symbol": "USDJPY"}
+    assert opened == binary.OpenChart(PUBLISHER, "USDJPY")
     assert (relayed.status_code, relayed.json()["result"]["rules"]) == (200, [])
     assert posted_early == ["USDJPY"]
-    assert hub_posts == ["USDJPY", "USDJPY"]
-    for ws in (spawner, usdjpy):
-        await ws.close()
+    assert hub_posts == ["USDJPY", "USDJPY", "USDJPY"]
+    for ea in (spawner, usdjpy):
+        await ea.close()
     server.close()
 
 
 async def test_a_reader_deferred_on_a_requested_chart_fails_on_its_retry_once_the_chart_failed(
     served, remote, hub_port, hub_posts, server_clock, monkeypatch
 ):
-    server = await serve_hub(Hub(CLOCK, post_to(served), idle_s=900), "127.0.0.1", hub_port)
-    spawner = await _ea(hub_port, "EURUSD", spawner=True)
-    adapter = await _ticks_of(hub_port, "EURUSD")
-    await _received(spawner)
+    server = await _serve(hub_port, post_to(served))
+    spawner = await FakeEa.connect(hub_port, ChartRole.SPAWNER, "EURUSD")
+    consumer = await _transactions(hub_port)
     loop = asyncio.get_running_loop()
 
     requested = await loop.run_in_executor(
         None, lambda: requests.get(f"{served}/commissions/XYZ", timeout=5)
     )
-    opened = await _received(spawner)
-    await _answered(spawner, adapter, chart_failed("XYZ"))
+    opened = await spawner.received()
+    await _answered(spawner, consumer, binary.ChartFailed(PUBLISHER, "XYZ", 4301))
     server_clock[0] = 1_001.0
     slept = []
 
@@ -293,56 +242,53 @@ async def test_a_reader_deferred_on_a_requested_chart_fails_on_its_retry_once_th
         503,
         "no publisher for XYZ; chart requested",
     )
-    assert opened == {"v": 1, "type": "open_chart", "symbol": "XYZ"}
+    assert opened == binary.OpenChart(PUBLISHER, "XYZ")
     assert (refused, slept) == (f"commissions: {FAILED}", [5])
     assert hub_posts == ["XYZ", "XYZ"]
     await _nothing(spawner)
-    for ws in (spawner, adapter):
-        await ws.close()
+    await spawner.close()
+    await consumer.close()
     server.close()
 
 
 async def test_the_route_answers_failed_with_the_spawners_reason_until_the_chart_opens(hub_port):
-    server = await serve_hub(
-        Hub(CLOCK, lambda path, frame: None, idle_s=900), "127.0.0.1", hub_port
-    )
-    spawner = await _ea(hub_port, "EURUSD", spawner=True)
-    adapter = await _ticks_of(hub_port, "EURUSD")
-    await _received(spawner)
+    server = await _serve(hub_port)
+    spawner = await FakeEa.connect(hub_port, ChartRole.SPAWNER, "EURUSD")
+    consumer = await _transactions(hub_port)
     loop = asyncio.get_running_loop()
 
     def post():
         return requests.post(f"http://127.0.0.1:{hub_port}/charts/XYZ", timeout=1).json()
 
     requested = await loop.run_in_executor(None, post)
-    opened = await _received(spawner)
-    await _answered(spawner, adapter, chart_failed("XYZ"))
+    opened = await spawner.received()
+    await _answered(spawner, consumer, binary.ChartFailed(PUBLISHER, "XYZ", 4301))
     failed = await loop.run_in_executor(None, post)
-    await _answered(spawner, adapter, chart_opened("XYZ"))
+    await _answered(spawner, consumer, binary.ChartOpened(PUBLISHER, "XYZ"))
     cleared = await loop.run_in_executor(None, post)
 
-    assert opened == {"v": 1, "type": "open_chart", "symbol": "XYZ"}
+    assert opened == binary.OpenChart(PUBLISHER, "XYZ")
     assert [requested, failed, cleared] == [
         {"ok": True, "result": "requested"},
         {"ok": True, "result": "failed", "reason": NOT_LISTED},
         {"ok": True, "result": "requested"},
     ]
     await _nothing(spawner)
-    for ws in (spawner, adapter):
-        await ws.close()
+    await spawner.close()
+    await consumer.close()
     server.close()
 
 
 async def test_a_read_of_a_symbol_whose_chart_failed_to_open_fails_at_once_naming_the_reason(
     served, remote, connection, hub_port, hub_posts, monkeypatch
 ):
-    server = await serve_hub(Hub(CLOCK, post_to(served), idle_s=900), "127.0.0.1", hub_port)
-    spawner = await _ea(hub_port, "EURUSD", spawner=True)
+    server = await _serve(hub_port, post_to(served))
+    spawner = await FakeEa.connect(hub_port, ChartRole.SPAWNER, "EURUSD")
+    consumer = await _transactions(hub_port)
     # The subscription requests XYZ's chart.
-    adapter = await _ticks_of(hub_port, "XYZ", "EURUSD")
-    assert await _received(spawner) == {"v": 1, "type": "open_chart", "symbol": "XYZ"}
-    await _received(spawner)
-    await _answered(spawner, adapter, chart_failed("XYZ"))
+    await consumer.subscribed(2, Subscription(Stream.TICKS, "XYZ"))
+    assert await spawner.received() == binary.OpenChart(PUBLISHER, "XYZ")
+    await _answered(spawner, consumer, binary.ChartFailed(PUBLISHER, "XYZ", 4301))
     monkeypatch.setattr(time, "sleep", forbidden_sleep)
     loop = asyncio.get_running_loop()
 
@@ -353,7 +299,7 @@ async def test_a_read_of_a_symbol_whose_chart_failed_to_open_fails_at_once_namin
         return str(refused.value), bars, remote.last_error()
 
     refused, bars, last_error = await loop.run_in_executor(None, reads)
-    await _answered(spawner, adapter, chart_opened("XYZ"))
+    await _answered(spawner, consumer, binary.ChartOpened(PUBLISHER, "XYZ"))
     deferred = await loop.run_in_executor(
         None, lambda: requests.get(f"{served}/commissions/XYZ", timeout=5)
     )
@@ -365,6 +311,6 @@ async def test_a_read_of_a_symbol_whose_chart_failed_to_open_fails_at_once_namin
         "no publisher for XYZ; chart requested",
     )
     assert hub_posts == ["XYZ", "XYZ", "XYZ"]
-    for ws in (spawner, adapter):
-        await ws.close()
+    await spawner.close()
+    await consumer.close()
     server.close()

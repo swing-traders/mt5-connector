@@ -31,8 +31,6 @@ from mt5connector.server.ws_server import COMMISSIONS_RELAY_PATH, SERVER_TIME_RE
 
 EURUSD_RELAY_PATH = f"{COMMISSIONS_RELAY_PATH}/EURUSD.a"
 IC_FRAME = {
-    "v": 1,
-    "type": "commissions",
     "symbol": "EURUSD.a",
     "ret": 1,
     "last_error": 0,
@@ -60,8 +58,6 @@ IC_FRAME = {
     ],
 }
 EURUSD_SERVER_TIME = {
-    "v": 1,
-    "type": "server_time",
     "symbol": "EURUSD.a",
     "trade_server": 1_752_580_800,
     "current": 1_752_580_798,
@@ -205,8 +201,6 @@ def test_a_relayed_empty_schedule_loads_a_zero_fee(remote, served, provider):
     post_to(served)(
         EURUSD_RELAY_PATH,
         {
-            "v": 1,
-            "type": "commissions",
             "symbol": "EURUSD.a",
             "ret": 0,
             "last_error": 0,

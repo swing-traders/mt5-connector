@@ -27,8 +27,6 @@ TRADE = [
     [],
 ]
 FRAME = {
-    "v": 1,
-    "type": "sessions",
     "symbol": "XAUUSD.a",
     "quote": QUOTE,
     "trade": TRADE,
@@ -99,8 +97,6 @@ def _with_day(week, index, day):
         ([1], "request body is not a JSON object"),
         ({k: v for k, v in FRAME.items() if k != "trade"}, "missing field: trade"),
         (FRAME | {"ret": 0}, "unknown field: ret"),
-        (FRAME | {"v": 2}, "unsupported frame version: 2"),
-        (FRAME | {"type": "commissions"}, "not a sessions frame: 'commissions'"),
         (FRAME | {"symbol": ""}, "not a symbol: ''"),
         (FRAME | {"symbol": "XAGUSD.a"}, "symbol 'XAGUSD.a' is not the relay's 'XAUUSD.a'"),
         (FRAME | {"last_error": 0.0}, "last_error is not an integer: 0.0"),
@@ -145,8 +141,6 @@ def _with_day(week, index, day):
         "array",
         "missing-trade",
         "unknown-field",
-        "version-2",
-        "commissions",
         "empty-symbol",
         "another-symbol",
         "float-last-error",

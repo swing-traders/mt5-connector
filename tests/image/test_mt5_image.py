@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -15,6 +16,8 @@ import subprocess
 import sys
 import time
 import types
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -878,5 +881,57 @@ def test_a_published_server_is_reachable_on_the_loopback_at_the_port_the_runtime
         # The runtime holds the host side of the REST port on the loopback while the server boots.
         with socket.create_connection(("127.0.0.1", rest), timeout=5):
             pass
+    finally:
+        subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
+
+
+def _health(port: int) -> tuple[int, dict] | None:
+    """The hub's /health status and body, or None while nothing answers on the port."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as refused:
+        return refused.code, json.loads(refused.read())
+    except OSError:
+        return None
+
+
+@_needs_image
+def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> None:
+    runtime = _runtime()
+    name = f"mt5-image-hub-test-{os.getpid()}"
+    subprocess.run(
+        [
+            runtime,
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--publish",
+            f"127.0.0.1::{_HUB_PORT}",
+            *_account_env(),
+            _IMAGE,
+        ],
+        env={**os.environ, **_ACCOUNT},
+        check=True,
+        timeout=60,
+    )
+    try:
+        hub = _published_port(runtime, name, _HUB_PORT)
+        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+        deadline = time.monotonic() + 30
+        answered = _health(hub)
+        while answered is None and time.monotonic() < deadline:
+            time.sleep(0.5)
+            answered = _health(hub)
+
+        assert answered is not None, "the hub never answered /health"
+        status, body = answered
+        assert status == 503
+        assert (body["ok"], body["result"]["spawner"], body["result"]["clock"]) == (
+            False,
+            False,
+            None,
+        )
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)

@@ -1,24 +1,18 @@
 """The history protocol: bar and tick windows read from the terminal and answered with their rows
-once the terminal's answers prove them, and the floors measured on the way.
-
-State: FloorStore, each (symbol, series)'s floor on the broker's clock — seconds for bars,
-milliseconds for ticks — with the true-UTC time it was measured, a generation that steps on every
-change of value, and whether the stub or a coarse prefix at the series' start set it; a stub
-measured again never moves a coarse floor back. Nothing is persisted, so floors are measured again
-after a restart."""
+once the terminal's answers prove them, and the floors measured on the way, kept in a FloorStore."""
 
 import logging
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import StrEnum
 
 import numpy as np
 
 from mt5connector.server.encoding import broker_datetime, encode, encode_bars
+from mt5connector.server.floors import Floor, FloorStore
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.terminal import Answered, Failed, Terminal
+from mt5connector.server.windows import BrokerWindow, broker_window, reading_into
 from mt5connector.server.wire import mirror
 from mt5connector.server.wire.broker_clock import BrokerClock
 from mt5connector.server.wire.history_wire import (
@@ -26,6 +20,7 @@ from mt5connector.server.wire.history_wire import (
     BAR_TIMEFRAME,
     SPAN_MARGIN,
     TICK_FLAGS,
+    FloorOrigin,
     Series,
     ServerCode,
     TickFlags,
@@ -52,67 +47,6 @@ _FIRST_MONDAY_S = 4 * _DAY_S
 _BEFORE_HISTORY_S = _DAY_S
 
 
-class FloorOrigin(StrEnum):
-    """What set a floor: the stub, the one row the terminal answers for a window before any
-    plausible history, or the first authentic row past a coarse prefix at the series' start."""
-
-    STUB = "stub"
-    COARSE = "coarse"
-
-
-@dataclass(frozen=True)
-class Floor:
-    """Where a series' rows begin, as the store holds it."""
-
-    # The broker's clock: seconds for bars, milliseconds for ticks.
-    value: int
-    # True UTC seconds.
-    measured_at: int
-    generation: int
-    origin: FloorOrigin
-
-
-class FloorStore:
-    """The floor measured for each (symbol, series)."""
-
-    def __init__(self) -> None:
-        self._floors: dict[tuple[str, Series], Floor] = {}
-        self._lock = threading.Lock()
-
-    def read(self, symbol: str, series: Series) -> Floor | None:
-        with self._lock:
-            return self._floors.get((symbol, series))
-
-    def of_symbol(self, symbol: str) -> dict[Series, Floor]:
-        with self._lock:
-            return {
-                series: floor for (owner, series), floor in self._floors.items() if owner == symbol
-            }
-
-    def write(
-        self, symbol: str, series: Series, value: int, measured_at: int, origin: FloorOrigin
-    ) -> Floor:
-        """Records a measurement and answers the floor it leaves in force, whose generation steps
-        when the value changes."""
-        with self._lock:
-            last = self._floors.get((symbol, series))
-            if last is None:
-                floor = Floor(value, measured_at, 1, origin)
-            elif (
-                last.origin is FloorOrigin.COARSE
-                and origin is FloorOrigin.STUB
-                and value <= last.value
-            ):
-                # The stub of a series served with a coarse prefix is that prefix's first row.
-                floor = Floor(last.value, measured_at, last.generation, last.origin)
-            elif last.value != value:
-                floor = Floor(value, measured_at, last.generation + 1, origin)
-            else:
-                floor = Floor(value, measured_at, last.generation, origin)
-            self._floors[(symbol, series)] = floor
-            return floor
-
-
 @dataclass(frozen=True)
 class Syncing:
     """The answer to a window the terminal's answers do not prove yet."""
@@ -132,22 +66,13 @@ class _Gap:
     rows_after: bool
 
 
-@dataclass(frozen=True)
-class _BrokerWindow:
-    """A true-UTC window on the broker's clock: the bounds read for it, and the intervals of the
-    seconds that read into it."""
-
-    # Broker seconds, each pair inclusive.
-    fetch: tuple[int, int]
-    proof: list[tuple[int, int]]
-
-    def gaps(self, gap: _Gap) -> list[_Gap]:
-        """The parts of a gap in the read bounds that lie in the window."""
-        return [
-            _Gap(max(lo, gap.lo), min(hi, gap.hi), gap.rows_before, gap.rows_after)
-            for lo, hi in self.proof
-            if lo <= gap.hi and hi >= gap.lo
-        ]
+def _window_gaps(window: BrokerWindow, gap: _Gap) -> list[_Gap]:
+    """The parts of a gap in the read bounds that lie in the window."""
+    return [
+        _Gap(max(lo, gap.lo), min(hi, gap.hi), gap.rows_before, gap.rows_after)
+        for lo, hi in window.proof
+        if lo <= gap.hi and hi >= gap.lo
+    ]
 
 
 class _Unanswerable(Exception):
@@ -255,7 +180,7 @@ class History:
     def _bars(self, calls: _Calls, symbol: str, series: Series, start: int, end: int) -> np.ndarray:
         self._select(calls, symbol)
         span_s = self._span_s(calls, series)
-        window = _broker_window(self._clock, start, end)
+        window = broker_window(self._clock, start, end)
         lo, hi = window.fetch
         stored = self._floors.read(symbol, series)
         kept = self._is_fresh(stored)
@@ -271,7 +196,7 @@ class History:
             rows = self._read_bars(
                 calls, symbol, series, max(lo, floor.value), hi, span_s, floor, kept, window
             )
-        return rows[_reading_into(self._clock, rows["time"], start, end)]
+        return rows[reading_into(self._clock, rows["time"], start, end)]
 
     def _read_bars(
         self,
@@ -283,7 +208,7 @@ class History:
         span_s: int,
         floor: Floor | None,
         kept: bool,
-        window: _BrokerWindow,
+        window: BrokerWindow,
     ) -> np.ndarray:
         """The bars opened in [lo, hi] on the broker's clock, read chunk by chunk, on the series'
         grid and from its floor on; raises _Unproven for a stretch of the window no chunk answered a
@@ -299,7 +224,7 @@ class History:
             at = self._clock.to_utc(int(rows["time"][off_grid]))
             raise _Unanswerable(mirror.RES_E_FAIL, f"{symbol} {series}: row {at} is off the grid")
         for fetched_gap in _gaps(chunks, parts):
-            for gap in window.gaps(fetched_gap):
+            for gap in _window_gaps(window, fetched_gap):
                 floor = self._prove_no_bars(calls, symbol, series, gap, span_s, floor, kept)
         # A coarse prefix can only lead a series, so it is sought only in an answer beginning at the
         # floor the gap proofs leave in force.
@@ -350,7 +275,7 @@ class History:
         self, calls: _Calls, symbol: str, start: int, end: int, flags: TickFlags
     ) -> np.ndarray:
         self._select(calls, symbol)
-        last = _broker_window(self._clock, start, end).fetch[1] * 1000 + 999
+        last = broker_window(self._clock, start, end).fetch[1] * 1000 + 999
         stored = self._floors.read(symbol, Series.TICKS)
         kept = self._is_fresh(stored)
         if kept:
@@ -364,7 +289,7 @@ class History:
         else:
             read_from = max(start, self._clock.to_utc_msc(floor.value) // 1000)
             rows = self._read_ticks(calls, symbol, read_from, end, flags, floor, kept)
-        return rows[_reading_into(self._clock, rows["time_msc"] // 1000, start, end)]
+        return rows[reading_into(self._clock, rows["time_msc"] // 1000, start, end)]
 
     def _read_ticks(
         self,
@@ -378,7 +303,7 @@ class History:
     ) -> np.ndarray:
         """The ticks of the broker window about true-UTC seconds `start` through `end`, in time
         order; raises _Unproven when there are none and nothing proves the window empty."""
-        window = _broker_window(self._clock, start, end)
+        window = broker_window(self._clock, start, end)
         lo, hi = window.fetch
         read = self._read(
             calls,
@@ -389,7 +314,7 @@ class History:
         times = read["time_msc"]
         rows = read[(times >= lo * 1000) & (times <= hi * 1000 + 999)]
         if len(rows) == 0:
-            for gap in window.gaps(_Gap(lo, hi, rows_before=False, rows_after=False)):
+            for gap in _window_gaps(window, _Gap(lo, hi, rows_before=False, rows_after=False)):
                 self._prove_no_ticks(calls, symbol, start, end, flags, gap, floor, kept)
         out_of_order = _first_decrease(rows["time_msc"])
         if out_of_order is not None:
@@ -680,7 +605,7 @@ class History:
     ) -> dict[str, object]:
         # The package ends a tick range at the first millisecond of its last second, so the read
         # runs to the broker's second after it.
-        lo, hi = _broker_window(self._clock, start, end).fetch
+        lo, hi = broker_window(self._clock, start, end).fetch
         return {
             "symbol": symbol,
             "date_from": broker_datetime(lo),
@@ -755,66 +680,6 @@ def _unanswered(outcome: Answered | Failed) -> str:
         return f"no answer, last_error {code} {message!r}"
     else:
         return f"last_error {code} {message!r}"
-
-
-def _broker_window(clock: BrokerClock, start: int, end: int) -> _BrokerWindow:
-    """The broker window about true-UTC [start, end]: the fetch bounds, the start shifted by the
-    least offset the clock runs at within a day of it and the end by the greatest, so a clock change
-    about either end stays inside; and the intervals of the broker seconds that read into the window
-    at either occurrence, which alone a gap proof covers."""
-    offsets = {}
-    # The broker seconds where reading into the window can change: a clock change's two readings,
-    # and each end's reading at every offset about it.
-    cuts = set()
-    for edge in (start, end):
-        samples = [edge - _DAY_S, edge, edge + _DAY_S]
-        offsets[edge] = [_offset_s(clock, sample) for sample in samples]
-        for left, right in zip(samples, samples[1:], strict=False):
-            before, after = _offset_s(clock, left), _offset_s(clock, right)
-            if before != after:
-                change = _clock_change(clock, left, right)
-                cuts.update((change + before, change + after))
-    lo = start + min(offsets[start])
-    hi = end + max(offsets[end])
-    for offset in {*offsets[start], *offsets[end]}:
-        cuts.update((start + offset, end + offset + 1))
-    bounds = sorted({lo, hi + 1, *(cut for cut in cuts if lo < cut <= hi)})
-    inside = _reading_into(clock, np.array(bounds[:-1]), start, end)
-    proof = []
-    for left, right, belongs in zip(bounds[:-1], bounds[1:], inside, strict=True):
-        if belongs:
-            if proof and proof[-1][1] + 1 == left:
-                proof[-1] = (proof[-1][0], right - 1)
-            else:
-                proof.append((left, right - 1))
-    return _BrokerWindow((lo, hi), proof)
-
-
-def _clock_change(clock: BrokerClock, left: int, right: int) -> int:
-    """The first true-UTC second after `left` at the offset the clock runs at on `right`, for the
-    one clock change between them."""
-    before = _offset_s(clock, left)
-    while right - left > 1:
-        middle = (left + right) // 2
-        if _offset_s(clock, middle) == before:
-            left = middle
-        else:
-            right = middle
-    return right
-
-
-def _offset_s(clock: BrokerClock, utc_epoch: int) -> int:
-    return int(clock.offset_at(utc_epoch).total_seconds())
-
-
-def _reading_into(clock: BrokerClock, seconds: np.ndarray, start: int, end: int) -> np.ndarray:
-    """Which broker seconds read into true-UTC [start, end] at either occurrence, so a window in a
-    repeated hour's second pass holds the records stamped in it."""
-    inside = []
-    for second in seconds.tolist():
-        first, last = clock.occurrences(second)
-        inside.append(start <= first <= end or start <= last <= end)
-    return np.array(inside, dtype=bool)
 
 
 def _chunks(lo: int, hi: int, span_s: int) -> list[tuple[int, int]]:
