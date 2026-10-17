@@ -1,11 +1,10 @@
 """The hub's streams, charts and relays: each publisher's frames fanned out to their subscribers in
-true UTC, the wanted frames, the spawner's charts, the relays to the HTTP server, and the frames the
-hub refuses."""
+true UTC, the wanted frames, the spawner's charts, the server-time relay, and the frames the hub
+refuses."""
 
 import asyncio
 import calendar
 import logging
-import socket
 import time
 from types import SimpleNamespace
 
@@ -16,7 +15,6 @@ from hub_doubles import Consumer, Peer, run_hub, sample, settings, settle
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.server import ws_server
-from mt5connector.server.server_time import ServerTimeSample
 from mt5connector.server.wire import binary, mirror
 from mt5connector.server.wire.binary import FrameKind
 from mt5connector.server.wire.history_wire import Series
@@ -27,7 +25,7 @@ from mt5connector.server.wire.push_wire import (
     Subscription,
     TransactionType,
 )
-from mt5connector.server.ws_server import SERVER_TIME_RELAY_PATH, Hub, post_to
+from mt5connector.server.ws_server import Hub
 
 IDLE_S = 900
 PUBLISHER = ChartRole.PUBLISHER
@@ -98,7 +96,7 @@ async def close_all(server, *peers):
 
 
 async def test_a_publishers_ticks_reach_the_consumers_of_its_symbol_alone_in_true_utc():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     first = await Consumer.connect(port)
     other = await Consumer.connect(port)
@@ -115,7 +113,7 @@ async def test_a_publishers_ticks_reach_the_consumers_of_its_symbol_alone_in_tru
 
 
 async def test_ticks_in_two_frames_are_passed_on_in_the_order_published():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD"))
@@ -129,7 +127,7 @@ async def test_ticks_in_two_frames_are_passed_on_in_the_order_published():
 
 
 async def test_a_bar_reaches_the_consumers_of_its_series_by_its_name_with_its_close_in_true_utc():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     m5 = await Consumer.connect(port)
     m1 = await Consumer.connect(port)
@@ -146,7 +144,7 @@ async def test_a_bar_reaches_the_consumers_of_its_series_by_its_name_with_its_cl
 
 
 async def test_trade_transactions_reach_their_subscribers_in_order_their_expiration_in_true_utc():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, Subscription(Stream.TRADE_TRANSACTIONS))
@@ -163,7 +161,7 @@ async def test_trade_transactions_reach_their_subscribers_in_order_their_expirat
 
 async def test_a_frame_a_publisher_sends_for_another_symbol_is_dropped_with_a_warning(caplog):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     gbpusd = await publisher(port, "GBPUSD")
     consumer = await Consumer.connect(port)
@@ -185,7 +183,7 @@ async def test_a_frame_a_publisher_sends_for_another_symbol_is_dropped_with_a_wa
 
 
 async def test_a_transaction_naming_no_symbol_passes_through_the_spawner_alone():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, Subscription(Stream.TRADE_TRANSACTIONS))
@@ -204,7 +202,7 @@ async def test_a_transaction_naming_no_symbol_passes_through_the_spawner_alone()
 
 
 async def test_each_publisher_is_told_the_wanted_frame_of_its_own_symbol_alone():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     gbpusd = await publisher(port, "GBPUSD")
     consumer = await Consumer.connect(port)
@@ -225,7 +223,7 @@ async def test_each_publisher_is_told_the_wanted_frame_of_its_own_symbol_alone()
 
 
 async def test_a_publisher_is_told_its_wanted_frame_on_its_hello_and_again_as_consumers_leave():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD"))
@@ -242,7 +240,7 @@ async def test_a_publisher_is_told_its_wanted_frame_on_its_hello_and_again_as_co
 
 
 async def test_a_subscription_another_consumer_shares_keeps_the_wanted_frame():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     first = await Consumer.connect(port)
     second = await Consumer.connect(port)
@@ -257,7 +255,7 @@ async def test_a_subscription_another_consumer_shares_keeps_the_wanted_frame():
 
 
 async def test_an_unsubscribe_is_acknowledged_and_ends_the_stream():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     eurusd = await publisher(port)
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD"))
@@ -278,7 +276,7 @@ async def test_a_second_ea_for_a_served_role_and_symbol_is_told_it_is_a_duplicat
     caplog,
 ):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     first = await publisher(port)
     # The spawner on a chart of the same symbol serves another role.
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
@@ -299,7 +297,7 @@ async def test_a_second_ea_for_a_served_role_and_symbol_is_told_it_is_a_duplicat
 
 async def test_a_refused_duplicates_frames_are_dropped_silently(caplog):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     first = Peer()
     second = Peer()
     consumer = Peer()
@@ -324,7 +322,7 @@ async def test_a_refused_duplicates_frames_are_dropped_silently(caplog):
 
 
 async def test_a_second_spawner_is_a_duplicate_and_the_first_stays_the_spawner():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     first = await FakeEa.connect(port, SPAWNER, "EURUSD")
 
     second = await FakeEa.connect(port, SPAWNER, "GBPUSD")
@@ -340,7 +338,7 @@ async def test_a_second_spawner_is_a_duplicate_and_the_first_stays_the_spawner()
 
 
 async def test_a_subscription_to_a_symbol_no_publisher_serves_has_the_spawner_open_its_chart():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
     gbpusd = await publisher(port, "GBPUSD")
     consumer = await Consumer.connect(port)
@@ -357,7 +355,7 @@ async def test_a_subscription_to_a_symbol_no_publisher_serves_has_the_spawner_op
 
 
 async def test_a_chart_requested_while_no_spawner_is_connected_is_sent_on_its_hello():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("USDJPY"))
 
@@ -368,7 +366,7 @@ async def test_a_chart_requested_while_no_spawner_is_connected_is_sent_on_its_he
 
 
 async def test_a_chart_is_requested_once_per_spawner_connection_until_its_ea_says_hello():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
     await asyncio.sleep(0.05)
 
@@ -385,7 +383,7 @@ async def test_a_chart_is_requested_once_per_spawner_connection_until_its_ea_say
 
 
 async def test_a_chart_in_use_whose_ea_leaves_is_requested_again():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
     usdjpy = await publisher(port, "USDJPY")
     consumer = await Consumer.connect(port)
@@ -422,7 +420,7 @@ def sent_to_ea(peer: Peer) -> list:
 
 async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_until_it_opens(caplog):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     spawner = Peer()
     tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"))
 
@@ -446,7 +444,7 @@ async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_until_it_op
 
 
 async def test_a_failed_chart_clears_on_its_eas_hello_and_a_use_after_the_ea_left_requests_it():
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     spawner = Peer()
     xyz = Peer()
     tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"))
@@ -473,7 +471,7 @@ async def test_a_failed_chart_clears_on_its_eas_hello_and_a_use_after_the_ea_lef
 
 
 async def test_a_chart_answer_from_a_publisher_is_refused_and_closes_it():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     gbpusd = await publisher(port, "GBPUSD")
 
     await gbpusd.send(binary.ChartFailed(PUBLISHER, "XYZ", 4301))
@@ -497,7 +495,7 @@ def clock(monkeypatch):
 
 
 async def test_the_spawner_is_told_to_close_each_chart_out_of_use_for_the_idle_period(clock):
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     spawner, usdjpy, gbpusd, xauusd, consumer = Peer(), Peer(), Peer(), Peer(), Peer()
     tasks = await _spawning(
         hub,
@@ -527,7 +525,7 @@ async def test_the_spawner_is_told_to_close_each_chart_out_of_use_for_the_idle_p
 
 
 async def test_a_touch_moves_a_charts_idle_deadline(clock):
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     spawner, usdjpy = Peer(), Peer()
     tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
 
@@ -546,7 +544,7 @@ async def test_a_touch_moves_a_charts_idle_deadline(clock):
 
 
 async def test_a_chart_the_spawner_keeps_open_is_closed_only_after_a_further_idle_period(clock):
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     spawner, usdjpy = Peer(), Peer()
     tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
     clock[0] = 1_000.0 + IDLE_S
@@ -582,7 +580,7 @@ def repeated_hour_warning(epoch):
 
 async def test_two_repeated_broker_hours_alternating_are_each_warned_of_once(caplog):
     caplog.set_level(logging.WARNING)
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     ea, consumer = Peer(), Peer()
     tasks = [asyncio.create_task(hub.handler(peer)) for peer in (ea, consumer)]
     ea.put_ea(binary.EaHello(PUBLISHER, "EURUSD"))
@@ -623,7 +621,7 @@ def pushed_spring_bar(stamp, opened):
 async def _pushed_h1(*stamps):
     """The frames a consumer of EURUSD's H1 bars receives as its publisher sends bars stamped at
     `stamps`."""
-    hub = Hub(CLOCK, lambda path, body: None, settings())
+    hub = Hub(CLOCK, settings())
     ea, consumer = Peer(), Peer()
     tasks = [asyncio.create_task(hub.handler(peer)) for peer in (ea, consumer)]
     ea.put_ea(binary.EaHello(PUBLISHER, "EURUSD"))
@@ -676,7 +674,7 @@ async def test_a_bar_after_the_skipped_hour_no_bar_was_stamped_in_is_pushed(capl
 
 
 async def test_a_consumer_whose_queue_overflows_is_closed_with_4008_and_the_rest_serve_on():
-    hub = Hub(CLOCK, lambda path, body: None, settings(consumer_queue_bound=3))
+    hub = Hub(CLOCK, settings(consumer_queue_bound=3))
     stuck, reading, ea = Peer(stuck=True), Peer(), Peer()
     tasks = [asyncio.create_task(hub.handler(peer)) for peer in (stuck, reading, ea)]
     for peer in (stuck, reading):
@@ -759,7 +757,7 @@ async def test_a_frame_the_hub_cannot_handle_is_refused_and_closes_its_connectio
     hello, sent, caplog
 ):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
 
     refusal = await _refused(port, hello, sent)
 
@@ -771,7 +769,7 @@ async def test_a_frame_the_hub_cannot_handle_is_refused_and_closes_its_connectio
 
 async def test_a_frame_of_an_unknown_kind_is_logged_and_skipped(caplog):
     caplog.set_level(logging.INFO, logger="mt5connector.server.ws_server")
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     consumer = await Consumer.connect(port)
 
     await consumer.ws.send(frame(99, b""))
@@ -782,7 +780,7 @@ async def test_a_frame_of_an_unknown_kind_is_logged_and_skipped(caplog):
 
 
 async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     broken = await publisher(port, "GBPUSD")
     eurusd = await publisher(port)
     consumer = await Consumer.connect(port)
@@ -799,9 +797,11 @@ async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on():
 # ── Relays ────────────────────────────────────────────────────────────────────
 
 
-async def test_the_spawners_server_time_is_relayed_and_never_fanned_out(caplog):
+async def test_the_spawners_server_time_is_never_fanned_out_and_one_for_another_symbol_dropped(
+    caplog,
+):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub, server, port, relayed = await run_hub()
+    hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD.a")
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD.a"))
@@ -809,91 +809,9 @@ async def test_the_spawners_server_time_is_relayed_and_never_fanned_out(caplog):
 
     await spawner.send(measured)
     await spawner.send(binary.ServerTime("GBPUSD", 1, 1, 1, True))
-    for _ in range(50):
-        if relayed:
-            break
-        await asyncio.sleep(0.01)
-
     await nothing(consumer.ws)
-    assert relayed == [
-        (
-            SERVER_TIME_RELAY_PATH,
-            {
-                "symbol": "EURUSD.a",
-                "trade_server": 1_752_580_800,
-                "current": 1_752_580_798,
-                "gmt": 1_752_570_000,
-                "connected": 1,
-            },
-        )
-    ]
+
     assert warnings(caplog) == [
         "dropping a server-time sample for 'GBPUSD' from the spawner for EURUSD.a"
     ]
     await close_all(server, consumer, spawner)
-
-
-async def test_a_publishers_relays_are_posted_under_its_own_symbol():
-    hub, server, port, relayed = await run_hub()
-    us500 = await publisher(port, "US500#")
-    schedule = {"ret": 0, "last_error": 0, "rules": []}
-    week = [[] for _ in range(7)]
-    sessions = {"quote": week, "trade": week, "last_error": 0}
-
-    await us500.send(binary.Commissions("EURUSD", schedule))
-    await us500.send(binary.Sessions("US500#", sessions))
-    for _ in range(50):
-        if len(relayed) == 2:
-            break
-        await asyncio.sleep(0.01)
-
-    assert sorted(relayed) == [
-        ("/relay/commissions/US500%23", {"symbol": "EURUSD"} | schedule),
-        ("/relay/sessions/US500%23", {"symbol": "US500#"} | sessions),
-    ]
-    await close_all(server, us500)
-
-
-def test_the_relay_posts_a_body_to_the_servers_route_over_loopback(served, server_times):
-    body = {
-        "symbol": "EURUSD",
-        "trade_server": 1752580800,
-        "current": 1752580798,
-        "gmt": 1752570000,
-        "connected": 1,
-    }
-
-    post_to(served)(SERVER_TIME_RELAY_PATH, body)
-
-    assert server_times.wait_newer(None, 0).sample == ServerTimeSample(
-        symbol="EURUSD",
-        trade_server=1752580800,
-        current=1752580798,
-        gmt=1752570000,
-        connected=True,
-    )
-
-
-def test_a_refused_post_is_logged_and_not_raised(served, server_times, caplog):
-    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-
-    post_to(served)(SERVER_TIME_RELAY_PATH, {"symbol": "EURUSD"})
-
-    assert server_times.wait_newer(None, 0) is None
-    assert [record.getMessage() for record in caplog.records] == [
-        f"relay to {served}/relay/server_time failed: HTTP Error 400: BAD REQUEST"
-    ]
-
-
-def test_an_unreachable_server_is_logged_and_not_raised(caplog):
-    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    base = f"http://127.0.0.1:{port}"
-
-    post_to(base)(SERVER_TIME_RELAY_PATH, {"symbol": "EURUSD"})
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert len(messages) == 1
-    assert messages[0].startswith(f"relay to {base}/relay/server_time failed: ")

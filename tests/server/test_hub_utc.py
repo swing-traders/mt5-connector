@@ -11,7 +11,7 @@ import pytest
 from ea_wire import zeroed
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
-from mt5connector.server.encoding import encode_bars
+from mt5connector.server.encoding import bar_close
 from mt5connector.server.hub_utc import Conversion, Results, broker_arguments, published
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.windows import reading_into
@@ -366,9 +366,20 @@ def test_the_window_filter_equals_the_clock_read_element_by_element(span, start,
     )
 
 
+def bars_one_by_one(series, opens):
+    """Each bar's true-UTC open and close as the clock reads its broker open, of two opening at one
+    true-UTC second the first."""
+    answered = []
+    for broker_open in opens:
+        opened = CLOCK.to_utc(broker_open)
+        if not answered or answered[-1][0] != opened:
+            answered.append((opened, bar_close(CLOCK, series, broker_open)))
+    return answered
+
+
 @pytest.mark.parametrize("span", list(SPANS))
 @pytest.mark.parametrize("timeframe", [mirror.TIMEFRAME_M1, mirror.TIMEFRAME_H1])
-def test_converted_bars_equal_encode_bars_bar_by_bar(span, timeframe):
+def test_converted_bars_equal_the_clock_read_bar_by_bar(span, timeframe):
     series = bar_series(timeframe)
     period = 60 if timeframe == mirror.TIMEFRAME_M1 else 3_600
     first = SPANS[span] - SPANS[span] % period
@@ -378,10 +389,7 @@ def test_converted_bars_equal_encode_bars_bar_by_bar(span, timeframe):
 
     converted = Results(row, {"timeframe": timeframe}, CLOCK, RepeatedHours()).part(rates)
 
-    expected = encode_bars(series, rates, CLOCK, RepeatedHours())
-    assert converted[["time", "time_close"]].tolist() == [
-        (bar["time"], bar["time_close"]) for bar in expected
-    ]
+    assert converted[["time", "time_close"]].tolist() == bars_one_by_one(series, opens.tolist())
 
 
 def test_each_repeated_and_skipped_hour_is_warned_of_once_naming_its_first_row(caplog):

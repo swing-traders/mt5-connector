@@ -44,7 +44,7 @@ The repository ships two distributions, versioned together: one release builds b
 | Distribution | Import packages | Installs into | Carries |
 |---|---|---|---|
 | `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the remote backend, the history client and the downloader, and the wire vocabulary |
-| `mt5-connector-server` | `mt5connector.server` | the terminal's Windows Python, and the Linux Python that runs the hub | the HTTP server, the hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
+| `mt5-connector-server` | `mt5connector.server` | the Linux Python that runs the hub beside the terminal | the hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
 
 `mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
 
@@ -94,7 +94,7 @@ pip install \
   "mt5-connector-client==<version>"
 ```
 
-and the server, at the same release, into the Windows Python beside the terminal (and the Linux Python that runs its hub), or run the image each release publishes with both installed ([The MT5 server](#the-mt5-server)):
+and the server, at the same release, into the Linux Python that runs its hub beside the terminal, or run the image each release publishes with it installed ([The MT5 server](#the-mt5-server)):
 
 ```bash
 python -m pip install --extra-index-url https://swing-traders.github.io/mt5-connector/simple/ "mt5-connector-server==<version>"
@@ -359,13 +359,13 @@ Any other bar type is `INTERNAL`: NautilusTrader aggregates it from the symbol's
 
 ## The MT5 server
 
-The adapter runs against `mt5-connector-server`: an HTTP server under the terminal's Windows Python that mirrors the `MetaTrader5` package with every epoch in true UTC, a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and that EA's source. Its HTTP API, its history protocol, its hub and the image that runs it are in [its README](packages/server/mt5connector/server/README.md). Each release publishes that image, built from this repository's `Dockerfile`, as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, the release tag with `+` as `-`.
+The adapter runs against `mt5-connector-server`: a WebSocket hub that carries what the EAs inside the terminal publish — one per symbol on its own chart, which opens when a consumer first asks for the symbol and closes once it is out of use: its ticks, closed bars and trade transactions — and answers the calls they serve, every epoch in true UTC, and that EA's source. Its hub, its history rules and the image that runs it are in [its README](packages/server/mt5connector/server/README.md). Each release publishes that image, built from this repository's `Dockerfile`, as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, the release tag with `+` as `-`.
 
 ```
 ┌─ your bot (Linux) ─────────────────┐      ┌─ beside the MT5 terminal ──────┐
-│  mt5-connector-client              │      │  HTTP API    :5000             │
-│   └─ HubSession                    │──────│  WS hub :9000                  │
-│      (streams and calls)           │      │  MT5 terminal                  │
+│  mt5-connector-client              │      │  WS hub :9000                  │
+│   └─ HubSession                    │──────│  MT5 terminal and its EAs      │
+│      (streams and calls)           │      │                                │
 └────────────────────────────────────┘      └────────────────────────────────┘
 ```
 
@@ -414,16 +414,13 @@ All tests but the image tier's mock the MT5 terminal — no live connection requ
 
 ```
 tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the shim, the history client and the downloader
-tests/server/              — the server's routes, lifecycle, WS hub and history protocol, and the shim through them
-tests/conformance/         — the inventory against the pinned MetaTrader5 wheel
+tests/server/              — the WS hub: its streams, requests, clock gate, epoch conversion and settings, the EA's half of the protocol, and the MQL5 generator
 tests/image/               — the server image, started on a made-up account; its GUI driver and log tail
 tests/live/                — the hub and its EAs in a running image, through the client's hub session
 tests/test_distributions.py — the two distributions' shared version and the import boundary between them
 ```
 
 The image tier runs against a built image when `MT5_IMAGE_TEST` names it, as the server README's [image tests](packages/server/mt5connector/server/README.md#the-image-tests) state; CI builds the image and runs it on every pull request.
-
-The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`. Its live server test, `tests/conformance/test_live_trade_request.py`, runs from any host when `MT5_LIVE_SERVER_URL` names a running server, and checks a market request on the symbol the server's `/health` names through the client shim without placing it.
 
 The live hub tier, `tests/live/`, runs from any host when `MT5_LIVE_HUB_URL` names a running image's hub (`ws://host:port`) and `MT5_LIVE_HUB_SYMBOL` a symbol its account trades, weekends included. Every case leaves the account flat:
 
@@ -479,8 +476,7 @@ mt5-connector/
 │       ├── pyproject.toml
 │       └── mt5connector/
 │           └── server/
-│               ├── README.md        # the server's API and what its image provides
-│               ├── app.py           # the HTTP server (mt5-connector-server)
+│               ├── README.md        # the hub protocol and what its image provides
 │               ├── ws_server.py     # the hub (mt5-connector-hub)
 │               ├── hub_requests.py  # the hub's pending requests and their deadlines
 │               ├── hub_gate.py      # the hub's clock gate

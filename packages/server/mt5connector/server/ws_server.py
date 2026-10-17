@@ -1,7 +1,7 @@
 """The hub, the one endpoint the EAs and the consumers connect to: each publisher's frames fanned
-out to their subscribers in true UTC, the relays the EAs send kept and handed to the HTTP server,
-every request a consumer asks routed to the EA of its call's role or answered by the hub, the clock
-gate, /health, and the charts the spawner opens and closes for the roles and symbols in use.
+out to their subscribers in true UTC, the relays the EAs send kept, every request a consumer asks
+routed to the EA of its call's role or answered by the hub, the clock gate, /health, and the charts
+the spawner opens and closes for the roles and symbols in use.
 
 State: the connections that said hello — each consumer's subscriptions, each EA's chart role and
 symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
@@ -15,18 +15,15 @@ consumer that reconnects."""
 
 import asyncio
 import dataclasses
-import http.client
 import json
 import logging
 import math
 import os
 import time
-import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from http import HTTPMethod, HTTPStatus
-from urllib.parse import quote, unquote
 
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
@@ -52,7 +49,6 @@ from mt5connector.server.wire.binary import ErrorKind
 from mt5connector.server.wire.broker_clock import BrokerClock
 from mt5connector.server.wire.history_wire import BAR_TIMEFRAME, Series, bar_series
 from mt5connector.server.wire.push_wire import (
-    CHARTS_PATH,
     CLOSE_TIMEOUT_S,
     HEALTH_PATH,
     PING_INTERVAL_S,
@@ -63,14 +59,9 @@ from mt5connector.server.wire.push_wire import (
     Subscription,
 )
 
-SERVER_TIME_RELAY_PATH = "/relay/server_time"
-COMMISSIONS_RELAY_PATH = "/relay/commissions"
-SESSIONS_RELAY_PATH = "/relay/sessions"
 OVERFLOW = 4008
-_RELAY_TIMEOUT_S = 5
 _IDLE_SWEEP_S = 5
 _HOUR_S = 3_600
-_LOOPBACK = "127.0.0.1"
 _TERMINAL_INFO = calls.CALLS[calls.Call.TERMINAL_INFO]
 _RANGES = calls.CALLS[calls.Call.RANGES]
 
@@ -113,11 +104,8 @@ class Hub:
     """Routes each publisher's frames to their subscribers and each request to the EA serving it,
     and has the spawner keep a chart open for each role and symbol in use."""
 
-    def __init__(
-        self, clock: BrokerClock, relay: Callable[[str, dict], None], settings: HubSettings
-    ) -> None:
+    def __init__(self, clock: BrokerClock, settings: HubSettings) -> None:
         self._clock = clock
-        self._relay = relay
         self._settings = settings
         self._gate = ClockGate(
             clock,
@@ -168,9 +156,7 @@ class Hub:
             self._drop(ws)
 
     async def process_request(self, connection, request: Request) -> Response | None:
-        """Answers /health, and the chart route — a POST from loopback naming a symbol in its path —
-        over plain HTTP; any other request goes on to the WebSocket handshake."""
-        prefix = f"{CHARTS_PATH}/"
+        """Answers /health over plain HTTP; any other request goes on to the WebSocket handshake."""
         if request.path == HEALTH_PATH and request.method == HTTPMethod.GET:
             labels = {ws: (ea.chart_role.value, ea.symbol) for ws, ea in self._eas.items()}
             status, body = health(
@@ -180,27 +166,8 @@ class Hub:
         elif request.path == HEALTH_PATH:
             message = f"{request.method} is not GET"
             return _json(connection, HTTPStatus.METHOD_NOT_ALLOWED, {"ok": False, "error": message})
-        elif not request.path.startswith(prefix):
+        else:
             return None
-        raw = request.path.removeprefix(prefix)
-        if connection.remote_address[0] != _LOOPBACK:
-            refusal = (HTTPStatus.FORBIDDEN, f"{connection.remote_address[0]} is not loopback")
-        elif request.method != HTTPMethod.POST:
-            refusal = (HTTPStatus.METHOD_NOT_ALLOWED, f"{request.method} is not POST")
-        elif raw == "" or "/" in raw or "?" in raw:
-            refusal = (HTTPStatus.NOT_FOUND, f"{request.path} names no symbol")
-        else:
-            refusal = None
-        if refusal is None:
-            key = (ChartRole.PUBLISHER, unquote(raw))
-            state = self.use_chart(key)
-            body = {"ok": True, "result": state}
-            if state == ChartState.FAILED:
-                body["reason"] = self._failed[key]
-            return _json(connection, HTTPStatus.OK, body)
-        else:
-            status, message = refusal
-            return _json(connection, status, {"ok": False, "error": message})
 
     def use_chart(self, key: ChartKey) -> ChartState:
         """Records a use of the chart of a role and symbol, and requests it while no EA serves it
@@ -379,7 +346,7 @@ class Hub:
 
     def _publish_bar(self, subscription: Subscription, bar: binary.Bar, broker_open: int) -> None:
         """Fans a bar out unless the last bar of its series fanned out opened at the same true-UTC
-        second; that first bar keeps the period, as the bars route answers it."""
+        second; that first bar keeps the period, as a history read answers it."""
         opened = bar.bar["time"]
         if self._bar_opens.get(subscription) == opened:
             self._repeated_hours.warn_dropped_bar(
@@ -422,18 +389,9 @@ class Hub:
     # ── Relays ────────────────────────────────────────────────────────────────
 
     def _server_time(self, ea: _Ea, frame: binary.ServerTime) -> None:
-        """Takes the spawner's server-time sample naming its own symbol into the gate, and hands it
-        to the HTTP server."""
+        """Takes the spawner's server-time sample naming its own symbol into the gate."""
         if frame.symbol == ea.symbol:
             self._gate.write(frame)
-            body = {
-                "symbol": frame.symbol,
-                "trade_server": frame.trade_server,
-                "current": frame.current,
-                "gmt": frame.gmt,
-                "connected": int(frame.connected),
-            }
-            self._post(SERVER_TIME_RELAY_PATH, body)
         else:
             logger.warning(
                 "dropping a server-time sample for %r from the spawner for %s",
@@ -443,32 +401,23 @@ class Hub:
 
     def _relayed_commissions(self, ea: _Ea, frame: binary.Commissions) -> None:
         """Keeps a publisher's commission schedule under its own symbol, or the reason it is
-        refused, and hands it to the HTTP server under that symbol."""
-        body = {"symbol": frame.symbol} | frame.schedule
-        refusal = commissions_refusal(body, ea.symbol)
+        refused."""
+        refusal = commissions_refusal(frame, ea.symbol)
         if refusal is None:
-            self._commissions.write(ea.symbol, commission_schedule(body))
+            self._commissions.write(ea.symbol, commission_schedule(frame.schedule))
         else:
             logger.warning("refusing the commission schedule for %s: %s", ea.symbol, refusal)
             self._commissions.write(ea.symbol, RelayRefusal(refusal))
-        self._post(f"{COMMISSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}", body)
 
     def _relayed_sessions(self, ea: _Ea, frame: binary.Sessions) -> None:
         """Keeps a publisher's trading sessions under its own symbol, or the reason they are
-        refused, and hands them to the HTTP server under that symbol."""
-        body = {"symbol": frame.symbol} | frame.sessions
-        refusal = sessions_refusal(body, ea.symbol)
+        refused."""
+        refusal = sessions_refusal(frame, ea.symbol)
         if refusal is None:
-            self._sessions.write(ea.symbol, trading_sessions(body))
+            self._sessions.write(ea.symbol, trading_sessions(frame.sessions))
         else:
             logger.warning("refusing the trading sessions for %s: %s", ea.symbol, refusal)
             self._sessions.write(ea.symbol, RelayRefusal(refusal))
-        self._post(f"{SESSIONS_RELAY_PATH}/{quote(ea.symbol, safe='')}", body)
-
-    def _post(self, path: str, body: dict) -> None:
-        """Hands the server a relayed body off the loop and not awaited, so a slow server never
-        holds back the hub."""
-        asyncio.get_running_loop().run_in_executor(None, self._relay, path, body)
 
     # ── Charts ────────────────────────────────────────────────────────────────
 
@@ -865,8 +814,8 @@ class Hub:
 
 
 def serve_hub(hub: Hub, host: str, port: int):
-    """The hub served on `host`:`port` with its HTTP routes; the hub keeps every connection alive
-    itself, and drops one within the close timeout."""
+    """The hub served on `host`:`port` with /health; the hub keeps every connection alive itself,
+    and drops one within the close timeout."""
     return serve(
         hub.handler,
         host,
@@ -877,33 +826,9 @@ def serve_hub(hub: Hub, host: str, port: int):
     )
 
 
-def post_to(base_url: str) -> Callable[[str, dict], None]:
-    """A relay that POSTs each body as JSON to the route at its path under `base_url`, and logs a
-    failed post as a warning."""
-    # No proxy: the server refuses a relayed body that does not arrive over loopback.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    def post(path: str, body: dict) -> None:
-        url = f"{base_url}{path}"
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with opener.open(request, timeout=_RELAY_TIMEOUT_S):
-                pass
-        except (OSError, http.client.HTTPException) as failure:
-            logger.warning("relay to %s failed: %s", url, failure)
-
-    return post
-
-
 async def _serve(settings: HubSettings) -> None:
     clock = BrokerClock(settings.broker_tz, timedelta(hours=settings.broker_offset_hours))
-    relay = post_to(f"http://127.0.0.1:{settings.api_port}")
-    hub = Hub(clock, relay, settings)
+    hub = Hub(clock, settings)
     hub.start()
     async with serve_hub(hub, "0.0.0.0", settings.hub_port):
         while True:

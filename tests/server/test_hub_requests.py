@@ -80,11 +80,6 @@ def warnings(caplog):
     return [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
 
 
-def posted(relayed, route):
-    """The bodies relayed to the server under a route, in the order relayed."""
-    return [(path, body) for path, body in relayed if path.startswith(route)]
-
-
 def deferred(kind: ErrorKind, retry_after_ms=5_000):
     return (kind, retry_after_ms)
 
@@ -98,7 +93,7 @@ def error_of(reply: binary.Answer):
 
 
 async def test_before_a_verifying_sample_every_request_is_answered_not_ready_and_health_is_503():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     consumer = await Consumer.connect(port)
 
     await consumer.ask(1, Call.ACCOUNT_INFO)
@@ -125,7 +120,7 @@ async def test_before_a_verifying_sample_every_request_is_answered_not_ready_and
 
 
 async def test_after_a_verifying_sample_a_request_reaches_its_ea_and_health_is_200_with_the_load():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
 
@@ -152,7 +147,7 @@ async def test_after_a_verifying_sample_a_request_reaches_its_ea_and_health_is_2
 
 
 async def test_a_gate_that_shuts_when_the_samples_stop_answers_not_ready_again():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
     await asyncio.sleep(MAX_AGE_S * 1.5)
@@ -167,7 +162,7 @@ async def test_a_gate_that_shuts_when_the_samples_stop_answers_not_ready_again()
 
 async def test_a_missed_bootstrap_window_leaves_the_hub_serving_with_its_gate_shut(caplog):
     caplog.set_level(logging.CRITICAL, logger="mt5connector.server.hub_gate")
-    hub, server, port, _ = await run_hub(clock_bootstrap_seconds=0.05)
+    hub, server, port = await run_hub(clock_bootstrap_seconds=0.05)
     hub.start()
     await asyncio.sleep(0.1)
     consumer = await Consumer.connect(port)
@@ -186,7 +181,7 @@ async def test_a_missed_bootstrap_window_leaves_the_hub_serving_with_its_gate_sh
 
 
 async def test_health_answers_get_alone():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     loop = asyncio.get_running_loop()
 
     def post():
@@ -206,7 +201,7 @@ async def test_health_answers_get_alone():
 
 
 async def test_a_request_no_ea_of_its_role_serves_is_deferred_at_once_and_its_chart_asked_once():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     loop = asyncio.get_running_loop()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
@@ -232,7 +227,7 @@ async def test_a_request_no_ea_of_its_role_serves_is_deferred_at_once_and_its_ch
 
 
 async def test_a_tick_history_read_with_no_history_ea_asks_the_spawner_for_its_history_chart():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
 
@@ -249,7 +244,7 @@ async def test_a_tick_history_read_with_no_history_ea_asks_the_spawner_for_its_h
 
 
 async def test_an_account_read_with_no_spawner_is_deferred_and_asks_for_no_chart():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
         await spawner.close()
@@ -264,7 +259,7 @@ async def test_an_account_read_with_no_spawner_is_deferred_and_asks_for_no_chart
 
 
 async def test_two_requests_an_ea_answers_in_reverse_order_resolve_each_with_its_own_answer():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         session = HubSession(
@@ -304,7 +299,7 @@ async def test_two_requests_an_ea_answers_in_reverse_order_resolve_each_with_its
 
 
 async def test_an_ea_leaving_answers_each_request_pending_on_it_ea_gone_at_once():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     loop = asyncio.get_running_loop()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
@@ -333,7 +328,7 @@ async def test_a_read_its_ea_never_answers_is_answered_timeout_at_the_read_deadl
 ):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     monkeypatch.setattr(calls, "READ_DEADLINE_S", 0.2)
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     loop = asyncio.get_running_loop()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
@@ -364,7 +359,7 @@ async def test_a_tick_read_its_ea_sends_no_busy_for_outlives_the_history_deadlin
 ):
     monkeypatch.setattr(calls, "HISTORY_DEADLINE_S", 0.1)
     monkeypatch.setattr(calls, "TICK_BUSY_S", 0.6)
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     loop = asyncio.get_running_loop()
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
@@ -392,7 +387,7 @@ async def test_a_tick_read_its_ea_sends_no_busy_for_outlives_the_history_deadlin
 
 
 async def test_a_tick_read_its_ea_sends_no_busy_for_is_held_at_the_hub_for_the_whole_tick_bound():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -420,7 +415,7 @@ async def test_a_busy_holds_a_read_past_its_deadline_and_its_answer_within_the_b
     monkeypatch,
 ):
     monkeypatch.setattr(calls, "READ_DEADLINE_S", 0.2)
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -505,7 +500,7 @@ async def test_a_tick_reads_busy_holds_its_request_and_its_eas_keepalive_for_its
 async def _asked_a_deaf_publisher(hub_settings):
     """A hub with a verified clock and a publisher asked one read, after which it answers no ping;
     its peers end with the consumer's."""
-    hub = ws_server.Hub(CLOCK, lambda path, body: None, hub_settings)
+    hub = ws_server.Hub(CLOCK, hub_settings)
     spawner = Peer()
     eurusd = Peer()
     consumer = Peer()
@@ -542,7 +537,7 @@ async def _end(peers, tasks) -> None:
 
 
 async def test_the_consumers_request_past_its_pending_bound_is_answered_overflow_at_once():
-    hub, server, port, _ = await run_hub(pending_bound=2)
+    hub, server, port = await run_hub(pending_bound=2)
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
 
@@ -557,7 +552,7 @@ async def test_the_consumers_request_past_its_pending_bound_is_answered_overflow
 
 
 async def test_a_request_its_eas_queue_has_no_room_for_is_answered_overflow():
-    hub = ws_server.Hub(CLOCK, lambda path, body: None, settings(ea_queue_bound=1))
+    hub = ws_server.Hub(CLOCK, settings(ea_queue_bound=1))
     spawner = Peer(stuck=True)
     consumer = Peer()
     tasks = [asyncio.create_task(hub.handler(peer)) for peer in (spawner, consumer)]
@@ -584,7 +579,7 @@ async def test_a_request_its_eas_queue_has_no_room_for_is_answered_overflow():
 
 
 async def test_a_bar_window_reaches_the_ea_on_the_brokers_clock_and_its_rows_return_in_true_utc():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.PUBLISHER, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -623,7 +618,7 @@ async def test_a_bar_window_reaches_the_ea_on_the_brokers_clock_and_its_rows_ret
 
 
 async def test_an_answer_in_parts_reaches_the_consumer_part_by_part_in_true_utc():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -665,7 +660,7 @@ async def test_an_answer_in_parts_reaches_the_consumer_part_by_part_in_true_utc(
 
 
 async def test_an_eas_error_reaches_the_consumer_with_the_mql5_error_it_left():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -688,7 +683,7 @@ async def test_an_eas_error_reaches_the_consumer_with_the_mql5_error_it_left():
 
 
 async def test_an_ea_answering_a_kind_the_hub_alone_answers_is_refused_and_its_requests_gone():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -710,7 +705,7 @@ async def test_an_ea_answering_a_kind_the_hub_alone_answers_is_refused_and_its_r
 
 
 async def test_a_history_reads_floor_reaches_the_ranges_with_the_terminals_maxbars():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.PUBLISHER, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -783,7 +778,7 @@ SESSIONS = {"quote": WEEK, "trade": WEEK, "last_error": 0}
 
 
 async def test_a_commission_schedule_is_answered_from_the_publishers_latest_relay():
-    hub, server, port, relayed = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
         row = calls.CALLS[Call.COMMISSION_SCHEDULE]
@@ -808,14 +803,10 @@ async def test_a_commission_schedule_is_answered_from_the_publishers_latest_rela
         assert error_of(unrelayed) == deferred(ErrorKind.SYNCING)
         assert (schedule.error, calls.read_hub_result(row, schedule)) == (None, SCHEDULE)
         assert error_of(refused) == (ErrorKind.EA_ERROR, None)
-        await eventually(lambda: len(posted(relayed, "/relay/commissions")) == 2)
-        # Each post runs on an executor thread, so they may land in either order.
-        assert sorted(
-            posted(relayed, "/relay/commissions"), key=lambda post: post[1]["symbol"]
-        ) == [
-            ("/relay/commissions/EURUSD", {"symbol": "EURUSD"} | SCHEDULE),
-            ("/relay/commissions/EURUSD", {"symbol": "GBPUSD"} | SCHEDULE),
-        ]
+        assert refused.error.message == (
+            "the commission_schedule relay for EURUSD was refused: "
+            "symbol 'GBPUSD' is not the relay's 'EURUSD'"
+        )
         await consumer.close()
         await eurusd.close()
         await spawner.close()
@@ -823,7 +814,7 @@ async def test_a_commission_schedule_is_answered_from_the_publishers_latest_rela
 
 
 async def test_trading_sessions_are_answered_from_the_publishers_latest_relay():
-    hub, server, port, relayed = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -834,10 +825,83 @@ async def test_trading_sessions_are_answered_from_the_publishers_latest_relay():
         reply = await consumer.received()
 
         assert calls.read_hub_result(calls.CALLS[Call.TRADING_SESSIONS], reply) == SESSIONS
-        await eventually(lambda: len(posted(relayed, "/relay/sessions")) == 1)
-        assert posted(relayed, "/relay/sessions") == [
-            ("/relay/sessions/EURUSD", {"symbol": "EURUSD"} | SESSIONS)
-        ]
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+def _with_day(week, index, day):
+    return week[:index] + [day] + week[index + 1 :]
+
+
+@pytest.mark.parametrize(
+    ("relayed", "reason"),
+    [
+        (
+            binary.Sessions("GBPUSD", SESSIONS),
+            "symbol 'GBPUSD' is not the relay's 'EURUSD'",
+        ),
+        (
+            binary.Sessions(
+                "EURUSD", SESSIONS | {"quote": _with_day(WEEK, 1, [[0, 61_140], [-1, 0]])}
+            ),
+            "quote[1][1] holds a negative second: [-1, 0]",
+        ),
+        (
+            binary.Sessions(
+                "EURUSD", SESSIONS | {"trade": _with_day(WEEK, 2, [[61_140, 0], [64_800, 3_600]])}
+            ),
+            "trade[2][1] does not end after it starts: [64800, 3600]",
+        ),
+        (
+            binary.Sessions("EURUSD", SESSIONS | {"trade": _with_day(WEEK, 2, [[3_600, 3_600]])}),
+            "trade[2][0] does not end after it starts: [3600, 3600]",
+        ),
+    ],
+    ids=["another-symbol", "negative-from", "from-after-to", "from-at-to"],
+)
+async def test_refused_trading_sessions_answer_the_read_with_the_refusal_until_a_frame_is_accepted(
+    relayed, reason
+):
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        eurusd = await publisher(port)
+        consumer = await Consumer.connect(port)
+
+        await eurusd.send(relayed)
+        await settle()
+        await consumer.ask(1, Call.TRADING_SESSIONS, symbol="EURUSD")
+        refused = await consumer.received()
+        await eurusd.send(binary.Sessions("EURUSD", SESSIONS))
+        await settle()
+        await consumer.ask(2, Call.TRADING_SESSIONS, symbol="EURUSD")
+        accepted = await consumer.received()
+
+        assert error_of(refused) == (ErrorKind.EA_ERROR, None)
+        assert refused.error.message == (
+            f"the trading_sessions relay for EURUSD was refused: {reason}"
+        )
+        assert calls.read_hub_result(calls.CALLS[Call.TRADING_SESSIONS], accepted) == SESSIONS
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+async def test_a_session_ending_at_0_is_kept_whatever_its_start():
+    quote = _with_day(WEEK, 0, [[0, 0], [86_399, 0]])
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        eurusd = await publisher(port)
+        consumer = await Consumer.connect(port)
+
+        await eurusd.send(binary.Sessions("EURUSD", SESSIONS | {"quote": quote}))
+        await settle()
+        await consumer.ask(1, Call.TRADING_SESSIONS, symbol="EURUSD")
+        reply = await consumer.received()
+
+        assert calls.read_hub_result(calls.CALLS[Call.TRADING_SESSIONS], reply)["quote"] == quote
         await consumer.close()
         await eurusd.close()
         await spawner.close()
@@ -845,7 +909,7 @@ async def test_trading_sessions_are_answered_from_the_publishers_latest_relay():
 
 
 async def test_an_order_reaches_its_symbols_publisher_with_its_expiration_on_the_brokers_clock():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -872,7 +936,7 @@ async def test_an_order_reaches_its_symbols_publisher_with_its_expiration_on_the
 
 
 async def test_outcomes_reach_the_consumer_as_the_transactions_held_with_epochs_in_true_utc():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -930,7 +994,7 @@ async def test_outcomes_reach_the_consumer_as_the_transactions_held_with_epochs_
 async def test_a_request_the_hub_cannot_read_is_refused_and_closes_the_consumer(
     request_frame, message
 ):
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     consumer = await Consumer.connect(port)
 
     await consumer.send(request_frame)
@@ -942,7 +1006,7 @@ async def test_a_request_the_hub_cannot_read_is_refused_and_closes_the_consumer(
 
 
 async def test_a_bar_read_of_a_timeframe_no_series_serves_is_refused():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     consumer = await Consumer.connect(port)
 
     await consumer.ask(
@@ -962,7 +1026,7 @@ async def test_a_bar_read_of_a_timeframe_no_series_serves_is_refused():
 
 async def test_an_answer_to_a_request_whose_consumer_left_is_dropped_without_a_warning(caplog):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -981,7 +1045,7 @@ async def test_an_answer_to_a_request_whose_consumer_left_is_dropped_without_a_w
 
 
 async def test_a_last_part_the_hub_cannot_convert_still_ends_its_request_with_ea_gone():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await publisher(port)
         consumer = await Consumer.connect(port)
@@ -999,7 +1063,7 @@ async def test_a_last_part_the_hub_cannot_convert_still_ends_its_request_with_ea
 
 
 async def test_while_the_gate_is_shut_a_request_at_the_pending_bound_is_answered_not_ready():
-    hub, server, port, _ = await run_hub(pending_bound=1)
+    hub, server, port = await run_hub(pending_bound=1)
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
         await consumer.ask(1, Call.ACCOUNT_INFO)
@@ -1049,7 +1113,7 @@ async def _window_read(port, call, date_from, date_to, rows):
 
 
 async def test_a_window_about_the_repeated_hour_is_read_across_every_broker_stamp_reading_into_it():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     # 05:45–06:15Z holds broker 08:45–08:59:59 at the hour's first pass and 08:00–08:15 at its
     # second.
     start = AUTUMN + 5 * HOUR + 45 * 60
@@ -1069,7 +1133,7 @@ async def test_a_window_about_the_repeated_hour_is_read_across_every_broker_stam
 
 
 async def test_a_window_about_the_skipped_hour_holds_the_records_stamped_in_it():
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     # 07:00–07:10Z holds broker 09:00–09:10, the skipped hour read at the offset before the change,
     # and broker 10:00–10:10.
     start = SPRING + 7 * HOUR
@@ -1087,7 +1151,7 @@ async def test_a_window_about_the_skipped_hour_holds_the_records_stamped_in_it()
 
 async def test_a_ranges_terminal_info_answered_in_a_part_before_the_last_ends_it_once(monkeypatch):
     monkeypatch.setattr(calls, "READ_DEADLINE_S", 0.2)
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
         await consumer.ask(17, Call.RANGES, symbol="EURUSD")
@@ -1107,7 +1171,7 @@ async def test_a_ranges_terminal_info_answered_in_a_part_before_the_last_ends_it
 
 @pytest.mark.parametrize("call", [Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE])
 async def test_a_range_reads_zero_bound_reaches_the_ea_as_zero(call):
-    hub, server, port, _ = await run_hub()
+    hub, server, port = await run_hub()
 
     arguments, _ = await _window_read(port, call, 0, 86_400, [])
 

@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -21,13 +20,6 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from nautilus_trader.model.identifiers import InstrumentId, Venue
-
-from mt5connector.client import factories as mt5_factories
-from mt5connector.client import remote_mt5
-from mt5connector.client.config import MT5Config
-from mt5connector.client.connection import ConnectionState, MT5Connection
-from mt5connector.client.errors import MT5ConnectionError
 
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
@@ -39,14 +31,9 @@ _ACCOUNT = {
     "MT5_SERVER": "MT5ImageTest-Not-A-Server",
     "MT5_SPAWNER_SYMBOL": "EURUSD",
 }
-# The boot steps, the server's login timeout and its clock-bootstrap window, with room to spare.
-_START_BOUND_SECONDS = 600
 # The stop timeout the image's contract asks for, over the entrypoint's own stop bounds together.
 _STOP_TIMEOUT_SECONDS = 190
-_API_PORT = 5000
 _HUB_PORT = 9000
-# On the host's loopback, at host ports the runtime picks.
-_PUBLISHED_PORTS = (f"127.0.0.1::{_API_PORT}", f"127.0.0.1::{_HUB_PORT}")
 _IMAGE_FILES = Path(__file__).resolve().parents[2] / "image"
 _BASES = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
 _CONFIG = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Config"
@@ -324,23 +311,26 @@ def _await_log(runtime: str, name: str, line: str, *, count: int, seconds: float
 
 
 @_needs_image
-def test_a_start_on_an_unknown_account_ends_through_the_server_and_prints_no_password() -> None:
-    result = subprocess.run(
-        [_runtime(), "run", "--rm", *_account_env(), _IMAGE],
+def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password() -> None:
+    runtime = _runtime()
+    name = f"mt5-image-boot-test-{os.getpid()}"
+    subprocess.run(
+        [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
         env={**os.environ, **_ACCOUNT},
-        capture_output=True,
-        text=True,
-        timeout=_START_BOUND_SECONDS,
+        check=True,
+        timeout=60,
     )
+    try:
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        output = _logs(runtime, name)
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
 
-    output = result.stdout + result.stderr
-    assert result.returncode != 0
     assert "mt5: restored the terminal's baked state, its history store aside" in output
     assert "mt5: fetching the trade server's broker into the server list" in output
     assert "mt5: the account dialog searched the trade server" in output
     assert "mt5: adding 127.0.0.1 to the WebRequest allowlist" in output
     assert "mt5: the WebRequest allowlist holds 127.0.0.1 alone" in output
-    assert "mt5: server exited with status" in output
     assert _ACCOUNT["MT5_PASSWORD"] not in output
 
 
@@ -483,7 +473,7 @@ def test_a_stop_closes_the_terminal_and_ends_the_container_within_the_stop_timeo
         timeout=60,
     )
     try:
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         started = time.monotonic()
         subprocess.run([runtime, "stop", name], capture_output=True, timeout=stop_timeout + 30)
         stopped_after = time.monotonic() - started
@@ -539,7 +529,7 @@ gui.main()
 
 @contextlib.contextmanager
 def _booted(runtime: str, tmp_path, name: str):
-    """A container of the image booted up to its server, its history store a volume of its own and
+    """A container of the image booted up to its hub, its history store a volume of its own and
     the scripts above mounted; removed with its volume on exit."""
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -568,7 +558,7 @@ def _booted(runtime: str, tmp_path, name: str):
         timeout=60,
     )
     try:
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         yield name
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
@@ -694,7 +684,7 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
             capture_output=True,
             timeout=_STOP_TIMEOUT_SECONDS + 60,
         )
-        _await_log(runtime, name, "mt5: starting the server", count=2, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=300)
         after = _allowlist(runtime, name)
         kept = subprocess.run(
             [runtime, "exec", name, "ls", _CONFIG, _COMMON_FILES, _BASES],
@@ -763,92 +753,6 @@ def test_a_dialog_without_the_expected_control_fails_the_driver_naming_it(tmp_pa
     assert "mt5: the Options dialog's Experts page has no Button 32767" in result.stderr
 
 
-# ── the client against the image, whose server no made-up account brings up ──
-
-_EURUSD = InstrumentId.from_str("EURUSD.MT5_TEST")
-
-
-def _client_config(server_url: str) -> MT5Config:
-    return MT5Config(
-        account=int(_ACCOUNT["MT5_LOGIN"]),
-        password=_ACCOUNT["MT5_PASSWORD"],
-        server=_ACCOUNT["MT5_SERVER"],
-        server_url=server_url,
-        ws_url=f"ws://127.0.0.1:{_HUB_PORT}",
-        venue=Venue("MT5_TEST"),
-    )
-
-
-def _loopback_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def _refused_at_once(connection: MT5Connection) -> None:
-    """`connection`'s connect raises the client's error for a request no server answered, within the
-    client's own bound on reaching a server, carrying no credential, and leaves it disconnected."""
-    started = time.monotonic()
-    with pytest.raises(MT5ConnectionError) as refused:
-        connection.connect()
-    assert time.monotonic() - started < remote_mt5.CONNECT_TIMEOUT_S
-    said = " ".join([str(refused.value), *getattr(refused.value, "__notes__", [])])
-    for name in ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"):
-        assert _ACCOUNT[name] not in said
-    assert connection._state is ConnectionState.DISCONNECTED
-
-
-@_needs_image
-def test_a_client_is_refused_at_once_by_a_server_that_never_comes_up(monkeypatch) -> None:
-    # The terminal cannot log the made-up account in, so the server exits without ever serving: a
-    # connect meets no server while the image boots or once it has exited.
-    runtime = _runtime()
-    port = _loopback_port()
-    name = f"mt5-image-client-test-{os.getpid()}"
-    monkeypatch.setattr(mt5_factories, "_mt5_config_registry", {})
-    transports: list[remote_mt5.RemoteMT5] = []
-
-    class _RecordedTransport(remote_mt5.RemoteMT5):
-        def __init__(self, server_url: str) -> None:
-            super().__init__(server_url)
-            transports.append(self)
-
-    monkeypatch.setattr("mt5connector.client.connection.RemoteMT5", _RecordedTransport)
-    config = _client_config(f"http://127.0.0.1:{port}")
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-p",
-            f"127.0.0.1:{port}:{_API_PORT}",
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
-    try:
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
-        _refused_at_once(MT5Connection(config))
-
-        subprocess.run([runtime, "wait", name], check=True, timeout=_START_BOUND_SECONDS)
-        _refused_at_once(MT5Connection(config))
-
-        # Building the clients' configs asks no server at all.
-        node = mt5_factories.build_mt5_node_config(
-            config, data_instruments=frozenset({_EURUSD}), exec_instruments=frozenset({_EURUSD})
-        )
-        assert node.data_clients["MT5_TEST"].instrument_provider.load_ids == frozenset({_EURUSD})
-        assert node.exec_clients["MT5_TEST"].instrument_provider.load_ids == frozenset({_EURUSD})
-        assert len(transports) == 2
-    finally:
-        subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
-
-
 def _published_port(runtime: str, name: str, port: int) -> int:
     """The host port the runtime published the container `name`'s `port` on."""
     reply = subprocess.run(
@@ -859,30 +763,6 @@ def _published_port(runtime: str, name: str, port: int) -> int:
         check=True,
     ).stdout
     return int(reply.split()[0].rpartition(":")[2])
-
-
-@_needs_image
-def test_a_published_server_is_reachable_on_the_loopback_at_the_port_the_runtime_picked() -> None:
-    runtime = _runtime()
-    name = f"mt5-image-publish-test-{os.getpid()}"
-    publishes = [token for spec in _PUBLISHED_PORTS for token in ("--publish", spec)]
-    subprocess.run(
-        [runtime, "run", "-d", "--name", name, *publishes, *_account_env(), _IMAGE],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
-    try:
-        rest = _published_port(runtime, name, _API_PORT)
-        hub = _published_port(runtime, name, _HUB_PORT)
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
-
-        assert rest != hub
-        # The runtime holds the host side of the REST port on the loopback while the server boots.
-        with socket.create_connection(("127.0.0.1", rest), timeout=5):
-            pass
-    finally:
-        subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
 
 
 def _health(port: int) -> tuple[int, dict] | None:
@@ -918,7 +798,7 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
     )
     try:
         hub = _published_port(runtime, name, _HUB_PORT)
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         deadline = time.monotonic() + 30
         answered = _health(hub)
         while answered is None and time.monotonic() < deadline:

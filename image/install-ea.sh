@@ -1,27 +1,26 @@
 #!/bin/sh
 # Places the connector's EA, its history indicator and the startup script in the terminal, compiled
-# with the EA's half of the hub protocol generated from the installed wheel, and writes the three
+# with the EA's half of the hub protocol generated from the installed server, and writes the three
 # chart templates that attach the EA in its roles. Runs once, at image build, under Xvfb.
 set -eu
 
 terminal_dir="$WINEPREFIX/drive_c/Program Files/MetaTrader 5"
 mql5="$terminal_dir/MQL5"
-wheel_mql5="$(winepath -u "$MT5_PYTHON_DIR")/Lib/site-packages/mt5connector/server/mql5"
+sources=$(python -c 'import os, mt5connector.server as s; print(os.path.dirname(s.__file__))')/mql5
 # MetaEditor truncates a /compile: path at its first space, so each source compiles from here.
 stage="$WINEPREFIX/drive_c/mt5build"
 
 rm -rf "$stage"
 mkdir "$stage"
-cp "$wheel_mql5/Expert/ticks.mq5" "$wheel_mql5/Scripts/ticks_setup.mq5" \
-    "$wheel_mql5/Indicators/hub_history.mq5" "$stage/"
-cp -R "$wheel_mql5/Include" "$stage/"
-# The Linux Python's wheel is the one the Windows Python installed.
+cp "$sources/Expert/ticks.mq5" "$sources/Scripts/ticks_setup.mq5" \
+    "$sources/Indicators/hub_history.mq5" "$stage/"
+cp -R "$sources/Include" "$stage/"
 python -m mt5connector.server.mql5gen "$stage/Include/hub_wire.mqh"
 echo "generated $stage/Include/hub_wire.mqh"
 
-cp "$wheel_mql5/Expert/ticks.mq5" "$mql5/Experts/"
-cp "$wheel_mql5/Scripts/ticks_setup.mq5" "$mql5/Scripts/"
-cp "$wheel_mql5/Indicators/hub_history.mq5" "$mql5/Indicators/"
+cp "$sources/Expert/ticks.mq5" "$mql5/Experts/"
+cp "$sources/Scripts/ticks_setup.mq5" "$mql5/Scripts/"
+cp "$sources/Indicators/hub_history.mq5" "$mql5/Indicators/"
 cp "$stage/Include/hub_codec.mqh" "$stage/Include/hub_wire.mqh" "$mql5/Include/"
 cp -R "$stage/Include/MQL5Book" "$mql5/Include/"
 

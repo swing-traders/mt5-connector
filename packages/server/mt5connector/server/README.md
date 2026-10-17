@@ -1,6 +1,6 @@
 # mt5-connector-server
 
-The terminal side of mt5-connector: an HTTP server that mirrors the `MetaTrader5` package with every epoch in true UTC, the hub that carries the terminal's ticks, closed bars and trade transactions and answers the calls the EAs serve, and the source of the EA and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
+The terminal side of mt5-connector: the hub that carries the terminal's ticks, closed bars and trade transactions and answers the calls the EAs serve, every epoch in true UTC, and the source of the EA, its history indicator and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
 
 Releases are wheels on the fork's package index, versioned together with the client's; `<version>` is a release's version, the `VERSION` file's value at its tag, the latest listed on the [releases page](https://github.com/swing-traders/mt5-connector/releases):
 
@@ -10,99 +10,11 @@ python -m pip install --extra-index-url https://swing-traders.github.io/mt5-conn
 
 | Part | What it is |
 |---|---|
-| `mt5connector.server.app` | the HTTP server, started as `mt5-connector-server` |
 | `mt5connector.server.ws_server` | the hub, started as `mt5-connector-hub` |
 | `mt5connector/server/mql5/` | the EA (`Expert/ticks.mq5`), its history indicator (`Indicators/hub_history.mq5`), its startup script (`Scripts/ticks_setup.mq5`) and the MQL5 libraries they include (`Include/`) |
 | `mt5connector.server.wire` | the wire vocabulary, copied from the client's `mt5connector.wire` when the wheel is built |
 
 ---
-
-## HTTP API
-
-The server mirrors the `MetaTrader5` package (5.0.6231): a `RemoteMT5` of the client's `mt5connector.client.remote_mt5`, one per connection, carries the package's functions with their signatures, and the package's constants and struct types live in `mirror.py`, the one inventory of the package in the wire vocabulary that both sides are generated from.
-
-- `POST /mt5/<function>` for each of the package's 32 functions, its arguments a JSON object keyed by parameter name; datetimes travel as true-UTC epoch seconds.
-- The server passes the package no keyword mapping at all when it has no named argument to pass, since `order_check` and `order_send` refuse their request with `(-2, 'Unnamed arguments not allowed')` beside any keyword mapping, an empty one included.
-- A package call answers `{"ok": true, "result": ..., "last_error": [code, message]}` or `{"ok": false, "error": {"code": ..., "message": ...}, "last_error": [code, message]}`. `last_error` is the package's `last_error()` read right after the call; a failure's error is that same pair. Structs answer as objects in the package's field order, arrays as lists of objects keyed by the dtype's fields.
-- Every epoch is true UTC in both directions. The terminal keeps time on the broker's clock — a zone's wall time plus a fixed offset, New York plus seven hours by default — and the server converts by the era of each instant:
-  - every epoch field of an answer, `0` (no time) left as `0`, with bars still stamped at their open;
-  - every time window a client sends, and a trade request's `expiration`.
-- An epoch in the zone's repeated autumn hour reads as its first occurrence, and one in its skipped spring hour at the offset before the change, the broker's clock moving minutes after the zone's. The server logs one warning per such hour, naming the field, however many answers carry it.
-- Answers are HTTP 200, except a failing `terminal_info`, which is HTTP 503: the terminal's IPC is down. A missing or unknown parameter, a time that is not an integer epoch, or a history query in none of its documented call forms, is refused with HTTP 400 and code -2 (`RES_E_INVALID_PARAMS`) before the package is called.
-- `POST /mt5/shutdown` is the one deliberate departure from the package: it answers `None` without calling the package's `shutdown()`. Every client shares the server's terminal session, and the adapter calls `shutdown()` whenever it disconnects, so passing it on would end the session for every client. `initialize` and `login` pass through unchanged.
-- `GET /health` answers the broker clock's latest verification — the relayed sample's chart `symbol`, its `trade_server` and `current` (last quote) times in true UTC, the terminal's own `gmt`, and the `skew_s` from the server's clock and the `offset_s` in effect — beside the server's load: the calls holding a slot `in_flight` now, the `peak_in_flight` and the `refusals` since start, and its `workers`. While the clock is not verified it answers HTTP 503. It never calls the terminal: the server initialized it at start, and the EAs' samples say whether it is connected to the trade server.
-- `POST /relay/server_time`, `POST /relay/commissions/<symbol>` and `POST /relay/sessions/<symbol>` take the server-time samples, commission schedules and trading sessions the hub relays from the EAs as JSON bodies of their frames' fields, the schedules and sessions under the symbol of the publisher that sent them, and answer `{"ok": true, "result": null}`. Each accepts a body from `127.0.0.1` only (HTTP 403 otherwise), and refuses anything but the body's exact shape with HTTP 400 and code -2:
-  - a commission schedule names the path's symbol, and carries in each enum field a member of that field's enum;
-  - trading sessions name the path's symbol, and carries seven days in each of `quote` and `trade`, every session two non-negative integers `[from, to]` with `from` before `to`, or `to` 0.
-
-  A refused schedule or sessions body is kept against the path's symbol until a later one for it is accepted.
-- `GET /commissions/<symbol>` answers the commission schedule the symbol's EA last relayed — `ret` and `last_error` of its `SymbolInfoCommissions` call and its `rules`, every enum field by the name `EnumToString` gives it, one of the members the MQL5 reference lists for the field's enum, which `push_wire.py` declares:
-
-  | HTTP | When |
-  |---|---|
-  | 200 | the last relay was accepted; a schedule with no rule answers an empty `rules` list |
-  | 503 with code -20001 (`SYNCING`) and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | nothing was relayed for the symbol yet |
-  | 422 with code -20003 (`RELAY_REFUSED`) | the last relay was refused; the message names the symbol and why |
-  | 503 with the failure envelope, code -20002 (`BUSY`) and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | every slot is taken |
-
-  No package call answers it, so its envelope carries no `last_error` — except the busy refusal, which is the failure envelope every slotted route answers with.
-- `GET /sessions/<symbol>` answers the trading sessions the symbol's EA last relayed, `{"quote", "trade", "last_error"}`: per weekday, Sunday first, each session `SymbolInfoSessionQuote` and `SymbolInfoSessionTrade` give as its `[from, to]`, in seconds from 00:00 of the broker day and unconverted, and the error the reads left. It answers as `GET /commissions/<symbol>` does — 200 once a relay was accepted, the syncing 503 before any, 422 with code -20003 once the last relay was refused, and the busy 503 — the refusal's message naming the sessions relay.
-- `GET /commissions/<symbol>`, `GET /sessions/<symbol>`, `POST /history/bars` and `POST /history/ticks` read a symbol, and first check that an EA publishes it. The server knows the symbols the EAs publish from their server-time samples, each naming its EA's chart symbol, fresh for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`:
-  - For a symbol no EA publishes, the server posts the symbol to the hub's chart route (`POST http://127.0.0.1:<MT5_HUB_PORT>/charts/<symbol>`), which has the spawner open its chart, and answers HTTP 503 with code -20001, `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` and the message `no publisher for <symbol>; chart requested` until the chart's EA relays.
-  - While the hub's last answer for a symbol is `requested`, the server posts it again at most once per `MT5_HISTORY_RETRY_SECONDS`, so a client's next retry meets a failure to open its chart; the hub sends the spawner one `open_chart` for it however often it is posted.
-  - The server posts any other symbol at most once per half `MT5_CHART_IDLE_SECONDS`, the start of an EA's samples counting as a post. For a symbol an EA publishes, the post tells the hub the symbol is in use, which keeps its chart open.
-  - For a symbol whose chart the spawner failed to open, the hub answers the post with the spawner's reason, and the server answers HTTP 400 with code -20004 (`CHART_FAILED`) and the message `the chart of <symbol> failed to open: <reason>`. Such a symbol is posted again on its next read, so a read after its chart opens is served.
-  - A post the hub does not answer is HTTP 503 with code -1 naming the failure; the next read posts again.
-  - The check runs after the clock gate, in the read's slot, so a hub that does not answer holds a slot and never the free worker. `/history/ranges` and the mirror routes check nothing.
-- `POST /history/bars` and `POST /history/ticks` answer a history window the server vouches for (see [History](#history)), and `GET /history/ranges?symbol=<symbol>` the floors it has measured.
-- While the broker clock is not verified, every route but `/health` and the relays answers HTTP 503 with `{"ok": false, "error": {"code": -1, "message": "the broker clock is not verified"}}` and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>`, and calls nothing.
-- Package calls run one at a time; waitress serves the API with `MT5_API_THREADS` workers, one of them always kept free for `/health` and the relays.
-- Every route that can reach the terminal or the hub — `/mt5/<function>`, the three history routes, `/commissions/<symbol>` and `/sessions/<symbol>` — takes one of `MT5_API_THREADS − 1` slots. A call that finds every slot taken is refused at once, never queued on a worker: HTTP 503 with the failure envelope, code -20002 naming the route, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>`. Each refusal is logged as a warning. The clock check answers first, so while the clock is not verified such a call gets its 503 and takes no slot.
-
-### The broker clock
-
-Once the terminal is initialized, the server verifies the broker's clock against the trade server's time the EAs relay through the WS hub, at any hour, market open or closed:
-
-- A sample is fresh while it is younger than `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` and says the terminal is connected to the trade server.
-- A fresh sample verifies the clock only once the terminal has been connected without a break for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, so a terminal back from downtime is not trusted while it re-fetches what it missed. A sample that says the terminal is disconnected, or a gap of `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` between two samples, starts the run again.
-- A fresh sample's trade-server time, converted to true UTC, must sit within 120 s of the server's clock, or the server exits with both times and the offset in its log. The terminal extrapolates the trade server's time from the clock it shares with the server, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the host's clock reads.
-- A sample reads the terminal's clock live, so its times in the repeated autumn hour read as the occurrence nearer the server's clock: the trade-server time measured, the `trade_server` and `current` `/health` answers, and the terminal's time a history window's start is held to. Every epoch an answer carries keeps its first occurrence.
-- At start the server waits up to `MT5_CLOCK_BOOTSTRAP_SECONDS` for the first sample that verifies the clock, and exits when none arrives; the window includes the connected run, so with the defaults `/health` first answers 200 at least 30 s after the first connected sample. It then re-verifies the latest sample every `MT5_CLOCK_CHECK_SECONDS`.
-- The moment the latest sample no longer verifies the clock it is unverified, and stays so until a sample verifies it again. Each change is logged once.
-
-## History
-
-The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. The history routes answer a window only once the terminal's answers prove it, so a client never receives emptiness it cannot trust.
-
-- `POST /history/bars` takes `{"symbol", "timeframe", "start", "end"}`, the timeframe by its MT5 name from `M1` to `W1` (a month has no fixed period, so `MN1` is refused), and `start` and `end` the bars' opens in true-UTC epoch seconds, inclusive at both ends.
-- A window about a clock change is read in the broker window holding every stamp that reads into it — a skipped hour's stamps read at the offset before the change, a repeated hour's at either pass — and answered with those stamps alone.
-- Every bar the bars route answers and the hub pushes carries its close, `time_close`, in true UTC: a frame on the broker day's grid, H2 to W1, closes at the next grid open on the broker's clock, an hour more or less than its period across a clock change; a finer one a period of real time after its open. Of two bars of a series that open at one true-UTC second — about a spring change, one stamped in the hour the broker's clock skips and the one after it — the first is answered and pushed, and the other dropped with one warning per such hour.
-- `POST /history/ticks` takes `{"symbol", "start", "end", "flags"}`: the ticks from the start of second `start` through the end of second `end`, true UTC, and `flags` the selection by its `COPY_TICKS_*` name — `ALL`, `INFO` or `TRADE`, `INFO` when absent.
-
-| HTTP | Answer | When |
-|---|---|---|
-| 200 | the mirror's envelope, its `result` the window's rows as the mirror answers them, each bar with its close as `time_close` | the terminal's answers prove the rows; an empty list is an answer like any other |
-| 503 | the failure envelope with code -20001, naming the symbol, the series and the window, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | the terminal's answers do not prove the window yet: ask again after the delay |
-| 503 | the failure envelope with code -20002, naming the route, and `Retry-After: <MT5_HISTORY_RETRY_SECONDS>` | every slot is taken: ask again after the delay |
-| 400 | the failure envelope with code -2 | a body out of shape, or a window that starts after the terminal's current time: the trade-server time an EA last relayed, plus the time since it arrived |
-
-A 200 carries the failure envelope instead when the terminal cannot select the symbol, or when the rows it answers break the checks below.
-
-How the server proves a window, within the request and without waiting:
-
-- It selects the symbol and reads the terminal's `maxbars`. The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in the fewest equal spans within that.
-- A read the terminal answers with rows and a success `last_error` is proven: the rows are the answer. A read it fails, with no answer or with an error, is a 503.
-- A read that answers no rows is proven empty by any one of these facts, each read from the terminal, and is a 503 without one:
-  - **Before the floor**: the window lies wholly before the series' floor. A window that begins before the floor answers its rows from the floor on.
-  - **The live edge**: the window lies after the second of the symbol's last quote, read with `symbol_info_tick`. A last quote at time zero dates nothing, and a window holding the last quote's second is a 503: that quote is itself a record.
-  - **Bracketed**: the terminal has a row before the window and a record after it. Before it: for bars, the last bar the terminal answers as opened at or before the window's start (`copy_rates_from` for one bar); for ticks, the window's UTC day, then its UTC week. After it: the first bar from the window's end to the symbol's last quote — the server's clock when it has none — within the span of one read, or the first tick from its last second. An empty span of a long bar window between spans that answered rows is bracketed by them.
-- Every read asks the terminal to sync what it lacks, and a client's retry after a 503 reads the window again.
-- Every bar must lie on its timeframe's grid, or the answer fails with code -1 naming the row. In an answer that begins at the series' floor, a leading run of an intraday series spaced a whole number of days apart, ahead of its first two rows one period apart, is not that timeframe's data: it is dropped and the floor moves past it. An answer that begins anywhere else drops no such run. Ticks must not go back in time.
-- A cold read holds the terminal for as long as the package's own call takes. `/health` never waits on the terminal, so liveness does not see it.
-
-A series' floor is set by the stub — the one bar the terminal answers for a window before any plausible history; for ticks, the first tick from then — or by a coarse prefix at the series' start, at the first row past it. It is used for `MT5_FLOOR_TTL_SECONDS`, then measured again, and sooner when a window read from a kept floor answers no rows, since the terminal's own floor may have moved past it. A stub measured again never moves a floor the coarse prefix set back: it replaces it only with a later row.
-
-`GET /history/ranges?symbol=<symbol>` answers `{"maxbars", "ranges": {"<series>": {"floor", "measured_at", "generation"}}}`: every floor measured for the symbol since the server started, keyed by timeframe name and `ticks`, in true UTC with the time it was measured. A floor's `generation` steps each time its value changes.
 
 ## The hub
 
@@ -225,10 +137,25 @@ Every request is answered once, by a result or an error, and nothing comes after
 - The hub never waits on an EA inside a consumer's request: a request sent is a pending entry with its deadline, its answer passed on when it arrives, in any order the EA answers.
 - A consumer that leaves leaves its requests pending on their EAs, their answers dropped.
 
+### History
+
+The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. A history read is answered only once the terminal's answers prove it, so a consumer never receives emptiness it cannot trust: a window nothing proves yet is `syncing`, and the consumer's retry reads it again.
+
+- A bar read names its timeframe from `M1` to `W1`: a month has no fixed period, so `MN1` is refused.
+- A window about a clock change is read in the broker window holding every stamp that reads into it — a skipped hour's stamps read at the offset before the change, a repeated hour's at either pass — and answered with those stamps alone.
+- Every bar an answer carries and the hub pushes carries its close, `time_close`, in true UTC: a frame on the broker day's grid, H2 to W1, closes at the next grid open on the broker's clock, an hour more or less than its period across a clock change; a finer one a period of real time after its open. Of two bars of a series that open at one true-UTC second — about a spring change, one stamped in the hour the broker's clock skips and the one after it — the first is answered and pushed, and the other dropped with one warning per such hour.
+- The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in spans within that, `maxbars` read from the terminal.
+- A read the terminal answers with rows and a success error is proven: the rows are the answer. A read that answers no rows is proven empty by one of these facts, each read from the terminal, and is `syncing` without one:
+  - **Before the floor**: the window lies wholly before the series' floor.
+  - **The live edge**: the window lies after the second of the symbol's last quote; a window holding that second is not, since the quote is itself a record.
+  - **Bracketed**: the terminal has a row before the window and a record after it. An empty span of a long bar window between spans that answered rows is bracketed by them.
+- Every bar must lie on its timeframe's grid, or the read fails naming the row. In an answer that begins at the series' floor, a leading run of an intraday series spaced a whole number of days apart, ahead of its first two rows one period apart, is not that timeframe's data: it is dropped and the floor moves past it. Ticks must not go back in time.
+- A series' floor is set by the stub — the one bar the terminal answers for a window before any plausible history; for ticks, the first tick from then — or by a coarse prefix at the series' start, at the first row past it. A stub never moves a floor the coarse prefix set back.
+
 ### Clock and true UTC
 
-- Every epoch reaches a consumer in true UTC, and an EA on the broker's clock that `MT5_BROKER_TZ` and `MT5_BROKER_OFFSET_HOURS` set, the hub converting by the era of each instant as the HTTP server does: every epoch field of a published frame and of an answer's records, every time argument of a request and a trade request's `expiration`. A zero epoch stays zero. An epoch in the broker's repeated hour reads as its first occurrence and one in its skipped hour at the offset before the change, with one warning per such hour. Every bar reaches a consumer with its close; of two bars of a series that open in one true-UTC period, a stream and an answer alike pass the first and drop the other, with a warning.
-- The hub verifies the broker clock against the spawner's `server_time` samples as the HTTP server does: a sample fresh for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, from a terminal connected without a break for that long, its trade server within 120 s of the hub's clock, measured again every `MT5_CLOCK_CHECK_SECONDS`. Until a sample verifies it the hub answers every request `not_ready`. No verification by `MT5_CLOCK_BOOTSTRAP_SECONDS` after start, and a sample the clock contradicts, are logged as critical and leave the gate shut; the hub keeps serving, and a later verifying sample opens it.
+- Every epoch reaches a consumer in true UTC, and an EA on the broker's clock that `MT5_BROKER_TZ` and `MT5_BROKER_OFFSET_HOURS` set — New York plus seven hours by default — the hub converting by the era of each instant: every epoch field of a published frame and of an answer's records, every time argument of a request and a trade request's `expiration`. A zero epoch stays zero. An epoch in the broker's repeated hour reads as its first occurrence and one in its skipped hour at the offset before the change, with one warning per such hour. Every bar reaches a consumer with its close; of two bars of a series that open in one true-UTC period, a stream and an answer alike pass the first and drop the other, with a warning.
+- The hub verifies the broker clock against the spawner's `server_time` samples, at any hour, market open or closed: a sample fresh for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, from a terminal connected without a break for that long, its trade server within 120 s of the hub's clock, measured again every `MT5_CLOCK_CHECK_SECONDS`. The terminal extrapolates the trade server's time from the clock it shares with the hub, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the host's clock reads. Until a sample verifies it the hub answers every request `not_ready`. No verification by `MT5_CLOCK_BOOTSTRAP_SECONDS` after start, and a sample the clock contradicts, are logged as critical and leave the gate shut; the hub keeps serving, and a later verifying sample opens it.
 - `GET /health` on the hub's port answers HTTP 200 while the spawner is connected, the latest sample is fresh and the clock verified, and HTTP 503 otherwise naming why. Its body carries, either way: `spawner`, whether one is connected; `clock`, the verification's `symbol`, `trade_server`, `current`, `gmt`, `skew_s` and `offset_s`, or null; `sample_age_s`; `bootstrap_missed`; `in_flight`, the requests pending; and `pending`, each EA's `role`, `symbol` and `requests` pending. Another method answers 405.
 
 ### Streams, charts and relays
@@ -236,10 +163,11 @@ Every request is answered once, by a result or an error, and nothing comes after
 - A publisher's ticks, bars and transactions of its own symbol, and the spawner's transactions that name no symbol, reach the consumers subscribed to them; a frame of another symbol is dropped with a warning. A transaction's symbol is its request's for a `TRADE_TRANSACTION_REQUEST`, its own otherwise.
 - A consumer's frames wait in a queue of at most `MT5_HUB_CONSUMER_QUEUE_BOUND`; the frame that finds it full closes that consumer with code 4008, and the rest are served on. An EA's frames wait in one of at most `MT5_HUB_EA_QUEUE_BOUND`: a request that finds it full is answered `overflow`, any other frame closes the EA with code 4008.
 - The hub pings every connection every 10 s, one ping outstanding at a time. A pong 30 s overdue — or, while a `busy` of the EA's stands, overdue past its bound — fails the connection: its requests are answered `ea_gone` at once and the hub drops it within its 10 s close timeout. A peer that stops reading while the hub has frames queued to it holds back the ping and the close frame.
-- **Charts.** A subscription to the ticks or bars of a symbol no publisher serves, a request for a role and symbol no EA serves, the server posting a symbol, and an EA going away while its chart is in use each request that chart. A request is held until its EA says hello, and sent to the spawner as `open_chart` once per spawner connection; one made while no spawner is connected is sent on the spawner's hello. The spawner answers `chart_opened` or `chart_failed`; the hub keeps a failure, with a warning, until the chart opens or its EA says hello, and answers a request needing that chart `ea_error`.
-- **The chart route.** `POST /charts/<symbol>` on the hub's port, from `127.0.0.1` alone and with no body, marks the symbol's publisher chart in use and answers `{"ok": true, "result": "published"}` while a publisher serves it, `{"ok": true, "result": "failed", "reason": "MQL5 error <error>"}` while its chart's failure stands, and otherwise requests its chart and answers `{"ok": true, "result": "requested"}`. Another method answers 405, a path naming no symbol 404, another host 403. Any other request but `/health` goes on to the WebSocket handshake.
-- **Idle charts.** A chart is in use while a consumer subscribes to its publisher's ticks or bars, a request waits on its EA, and for `MT5_CHART_IDLE_SECONDS` after its last use: a post, a request or a subscription naming it, its EA's hello, the spawner's `chart_kept`. The hub tells the spawner to close a chart out of use for that long, as `close_chart`, once per spawner connection, and again once it is out of use for another period after a `chart_kept`; the spawner's own chart never closes.
-- **Relays.** The hub keeps each publisher's latest commission schedule and trading sessions under its own symbol, or why they were refused, and hands them, and every `server_time` sample of the spawner naming its own symbol, to the HTTP server's relay routes on `127.0.0.1:MT5_API_PORT` off its event loop, as JSON bodies of the frame's fields; a failed post is logged. A `server_time` sample naming another symbol is dropped with a warning.
+- **Charts.** A subscription to the ticks or bars of a symbol no publisher serves, a request for a role and symbol no EA serves, and an EA going away while its chart is in use each request that chart. A request is held until its EA says hello, and sent to the spawner as `open_chart` once per spawner connection; one made while no spawner is connected is sent on the spawner's hello. The spawner answers `chart_opened` or `chart_failed`; the hub keeps a failure, with a warning, until the chart opens or its EA says hello, and answers a request needing that chart `ea_error`.
+- **Idle charts.** A chart is in use while a consumer subscribes to its publisher's ticks or bars, a request waits on its EA, and for `MT5_CHART_IDLE_SECONDS` after its last use: a request or a subscription naming it, its EA's hello, the spawner's `chart_kept`. The hub tells the spawner to close a chart out of use for that long, as `close_chart`, once per spawner connection, and again once it is out of use for another period after a `chart_kept`; the spawner's own chart never closes.
+- **Relays.** The hub takes every `server_time` sample of the spawner naming its own symbol into its clock gate, and drops one naming another symbol with a warning. It keeps each publisher's latest commission schedule and trading sessions under its own symbol, or why they were refused, until a later one is accepted:
+  - a schedule or sessions frame naming another symbol than its publisher's is refused, and so are sessions holding a session with a negative second or one that does not end after it starts, a `to` of 0 ending at midnight;
+  - a schedule naming a member its field's enum lacks never decodes: it is a frame the hub cannot handle.
 
 ### The EA
 
@@ -279,17 +207,16 @@ What it does inside the terminal:
 
 ## What the image provides
 
-The repository's `Dockerfile` builds one image that runs the terminal, the HTTP server and the hub: a MetaTrader 5 terminal under Wine with the EA compiled in, the HTTP server under a Windows Python and the hub under a Linux Python, headless under Xvfb. Its server and EA are the checkout's, and everything else is downloaded at build time; it carries no credential, login, server name or server list. A release publishes it as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, `<tag>` the release tag `v<version>` with its `+` replaced by `-`.
+The repository's `Dockerfile` builds one image that runs the terminal and the hub: a MetaTrader 5 terminal under Wine with the EA compiled in, and the hub under a Linux Python, headless under Xvfb. Its hub and EA are the checkout's, and everything else is downloaded at build time; it carries no credential, login, server name or server list. A release publishes it as `ghcr.io/swing-traders/mt5-connector-server:<tag>`, `<tag>` the release tag `v<version>` with its `+` replaced by `-`.
 
 | Component | Where it is pinned |
 |---|---|
 | the base, `mambaorg/micromamba` on Debian 13 | by tag in the final stage's `FROM` |
 | WineHQ devel, amd64 and i386 | `ARG VERSION_WINE` |
 | wine-mono | `image/artifacts.txt` |
-| the Windows Python, python.org's x64 installer, at `C:\Python` | `image/artifacts.txt` |
+| the Windows Python, python.org's x64 installer, at `C:\Python`, which runs the dialogs' driver | `image/artifacts.txt` |
 | the Linux Python, the base environment at `/opt/conda` | `environment.yml` |
-| `mt5-connector-server`, one wheel built from the checkout into both Pythons | `VERSION` |
-| the Windows Python's dependencies, `MetaTrader5` among them | `image/requirements-wine.txt`, by hash |
+| `mt5-connector-server`, one wheel built from the checkout into the Linux Python | `VERSION` |
 | the terminal's web installer, `mt5setup.exe` | `image/artifacts.txt` |
 
 ### Running it
@@ -299,7 +226,7 @@ A run gives the container:
 | What | How |
 |---|---|
 | the account and the spawner's symbol | `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, as environment variables |
-| the server's other settings, where their defaults do not suit | the optional variables under [Settings](#settings) |
+| the hub's settings, where their defaults do not suit | the optional variables under [Settings](#settings) |
 | the terminal's history store | a volume on `/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases`, one per account |
 | time to stop | a stop timeout of 190 s |
 
@@ -311,49 +238,26 @@ podman run -d --name mt5-alpha \
   ghcr.io/swing-traders/mt5-connector-server:<tag>
 ```
 
-- The HTTP server listens on port 5000 and the hub on 9000, inside the container ([Network](#network)). The image fixes `MT5_API_PORT` and `MT5_HUB_PORT`, since the EA's templates are written against the hub's port.
+- The hub listens on port 9000 inside the container ([Network](#network)). The image fixes `MT5_HUB_PORT`, since the EA's templates are written against it.
 - `MT5_SPAWNER_SYMBOL` names a liquid symbol the account has, by the broker's own name, exactly as the terminal lists it: some brokers suffix every symbol (`XAUUSD.r`).
 - The history volume holds `Bases` and nothing else. The image ships the store empty, so a fresh volume starts with nothing from it, and a new image started on the same volume starts with the history the last one synced.
 - The runtime user is `mt5` (UID/GID 65532), with `WINEPREFIX=/home/mt5/.wine`, `WINEARCH=win64` and `WINEDEBUG=-all`. The image sets `MT5_TERMINAL_PATH` to the portable install's `terminal64.exe` and `MT5_PYTHON_DIR` to the Windows Python's directory.
+- The entrypoint refuses to start without `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, naming the first missing, and writes them into the terminal's startup ini ([setup.ini](#setupini)).
 
 ### Settings
 
-The HTTP server reads its settings from the environment once at start; a missing or malformed one stops it with an error naming the setting, and no error carries a credential's value:
+The hub reads its settings from the environment once at start, and stops naming the first that is malformed or out of range:
 
 | Variable | Setting | Default |
 |---|---|---|
-| `MT5_TERMINAL_PATH` | the terminal executable, as Windows names it (`C:\Program Files\MetaTrader 5\terminal64.exe` for a default install) | required |
-| `MT5_LOGIN` | account number | required |
-| `MT5_PASSWORD` | account password | required |
-| `MT5_SERVER` | trade server name | required |
-| `MT5_SPAWNER_SYMBOL` | the symbol of the spawner's chart, the terminal's `[StartUp]` `Symbol` | required |
-| `MT5_LOGIN_TIMEOUT_MS` | initialize timeout | `60000` |
-| `MT5_API_HOST` | bind address | `0.0.0.0` |
-| `MT5_API_PORT` | HTTP port | `5000` |
-| `MT5_API_THREADS` | waitress threads, one of them kept free for `/health` and the relays; at least 2 | `5` |
-| `MT5_CLOCK_CHECK_SECONDS` | interval between re-verifications of the broker's clock | `300` |
-| `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` | how long a relayed server-time sample stays fresh, and how long the terminal must stay connected before a sample verifies the clock | `30` |
-| `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long the server waits at start for the first sample that verifies the clock | `120` |
+| `MT5_HUB_PORT` | the hub's port, bound on all interfaces | `9000` |
 | `MT5_BROKER_TZ` | the zone the broker's clock follows, as an IANA name | `America/New_York` |
 | `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
-| `MT5_HISTORY_RETRY_SECONDS` | the `Retry-After` of an unproven history answer, a read of a symbol whose chart is requested, a commission schedule or trading sessions not yet relayed, or a call refused with every slot taken: how long the client waits before asking again. The server posts a symbol whose chart is requested to the hub again at most this often | `5` |
-| `MT5_FLOOR_TTL_SECONDS` | how long a measured history floor is used before it is measured again | `900` |
-| `MT5_HUB_PORT` | the hub's port, which the server posts the symbols it reads to on `127.0.0.1` | `9000` |
-| `MT5_CHART_IDLE_SECONDS` | how long a symbol stays in use after its last use; the server posts a symbol it reads at most once per half of it, unless the hub's last answer requested its chart | `900` |
-
-The hub reads these, and stops naming the first that is malformed or out of range:
-
-| Variable | Setting | Default |
-|---|---|---|
-| `MT5_HUB_PORT` | the hub's port, bound on all interfaces, as the HTTP server reads it | `9000` |
-| `MT5_API_PORT` | the HTTP server's port, which the hub posts each relayed server time, commission schedule and trading sessions to on `127.0.0.1` | `5000` |
-| `MT5_BROKER_TZ` | the zone the broker's clock follows, as the HTTP server reads it | `America/New_York` |
-| `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone, as the HTTP server reads it | `7` |
-| `MT5_CHART_IDLE_SECONDS` | how long a chart out of use stays open, as the HTTP server reads it | `900` |
-| `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` | how long a server-time sample stays fresh, and how long the terminal must stay connected before one verifies the clock, as the HTTP server reads it | `30` |
-| `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long after start a verification is due before the hub logs its absence, as the HTTP server reads it | `120` |
-| `MT5_CLOCK_CHECK_SECONDS` | interval between re-verifications of the broker's clock, as the HTTP server reads it | `300` |
-| `MT5_HISTORY_RETRY_SECONDS` | the delay a deferring answer gives, as the HTTP server reads it | `5` |
+| `MT5_CHART_IDLE_SECONDS` | how long a chart out of use stays open | `900` |
+| `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` | how long a server-time sample stays fresh, and how long the terminal must stay connected before one verifies the clock | `30` |
+| `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long after start a verification is due before the hub logs its absence | `120` |
+| `MT5_CLOCK_CHECK_SECONDS` | interval between re-verifications of the broker's clock | `300` |
+| `MT5_HISTORY_RETRY_SECONDS` | the delay a deferring answer gives | `5` |
 | `MT5_HUB_CONSUMER_QUEUE_BOUND` | the most frames queued for a consumer; one more closes it | `10000` |
 | `MT5_HUB_EA_QUEUE_BOUND` | the most frames queued for an EA; a request past it is answered `overflow`, any other frame closes it | `10000` |
 | `MT5_HUB_PENDING_BOUND` | the most requests of one consumer pending at once; one more is answered `overflow` | `1000` |
@@ -364,15 +268,10 @@ The credentials reach the processes as environment variables at start; the image
 
 | Process | Runs under | Started by |
 |---|---|---|
-| the HTTP server | the Windows Python, under Wine in the terminal's prefix: the `MetaTrader5` package it drives the terminal through is Windows-only | `mt5-connector-server`, or `python -m mt5connector.server.app` |
 | the hub | the image's Linux Python | `mt5-connector-hub`, or `python -m mt5connector.server.ws_server` |
 
-- Both Pythons install the one wheel of `mt5-connector-server` the build makes from the checkout. Its dependencies pin `MetaTrader5` on Windows alone and `tzdata` because the Windows Python has no zone database. The hub imports neither, but installing the distribution brings them both.
-- The hub posts every relayed server time, commission schedule and trading sessions to `127.0.0.1`, the server posts the symbols it reads to the hub's chart route on `127.0.0.1`, and each accepts those routes from `127.0.0.1` alone: the two share a loopback.
-- At start the server initializes the terminal named by `MT5_TERMINAL_PATH` with the account's login, password and server, and exits non-zero when that fails.
-- Once the terminal reports itself connected with the broker's symbol list loaded, the server asks it for the definition of `MT5_SPAWNER_SYMBOL`, and exits non-zero with `spawner symbol <symbol> is not listed at the broker` when it has none: the startup script never runs on a chart without a symbol, so no EA would ever relay.
-- It then answers HTTP 503 on every route but `/health` and the relays until a server-time sample from an EA verifies the broker clock, and exits non-zero when none does within `MT5_CLOCK_BOOTSTRAP_SECONDS`, or when any sample it measures, then or later, puts the trade server more than 120 s from the server's clock. The terminal, the spawner's EA and the hub must therefore be up within that window of the server's start; whatever starts the server decides whether to start it again.
-- `/health` answers HTTP 200 once the clock is verified, and 503 whenever it is not. The hub's own `/health`, on its port, answers HTTP 200 while its spawner is connected and its own verification of the clock stands, and 503 otherwise; the hub never exits on its clock.
+- The Linux Python installs the one wheel of `mt5-connector-server` the build makes from the checkout. Nothing of this repository's runs under the Windows Python but the dialogs' driver, `image/terminal_gui.py`, on its standard library alone.
+- The hub's `/health` answers HTTP 200 while its spawner is connected and its verification of the clock stands, and 503 otherwise; the hub never exits on its clock.
 
 ### Boot
 
@@ -385,8 +284,8 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
    - each line converted from the terminal's UTF-16LE to UTF-8, its byte-order mark and carriage return stripped, and prefixed `terminal:` or `experts:`, its text otherwise written as the terminal wrote it;
    - each log followed onto the next UTC day's file when it appears.
 5. **Adds `127.0.0.1` to the WebRequest allowlist,** which no ini key sets: on the Experts tab of Tools → Options it ticks "Allow WebRequest for listed URL" where unticked, adds `127.0.0.1` to the list, and applies the dialog. The list must then hold that one URL.
-6. Starts the hub (`mt5-connector-hub`, the Linux Python) and the HTTP server (`mt5-connector-server`, the Windows Python).
-7. Supervises Xvfb, the terminal, the hub and the server: the first of them to exit ends the container with its status, and whatever started the container decides whether to start it again. A lost broker session is the terminal's own to recover and ends nothing, and so does a log tail that exits: the log names its status and the tail is restarted, skipping what the logs hold at its first read — so the lines written between the stopped tail's last read and the restart are lost.
+6. Starts the hub (`mt5-connector-hub`, the Linux Python).
+7. Supervises Xvfb, the terminal and the hub: the first of them to exit ends the container with its status, and whatever started the container decides whether to start it again. A lost broker session is the terminal's own to recover and ends nothing, and so does a log tail that exits: the log names its status and the tail is restarted, skipping what the logs hold at its first read — so the lines written between the stopped tail's last read and the restart are lost.
 
 **The dialogs are driven by control identity**, by `/opt/mt5/terminal_gui.py` under the Windows Python, through Win32 messages and never a screen position:
 
@@ -396,11 +295,11 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 
 The WebRequest list's text cannot be read, so its row count is what confirms the URL. Each action prints one line and is bounded at 40 s; a window or control it cannot find fails the start, naming it. The server's name reaches the driver through `MT5_SERVER` alone.
 
-A terminal window, dialog or control that never appears fails the start at once, naming the step. What the entrypoint cannot see — a server search that found nothing, a refused login — ends the start through the server's own refusal: it exits non-zero when no EA sample verifies the broker clock within `MT5_CLOCK_BOOTSTRAP_SECONDS`, and the container ends with it. It also exits non-zero on a spawner symbol the broker does not list.
+A terminal window, dialog or control that never appears fails the start at once, naming the step. What the entrypoint cannot see — a server search that found nothing, a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
 
 ### Stop
 
-A stop closes the terminal as a user would — `taskkill` without `/F`, which posts `WM_CLOSE` — and waits up to 60 s for it, then stops the log tail within 10 s once it has streamed the terminal's last lines, the server and the hub together within 10 s, and Xvfb last within another 10 s. It kills whatever is still running and ends the container with the terminal's own exit status, or 0 when no terminal was running.
+A stop closes the terminal as a user would — `taskkill` without `/F`, which posts `WM_CLOSE` — and waits up to 60 s for it, then stops the log tail within 10 s once it has streamed the terminal's last lines, the hub within 10 s, and Xvfb last within another 10 s. It kills whatever is still running and ends the container with the terminal's own exit status, or 0 when no terminal was running.
 
 Those bounds together, with a call in flight when the stop arrives, stay at least 30 s under the 190 s stop timeout a run gives the container, so a stop ends the terminal by its close, never a kill.
 
@@ -447,12 +346,12 @@ The three sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, i
 - It truncates a `/compile:` path that contains a space: each source is compiled from a directory whose path has none — `C:\mt5build\ticks.mq5` — and the `.ex5` copied into place. An `#include <...>` resolves in the terminal's `MQL5\Include\`, so the includes are placed there first.
 - A clean compile writes `0 errors, 0 warnings` to its `/log:` file; a missing `.ex5` is a failed compile.
 
-The image's build places and compiles them with `image/install-ea.sh`, from the wheel in the Windows Python, under Xvfb, after generating `hub_wire.mqh` with the Linux Python's copy of the same wheel; its log names the generated file. It fails unless each `.ex5` appears and each `/log:` file's `Result:` line reads `0 errors, 0 warnings`, and its log prints each line.
+The image's build places and compiles them with `image/install-ea.sh`, from the wheel the Linux Python installed, under Xvfb, after generating `hub_wire.mqh` with it; its log names the generated file. It fails unless each `.ex5` appears and each `/log:` file's `Result:` line reads `0 errors, 0 warnings`, and its log prints each line.
 
-On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on, which the server's start checks the broker lists, and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with its role's template, `ticks.tpl`, which attaches the EA as that symbol's publisher, or `ticks_history.tpl`, as its history EA.
+On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on and applies the template `ticks_spawner.tpl`, which attaches the EA as the spawner, then closes the chart it ran on, which would hold a `CHARTS_MAX` slot for nothing. The terminal starts with no chart, so a chart already running the EA at start is a boot defect, which the script prints, naming the chart's symbol, and opens and closes nothing. Every other chart opens on demand: the spawner opens it with its role's template, `ticks.tpl`, which attaches the EA as that symbol's publisher, or `ticks_history.tpl`, as its history EA.
 
 - The terminal keeps at most `CHARTS_MAX` (100) charts open, the spawner's included.
-- A chart the spawner opens on demand that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a read of that symbol that posts it to the hub fails naming the reason, until a chart of it opens or its EA says hello.
+- A chart the spawner opens on demand that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a request that needs it is answered `ea_error` naming the reason, until a chart of it opens or its EA says hello.
 - The spawner refused as a duplicate keeps its chart and says hello again every `ReconnectIntervalSec`; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
 - A chart closes once its symbol has been out of use for `MT5_CHART_IDLE_SECONDS`: the spawner closes it and takes the symbol out of Market Watch, where the terminal would keep processing its ticks.
 - A symbol with open positions or pending orders never closes idle: the spawner keeps its chart and the hub counts it in use for another `MT5_CHART_IDLE_SECONDS`.
@@ -616,8 +515,8 @@ Each EA's socket reaches only a host on the terminal's allowlist — Tools → O
 
 ### Network
 
-- The adapter needs two ports: the HTTP server's `MT5_API_PORT` and the hub's `MT5_HUB_PORT`. Its config names both URLs: `server_url` the HTTP server's and `ws_url` the hub's.
-- There is no authentication: the API and the hub trust their network. The image publishes no host port, loopback included: both are reachable on the container network alone, and publishing either port is a design change.
+- The image serves one port, the hub's `MT5_HUB_PORT`; the adapter's config names it as `ws_url`.
+- There is no authentication: the hub trusts its network. The image publishes no host port, loopback included: the hub is reachable on the container network alone, and publishing its port is a design change.
 
 ### Building
 
@@ -627,11 +526,11 @@ podman build --format=docker --build-arg DEBUG=1 -t mt5-connector-server-debug .
 ```
 
 - The build context is the repository root, and `.dockerignore` admits `environment.yml`, `VERSION`, `packages/` and `image/` alone. Podman builds with `--format=docker`: its default OCI format drops the base image's `SHELL`, through which the build's `RUN` steps run in the activated environment. Docker needs no flag.
-- The download stage takes `image/artifacts.txt`, `image/requirements-wine.txt` and `image/first-start.sh` on their own, and the checkout comes in once the terminal is installed, so a change to a package or a boot script rebuilds neither Wine nor the terminal.
+- The download stage takes `image/artifacts.txt` and `image/first-start.sh` on their own, and the checkout comes in once the terminal is installed, so a change to a package or a boot script rebuilds neither Wine nor the terminal.
 - The Linux Python is the checkout's `environment.yml`, installed whole as the base environment — Python, the client editable from the checkout's copy at `/opt/mt5-connector`, and its NautilusTrader pin — and then made root-owned and read-only.
-- One wheel of `packages/server`, built with that Python, installs there with its dependencies, for the hub, and into the Windows Python with `--no-deps`, after `image/requirements-wine.txt`'s hashed dependencies. Nothing of this repository's own comes from an index, and `pip check` fails the build in either Python whose installed dependencies no longer satisfy the server's pins.
+- One wheel of `packages/server`, built with that Python, installs there with its dependencies. Nothing of this repository's own comes from an index, and `pip check` fails the build when the installed dependencies no longer satisfy the server's pins.
 - `--build-arg DEBUG=1` adds x11vnc, which the entrypoint starts on the display listening on the container's loopback (`127.0.0.1:5900`) and nowhere else; the default build carries no VNC at all, and any other `DEBUG` value fails the build.
-- The image is about 6.3 GB.
+- The image is about 6.7 GB.
 
 The build also:
 
@@ -647,7 +546,6 @@ The build also:
 - Every apt package the `Dockerfile` pins takes its version from an `ARG` named `VERSION_<PACKAGE>` — `VERSION_WINE` — used at every pin.
 - `image/artifacts.txt` lists every file the download stage fetches, one per line as `<name> <url> <sha256>`: its URL carries the version, its hash pins the bytes, and nothing else states that version. One build step fetches them all and checks every hash, so a changed upstream file fails the build.
 - A downloaded artifact is bumped by editing its row's URL and `sha256sum` and nothing else. The WineHQ packages are bumped by `VERSION_WINE` alone.
-- `image/requirements-wine.txt` is a pip `--require-hashes` file, binary wheels only: the server's dependency closure for the Windows Python, every package at its version with the hash of its `cp313` `win_amd64` wheel or its pure wheel. A change to the server's dependencies, or to the Windows Python's minor version, updates it in the same change.
 
 ### The terminal build
 
@@ -659,7 +557,7 @@ podman run --rm --entrypoint cat mt5-connector-server /home/mt5/.terminal-build
 
 `mt5setup.exe` is a web installer: its own bytes are pinned, but it installs whatever terminal build MetaQuotes currently serves, so two builds from identical inputs can carry different terminal builds. Nothing stops the terminal's own update check: it never applies an update by itself, so the build an image baked is the one it runs. The installer exits 1 after a successful install, so the build checks the terminal's first start rather than the installer's exit code; without network access, or with a terminal that cannot start, it hangs instead of failing and ignores a termination signal, so the build kills it after 600 s and fails the step.
 
-The files the build downloads itself and the Windows Python's packages are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend both projects build with, resolve at build time as `environment.yml` and the two `pyproject.toml` files declare them.
+The files the build downloads itself are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend both projects build with, resolve at build time as `environment.yml` and the two `pyproject.toml` files declare them.
 
 ### The image tests
 
@@ -671,7 +569,7 @@ MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
 
 It pins that:
 
-- the start ends through the server, printing the account's password nowhere;
+- a start on that account boots up to the hub, printing the account's password nowhere;
 - the first supervised process to exit — the hub, Xvfb, the terminal during the boot — ends the container with its status, naming it;
 - a display that never comes up, a restore that never returns and a driver action that never returns each fail the start naming the step and its bound;
 - a stop closes the terminal, stops the log tail after it and ends the container within the stop timeout, killing nothing;
@@ -680,7 +578,6 @@ It pins that:
 - a restart restores the baked state — a file added under `Config\` or the AppData tree removed, a same-length rewrite of a baked file with its timestamp undone, a value written into the terminal's registry key gone — and leaves `Bases` alone;
 - the terminal's journal and experts log reach the container log as UTF-8 under their prefixes, a journal line naming the login and the server arriving as the terminal wrote it;
 - the driver fails naming a control a dialog lacks;
-- a client's connect to the server, which never comes up, is refused at once, carrying no credential, while the image boots and once it has exited, and building the clients' configs asks no server;
-- both ports published on the loopback at host ports the runtime picks read back off the running container, and the HTTP server's is reachable while the server boots.
+- the hub boots and answers `/health` 503, with no spawner connected and no clock verified, on the loopback port the runtime published it at.
 
 Its tests of the driver's menu and tab lookups and of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — run without an image.

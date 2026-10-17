@@ -28,7 +28,6 @@ def settings(**overrides) -> HubSettings:
     """The hub's default settings but for a short sample max age, and what a test overrides."""
     defaults = {
         "hub_port": 9000,
-        "api_port": 5000,
         "broker_tz": ZoneInfo("America/New_York"),
         "broker_offset_hours": 7,
         "chart_idle_seconds": 900,
@@ -44,12 +43,11 @@ def settings(**overrides) -> HubSettings:
 
 
 async def run_hub(**overrides):
-    """The hub served on a free loopback port, recording each body it relays and its path."""
-    relayed = []
-    hub = Hub(CLOCK, lambda path, body: relayed.append((path, body)), settings(**overrides))
+    """The hub served on a free loopback port."""
+    hub = Hub(CLOCK, settings(**overrides))
     server = await serve_hub(hub, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    return hub, server, port, relayed
+    return hub, server, port
 
 
 @dataclass

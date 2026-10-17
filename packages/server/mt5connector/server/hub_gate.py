@@ -1,8 +1,7 @@
-"""The hub's clock gate: the broker clock verified against the trade-server time the spawner relays,
-under the HTTP server's rules — a sample fresh for its max-age, from a terminal connected without a
-break for that long, measured within the tolerance — and re-verified on its interval. A missed
-bootstrap window or a sample the broker clock contradicts never ends the process: the gate stays
-shut until a sample verifies it.
+"""The hub's clock gate: the broker clock verified against the trade-server time the spawner relays
+— a sample fresh for its max-age, from a terminal connected without a break for that long, measured
+within the tolerance — and re-verified on its interval. A missed bootstrap window or a sample the
+broker clock contradicts never ends the process: the gate stays shut until a sample verifies it.
 
 State: the latest sample, the monotonic time it arrived and when its unbroken connected run began;
 the sample last measured; the latest verification, held while the latest sample is verifiable and

@@ -1,6 +1,6 @@
-"""The hub protocol's vocabulary beside its frames, shared by the hub, its consumers and the server:
-its roles, streams, keepalive and chart route, the MQL5 names and structs its frames carry, and the
-chart events a publisher exchanges with its history indicator."""
+"""The hub protocol's vocabulary beside its frames, shared by the hub and its consumers: its roles,
+streams and keepalive, the MQL5 names and structs its frames carry, and the chart events a publisher
+exchanges with its history indicator."""
 
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
@@ -15,8 +15,6 @@ PING_INTERVAL_S = 10
 PING_TIMEOUT_INTERVALS = 3
 CLOSE_TIMEOUT_S = 10
 
-# The hub's loopback route the server posts a symbol it serves a read of to.
-CHARTS_PATH = "/charts"
 # The hub's liveness route.
 HEALTH_PATH = "/health"
 # The indicator a publisher attaches to its own chart to sync the bars it reads.
@@ -51,8 +49,7 @@ class HistoryEvent(IntEnum):
 
 
 class ChartState(StrEnum):
-    """The hub's answer to a post naming a symbol: an EA publishes it, its chart is requested, or
-    the spawner failed to open its chart."""
+    """A chart at the hub: an EA serves it, it is requested, or the spawner failed to open it."""
 
     PUBLISHED = "published"
     REQUESTED = "requested"
