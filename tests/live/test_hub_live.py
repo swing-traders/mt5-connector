@@ -39,6 +39,8 @@ MINUTE_S = 60
 HISTORY_DAYS = 90
 # The longest a publisher's read may take while its symbol's ticks download.
 TICK_READ_S = 1.0
+# The sessions that command at once.
+SENDERS = 10
 _SETTLED = frozenset(
     {mirror.TRADE_RETCODE_PLACED, mirror.TRADE_RETCODE_DONE, mirror.TRADE_RETCODE_DONE_PARTIAL}
 )
@@ -86,13 +88,43 @@ class Owner:
             await asyncio.sleep(0.1)
 
 
+class Stamped(Owner):
+    """What a session hands its owner, in order, and when each was handed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.handed: list[float] = []
+
+    def on_frame(self, frame) -> None:
+        self.handed.append(time.monotonic())
+        super().on_frame(frame)
+
+    def when(self, matches) -> float:
+        """When the first frame that matches was handed."""
+        return next(
+            at for at, frame in zip(self.handed, self.frames, strict=True) if matches(frame)
+        )
+
+
+def verdict_of(request_id: int):
+    """Whether a frame is the REQUEST transaction carrying `request_id`."""
+
+    def matches(frame) -> bool:
+        return (
+            isinstance(frame, binary.TradeTransaction)
+            and frame.transaction["type"] == TransactionType.REQUEST
+            and frame.result["request_id"] == request_id
+        )
+
+    return matches
+
+
 def config() -> MT5Config:
     # The session reads the hub's URL and its reconnect delays alone; the account is the image's.
     return MT5Config(
         account=1,
         password="unused",
         server="unused",
-        server_url="http://127.0.0.1",
         ws_url=HUB_URL,
     )
 
@@ -433,3 +465,40 @@ async def test_a_command_for_a_symbol_no_publisher_serves_answers_once_its_chart
         assert answered.result.retcode > 0
     finally:
         await assert_flat(hub_session)
+
+
+async def test_sessions_commanding_at_once_each_hear_their_answer_then_their_verdict(session):
+    watcher, _ = session
+    info = (await ask(watcher, Call.SYMBOL_INFO, symbol=SYMBOL)).result
+    tick = (await ask(watcher, Call.SYMBOL_INFO_TICK, symbol=SYMBOL)).result
+    owners = [Stamped() for _ in range(SENDERS)]
+    senders = [await connected(owner) for owner in owners]
+
+    async def commanded(sender: HubSession, owner: Stamped) -> tuple[float, float]:
+        """The time to the command's answer, and to its verdict, from when it was asked."""
+        asked = time.monotonic()
+        answered = await ask(sender, Call.ORDER_SEND, request=refused_order(info, tick.bid / 2))
+        answered_s = time.monotonic() - asked
+        assert answered.result.retcode == mirror.TRADE_RETCODE_PLACED
+        assert answered.result.request_id > 0
+        await owner.first(verdict_of(answered.result.request_id), 30)
+        return answered_s, owner.when(verdict_of(answered.result.request_id)) - asked
+
+    try:
+        for sender in senders:
+            await sender.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+        timings = await asyncio.gather(
+            *(commanded(sender, owner) for sender, owner in zip(senders, owners, strict=True))
+        )
+        for name, durations in (
+            ("answer", [answered for answered, _ in timings]),
+            ("verdict", [verdict for _, verdict in timings]),
+        ):
+            p50, p95 = np.percentile(durations, [50, 95])
+            print(f"{name}: p50 {p50:.3f} s, p95 {p95:.3f} s, max {max(durations):.3f} s")
+
+        assert len(timings) == SENDERS
+    finally:
+        await assert_flat(watcher)
+        for sender in senders:
+            await sender.disconnect()

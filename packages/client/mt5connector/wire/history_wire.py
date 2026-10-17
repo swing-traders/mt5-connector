@@ -1,14 +1,9 @@
-"""The history routes' vocabulary, shared by the server, the hub and their client: their paths, the
-series and their periods, a bar's row, the tick selections, what sets a floor, and the codes the
-server answers beside the package's own."""
+"""The history protocol's vocabulary, shared by the hub and its client: the series and their
+periods, a bar's row, the tick selections and what sets a floor."""
 
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 
 from . import mirror
-
-BARS_PATH = "/history/bars"
-TICKS_PATH = "/history/ticks"
-RANGES_PATH = "/history/ranges"
 
 # The terminal answers a range spanning more than MaxBars − 11 periods with nothing.
 SPAN_MARGIN = 11
@@ -54,20 +49,6 @@ class FloorOrigin(StrEnum):
 
     STUB = "stub"
     COARSE = "coarse"
-
-
-class ServerCode(IntEnum):
-    """The error codes the server answers beside the package's own, outside their range."""
-
-    # HTTP 503 with Retry-After: a history window is unproven, a schedule has not been relayed, or
-    # no EA publishes the symbol yet.
-    SYNCING = -20_001
-    # HTTP 503 with Retry-After: every slot of the server's cap on calls is taken.
-    BUSY = -20_002
-    # HTTP 422: the last commission relay for the symbol was refused.
-    RELAY_REFUSED = -20_003
-    # HTTP 400: the spawner failed to open the symbol's chart.
-    CHART_FAILED = -20_004
 
 
 # Each bar series' period and the package's timeframe for it. MN1 has no fixed period, so no series

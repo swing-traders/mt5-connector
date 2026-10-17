@@ -14,7 +14,7 @@ An owned hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5
 
 It ships two distributions and the image that runs the server, never a deployment. The distributions share one `mt5connector` namespace package (no `__init__.py` at `mt5connector/`), each its own hatchling project:
 
-- **`mt5-connector-client`** (`packages/client/`) — `mt5connector.client`: NT data and execution clients, the instrument provider, the factories, the remote backend (an HTTP shim generated from the inventory), the history client and the downloader.
+- **`mt5-connector-client`** (`packages/client/`) — `mt5connector.client`: NT data and execution clients, the instrument provider, the factories, the history client and the downloader.
 - **Wire vocabulary** (`packages/client/mt5connector/wire/`: `mirror.py`, `broker_clock.py`, `history_wire.py`, `push_wire.py`, `binary.py`, `calls.py`) — the inventory of the pinned `MetaTrader5` package, the broker-clock conversion, the history protocol's names, and the hub protocol's names, binary frames and call registry. It lives once, in the client's tree, and ships in both wheels.
 - **`mt5-connector-server`** (`packages/server/`) — `mt5connector.server`: the hub (`mt5-connector-hub`), the EA, its history indicator and its startup script with their vendored MQL5 libraries as package data (`mql5/`), and its README — the hub protocol and the contract the image that runs it builds to.
 
@@ -268,7 +268,6 @@ This file is rules of engagement: guidelines, hard requirements, and non-obvious
 ```
 NT TradingNode ──> mt5connector.client (data + exec clients, provider, factories, history client)
                       │
-                      ├── remote_mt5 (the HTTP shim generated from the inventory)
                       └── hub (the hub session: streams and calls, on NT's WebSocketClient)
                                  │
                                  ▼
@@ -278,7 +277,7 @@ NT TradingNode ──> mt5connector.client (data + exec clients, provider, facto
                      the EAs inside the terminal ──> the broker
 ```
 
-The adapter reaches the terminal through the server and the hub alone, every call on a transport of the connection or client it belongs to — the connection's server transport (`MT5Connection.mt5`) or hub session (`MT5Connection.session`), or a client's own hub session; no module holds a server, a session or a last error. The shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
+The adapter reaches the terminal through the hub alone, every call on a hub session of the connection or client it belongs to — the connection's (`MT5Connection.session`) or a client's own; no module holds a session or a last error. A config is refused when built without the hub's URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
 
 The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `environment.yml`, the hub and the EA from `packages/server`. The image's Windows Python runs the dialogs' driver, `image/terminal_gui.py`, on its standard library alone; nothing is installed into it. Every apt package the `Dockerfile` pins takes its version from an `ARG VERSION_<PACKAGE>` used at every pin, never a literal, and every file it downloads is versioned by its row in `image/artifacts.txt` alone — the URL carries the version, the SHA-256 pins the bytes.
 
@@ -289,7 +288,7 @@ The server image (`Dockerfile`, its files in `image/`) is a release artifact lik
 The design documents itself in-repo: `packages/server/mt5connector/server/` module docstrings carry the contracts, and its `README.md` the hub protocol, the history rules, the EA and what the image provides. What an agent must not get wrong when touching anything nearby:
 
 - **The wire vocabulary lives once.** `packages/server/mt5connector/server/wire` is a symlink to `packages/client/mt5connector/wire`, and the server's wheel build follows it into real copies; the server imports `mt5connector.server.wire` and nothing of `mt5connector.wire` or `mt5connector.client`, and a wire module imports its siblings relatively. A server module that needs more of the client is a design question, never a second copy.
-- **The inventory is the single source.** `mirror.py` declares every mirrored function, its parameters, its structs with their members' MQL5 types, epoch fields and units, the dtypes and the constants; the shim's functions and namedtuples, the hub's call registry and the EA's generated half are generated from it. Adding or changing a function is one inventory row — never a hand-written shim function or struct writer.
+- **The inventory is the single source.** `mirror.py` declares every mirrored function, its parameters, its structs with their members' MQL5 types, epoch fields and units, the dtypes and the constants; the hub's call registry and the EA's generated half are generated from it. Adding or changing a function is one inventory row — never a hand-written struct writer.
 - **UTC on the wire, broker time only inside the terminal.** The hub converts every epoch the EAs publish and answer to true UTC, and every epoch a request asks to the broker's clock, through `BrokerClock` at the era of the timestamp itself, and stamps every bar's close; a consumer never does clock math.
   - A repeated wall-clock hour reads as its first occurrence, and a skipped one at the offset before the change, since the broker's clock moves minutes after the zone's; each warns once per hour. The spawner's server-time sample, a live reading of the terminal's clock, reads a repeated hour as the occurrence nearer the hub's clock.
   - Of two bars of a series that convert to one true-UTC period, the hub pushes and answers the first and drops the other, with a warning once per hour; nothing is merged.
@@ -400,7 +399,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ## Test tiers
 
-- **Every test but the image tier and the live hub tier runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`), or serve its sessions a hub double on a loopback port (`hub_double.py`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
+- **Every test but the image tier and the live hub tier runs without a terminal.** Client tests (`tests/client/`) hand a client a double of its connection or of its hub session (`session_double.py`), or serve its sessions a hub double on a loopback port (`hub_double.py`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
 - **The image tier** (`tests/image/`) starts a built image on a made-up account and runs only when asked for, its GUI-driver and log-tail tests aside; the server README says how to run it.
 - **The live hub tier** (`tests/live/`) needs a running image's hub; it runs only when asked for, and `README.md` says how to run it.
@@ -412,7 +411,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 - **Don't commit a credential, an `.env`, an account number, or a server name that identifies an account** — and don't log one. A settings error names the variable, never a credential's value.
 - **Don't patch NT to fit MT5.** The connector works the way NT expects an adapter to work; where the venue's shape differs (per-ticket hedging, venue-minted ids, bid-built bars), the adapter translates, and anything the adapter cannot translate is raised with the consumer, not papered over in NT.
-- **Don't hand-write what the inventory generates** — a shim function, a struct writer.
+- **Don't hand-write what the inventory generates** — a struct writer.
 - **Don't do clock math outside the hub.** The hub answers in true UTC, so a consumer that converts broker time converts it twice.
 - **Don't trust `[]`.** An empty package answer proves nothing on its own; the protocol's evidence rules decide what is canonical.
 - **Don't `pip install` into any of the Pythons.** The env files and the two projects' `pyproject.toml` are the declarations, and the image's Windows Python carries nothing installed.

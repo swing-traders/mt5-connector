@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 # The session's deadline for a request stands this far past the hub's, so the hub's own answer
 # arrives first.
-_MARGIN_S = 5.0
+SESSION_MARGIN_S = 5.0
 _DEADLINES = {
     calls.Wait.READ: calls.READ_DEADLINE_S,
     calls.Wait.COMMAND: calls.COMMAND_DEADLINE_S,
@@ -221,7 +221,9 @@ class HubSession:
         await self._greeting.wait()
         request_id = self._next_request_id
         self._next_request_id += 1
-        timer = self._loop.call_later(_DEADLINES[row.wait] + _MARGIN_S, self._expired, request_id)
+        timer = self._loop.call_later(
+            _DEADLINES[row.wait] + SESSION_MARGIN_S, self._expired, request_id
+        )
         flight = _InFlight(row, self._loop.create_future(), timer)
         if call is calls.Call.ORDER_SEND:
             flight.symbol = arguments["request"]["symbol"]
@@ -357,7 +359,7 @@ class HubSession:
         flight = self._in_flight.get(busy.request_id)
         if flight is not None:
             flight.timer.cancel()
-            delay = busy.bound_s + calls.BUSY_MARGIN_S + _MARGIN_S
+            delay = busy.bound_s + calls.BUSY_MARGIN_S + SESSION_MARGIN_S
             flight.timer = self._loop.call_later(delay, self._expired, busy.request_id)
 
     def _expired(self, request_id: int) -> None:

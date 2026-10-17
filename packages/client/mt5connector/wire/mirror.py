@@ -4,8 +4,6 @@ structs and arrays they return with their epoch fields, and its constants."""
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-PACKAGE_VERSION = "5.0.6231"
-
 
 class FunctionName(StrEnum):
     INITIALIZE = "initialize"
@@ -60,14 +58,6 @@ class ArrayName(StrEnum):
     TICKS = "ticks"
 
 
-class Calling(StrEnum):
-    """How the package's C function takes its arguments."""
-
-    NO_ARGS = "no_args"
-    POSITIONAL = "positional"
-    KEYWORDS = "keywords"
-
-
 class ParamKind(StrEnum):
     INT = "int"
     STR = "str"
@@ -93,39 +83,26 @@ class EpochUnit(StrEnum):
     MILLISECONDS = "milliseconds"
 
 
-class Failure(StrEnum):
-    """What the package answers when a function fails."""
-
-    NONE = "none"
-    FALSE = "false"
-    NEVER = "never"
-
-
 @dataclass(frozen=True)
 class Param:
-    """One parameter; `named` marks the ones the package documents as keyword arguments."""
+    """One parameter."""
 
     name: str
     kind: ParamKind
     required: bool = False
-    named: bool = False
 
 
 @dataclass(frozen=True)
 class Function:
-    """One package function, as the server routes it and the remote shim calls it."""
+    """One package function: its parameters and the result it returns."""
 
     name: FunctionName
-    calling: Calling
     params: tuple[Param, ...]
     result: ResultKind
-    failure: Failure
     struct: StructName | None = None
     array: ArrayName | None = None
     # The documented call forms, of which a call carries at least one in full.
     forms: tuple[tuple[str, ...], ...] = ()
-    # A call on the terminal session the server owns, which the server answers without the package.
-    server_session: bool = False
 
 
 class MqlType(StrEnum):
@@ -232,39 +209,21 @@ class Array:
         return tuple(name for name, _ in self.dtype)
 
 
-def is_failure(function: Function, value: object) -> bool:
-    """Whether a value the package returned is its failure answer for this function."""
-    if function.failure is Failure.NONE:
-        return value is None
-    elif function.failure is Failure.FALSE:
-        return value is False
-    else:
-        return False
-
-
-def failure_value(function: Function) -> bool | None:
-    """The value the package answers when this function fails."""
-    if function.failure is Failure.FALSE:
-        return False
-    else:
-        return None
-
-
 _SYMBOL = Param("symbol", ParamKind.STR, required=True)
 _DATE_FROM = Param("date_from", ParamKind.DATETIME, required=True)
 _DATE_TO = Param("date_to", ParamKind.DATETIME, required=True)
 _HISTORY_QUERY = (
     Param("date_from", ParamKind.DATETIME),
     Param("date_to", ParamKind.DATETIME),
-    Param("group", ParamKind.STR, named=True),
-    Param("ticket", ParamKind.INT, named=True),
-    Param("position", ParamKind.INT, named=True),
+    Param("group", ParamKind.STR),
+    Param("ticket", ParamKind.INT),
+    Param("position", ParamKind.INT),
 )
 _HISTORY_FORMS = (("date_from", "date_to"), ("ticket",), ("position",))
 _OPEN_QUERY = (
-    Param("symbol", ParamKind.STR, named=True),
-    Param("group", ParamKind.STR, named=True),
-    Param("ticket", ParamKind.INT, named=True),
+    Param("symbol", ParamKind.STR),
+    Param("group", ParamKind.STR),
+    Param("ticket", ParamKind.INT),
 )
 _REQUEST = Param("request", ParamKind.REQUEST, required=True)
 
@@ -273,58 +232,46 @@ FUNCTIONS: dict[FunctionName, Function] = {
     for function in (
         Function(
             FunctionName.INITIALIZE,
-            Calling.KEYWORDS,
             (
                 Param("path", ParamKind.STR),
-                Param("login", ParamKind.INT, named=True),
-                Param("password", ParamKind.STR, named=True),
-                Param("server", ParamKind.STR, named=True),
-                Param("timeout", ParamKind.TIMEOUT_MS, named=True),
-                Param("portable", ParamKind.BOOL, named=True),
+                Param("login", ParamKind.INT),
+                Param("password", ParamKind.STR),
+                Param("server", ParamKind.STR),
+                Param("timeout", ParamKind.TIMEOUT_MS),
+                Param("portable", ParamKind.BOOL),
             ),
             ResultKind.BOOL,
-            Failure.FALSE,
         ),
         Function(
             FunctionName.SHUTDOWN,
-            Calling.NO_ARGS,
             (),
             ResultKind.NONE,
-            Failure.NEVER,
-            server_session=True,
         ),
         Function(
             FunctionName.LOGIN,
-            Calling.KEYWORDS,
             (
                 Param("login", ParamKind.INT, required=True),
-                Param("password", ParamKind.STR, named=True),
-                Param("server", ParamKind.STR, named=True),
-                Param("timeout", ParamKind.TIMEOUT_MS, named=True),
+                Param("password", ParamKind.STR),
+                Param("server", ParamKind.STR),
+                Param("timeout", ParamKind.TIMEOUT_MS),
             ),
             ResultKind.BOOL,
-            Failure.FALSE,
         ),
-        Function(FunctionName.VERSION, Calling.NO_ARGS, (), ResultKind.TUPLE, Failure.NONE),
+        Function(FunctionName.VERSION, (), ResultKind.TUPLE),
         Function(
             FunctionName.TERMINAL_INFO,
-            Calling.NO_ARGS,
             (),
             ResultKind.STRUCT,
-            Failure.NONE,
             struct=StructName.TERMINAL_INFO,
         ),
         Function(
             FunctionName.ACCOUNT_INFO,
-            Calling.NO_ARGS,
             (),
             ResultKind.STRUCT,
-            Failure.NONE,
             struct=StructName.ACCOUNT_INFO,
         ),
         Function(
             FunctionName.COPY_TICKS_FROM,
-            Calling.POSITIONAL,
             (
                 _SYMBOL,
                 _DATE_FROM,
@@ -332,20 +279,16 @@ FUNCTIONS: dict[FunctionName, Function] = {
                 Param("flags", ParamKind.INT, required=True),
             ),
             ResultKind.ARRAY,
-            Failure.NONE,
             array=ArrayName.TICKS,
         ),
         Function(
             FunctionName.COPY_TICKS_RANGE,
-            Calling.POSITIONAL,
             (_SYMBOL, _DATE_FROM, _DATE_TO, Param("flags", ParamKind.INT, required=True)),
             ResultKind.ARRAY,
-            Failure.NONE,
             array=ArrayName.TICKS,
         ),
         Function(
             FunctionName.COPY_RATES_FROM,
-            Calling.POSITIONAL,
             (
                 _SYMBOL,
                 Param("timeframe", ParamKind.INT, required=True),
@@ -353,12 +296,10 @@ FUNCTIONS: dict[FunctionName, Function] = {
                 Param("count", ParamKind.INT, required=True),
             ),
             ResultKind.ARRAY,
-            Failure.NONE,
             array=ArrayName.RATES,
         ),
         Function(
             FunctionName.COPY_RATES_FROM_POS,
-            Calling.POSITIONAL,
             (
                 _SYMBOL,
                 Param("timeframe", ParamKind.INT, required=True),
@@ -366,88 +307,66 @@ FUNCTIONS: dict[FunctionName, Function] = {
                 Param("count", ParamKind.INT, required=True),
             ),
             ResultKind.ARRAY,
-            Failure.NONE,
             array=ArrayName.RATES,
         ),
         Function(
             FunctionName.COPY_RATES_RANGE,
-            Calling.POSITIONAL,
             (_SYMBOL, Param("timeframe", ParamKind.INT, required=True), _DATE_FROM, _DATE_TO),
             ResultKind.ARRAY,
-            Failure.NONE,
             array=ArrayName.RATES,
         ),
-        Function(
-            FunctionName.POSITIONS_TOTAL, Calling.NO_ARGS, (), ResultKind.SCALAR, Failure.NONE
-        ),
+        Function(FunctionName.POSITIONS_TOTAL, (), ResultKind.SCALAR),
         Function(
             FunctionName.POSITIONS_GET,
-            Calling.KEYWORDS,
             _OPEN_QUERY,
             ResultKind.STRUCTS,
-            Failure.NONE,
             struct=StructName.TRADE_POSITION,
         ),
-        Function(FunctionName.ORDERS_TOTAL, Calling.NO_ARGS, (), ResultKind.SCALAR, Failure.NONE),
+        Function(FunctionName.ORDERS_TOTAL, (), ResultKind.SCALAR),
         Function(
             FunctionName.ORDERS_GET,
-            Calling.KEYWORDS,
             _OPEN_QUERY,
             ResultKind.STRUCTS,
-            Failure.NONE,
             struct=StructName.TRADE_ORDER,
         ),
         Function(
             FunctionName.HISTORY_ORDERS_TOTAL,
-            Calling.POSITIONAL,
             (_DATE_FROM, _DATE_TO),
             ResultKind.SCALAR,
-            Failure.NONE,
         ),
         Function(
             FunctionName.HISTORY_ORDERS_GET,
-            Calling.KEYWORDS,
             _HISTORY_QUERY,
             ResultKind.STRUCTS,
-            Failure.NONE,
             struct=StructName.TRADE_ORDER,
             forms=_HISTORY_FORMS,
         ),
         Function(
             FunctionName.HISTORY_DEALS_TOTAL,
-            Calling.POSITIONAL,
             (_DATE_FROM, _DATE_TO),
             ResultKind.SCALAR,
-            Failure.NONE,
         ),
         Function(
             FunctionName.HISTORY_DEALS_GET,
-            Calling.KEYWORDS,
             _HISTORY_QUERY,
             ResultKind.STRUCTS,
-            Failure.NONE,
             struct=StructName.TRADE_DEAL,
             forms=_HISTORY_FORMS,
         ),
         Function(
             FunctionName.ORDER_CHECK,
-            Calling.KEYWORDS,
             (_REQUEST,),
             ResultKind.STRUCT,
-            Failure.NONE,
             struct=StructName.ORDER_CHECK_RESULT,
         ),
         Function(
             FunctionName.ORDER_SEND,
-            Calling.KEYWORDS,
             (_REQUEST,),
             ResultKind.STRUCT,
-            Failure.NONE,
             struct=StructName.ORDER_SEND_RESULT,
         ),
         Function(
             FunctionName.ORDER_CALC_MARGIN,
-            Calling.POSITIONAL,
             (
                 Param("action", ParamKind.INT, required=True),
                 _SYMBOL,
@@ -455,11 +374,9 @@ FUNCTIONS: dict[FunctionName, Function] = {
                 Param("price", ParamKind.FLOAT, required=True),
             ),
             ResultKind.SCALAR,
-            Failure.NONE,
         ),
         Function(
             FunctionName.ORDER_CALC_PROFIT,
-            Calling.POSITIONAL,
             (
                 Param("action", ParamKind.INT, required=True),
                 _SYMBOL,
@@ -468,56 +385,43 @@ FUNCTIONS: dict[FunctionName, Function] = {
                 Param("price_close", ParamKind.FLOAT, required=True),
             ),
             ResultKind.SCALAR,
-            Failure.NONE,
         ),
         Function(
             FunctionName.SYMBOL_INFO,
-            Calling.POSITIONAL,
             (_SYMBOL,),
             ResultKind.STRUCT,
-            Failure.NONE,
             struct=StructName.SYMBOL_INFO,
         ),
         Function(
             FunctionName.SYMBOL_INFO_TICK,
-            Calling.POSITIONAL,
             (_SYMBOL,),
             ResultKind.STRUCT,
-            Failure.NONE,
             struct=StructName.TICK,
         ),
-        Function(FunctionName.SYMBOLS_TOTAL, Calling.NO_ARGS, (), ResultKind.SCALAR, Failure.NONE),
+        Function(FunctionName.SYMBOLS_TOTAL, (), ResultKind.SCALAR),
         Function(
             FunctionName.SYMBOLS_GET,
-            Calling.KEYWORDS,
-            (Param("group", ParamKind.STR, named=True),),
+            (Param("group", ParamKind.STR),),
             ResultKind.STRUCTS,
-            Failure.NONE,
             struct=StructName.SYMBOL_INFO,
         ),
         Function(
             FunctionName.MARKET_BOOK_ADD,
-            Calling.POSITIONAL,
             (_SYMBOL,),
             ResultKind.BOOL,
-            Failure.FALSE,
         ),
         Function(
             FunctionName.MARKET_BOOK_RELEASE,
-            Calling.POSITIONAL,
             (_SYMBOL,),
             ResultKind.BOOL,
-            Failure.FALSE,
         ),
         Function(
             FunctionName.MARKET_BOOK_GET,
-            Calling.POSITIONAL,
             (_SYMBOL,),
             ResultKind.STRUCTS,
-            Failure.NONE,
             struct=StructName.BOOK_INFO,
         ),
-        Function(FunctionName.LAST_ERROR, Calling.NO_ARGS, (), ResultKind.TUPLE, Failure.NEVER),
+        Function(FunctionName.LAST_ERROR, (), ResultKind.TUPLE),
     )
 }
 
@@ -1254,6 +1158,3 @@ CONSTANT_FAMILIES = (
 CONSTANTS: dict[str, int] = {
     name: value for name, value in globals().items() if name.startswith(CONSTANT_FAMILIES)
 }
-
-# What last_error() reports after a call that succeeded.
-SUCCESS: tuple[int, str] = (RES_S_OK, "Success")

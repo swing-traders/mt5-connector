@@ -303,7 +303,6 @@ async def test_two_requests_an_ea_answers_in_reverse_order_resolve_each_with_its
                 account=12345678,
                 password="p",
                 server="Broker-Demo",
-                server_url="http://127.0.0.1:5000",
                 ws_url=f"ws://127.0.0.1:{port}",
             ),
             asyncio.get_running_loop(),

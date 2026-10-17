@@ -102,7 +102,6 @@ class Client:
             account=12345678,
             password="p",
             server="Broker-Demo",
-            server_url="http://127.0.0.1:5000",
             ws_url="ws://127.0.0.1:9000",
         )
         with patch.object(data, "HubSession", SessionDouble):

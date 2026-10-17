@@ -1,10 +1,9 @@
 """The adapter's connection to the MT5 terminal behind the hub, and the account as the terminal
 reports it.
 
-State: where the connection is in its lifecycle; its transport to the server; and while connected,
-its hub session and the event loop the session runs on, on the connection's own thread. A connection
-not connected runs no thread. A lost hub leaves the connection connected: NT's client reconnects its
-session."""
+State: where the connection is in its lifecycle, and while connected, its hub session and the event
+loop the session runs on, on the connection's own thread. A connection not connected runs no thread.
+A lost hub leaves the connection connected: NT's client reconnects its session."""
 
 from __future__ import annotations
 
@@ -21,7 +20,6 @@ from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
 from mt5connector.client.errors import Deferred, MT5ConnectionError, NotReady, Syncing
 from mt5connector.client.hub import HubSession
-from mt5connector.client.remote_mt5 import RemoteMT5
 from mt5connector.wire import mirror
 from mt5connector.wire.binary import ErrorKind
 
@@ -144,11 +142,10 @@ def _finite(value: float, field: str) -> Decimal:
 
 class MT5Connection:
     """The connection to the MT5 terminal behind one hub, shared by the clients of one account: its
-    lifecycle, the hub session its reads ride, and the transport every server call travels on."""
+    lifecycle and the hub session its reads ride."""
 
     def __init__(self, config: MT5Config) -> None:
         self._config = config
-        self.mt5 = RemoteMT5(config.server_url)
         self._state = ConnectionState.DISCONNECTED
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -174,9 +171,8 @@ class MT5Connection:
         self._state = ConnectionState.CONNECTED
 
     def disconnect(self) -> None:
-        """Disconnects the hub session, stops the connection's thread and closes the transport's
-        HTTP session, the last two even when the first raises; raises MT5ConnectionError naming the
-        state on a connection not connected."""
+        """Disconnects the hub session and stops the connection's thread, the latter even when the
+        former raises; raises MT5ConnectionError naming the state on a connection not connected."""
         if self._state != ConnectionState.CONNECTED:
             raise MT5ConnectionError(f"MT5 not connected (state={self._state.name})")
         logger.info("MT5Connection: shutting down")
@@ -188,7 +184,6 @@ class MT5Connection:
             self._loop = None
             self._thread = None
             self._session = None
-            self.mt5.close_session()
             self._state = ConnectionState.DISCONNECTED
         logger.info("MT5Connection: disconnected")
 

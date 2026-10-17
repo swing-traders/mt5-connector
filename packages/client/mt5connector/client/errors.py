@@ -6,8 +6,8 @@ class MT5Error(Exception):
 
 
 class MT5ConfigError(MT5Error):
-    """Raised when the configuration, or the account it points at, cannot be run (e.g. no
-    server_url, an account that does not hedge)."""
+    """Raised when the configuration, or the account it points at, cannot be run (e.g. no ws_url, an
+    account that does not hedge)."""
 
 
 class MT5ConnectionError(MT5Error):
@@ -26,15 +26,6 @@ class ResponseLost(ServerUnreachable):
 class ProtocolError(ServerUnreachable):
     """Raised for a request whose answer, or a frame of the hub's no request can be told from,
     breaks the hub protocol's layout."""
-
-
-class ServerBusy(MT5ConnectionError):
-    """Raised when the remote MT5 server refuses a call because every slot of its cap is taken,
-    carrying the delay its Retry-After gives."""
-
-    def __init__(self, message: str, retry_after_s: int) -> None:
-        super().__init__(message)
-        self.retry_after_s = retry_after_s
 
 
 class HubAnswerError(MT5ConnectionError):

@@ -1,22 +1,17 @@
-"""The terminal's account, symbol and tick structs as the hub session hands them back, every field
-the package carries present, the trading sessions a publisher relays, and a hub session serving an
-instrument provider's reads, for tests that feed the client a venue."""
+"""The terminal's account, symbol, tick, order, deal and position structs and a trade request's
+immediate answer as the hub session hands them back, every field the hub carries present, the
+trading sessions a publisher relays, and a hub session serving an instrument provider's reads, for
+tests that feed the client a venue."""
 
 import asyncio
-from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 from mt5connector.client.errors import EaError
 from mt5connector.client.hub import Answered, HubSession
-from mt5connector.wire import calls, mirror
+from mt5connector.wire import binary, calls, mirror
 
 Call = calls.Call
-# The order_send result the execution client's shim answers, which no hub call carries.
-_SHIM_TYPES = {
-    name: namedtuple(name.value, mirror.STRUCTS[name].fields)
-    for name in (mirror.StructName.TRADE_REQUEST, mirror.StructName.ORDER_SEND_RESULT)
-}
 # MQL5's ERR_MARKET_UNKNOWN_SYMBOL, which the hub's answer carries for a symbol the broker does not
 # list.
 UNKNOWN_SYMBOL = 4301
@@ -105,10 +100,8 @@ def tick(bid: float, ask: float, time: int = 1_760_000_000):
     )
 
 
-def _struct(
-    name: mirror.StructName, strings: frozenset[str], fields: dict, types=calls.STRUCT_TYPES
-):
-    struct = types[name]
+def _struct(name: str, strings: frozenset[str], fields: dict):
+    struct = calls.STRUCT_TYPES[name]
     values = {field: "" if field in strings else 0 for field in struct._fields}
     return struct(**(values | fields))
 
@@ -179,16 +172,13 @@ def trade_position(**fields):
     )
 
 
-def send_result(**fields):
-    """The venue's answer to a trade request that completed, under `fields`."""
-    request = _struct(
-        mirror.StructName.TRADE_REQUEST, frozenset({"symbol", "comment"}), {}, _SHIM_TYPES
-    )
+def trade_result(**fields):
+    """The terminal's immediate answer to a trade request it sent, retcode 10008, under `fields`; a
+    session double gives it a request id when `fields` names none."""
     return _struct(
-        mirror.StructName.ORDER_SEND_RESULT,
+        binary.TRADE_RESULT.name,
         frozenset({"comment"}),
-        {"retcode": mirror.TRADE_RETCODE_DONE, "order": 9001, "request": request} | fields,
-        _SHIM_TYPES,
+        {"retcode": mirror.TRADE_RETCODE_PLACED} | fields,
     )
 
 

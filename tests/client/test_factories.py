@@ -35,7 +35,6 @@ def make_config(account=12345678, server="Exness-MT5Trial1", venue=MT5_VENUE):
         account=account,
         password="test_password",
         server=server,
-        server_url="http://127.0.0.1:5000",
         ws_url="ws://127.0.0.1:9000",
         venue=venue,
     )

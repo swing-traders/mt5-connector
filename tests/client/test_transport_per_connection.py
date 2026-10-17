@@ -1,14 +1,10 @@
-"""Two connections in one process, each on its own server and hub: every call a connection makes — a
-package call on the server, an account, instrument or history read on the hub — reaches its own,
-whichever connected last. Each blocking call runs off the loop the hub doubles serve on."""
+"""Two connections in one process, each on its own hub: every read a connection makes — an account,
+an instrument or a history read — reaches its own, whichever connected last. Each blocking call runs
+off the loop the hub doubles serve on."""
 
 import asyncio
-import json
-import threading
 from datetime import UTC, datetime
 from decimal import Decimal
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
 
 import numpy as np
 import pytest
@@ -31,10 +27,6 @@ from mt5connector.wire.history_wire import BARS
 
 Call = calls.Call
 NOW_NS = 1_760_000_000_000_000_000
-
-
-def _answer(result, last_error=(1, "Success")) -> dict:
-    return {"ok": True, "result": result, "last_error": list(last_error)}
 
 
 # EURUSD's schedule as its publisher relays it: 3.5 USD a lot, charged on both legs.
@@ -66,50 +58,15 @@ SCHEDULE = {
 }
 
 
-class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        self._answer()
-
-    def do_GET(self):
-        self._answer()
-
-    def _answer(self):
-        path = urlparse(self.path).path
-        self.server.terminal.received.append((path, self.client_address))
-        if path in self.server.terminal.answers:
-            status = 200
-            payload = json.dumps(self.server.terminal.answers[path]).encode()
-        else:
-            status = 404
-            payload = b"{}"
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *args):
-        pass
-
-
 class Terminal:
-    """A server on its own loopback port serving EURUSD's quote, and a hub on its own serving one
-    logged-in account, EURUSD charging SCHEDULE, and no history; the requests the server received in
-    order."""
+    """A hub on its own loopback port serving one logged-in account, EURUSD charging SCHEDULE, and
+    no history."""
 
-    def __init__(self, url: str, hub: HubDouble, login: int, server: str) -> None:
-        self.url = url
+    def __init__(self, hub: HubDouble, login: int, server: str) -> None:
         self.hub = hub
         self.login = login
         self.server = server
-        self.received = []
         self.forgotten = 0
-        self.answers = {
-            "/mt5/symbol_info_tick": _answer(tick(bid=1.085, ask=1.0852)._asdict()),
-        }
         hub.answers = {
             Call.ACCOUNT_INFO: [account_info(login=login, server=server)._asdict()],
             Call.SYMBOLS_GET: [[listing(symbol_info())._asdict()]],
@@ -121,12 +78,6 @@ class Terminal:
             Call.COPY_RATES_RANGE: [np.zeros(0, dtype=np.dtype(list(BARS.dtype)))],
             Call.COPY_TICKS_RANGE: [np.zeros(0, dtype=np.dtype(list(mirror.TICKS.dtype)))],
         }
-
-    def paths(self) -> list[str]:
-        return [path for path, _ in self.received]
-
-    def clients(self) -> list:
-        return [client for _, client in self.received]
 
     def calls(self) -> list[Call]:
         """The calls the hub was asked since it was last forgotten, over every connection, in
@@ -142,8 +93,7 @@ class Terminal:
 
 @pytest.fixture
 async def terminals():
-    """Starts a Terminal on free loopback ports for each (login, server) asked; stops them all."""
-    servers = []
+    """Starts a Terminal on a free loopback port for each (login, server) asked; stops them all."""
     hubs = []
 
     async def start(login: int, server: str) -> Terminal:
@@ -151,17 +101,9 @@ async def terminals():
         hub_server = await serve(hub.handler, "127.0.0.1", 0)
         hub.port = hub_server.sockets[0].getsockname()[1]
         hubs.append(hub_server)
-        http = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        http.daemon_threads = True
-        http.terminal = Terminal(f"http://127.0.0.1:{http.server_address[1]}", hub, login, server)
-        threading.Thread(target=http.serve_forever, daemon=True).start()
-        servers.append(http)
-        return http.terminal
+        return Terminal(hub, login, server)
 
     yield start
-    for http in servers:
-        http.shutdown()
-        http.server_close()
     for hub_server in hubs:
         hub_server.close()
 
@@ -187,7 +129,6 @@ async def connected():
                 account=terminal.login,
                 password="p",
                 server=terminal.server,
-                server_url=terminal.url,
                 ws_url=f"ws://127.0.0.1:{terminal.hub.port}",
                 venue=Venue(terminal.server),
             )
@@ -212,7 +153,6 @@ def provider_of(connection: MT5Connection, venue: str) -> MT5InstrumentProvider:
 
 def forget(*terminals: Terminal) -> None:
     for terminal in terminals:
-        terminal.received.clear()
         terminal.forgotten += len(terminal.calls())
 
 
@@ -227,7 +167,7 @@ async def test_an_account_read_after_another_connection_connects_reaches_its_own
 
     assert account.login == 1001
     assert alpha.calls() == [Call.ACCOUNT_INFO]
-    assert (alpha.paths(), beta.paths(), beta.calls()) == ([], [], [])
+    assert beta.calls() == []
 
 
 async def test_a_failed_read_reports_its_own_hubs_error(alpha, beta, connected):
@@ -259,7 +199,7 @@ async def test_an_instrument_load_after_another_connection_connects_reaches_its_
         Call.TRADING_SESSIONS,
         Call.SYMBOL_INFO_TICK,
     }
-    assert (alpha.paths(), beta.paths(), beta.calls()) == ([], [], [])
+    assert beta.calls() == []
 
 
 async def test_a_loaded_instrument_carries_the_fee_and_sessions_its_hub_relays(alpha, connected):
@@ -292,7 +232,7 @@ async def test_history_reads_after_another_connection_connects_reach_their_own_h
 
     assert all(result.success for result in results["EURUSD"])
     assert {Call.RANGES, Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE} <= set(alpha.calls())
-    assert (beta.paths(), beta.calls()) == ([], [])
+    assert beta.calls() == []
 
 
 async def test_a_history_failure_is_recorded_with_its_own_hubs_error(
@@ -315,21 +255,17 @@ async def test_a_history_failure_is_recorded_with_its_own_hubs_error(
     assert result.errors == ["Ranges failed: ranges: Terminal: Not found"]
 
 
-async def test_disconnecting_another_connection_leaves_this_ones_sessions_open_on_its_own(
+async def test_disconnecting_another_connection_leaves_this_ones_session_open_on_its_own(
     alpha, beta, connected
 ):
     first = await connected(alpha)
     second = await connected(beta)
-    await asyncio.to_thread(first.mt5.symbol_info_tick, "EURUSD")
-    kept_alive = alpha.clients()[-1]
     await asyncio.to_thread(second.disconnect)
     forget(alpha, beta)
 
     account = await asyncio.to_thread(first.get_account_info)
-    await asyncio.to_thread(first.mt5.symbol_info_tick, "EURUSD")
 
     assert account.login == 1001
     assert len(alpha.hub.connections) == 1
     assert alpha.hub.requests(0)[-1].call == Call.ACCOUNT_INFO
-    assert alpha.received == [("/mt5/symbol_info_tick", kept_alive)]
-    assert (beta.paths(), beta.calls()) == ([], [])
+    assert beta.calls() == []

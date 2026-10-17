@@ -5,6 +5,7 @@ its orders."""
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,7 +30,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from session_double import SessionDouble
+from session_double import ExecSession
 from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
@@ -49,7 +50,6 @@ def _config(venue: Venue = MT5_VENUE) -> MT5Config:
         account=12345678,
         password="p",
         server="Broker-Demo",
-        server_url="http://127.0.0.1:5000",
         ws_url="ws://127.0.0.1:9000",
         venue=venue,
     )
@@ -78,7 +78,7 @@ def _provider(instruments) -> MT5InstrumentProvider:
 
 
 def _client(
-    transport,
+    served,
     raw_account,
     terminal_trade_allowed=True,
     instruments=(),
@@ -90,14 +90,13 @@ def _client(
     except RuntimeError:
         loop = asyncio.new_event_loop()
     conn = MagicMock(spec=MT5Connection)
-    conn.mt5 = transport
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(raw_account)
     conn.get_terminal_info.return_value = {
         "connected": True,
         "trade_allowed": terminal_trade_allowed,
     }
     clock = LiveClock()
-    with patch.object(execution, "HubSession", SessionDouble):
+    with patch.object(execution, "HubSession", partial(ExecSession, served)):
         client = MT5LiveExecutionClient(
             loop=loop,
             connection=conn,
@@ -113,7 +112,7 @@ def _client(
 
 @pytest.fixture
 def venue():
-    """The transport of the client's connection: no order, position or deal."""
+    """The venue behind the client's hub session: no order, position or deal."""
     package = MagicMock()
     package.orders_get.return_value = ()
     package.positions_get.return_value = ()
@@ -207,7 +206,7 @@ def test_the_snapshots_money_is_decimal_from_the_boundary_on():
     assert all(isinstance(value, Decimal) for value in money)
 
 
-async def test_the_terminal_info_exposes_trading_permission_and_connection(config, hub, mock_mt5):
+async def test_the_terminal_info_exposes_trading_permission_and_connection(config, hub):
     terminal = calls.CALLS[calls.Call.TERMINAL_INFO].layout
     hub.answers[calls.Call.ACCOUNT_INFO] = [account_info()._asdict()]
     hub.answers[calls.Call.TERMINAL_INFO] = [zeroed(terminal, trade_allowed=True, connected=True)]
@@ -334,12 +333,11 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
     states = []
     msgbus.subscribe(topic="events.account.*", handler=states.append)
     conn = MagicMock(spec=MT5Connection)
-    conn.mt5 = venue
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(
         account_info(login=7654321, currency="EUR")
     )
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
-    with patch.object(execution, "HubSession", SessionDouble):
+    with patch.object(execution, "HubSession", partial(ExecSession, venue)):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -515,11 +513,10 @@ def terminal():
     return symbols
 
 
-def _served_client(transport, symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
-    """A client over a real provider whose config is `provider_config`, its connection's transport
-    `transport` and its hub session's reads `symbols`."""
+def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
+    """A client over a real provider whose config is `provider_config`, its hub session answered by
+    `venue` and its connection's session's reads by `symbols`."""
     conn = MagicMock(spec=MT5Connection)
-    conn.mt5 = transport
     _serve_symbols(conn, symbols)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
@@ -527,7 +524,7 @@ def _served_client(transport, symbols: SymbolVenue, provider_config: InstrumentP
     provider = MT5InstrumentProvider(
         connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
     )
-    with patch.object(execution, "HubSession", SessionDouble):
+    with patch.object(execution, "HubSession", partial(ExecSession, venue)):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,

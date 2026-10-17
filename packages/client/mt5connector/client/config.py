@@ -21,13 +21,6 @@ from mt5connector.client.errors import MT5ConfigError
 _VENUE_LABEL = re.compile(r"MT5(_[A-Z0-9]{1,8})?")
 
 
-class HttpScheme(StrEnum):
-    """The schemes the server's URL may name."""
-
-    HTTP = "http"
-    HTTPS = "https"
-
-
 class WebSocketScheme(StrEnum):
     """The schemes the push hub's URL may name."""
 
@@ -56,7 +49,6 @@ class MT5Config:
     timeout_s: float = 10.0
 
     # Required: defaulted only so that a config without one is refused as an MT5ConfigError.
-    server_url: str | None = None
     ws_url: str | None = None
 
     def __post_init__(self) -> None:
@@ -111,11 +103,6 @@ class MT5Config:
                 f"reconnect_max_delay_s {self.reconnect_max_delay_s}"
             )
 
-        if not self.server_url:
-            raise MT5ConfigError("MT5Config.server_url cannot be empty.")
-        server = _endpoint("server_url", self.server_url)
-        if server.scheme not in set(HttpScheme) or not server.hostname:
-            raise MT5ConfigError("MT5Config.server_url is no http or https URL with a host")
         if not self.ws_url:
             raise MT5ConfigError("MT5Config.ws_url cannot be empty.")
         ws = _endpoint("ws_url", self.ws_url)

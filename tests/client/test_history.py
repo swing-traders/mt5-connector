@@ -36,7 +36,6 @@ async def session(hub):
         account=12345678,
         password="p",
         server="Broker-Demo",
-        server_url="http://127.0.0.1:5000",
         ws_url=f"ws://127.0.0.1:{hub.port}",
     )
     hub_session = HubSession(config, asyncio.get_running_loop(), MagicMock(), None, MagicMock())

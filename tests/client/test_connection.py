@@ -15,7 +15,7 @@ from hub_double import zeroed
 from venue_doubles import account_info
 from websockets.asyncio.server import serve
 
-from mt5connector.client import connection, history
+from mt5connector.client import history
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot, ConnectionState, MT5Connection
 from mt5connector.client.errors import EaError, InvalidWindow, MT5ConnectionError
@@ -84,7 +84,7 @@ async def connections():
 
 
 @pytest.fixture
-def connect(ready, mock_mt5, connections):
+def connect(ready, connections):
     """A connected connection on the ready hub double."""
 
     async def connected(config=None) -> MT5Connection:
@@ -119,11 +119,11 @@ class TestConnectionState:
 
 class TestInitialState:
 
-    def test_starts_disconnected(self, config, mock_mt5):
+    def test_starts_disconnected(self, config):
         conn = MT5Connection(config)
         assert_not_connected(conn, "DISCONNECTED")
 
-    def test_repr_shows_disconnected(self, config, mock_mt5):
+    def test_repr_shows_disconnected(self, config):
         conn = MT5Connection(config)
         assert "DISCONNECTED" in repr(conn)
 
@@ -134,13 +134,6 @@ class TestInitialState:
 
 
 class TestSuccessfulConnect:
-
-    def test_the_connection_holds_its_own_transport_on_the_configured_server(
-        self, config, mock_mt5
-    ):
-        conn = MT5Connection(config)
-        assert conn.mt5 is mock_mt5
-        connection.RemoteMT5.assert_called_once_with("http://127.0.0.1:5000")
 
     async def test_connect_confirms_the_login_by_one_account_read_through_the_hub(
         self, hub, connect
@@ -157,7 +150,7 @@ class TestSuccessfulConnect:
         await connect()
         assert "MT5Connection: connected — Account | Balance: 10000.00 USD" in caplog.text
 
-    async def test_a_config_of_the_credentials_and_the_two_urls_alone_connects(
+    async def test_a_config_of_the_credentials_and_the_hubs_url_alone_connects(
         self, hub, ready, connect
     ):
         conn = await connect(
@@ -165,7 +158,6 @@ class TestSuccessfulConnect:
                 account=12345678,
                 password="test_password",
                 server="Broker-Demo",
-                server_url="http://127.0.0.1:5000",
                 ws_url=ready.ws_url,
             )
         )
@@ -176,16 +168,12 @@ class TestSuccessfulConnect:
         await connect()
         assert len(threads() - before) == 1
 
-    async def test_disconnect_closes_the_session_stops_the_thread_and_closes_the_transport(
-        self, hub, connect, mock_mt5
-    ):
+    async def test_disconnect_closes_the_session_and_stops_the_thread(self, hub, connect):
         before = threads()
         conn = await connect()
         await off_loop(conn.disconnect)
 
         assert threads() - before == set()
-        mock_mt5.close_session.assert_called_once()
-        mock_mt5.shutdown.assert_not_called()
         await hub.connections[0].wait_closed()
 
     async def test_state_is_disconnected_after_disconnect(self, connect):
@@ -214,7 +202,7 @@ class TestReadiness:
         assert len(hub.asked(Call.ACCOUNT_INFO)) == 2
 
     async def test_a_hub_not_ready_within_the_timeout_fails_the_connect_naming_its_deferral(
-        self, hub, ready, mock_mt5
+        self, hub, ready
     ):
         hub.answers[Call.ACCOUNT_INFO] = [NOT_READY]
         conn = MT5Connection(replace(ready, timeout_s=0.3))
@@ -242,7 +230,7 @@ class TestReadiness:
         conn.ensure_connected()
         await off_loop(conn.disconnect)
 
-    async def test_an_unreachable_hub_fails_the_connect_naming_it(self, unreachable, mock_mt5):
+    async def test_an_unreachable_hub_fails_the_connect_naming_it(self, unreachable):
         conn = MT5Connection(unreachable)
         before = threads()
 
@@ -252,9 +240,7 @@ class TestReadiness:
         assert threads() - before == set()
         assert_not_connected(conn, "DISCONNECTED")
 
-    async def test_an_account_read_the_ea_fails_fails_the_connect_with_its_error(
-        self, hub, ready, mock_mt5
-    ):
+    async def test_an_account_read_the_ea_fails_fails_the_connect_with_its_error(self, hub, ready):
         hub.answers[Call.ACCOUNT_INFO] = [EA_ERROR]
         conn = MT5Connection(ready)
         before = threads()
@@ -266,7 +252,7 @@ class TestReadiness:
         assert_not_connected(conn, "DISCONNECTED")
 
     async def test_an_account_of_a_margin_mode_unknown_fails_the_connect_and_closes_the_session(
-        self, hub, ready, mock_mt5
+        self, hub, ready
     ):
         hub.answers[Call.ACCOUNT_INFO] = [account_info(margin_mode=99)._asdict()]
         conn = MT5Connection(ready)
@@ -291,13 +277,13 @@ class TestEnsureConnected:
         conn = await connect()
         conn.ensure_connected()
 
-    def test_raises_when_disconnected(self, config, mock_mt5):
+    def test_raises_when_disconnected(self, config):
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError) as exc_info:
             conn.ensure_connected()
         assert str(exc_info.value) == "MT5 not connected (state=DISCONNECTED)"
 
-    def test_raises_while_connecting(self, config, mock_mt5):
+    def test_raises_while_connecting(self, config):
         conn = MT5Connection(config)
         conn._state = ConnectionState.CONNECTING
         assert_not_connected(conn, "CONNECTING")
@@ -339,7 +325,7 @@ class TestRun:
         with pytest.raises(InvalidWindow):
             await off_loop(conn.run, history.bars(conn.session, "X", Series.M1, NINE, NINE))
 
-    def test_run_and_the_session_refuse_a_connection_not_connected(self, config, mock_mt5):
+    def test_run_and_the_session_refuse_a_connection_not_connected(self, config):
         conn = MT5Connection(config)
 
         async def nothing():
@@ -373,7 +359,7 @@ class TestGetAccountInfo:
         assert info.currency == "USD"
         assert info.leverage == 500
 
-    def test_raises_if_not_connected(self, config, mock_mt5):
+    def test_raises_if_not_connected(self, config):
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError):
             conn.get_account_info()
@@ -418,7 +404,7 @@ class TestGetTerminalInfo:
         with pytest.raises(EaError):
             await off_loop(conn.get_terminal_info)
 
-    def test_raises_when_not_connected(self, config, mock_mt5):
+    def test_raises_when_not_connected(self, config):
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError):
             conn.get_terminal_info()
@@ -431,7 +417,7 @@ class TestGetTerminalInfo:
 
 class TestContextManager:
 
-    async def test_connects_on_enter_and_disconnects_on_exit(self, ready, mock_mt5):
+    async def test_connects_on_enter_and_disconnects_on_exit(self, ready):
         def used() -> MT5Connection:
             with MT5Connection(ready) as conn:
                 conn.ensure_connected()
@@ -439,9 +425,8 @@ class TestContextManager:
 
         conn = await off_loop(used)
         assert_not_connected(conn, "DISCONNECTED")
-        mock_mt5.close_session.assert_called_once()
 
-    async def test_disconnects_on_exception_and_does_not_suppress_it(self, ready, mock_mt5):
+    async def test_disconnects_on_exception_and_does_not_suppress_it(self, ready):
         held = []
 
         def failing() -> None:
@@ -461,11 +446,11 @@ class TestContextManager:
 
 class TestRepr:
 
-    def test_repr_omits_the_login(self, config, mock_mt5):
+    def test_repr_omits_the_login(self, config):
         conn = MT5Connection(config)
         assert "12345678" not in repr(conn)
 
-    def test_repr_omits_the_server(self, config, mock_mt5):
+    def test_repr_omits_the_server(self, config):
         conn = MT5Connection(config)
         assert "Exness-MT5Trial1" not in repr(conn)
 
@@ -483,22 +468,16 @@ class TestRepr:
 
 class TestLifecycleTransitions:
 
-    def test_a_disconnect_on_a_connection_never_connected_is_refused_naming_its_state(
-        self, config, mock_mt5
-    ):
+    def test_a_disconnect_on_a_connection_never_connected_is_refused_naming_its_state(self, config):
         conn = MT5Connection(config)
         with pytest.raises(MT5ConnectionError, match="DISCONNECTED"):
             conn.disconnect()
-        mock_mt5.close_session.assert_not_called()
 
-    async def test_a_second_disconnect_is_refused_and_closes_the_transport_once(
-        self, connect, mock_mt5
-    ):
+    async def test_a_second_disconnect_is_refused(self, connect):
         conn = await connect()
         await off_loop(conn.disconnect)
         with pytest.raises(MT5ConnectionError, match="DISCONNECTED"):
             conn.disconnect()
-        mock_mt5.close_session.assert_called_once()
 
     async def test_a_connect_on_a_connected_connection_is_refused_naming_its_state(
         self, hub, connect
@@ -562,7 +541,6 @@ def secret_config(ws_url: str) -> MT5Config:
         account=LOGIN,
         password=PASSWORD,
         server=SERVER,
-        server_url="http://127.0.0.1:5000",
         ws_url=ws_url,
         reconnect_initial_delay_s=0.01,
         timeout_s=0.2,
@@ -594,19 +572,19 @@ class TestCredentials:
         assert_names_no_credential(repr(snapshot))
         assert_names_no_credential(str(snapshot))
 
-    async def test_the_connection_shows_none(self, secret, connect, mock_mt5):
+    async def test_the_connection_shows_none(self, secret, connect):
         assert_names_no_credential(repr(MT5Connection(secret)) + str(MT5Connection(secret)))
         conn = await connect(secret)
         assert_names_no_credential(repr(conn) + str(conn))
 
-    async def test_a_failed_connect_names_none(self, hub, secret, mock_mt5):
+    async def test_a_failed_connect_names_none(self, hub, secret):
         hub.answers[Call.ACCOUNT_INFO] = [NOT_READY]
         with pytest.raises(MT5ConnectionError) as failed:
             await off_loop(MT5Connection(secret).connect)
         assert_names_no_credential(str(failed.value))
         assert_names_no_credential(repr(failed.value))
 
-    async def test_the_logs_name_none(self, hub, secret, mock_mt5, caplog):
+    async def test_the_logs_name_none(self, hub, secret, caplog):
         caplog.set_level(logging.DEBUG, logger="mt5connector")
         try:
             conn = await off_loop(_ensure_connection, secret)

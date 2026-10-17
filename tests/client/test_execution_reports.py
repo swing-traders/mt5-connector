@@ -1,7 +1,7 @@
 """The execution client's reports for NT's reconciliation: each one magic-filtered, its quantities
 and prices in the instrument's precisions, its times the venue's own, read over a bounded window."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -33,8 +33,8 @@ from mt5connector.wire import mirror
 
 
 @pytest.fixture
-async def h(exec_shim):
-    harness = build(exec_shim)
+async def h(exec_venue):
+    harness = build(exec_venue)
     await harness.connect()
     return harness
 
@@ -77,6 +77,11 @@ async def fill_reports(h, venue_order_id=None, start=None, end=None):
     )
 
 
+def window_s(read) -> int:
+    """The span in seconds of the history window a read was last asked for."""
+    return read.call_args.kwargs["date_to"] - read.call_args.kwargs["date_from"]
+
+
 async def position_reports(h):
     return await h.client.generate_position_status_reports(
         GeneratePositionStatusReports(
@@ -98,8 +103,8 @@ def by_ticket(*venue_orders):
 # ── One order ────────────────────────────────────────────────────────────────
 
 
-async def test_a_resting_order_reports_accepted_in_the_instruments_precisions(exec_shim):
-    h = build(exec_shim)
+async def test_a_resting_order_reports_accepted_in_the_instruments_precisions(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), ticket=9001)
     await h.connect()
     h.venue.orders_get.side_effect = by_ticket(
@@ -195,8 +200,8 @@ async def test_a_failure_to_read_the_venue_propagates(h):
         await one_report(h, venue_order_id=VenueOrderId("9003"))
 
 
-async def test_an_order_without_a_ticket_is_found_resting_by_its_digest(exec_shim):
-    h = build(exec_shim)
+async def test_an_order_without_a_ticket_is_found_resting_by_its_digest(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
     await h.connect()
     h.venue.orders_get.side_effect = by_ticket(
@@ -211,9 +216,9 @@ async def test_an_order_without_a_ticket_is_found_resting_by_its_digest(exec_shi
 
 
 async def test_an_order_without_a_ticket_is_found_in_the_lookbacks_history_by_its_digest(
-    exec_shim,
+    exec_venue,
 ):
-    h = build(exec_shim, history_lookback_mins=30)
+    h = build(exec_venue, history_lookback_mins=30)
     order = h.place(h.market(), status=OrderStatus.SUBMITTED)
     await h.connect()
     h.venue.history_orders_get.return_value = (
@@ -230,12 +235,11 @@ async def test_an_order_without_a_ticket_is_found_in_the_lookbacks_history_by_it
         VenueOrderId("9006"),
         OrderStatus.FILLED,
     )
-    date_from, date_to = h.venue.history_orders_get.call_args.args
-    assert date_to - date_from == timedelta(minutes=30)
+    assert window_s(h.venue.history_orders_get) == 30 * 60
 
 
-async def test_an_order_without_a_ticket_found_nowhere_reports_none(exec_shim):
-    h = build(exec_shim)
+async def test_an_order_without_a_ticket_found_nowhere_reports_none(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
     await h.connect()
     assert await one_report(h, client_order_id=order.client_order_id) is None
@@ -318,13 +322,14 @@ async def test_order_reports_unite_resting_and_historical_orders_of_this_magic_b
     end = pd.Timestamp("2026-10-03T11:00:00Z")
     reports = await order_reports(h, start=start, end=end)
     assert sorted(report.venue_order_id.value for report in reports) == ["9101", "9103"]
-    h.venue.history_orders_get.assert_called_once_with(start, end)
+    h.venue.history_orders_get.assert_called_once_with(
+        date_from=1_791_021_600, date_to=1_791_025_200
+    )
 
 
 async def test_order_reports_default_to_the_configs_lookback(h):
     await order_reports(h)
-    date_from, date_to = h.venue.history_orders_get.call_args.args
-    assert date_to - date_from == timedelta(minutes=60)
+    assert window_s(h.venue.history_orders_get) == 60 * 60
 
 
 async def test_open_only_order_reports_read_no_history(h):
@@ -338,8 +343,8 @@ async def test_open_only_order_reports_read_no_history(h):
 # ── Fills ────────────────────────────────────────────────────────────────────
 
 
-async def test_fill_reports_read_a_bounded_window_and_carry_the_venue_position(exec_shim):
-    h = build(exec_shim)
+async def test_fill_reports_read_a_bounded_window_and_carry_the_venue_position(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), ticket=9001)
     await h.connect()
     h.venue.history_deals_get.return_value = (
@@ -355,8 +360,7 @@ async def test_fill_reports_read_a_bounded_window_and_carry_the_venue_position(e
         ours_deal(ticket=7004, order=9001, volume=0.0),
     )
     reports = await fill_reports(h)
-    date_from, date_to = h.venue.history_deals_get.call_args.args
-    assert date_to - date_from == timedelta(minutes=60)
+    assert window_s(h.venue.history_deals_get) == 60 * 60
     (report,) = reports
     assert (
         report.account_id,
@@ -396,7 +400,9 @@ async def test_fill_reports_pass_the_commands_window_and_filter_by_its_order(h):
     end = pd.Timestamp("2026-10-03T11:00:00Z")
     reports = await fill_reports(h, venue_order_id=VenueOrderId("9002"), start=start, end=end)
     assert [report.trade_id for report in reports] == [TradeId("7002")]
-    h.venue.history_deals_get.assert_called_once_with(start, end)
+    h.venue.history_deals_get.assert_called_once_with(
+        date_from=1_791_021_600, date_to=1_791_025_200
+    )
 
 
 # ── Positions ────────────────────────────────────────────────────────────────

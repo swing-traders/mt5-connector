@@ -1,16 +1,14 @@
-"""Shared fixtures: a valid MT5Config, the transport an MT5Connection builds, mocked, a transport
-for the execution client's connection, and a hub double on a free loopback port."""
+"""Shared fixtures: a valid MT5Config, the venue behind the execution client's hub session, and a
+hub double on a free loopback port."""
 
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock
 
 import pytest
 from hub_double import HubDouble
-from venue_doubles import account_info, send_result, tick
+from venue_doubles import tick, trade_result
 from websockets.asyncio.server import serve
 
 from mt5connector.client.config import MT5Config
-from mt5connector.client.remote_mt5 import RemoteMT5
-from mt5connector.wire import mirror
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED CONFIG FIXTURE
@@ -24,7 +22,6 @@ def config():
         account=12345678,
         password="test_password",
         server="Exness-MT5Trial1",
-        server_url="http://127.0.0.1:5000",
         ws_url="ws://127.0.0.1:9000",
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
@@ -33,63 +30,31 @@ def config():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MT5 MODULE MOCK FIXTURE
+# THE EXECUTION CLIENT'S VENUE
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
-def mock_mt5():
-    """The transport every MT5Connection built in the test holds, answering a terminal that
-    initializes, logs in and reports a USD account; a test overrides the answer it needs."""
-    mock = create_autospec(RemoteMT5, instance=True)
-    mock.initialize.return_value = True
-    mock.shutdown.return_value = None
-    mock.login.return_value = True
-    mock.last_error.return_value = (0, "No error")
-
-    mock.account_info.return_value = account_info(
-        login=12345678,
-        server="Exness-MT5Trial1",
-        balance=10000.00,
-        equity=10050.25,
-        margin=100.00,
-        margin_free=9950.25,
-        margin_level=10050.25,
-        currency="USD",
-        leverage=2000,
-        profit=50.25,
-        name="Test Trader",
-        company="Exness Technologies Ltd",
+def exec_venue():
+    """The calls the execution client asks its hub session, each answered as the venue answers it:
+    no order, deal or position, a quote, and every trade request sent."""
+    venue = MagicMock(
+        spec=[
+            "orders_get",
+            "positions_get",
+            "history_orders_get",
+            "history_deals_get",
+            "symbol_info_tick",
+            "order_send",
+        ]
     )
-
-    terminal = MagicMock()
-    terminal.name = "MetaTrader 5"
-    terminal.path = "C:\\Program Files\\MetaTrader 5"
-    terminal.data_path = "C:\\Users\\Trader\\AppData\\Roaming\\MetaQuotes\\Terminal"
-    terminal.connected = True
-    terminal.trade_allowed = True
-    terminal.ping_last = 3
-    terminal.retransmission = 0.0
-    mock.terminal_info.return_value = terminal
-
-    with patch("mt5connector.client.connection.RemoteMT5", autospec=True) as transport:
-        transport.return_value = mock
-        yield mock
-
-
-@pytest.fixture
-def exec_shim():
-    """A transport for the execution client's connection, holding the package's signatures: no
-    order, deal or position, a quote, and every trade request completed."""
-    shim = create_autospec(RemoteMT5, instance=True)
-    shim.orders_get.return_value = ()
-    shim.positions_get.return_value = ()
-    shim.history_deals_get.return_value = ()
-    shim.history_orders_get.return_value = ()
-    shim.symbol_info_tick.return_value = tick(bid=1.085, ask=1.0852)
-    shim.order_send.return_value = send_result()
-    shim.last_error.return_value = mirror.SUCCESS
-    return shim
+    venue.orders_get.return_value = ()
+    venue.positions_get.return_value = ()
+    venue.history_deals_get.return_value = ()
+    venue.history_orders_get.return_value = ()
+    venue.symbol_info_tick.return_value = tick(bid=1.085, ask=1.0852)
+    venue.order_send.return_value = trade_result()
+    return venue
 
 
 @pytest.fixture
