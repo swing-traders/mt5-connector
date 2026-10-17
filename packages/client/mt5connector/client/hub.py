@@ -58,6 +58,7 @@ _DEADLINES = {
     calls.Wait.READ: calls.READ_DEADLINE_S,
     calls.Wait.COMMAND: calls.COMMAND_DEADLINE_S,
     calls.Wait.HISTORY: calls.HISTORY_DEADLINE_S,
+    calls.Wait.TICKS: calls.TICK_BUSY_S,
 }
 
 

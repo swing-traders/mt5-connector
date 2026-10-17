@@ -158,7 +158,7 @@ def layout(
     return Layout(
         name or struct_.name.value,
         tuple(member for member in struct_.members if member.name not in without),
-        struct_.epochs,
+        {field: unit for field, unit in struct_.epochs.items() if field not in without},
         struct_.key,
     )
 
@@ -168,6 +168,14 @@ TRADE_REQUEST = layout(mirror.STRUCTS[mirror.StructName.TRADE_REQUEST], name="Mq
 # MqlTradeResult: the package's OrderSendResult without the request the package appends to it.
 TRADE_RESULT = layout(_SEND_RESULT, name="MqlTradeResult", without=frozenset(_SEND_RESULT.nested))
 TRADE_TRANSACTION = Layout("MqlTradeTransaction", TRANSACTION_MEMBERS, TRANSACTION_EPOCHS)
+_SYMBOL_INFO = mirror.STRUCTS[mirror.StructName.SYMBOL_INFO]
+# A symbol in the terminal's listing: its name and its definition, without the market state a symbol
+# outside Market Watch refuses.
+SYMBOL_LISTING = layout(
+    _SYMBOL_INFO,
+    name="SymbolListing",
+    without=frozenset(member.name for member in _SYMBOL_INFO.members if member.selected),
+)
 
 # ── Frames ────────────────────────────────────────────────────────────────────
 

@@ -109,6 +109,30 @@ public:
         Bytes(bytes, 0, ArraySize(bytes));
     }
 
+    void Rows(const MqlTick &rows[], const int start, const int count)
+    {
+        const int at = ArraySize(m_data);
+        ArrayResize(m_data, at + count * HUB_TICK_SIZE, at + count * HUB_TICK_SIZE + 4096);
+        uchar record[];
+        for (int i = 0; i < count; i++)
+        {
+            StructToCharArray(rows[start + i], record);
+            ArrayCopy(m_data, record, at + i * HUB_TICK_SIZE, 0, HUB_TICK_SIZE);
+        }
+    }
+
+    void Rows(const MqlRates &rows[], const int start, const int count)
+    {
+        const int at = ArraySize(m_data);
+        ArrayResize(m_data, at + count * HUB_RATES_SIZE, at + count * HUB_RATES_SIZE + 4096);
+        uchar record[];
+        for (int i = 0; i < count; i++)
+        {
+            StructToCharArray(rows[start + i], record);
+            ArrayCopy(m_data, record, at + i * HUB_RATES_SIZE, 0, HUB_RATES_SIZE);
+        }
+    }
+
     // A frame's header, its count and length zero until Seal fills them in.
     void Begin(const ENUM_HUB_FRAME kind, const ushort flags, const ulong correlation)
     {

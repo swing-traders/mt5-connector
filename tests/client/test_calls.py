@@ -30,13 +30,15 @@ HISTORY_CALLS = {
     Call.COPY_TICKS_RANGE,
     Call.COPY_TICKS_FROM,
 }
+# The tick history, which the history EA reads in its own thread.
+TICK_CALLS = {Call.COPY_TICKS_RANGE, Call.COPY_TICKS_FROM}
 PUBLISHER_CALLS = {
     Call.SYMBOL_SELECT,
     Call.SYMBOL_INFO,
     Call.SYMBOL_INFO_TICK,
     Call.ORDER_SEND,
     Call.OUTCOMES,
-} | HISTORY_CALLS
+} | (HISTORY_CALLS - TICK_CALLS)
 HUB_CALLS = {Call.RANGES, Call.COMMISSION_SCHEDULE, Call.TRADING_SESSIONS}
 
 
@@ -96,15 +98,19 @@ def test_each_call_is_served_by_the_role_the_design_gives_it():
     assert served == {
         ChartRole.SPAWNER: SPAWNER_CALLS,
         ChartRole.PUBLISHER: PUBLISHER_CALLS,
+        ChartRole.HISTORY: TICK_CALLS,
         None: HUB_CALLS,
     }
 
 
-def test_a_command_waits_under_the_command_deadline_a_copy_under_the_history_one_the_rest_reads():
+def test_a_command_waits_under_the_command_deadline_a_copy_under_its_historys_the_rest_reads():
     waits = {call: row.wait for call, row in calls.CALLS.items()}
 
     assert {call for call, wait in waits.items() if wait is calls.Wait.COMMAND} == {Call.ORDER_SEND}
-    assert {call for call, wait in waits.items() if wait is calls.Wait.HISTORY} == HISTORY_CALLS
+    assert {call for call, wait in waits.items() if wait is calls.Wait.HISTORY} == (
+        HISTORY_CALLS - TICK_CALLS
+    )
+    assert {call for call, wait in waits.items() if wait is calls.Wait.TICKS} == TICK_CALLS
     assert all(
         wait is calls.Wait.READ
         for call, wait in waits.items()
@@ -170,7 +176,7 @@ def test_a_calls_arguments_travel_by_their_wire_types(call, arguments):
         (Call.ACCOUNT_INFO, calls.Shape.STRUCT, "AccountInfo"),
         (Call.TERMINAL_INFO, calls.Shape.STRUCT, "TerminalInfo"),
         (Call.SYMBOL_INFO, calls.Shape.STRUCT, "SymbolInfo"),
-        (Call.SYMBOLS_GET, calls.Shape.STRUCTS, "SymbolInfo"),
+        (Call.SYMBOLS_GET, calls.Shape.STRUCTS, "SymbolListing"),
         (Call.POSITIONS_GET, calls.Shape.STRUCTS, "TradePosition"),
         (Call.HISTORY_ORDERS_GET, calls.Shape.STRUCTS, "TradeOrder"),
         (Call.HISTORY_DEALS_GET, calls.Shape.STRUCTS, "TradeDeal"),
@@ -197,8 +203,30 @@ def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_it
     terminal = calls.CALLS[Call.TERMINAL_INFO].layout
     result = calls.CALLS[Call.ORDER_SEND].layout
 
-    assert "tradeapi_disabled" not in terminal.fields
-    assert len(terminal.fields) == 21
+    # Without tradeapi_disabled, which no MQL5 property backs, and community_balance, which the
+    # terminal refuses without an MQL5 community login.
+    assert terminal.fields == (
+        "community_account",
+        "community_connection",
+        "connected",
+        "dlls_allowed",
+        "trade_allowed",
+        "email_enabled",
+        "ftp_enabled",
+        "notifications_enabled",
+        "mqid",
+        "build",
+        "maxbars",
+        "codepage",
+        "ping_last",
+        "retransmission",
+        "company",
+        "name",
+        "language",
+        "path",
+        "data_path",
+        "commondata_path",
+    )
     assert result.fields == (
         "retcode",
         "deal",

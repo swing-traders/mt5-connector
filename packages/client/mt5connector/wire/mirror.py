@@ -192,11 +192,13 @@ def accessor(declared: MqlType) -> Accessor:
 class Member:
     """A struct's field, its MQL5 type, and the MQL5 property an EA reads it by — an `*Info*` or
     `*Get*` property identifier, or the MQL5 struct's own field name; type and property are None for
-    a field no MQL5 property backs, which travels in no hub frame's field sequence."""
+    a field no hub frame's field sequence carries."""
 
     name: str
     declared: MqlType | None
     property: str | None = None
+    # A symbol's market state, which the terminal refuses to read for a symbol outside Market Watch.
+    selected: bool = False
 
 
 @dataclass(frozen=True)
@@ -721,7 +723,8 @@ STRUCTS: dict[StructName, Struct] = {
                 Member("maxbars", MqlType.INT, "TERMINAL_MAXBARS"),
                 Member("codepage", MqlType.INT, "TERMINAL_CODEPAGE"),
                 Member("ping_last", MqlType.INT, "TERMINAL_PING_LAST"),
-                Member("community_balance", MqlType.DOUBLE, "TERMINAL_COMMUNITY_BALANCE"),
+                # TERMINAL_COMMUNITY_BALANCE is refused without an MQL5 community login.
+                Member("community_balance", None),
                 Member("retransmission", MqlType.DOUBLE, "TERMINAL_RETRANSMISSION"),
                 Member("company", MqlType.STRING, "TERMINAL_COMPANY"),
                 Member("name", MqlType.STRING, "TERMINAL_NAME"),
@@ -738,16 +741,20 @@ STRUCTS: dict[StructName, Struct] = {
                 Member("custom", MqlType.BOOL, "SYMBOL_CUSTOM"),
                 Member("chart_mode", MqlType.ENUM_SYMBOL_CHART_MODE, "SYMBOL_CHART_MODE"),
                 Member("select", MqlType.BOOL, "SYMBOL_SELECT"),
-                Member("visible", MqlType.BOOL, "SYMBOL_VISIBLE"),
-                Member("session_deals", MqlType.LONG, "SYMBOL_SESSION_DEALS"),
-                Member("session_buy_orders", MqlType.LONG, "SYMBOL_SESSION_BUY_ORDERS"),
-                Member("session_sell_orders", MqlType.LONG, "SYMBOL_SESSION_SELL_ORDERS"),
-                Member("volume", MqlType.LONG, "SYMBOL_VOLUME"),
-                Member("volumehigh", MqlType.LONG, "SYMBOL_VOLUMEHIGH"),
-                Member("volumelow", MqlType.LONG, "SYMBOL_VOLUMELOW"),
-                Member("time", MqlType.DATETIME, "SYMBOL_TIME"),
+                Member("visible", MqlType.BOOL, "SYMBOL_VISIBLE", selected=True),
+                Member("session_deals", MqlType.LONG, "SYMBOL_SESSION_DEALS", selected=True),
+                Member(
+                    "session_buy_orders", MqlType.LONG, "SYMBOL_SESSION_BUY_ORDERS", selected=True
+                ),
+                Member(
+                    "session_sell_orders", MqlType.LONG, "SYMBOL_SESSION_SELL_ORDERS", selected=True
+                ),
+                Member("volume", MqlType.LONG, "SYMBOL_VOLUME", selected=True),
+                Member("volumehigh", MqlType.LONG, "SYMBOL_VOLUMEHIGH", selected=True),
+                Member("volumelow", MqlType.LONG, "SYMBOL_VOLUMELOW", selected=True),
+                Member("time", MqlType.DATETIME, "SYMBOL_TIME", selected=True),
                 Member("digits", MqlType.INT, "SYMBOL_DIGITS"),
-                Member("spread", MqlType.INT, "SYMBOL_SPREAD"),
+                Member("spread", MqlType.INT, "SYMBOL_SPREAD", selected=True),
                 Member("spread_float", MqlType.BOOL, "SYMBOL_SPREAD_FLOAT"),
                 Member("ticks_bookdepth", MqlType.INT, "SYMBOL_TICKS_BOOKDEPTH"),
                 Member("trade_calc_mode", MqlType.ENUM_SYMBOL_CALC_MODE, "SYMBOL_TRADE_CALC_MODE"),
@@ -770,18 +777,18 @@ STRUCTS: dict[StructName, Struct] = {
                 ),
                 Member("option_mode", MqlType.ENUM_SYMBOL_OPTION_MODE, "SYMBOL_OPTION_MODE"),
                 Member("option_right", MqlType.ENUM_SYMBOL_OPTION_RIGHT, "SYMBOL_OPTION_RIGHT"),
-                Member("bid", MqlType.DOUBLE, "SYMBOL_BID"),
-                Member("bidhigh", MqlType.DOUBLE, "SYMBOL_BIDHIGH"),
-                Member("bidlow", MqlType.DOUBLE, "SYMBOL_BIDLOW"),
-                Member("ask", MqlType.DOUBLE, "SYMBOL_ASK"),
-                Member("askhigh", MqlType.DOUBLE, "SYMBOL_ASKHIGH"),
-                Member("asklow", MqlType.DOUBLE, "SYMBOL_ASKLOW"),
-                Member("last", MqlType.DOUBLE, "SYMBOL_LAST"),
-                Member("lasthigh", MqlType.DOUBLE, "SYMBOL_LASTHIGH"),
-                Member("lastlow", MqlType.DOUBLE, "SYMBOL_LASTLOW"),
-                Member("volume_real", MqlType.DOUBLE, "SYMBOL_VOLUME_REAL"),
-                Member("volumehigh_real", MqlType.DOUBLE, "SYMBOL_VOLUMEHIGH_REAL"),
-                Member("volumelow_real", MqlType.DOUBLE, "SYMBOL_VOLUMELOW_REAL"),
+                Member("bid", MqlType.DOUBLE, "SYMBOL_BID", selected=True),
+                Member("bidhigh", MqlType.DOUBLE, "SYMBOL_BIDHIGH", selected=True),
+                Member("bidlow", MqlType.DOUBLE, "SYMBOL_BIDLOW", selected=True),
+                Member("ask", MqlType.DOUBLE, "SYMBOL_ASK", selected=True),
+                Member("askhigh", MqlType.DOUBLE, "SYMBOL_ASKHIGH", selected=True),
+                Member("asklow", MqlType.DOUBLE, "SYMBOL_ASKLOW", selected=True),
+                Member("last", MqlType.DOUBLE, "SYMBOL_LAST", selected=True),
+                Member("lasthigh", MqlType.DOUBLE, "SYMBOL_LASTHIGH", selected=True),
+                Member("lastlow", MqlType.DOUBLE, "SYMBOL_LASTLOW", selected=True),
+                Member("volume_real", MqlType.DOUBLE, "SYMBOL_VOLUME_REAL", selected=True),
+                Member("volumehigh_real", MqlType.DOUBLE, "SYMBOL_VOLUMEHIGH_REAL", selected=True),
+                Member("volumelow_real", MqlType.DOUBLE, "SYMBOL_VOLUMELOW_REAL", selected=True),
                 Member("option_strike", MqlType.DOUBLE, "SYMBOL_OPTION_STRIKE"),
                 Member("point", MqlType.DOUBLE, "SYMBOL_POINT"),
                 Member("trade_tick_value", MqlType.DOUBLE, "SYMBOL_TRADE_TICK_VALUE"),
@@ -800,42 +807,69 @@ STRUCTS: dict[StructName, Struct] = {
                 Member("swap_short", MqlType.DOUBLE, "SYMBOL_SWAP_SHORT"),
                 Member("margin_initial", MqlType.DOUBLE, "SYMBOL_MARGIN_INITIAL"),
                 Member("margin_maintenance", MqlType.DOUBLE, "SYMBOL_MARGIN_MAINTENANCE"),
-                Member("session_volume", MqlType.DOUBLE, "SYMBOL_SESSION_VOLUME"),
-                Member("session_turnover", MqlType.DOUBLE, "SYMBOL_SESSION_TURNOVER"),
-                Member("session_interest", MqlType.DOUBLE, "SYMBOL_SESSION_INTEREST"),
+                Member("session_volume", MqlType.DOUBLE, "SYMBOL_SESSION_VOLUME", selected=True),
                 Member(
-                    "session_buy_orders_volume", MqlType.DOUBLE, "SYMBOL_SESSION_BUY_ORDERS_VOLUME"
+                    "session_turnover", MqlType.DOUBLE, "SYMBOL_SESSION_TURNOVER", selected=True
+                ),
+                Member(
+                    "session_interest", MqlType.DOUBLE, "SYMBOL_SESSION_INTEREST", selected=True
+                ),
+                Member(
+                    "session_buy_orders_volume",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_BUY_ORDERS_VOLUME",
+                    selected=True,
                 ),
                 Member(
                     "session_sell_orders_volume",
                     MqlType.DOUBLE,
                     "SYMBOL_SESSION_SELL_ORDERS_VOLUME",
+                    selected=True,
                 ),
-                Member("session_open", MqlType.DOUBLE, "SYMBOL_SESSION_OPEN"),
-                Member("session_close", MqlType.DOUBLE, "SYMBOL_SESSION_CLOSE"),
-                Member("session_aw", MqlType.DOUBLE, "SYMBOL_SESSION_AW"),
+                Member("session_open", MqlType.DOUBLE, "SYMBOL_SESSION_OPEN", selected=True),
+                Member("session_close", MqlType.DOUBLE, "SYMBOL_SESSION_CLOSE", selected=True),
+                Member("session_aw", MqlType.DOUBLE, "SYMBOL_SESSION_AW", selected=True),
                 Member(
-                    "session_price_settlement", MqlType.DOUBLE, "SYMBOL_SESSION_PRICE_SETTLEMENT"
+                    "session_price_settlement",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_PRICE_SETTLEMENT",
+                    selected=True,
                 ),
-                Member("session_price_limit_min", MqlType.DOUBLE, "SYMBOL_SESSION_PRICE_LIMIT_MIN"),
-                Member("session_price_limit_max", MqlType.DOUBLE, "SYMBOL_SESSION_PRICE_LIMIT_MAX"),
+                Member(
+                    "session_price_limit_min",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_PRICE_LIMIT_MIN",
+                    selected=True,
+                ),
+                Member(
+                    "session_price_limit_max",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_PRICE_LIMIT_MAX",
+                    selected=True,
+                ),
                 Member("margin_hedged", MqlType.DOUBLE, "SYMBOL_MARGIN_HEDGED"),
-                Member("price_change", MqlType.DOUBLE, "SYMBOL_PRICE_CHANGE"),
-                Member("price_volatility", MqlType.DOUBLE, "SYMBOL_PRICE_VOLATILITY"),
-                Member("price_theoretical", MqlType.DOUBLE, "SYMBOL_PRICE_THEORETICAL"),
-                Member("price_greeks_delta", MqlType.DOUBLE, "SYMBOL_PRICE_DELTA"),
-                Member("price_greeks_theta", MqlType.DOUBLE, "SYMBOL_PRICE_THETA"),
-                Member("price_greeks_gamma", MqlType.DOUBLE, "SYMBOL_PRICE_GAMMA"),
-                Member("price_greeks_vega", MqlType.DOUBLE, "SYMBOL_PRICE_VEGA"),
-                Member("price_greeks_rho", MqlType.DOUBLE, "SYMBOL_PRICE_RHO"),
-                Member("price_greeks_omega", MqlType.DOUBLE, "SYMBOL_PRICE_OMEGA"),
-                Member("price_sensitivity", MqlType.DOUBLE, "SYMBOL_PRICE_SENSITIVITY"),
+                Member("price_change", MqlType.DOUBLE, "SYMBOL_PRICE_CHANGE", selected=True),
+                Member(
+                    "price_volatility", MqlType.DOUBLE, "SYMBOL_PRICE_VOLATILITY", selected=True
+                ),
+                Member(
+                    "price_theoretical", MqlType.DOUBLE, "SYMBOL_PRICE_THEORETICAL", selected=True
+                ),
+                Member("price_greeks_delta", MqlType.DOUBLE, "SYMBOL_PRICE_DELTA", selected=True),
+                Member("price_greeks_theta", MqlType.DOUBLE, "SYMBOL_PRICE_THETA", selected=True),
+                Member("price_greeks_gamma", MqlType.DOUBLE, "SYMBOL_PRICE_GAMMA", selected=True),
+                Member("price_greeks_vega", MqlType.DOUBLE, "SYMBOL_PRICE_VEGA", selected=True),
+                Member("price_greeks_rho", MqlType.DOUBLE, "SYMBOL_PRICE_RHO", selected=True),
+                Member("price_greeks_omega", MqlType.DOUBLE, "SYMBOL_PRICE_OMEGA", selected=True),
+                Member(
+                    "price_sensitivity", MqlType.DOUBLE, "SYMBOL_PRICE_SENSITIVITY", selected=True
+                ),
                 Member("basis", MqlType.STRING, "SYMBOL_BASIS"),
                 Member("category", MqlType.STRING, "SYMBOL_CATEGORY"),
                 Member("currency_base", MqlType.STRING, "SYMBOL_CURRENCY_BASE"),
                 Member("currency_profit", MqlType.STRING, "SYMBOL_CURRENCY_PROFIT"),
                 Member("currency_margin", MqlType.STRING, "SYMBOL_CURRENCY_MARGIN"),
-                Member("bank", MqlType.STRING, "SYMBOL_BANK"),
+                Member("bank", MqlType.STRING, "SYMBOL_BANK", selected=True),
                 Member("description", MqlType.STRING, "SYMBOL_DESCRIPTION"),
                 Member("exchange", MqlType.STRING, "SYMBOL_EXCHANGE"),
                 Member("formula", MqlType.STRING, "SYMBOL_FORMULA"),

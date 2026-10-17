@@ -1,7 +1,9 @@
 // The EA inside the terminal, in the role its chart's template sets: the spawner serves the
 // account, relays the trade server's time and opens and closes the charts the hub asks for; a
-// publisher serves its symbol's ticks, closed bars, transactions, reads and trade commands. Every
-// frame it sends and reads is the hub protocol's binary one.
+// publisher serves its symbol's ticks, closed bars, transactions, reads, trade commands and bar
+// history, which the indicator it attaches beside itself syncs; a history EA serves its symbol's
+// tick history, read in its own thread. Every frame it sends and reads is the hub protocol's binary
+// one.
 #property script_show_inputs
 
 #include <MQL5Book/ws/wsclient.mqh>
@@ -12,8 +14,9 @@ input string Server = "ws://127.0.0.1:9000/";
 input int ReconnectIntervalSec = 3;
 input int RelaySeconds = 5;
 input int PollMilliseconds = 16;
-// The template the spawner applies to a chart it opens for a publisher.
+// The templates the spawner applies to a chart it opens for a publisher and for a history EA.
 input string ChartTemplate = "ticks.tpl";
+input string HistoryTemplate = "ticks_history.tpl";
 // The whole time from a dead connection's last pong to the hub dropping it, while the hub's writes
 // to it drain: the hub's ping interval, ping timeout and close timeout together.
 input int HubPingTimeoutSec = 50;
@@ -452,6 +455,25 @@ public:
         message = why;
         error = mql5Error;
     }
+
+    // Fails the answer naming every property of `record` a generated writer could not read, each
+    // with its error; the first one's error is the answer's.
+    void FailRead(const string record, const HubPropertyFailures &failures)
+    {
+        int listed = failures.count;
+        if (listed > HUB_PROPERTY_FAILURES_MAX)
+            listed = HUB_PROPERTY_FAILURES_MAX;
+        string named = "";
+        for (int i = 0; i < listed; i++)
+        {
+            if (i > 0)
+                named += ", ";
+            named += StringFormat("%s (%d)", failures.properties[i], failures.errors[i]);
+        }
+        if (failures.count > listed)
+            named += StringFormat(" and %d more", failures.count - listed);
+        Fail(StringFormat("%s: %s could not be read", record, named), failures.errors[0]);
+    }
 };
 
 void SendPart(const ulong requestId, const uint part, const bool last, const int lastError,
@@ -471,6 +493,23 @@ void SendPart(const ulong requestId, const uint part, const bool last, const int
     Send(frame);
 }
 
+// Answers a request with an error, the MQL5 error its last_error; a deferring kind carries the
+// delay before the request is asked again.
+void SendError(const ulong requestId, const ENUM_HUB_ERROR kind, const string message,
+               const int error)
+{
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_ANSWER, HUB_FLAG_LAST, requestId);
+    frame.U32(0);
+    frame.I32(error);
+    frame.U8((uchar)kind);
+    frame.String(message);
+    if (HubDefers(kind))
+        frame.U32(HUB_RETRY_AFTER_MS);
+    frame.Seal(0);
+    Send(frame);
+}
+
 // Answers a request once: its records in parts of at most HUB_PART_BYTES result bytes, numbered
 // from 0 and the last flagged, each carrying the MQL5 error the call left; or the error it met.
 void SendAnswer(const ulong requestId, Answer &answer, const int lastError)
@@ -479,14 +518,7 @@ void SendAnswer(const ulong requestId, Answer &answer, const int lastError)
         answer.Fail("a record holds a string too long for the protocol", 0);
     if (answer.failed)
     {
-        BinaryWriter frame;
-        frame.Begin(HUB_FRAME_ANSWER, HUB_FLAG_LAST, requestId);
-        frame.U32(0);
-        frame.I32(answer.error);
-        frame.U8((uchar)HUB_ERROR_EA_ERROR);
-        frame.String(answer.message);
-        frame.Seal(0);
-        Send(frame);
+        SendError(requestId, HUB_ERROR_EA_ERROR, answer.message, answer.error);
     }
     else
     {
@@ -523,12 +555,17 @@ void AnswerSymbols(RequestArguments &arguments, Answer &answer)
     }
     else
     {
-        // Every symbol the terminal knows, in Market Watch or not.
+        // Every symbol the terminal knows, in Market Watch or not, by its definition; one property
+        // that cannot be read fails the listing.
         const int total = SymbolsTotal(false);
-        for (int i = 0; i < total; i++)
+        HubPropertyFailures failures;
+        for (int i = 0; i < total && !answer.failed; i++)
         {
-            WriteSymbolInfo(answer.rows, SymbolName(i, false));
-            answer.Record();
+            const string name = SymbolName(i, false);
+            if (WriteSymbolListing(answer.rows, name, failures))
+                answer.Record();
+            else
+                answer.FailRead(name, failures);
         }
     }
 }
@@ -546,7 +583,8 @@ void AnswerPositions(RequestArguments &arguments, Answer &answer)
         const string symbol = arguments.String(HUB_ARG_POSITIONS_GET_SYMBOL);
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_POSITIONS_GET_TICKET);
         const int total = PositionsTotal();
-        for (int i = 0; i < total; i++)
+        HubPropertyFailures failures;
+        for (int i = 0; i < total && !answer.failed; i++)
         {
             // Each selects the position for the writer.
             const string held = PositionGetSymbol(i);
@@ -554,8 +592,10 @@ void AnswerPositions(RequestArguments &arguments, Answer &answer)
             if (heldTicket > 0 && (!bySymbol || held == symbol)
                 && (!byTicket || heldTicket == ticket))
             {
-                WritePosition(answer.rows);
-                answer.Record();
+                if (WritePosition(answer.rows, failures))
+                    answer.Record();
+                else
+                    answer.FailRead(StringFormat("position %I64u", heldTicket), failures);
             }
         }
     }
@@ -574,15 +614,18 @@ void AnswerOrders(RequestArguments &arguments, Answer &answer)
         const string symbol = arguments.String(HUB_ARG_ORDERS_GET_SYMBOL);
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_ORDERS_GET_TICKET);
         const int total = OrdersTotal();
-        for (int i = 0; i < total; i++)
+        HubPropertyFailures failures;
+        for (int i = 0; i < total && !answer.failed; i++)
         {
             // Selects the order for the writer.
             const ulong held = OrderGetTicket(i);
             if (held > 0 && (!bySymbol || OrderGetString(ORDER_SYMBOL) == symbol)
                 && (!byTicket || held == ticket))
             {
-                WriteOrder(answer.rows);
-                answer.Record();
+                if (WriteOrder(answer.rows, failures))
+                    answer.Record();
+                else
+                    answer.FailRead(StringFormat("order %I64u", held), failures);
             }
         }
     }
@@ -601,10 +644,7 @@ void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
         // A ticket the history does not hold answers no record, its error the answer's.
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_TICKET);
         if (HistoryOrderSelect(ticket))
-        {
-            WriteHistoryOrder(answer.rows, ticket);
-            answer.Record();
-        }
+            AnswerHistoryOrder(answer, ticket);
     }
     else if (arguments.Has(HUB_ARG_HISTORY_ORDERS_GET_POSITION))
     {
@@ -623,22 +663,28 @@ void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
     }
 }
 
+void AnswerHistoryOrder(Answer &answer, const ulong ticket)
+{
+    HubPropertyFailures failures;
+    if (WriteHistoryOrder(answer.rows, ticket, failures))
+        answer.Record();
+    else
+        answer.FailRead(StringFormat("order %I64u", ticket), failures);
+}
+
 void AnswerSelectedOrders(Answer &answer)
 {
     const int total = HistoryOrdersTotal();
-    for (int i = 0; i < total; i++)
+    for (int i = 0; i < total && !answer.failed; i++)
     {
         const ulong ticket = HistoryOrderGetTicket(i);
         if (ticket > 0)
-        {
-            WriteHistoryOrder(answer.rows, ticket);
-            answer.Record();
-        }
+            AnswerHistoryOrder(answer, ticket);
     }
 }
 
-// The deals of the history a query names: those of the order its ticket names, every one of a
-// position, or those of a window on the broker's clock.
+// The deals of the history a query names: the one its ticket names, every one of a position, or
+// those of a window on the broker's clock.
 void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
 {
     if (arguments.String(HUB_ARG_HISTORY_DEALS_GET_GROUP) != "")
@@ -647,18 +693,15 @@ void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
     }
     else if (arguments.Has(HUB_ARG_HISTORY_DEALS_GET_TICKET))
     {
-        // The package's ticket here is an order's, which its deals carry as DEAL_ORDER; the whole
-        // history is selected to find them.
-        const ulong order = (ulong)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_TICKET);
-        if (HistorySelect(0, TimeTradeServer() + DAY_SECONDS))
-            AnswerSelectedDeals(answer, true, order);
-        else
-            answer.Fail("HistorySelect failed", GetLastError());
+        // A ticket the history does not hold answers no record, its error the answer's.
+        const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_TICKET);
+        if (HistoryDealSelect(ticket))
+            AnswerDeal(answer, ticket);
     }
     else if (arguments.Has(HUB_ARG_HISTORY_DEALS_GET_POSITION))
     {
         if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_POSITION)))
-            AnswerSelectedDeals(answer, false, 0);
+            AnswerSelectedDeals(answer);
         else
             answer.Fail("HistorySelectByPosition failed", GetLastError());
     }
@@ -666,38 +709,48 @@ void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
     {
         if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_FROM),
                           (datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_TO)))
-            AnswerSelectedDeals(answer, false, 0);
+            AnswerSelectedDeals(answer);
         else
             answer.Fail("HistorySelect failed", GetLastError());
     }
 }
 
-// The deals the history selected, those of the order `order` alone when `byOrder`.
-void AnswerSelectedDeals(Answer &answer, const bool byOrder, const ulong order)
+void AnswerDeal(Answer &answer, const ulong ticket)
+{
+    HubPropertyFailures failures;
+    if (WriteDeal(answer.rows, ticket, failures))
+        answer.Record();
+    else
+        answer.FailRead(StringFormat("deal %I64u", ticket), failures);
+}
+
+void AnswerSelectedDeals(Answer &answer)
 {
     const int total = HistoryDealsTotal();
-    for (int i = 0; i < total; i++)
+    for (int i = 0; i < total && !answer.failed; i++)
     {
         const ulong ticket = HistoryDealGetTicket(i);
-        if (ticket > 0 && (!byOrder || (ulong)HistoryDealGetInteger(ticket, DEAL_ORDER) == order))
-        {
-            WriteDeal(answer.rows, ticket);
-            answer.Record();
-        }
+        if (ticket > 0)
+            AnswerDeal(answer, ticket);
     }
 }
 
 void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &answer)
 {
+    HubPropertyFailures failures;
     switch (call)
     {
     case HUB_CALL_ACCOUNT_INFO:
-        WriteAccountInfo(answer.rows);
-        answer.Record();
+        if (WriteAccountInfo(answer.rows, failures))
+            answer.Record();
+        else
+            answer.FailRead("the account", failures);
         break;
     case HUB_CALL_TERMINAL_INFO:
-        WriteTerminalInfo(answer.rows);
-        answer.Record();
+        if (WriteTerminalInfo(answer.rows, failures))
+            answer.Record();
+        else
+            answer.FailRead("the terminal", failures);
         break;
     case HUB_CALL_SYMBOLS_TOTAL:
         answer.rows.I64(SymbolsTotal(false));
@@ -743,15 +796,13 @@ void AnswerSymbolInfo(RequestArguments &arguments, Answer &answer)
 {
     const string symbol = arguments.String(HUB_ARG_SYMBOL_INFO_SYMBOL);
     bool custom = false;
-    if (SymbolExist(symbol, custom))
-    {
-        WriteSymbolInfo(answer.rows, symbol);
-        answer.Record();
-    }
-    else
-    {
+    HubPropertyFailures failures;
+    if (!SymbolExist(symbol, custom))
         answer.Fail("SymbolExist found no such symbol", GetLastError());
-    }
+    else if (WriteSymbolInfo(answer.rows, symbol, failures))
+        answer.Record();
+    else
+        answer.FailRead(symbol, failures);
 }
 
 void AnswerSymbolInfoTick(RequestArguments &arguments, Answer &answer)
@@ -794,8 +845,8 @@ int OutcomeSlot(const uint requestId)
     return -1;
 }
 
-// Each request id's transaction the outcome log holds, in the order asked; an id it no longer
-// holds answers nothing.
+// Each request id's transaction the outcome log holds, in the order asked; an id it no longer holds
+// answers nothing.
 void AnswerOutcomes(RequestArguments &arguments, Answer &answer)
 {
     for (int i = 0; i < ArraySize(arguments.ids); i++)
@@ -828,56 +879,1551 @@ void ServeSymbol(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &
     case HUB_CALL_OUTCOMES:
         AnswerOutcomes(arguments, answer);
         break;
-    case HUB_CALL_COPY_RATES_RANGE:
-    case HUB_CALL_COPY_RATES_FROM:
-    case HUB_CALL_COPY_TICKS_RANGE:
-    case HUB_CALL_COPY_TICKS_FROM:
-        answer.Fail("history reads are not served", ERR_FUNCTION_NOT_ALLOWED);
-        break;
     default:
         answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
         break;
     }
 }
 
-// Serve one request and answer it once
-void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
+// Serves a call that answers at once, by its role.
+void Serve(const ulong requestId, const ENUM_HUB_CALL call, RequestArguments &arguments)
 {
     Answer answer;
-    int lastError = 0;
-    const ushort code = reader.U16();
-    if (reader.failed)
+    ResetLastError();
+    switch (Role)
     {
-        answer.Fail("a request out of its layout", ERR_INVALID_PARAMETER);
+    case ROLE_SPAWNER:
+        ServeAccount(call, arguments, answer);
+        break;
+    case ROLE_PUBLISHER:
+        ServeSymbol(call, arguments, answer);
+        break;
     }
-    else if (!HubServes(Role, (ENUM_HUB_CALL)code))
+    SendAnswer(requestId, answer, GetLastError());
+}
+
+// Serve one request and answer it once: a history read once its windows are synced, any other call
+// at once
+void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
+{
+    const ENUM_HUB_CALL call = (ENUM_HUB_CALL)reader.U16();
+    RequestArguments arguments;
+    if (reader.failed)
+        SendError(requestId, HUB_ERROR_EA_ERROR, "a request out of its layout",
+                  ERR_INVALID_PARAMETER);
+    else if (!HubServes(Role, call))
+        SendError(requestId, HUB_ERROR_EA_ERROR, "the call is not served by this EA's role",
+                  ERR_FUNCTION_NOT_ALLOWED);
+    else if (!arguments.Read(call, count, reader))
+        SendError(requestId, HUB_ERROR_EA_ERROR, "arguments out of the call's layout",
+                  ERR_INVALID_PARAMETER);
+    else if (call == HUB_CALL_COPY_RATES_RANGE || call == HUB_CALL_COPY_RATES_FROM
+             || call == HUB_CALL_COPY_TICKS_RANGE || call == HUB_CALL_COPY_TICKS_FROM)
+        StartHistory(requestId, call, arguments);
+    else
+        Serve(requestId, call, arguments);
+}
+
+// ── History: windows synced, the rules over them, answers in parts ───────────────────────────────
+
+// How long a series' floor is used before it is measured again.
+#define FLOOR_TTL_SECONDS 900
+// 1970-01-02 on the broker's clock, before any plausible history: where the floor stubs are read.
+#define BEFORE_HISTORY_SECONDS 86400
+#define WEEK_SECONDS (7 * DAY_SECONDS)
+// Broker weeks start on Monday, and 1970-01-05 was the first.
+#define FIRST_MONDAY_SECONDS (4 * DAY_SECONDS)
+// The ticks among the series a floor is kept for: no timeframe is 0.
+#define TICK_SERIES 0
+// How often a tick request's busy is renewed while it is in flight, well within its bound.
+#define TICK_BUSY_RENEWAL_S (HUB_TICK_BUSY_S / 3)
+// The least time between two calls of one tick read, so a call the terminal answers at once with a
+// loading error is not made again in a spin.
+#define TICK_CALL_SPACING_MS 1000
+
+// Where a series' rows begin on the broker's clock — seconds for bars, milliseconds for ticks —
+// when it was measured, by GetTickCount64, what set it, and whether an answer has told the hub of
+// it on this connection.
+struct Floor
+{
+    bool held;
+    long value;
+    ulong measuredAt;
+    ENUM_FLOOR_ORIGIN origin;
+    bool published;
+};
+
+// A window of rates the indicator syncs: the ask that carries it, a timeframe, and a range's bounds
+// or a start and count, in broker seconds. Synced in a stage of its own, it holds the rows and the
+// first row's time the indicator's read of it answered.
+struct HistoryWindow
+{
+    ENUM_HUB_EVENT ask;
+    int timeframe;
+    long from;
+    long to;
+    bool answered;
+    int rows;
+    long first;
+};
+
+// What a tick read is: a range, or a count from a time.
+enum ENUM_TICK_READ
+{
+    TICK_READ_RANGE,
+    TICK_READ_FROM
+};
+
+// How the terminal's answers stand on a gap: proven empty, or what keeps them from proving it.
+enum ENUM_GAP_PROOF
+{
+    GAP_PROVEN,
+    GAP_HOLDS_LAST_QUOTE,
+    GAP_NO_RECORD_AFTER,
+    GAP_NO_ROW_BEFORE
+};
+
+// A stretch of a window no read answered a row for, in broker seconds, and whether rows were read
+// before and after it.
+struct Gap
+{
+    long lo;
+    long hi;
+    bool rowsBefore;
+    bool rowsAfter;
+};
+
+// How a run of a request's rules ended, or that it goes on.
+enum ENUM_RUN_STATE
+{
+    RUN_GOING,
+    RUN_SYNCING,
+    RUN_UNPROVEN,
+    RUN_FAILED
+};
+
+// A history request, from its arrival to its answer's last part.
+class HistoryRequest
+{
+public:
+    ulong id;
+    ENUM_HUB_CALL call;
+    string symbol;
+    // A bar read's timeframe and its series' period.
+    int timeframe;
+    int period;
+    // A range read's bounds in broker seconds, or a count read's start and count.
+    long from;
+    long to;
+    uint flags;
+    // The symbol's last quote and the terminal's time at arrival, which every run of the rules
+    // reads: whether SymbolInfoTick answered, its time, zero for the zero tick, and its error.
+    bool quoteRead;
+    long quoteTime;
+    int quoteError;
+    long present;
+    HistoryWindow synced[];
+    HistoryWindow stage[];
+    // The readies heard of the stage, the first error one carried, and when it was asked.
+    int readies;
+    int stageError;
+    ulong askedAt;
+    bool answering;
+    // When the hub last heard the request is busy, and when a tick request arrived, which bounds
+    // how long its reads wait.
+    ulong busyAt;
+    ulong arrivedAt;
+    MqlRates rates[];
+    MqlTick ticks[];
+    int sent;
+    uint part;
+    int lastError;
+
+    HistoryRequest(const ulong requestId, const ENUM_HUB_CALL requested)
+        : id(requestId), call(requested), symbol(""), timeframe(0), period(0),
+          from(0), to(0), flags(0), quoteRead(false), quoteTime(0), quoteError(0), present(0),
+          readies(0), stageError(0), askedAt(0), answering(false), busyAt(0), arrivedAt(0), sent(0),
+          part(0), lastError(0)
     {
-        answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
+    }
+};
+
+HistoryRequest *g_history[];
+// The floors of this EA's series, by timeframe or TICK_SERIES.
+int g_floorSeries[];
+Floor g_floors[];
+
+// One run of a request's rules over the windows synced for it. Its floor writes reach the store
+// only once it ends, so a run stopped to sync leaves the store as it found it.
+class HistoryRun
+{
+public:
+    ENUM_RUN_STATE state;
+    string why;
+    int error;
+    // The error the latest read left.
+    int lastError;
+    HistoryWindow needed[];
+    // The request's series, and its floor as the store holds it with this run's writes.
+    int series;
+    Floor floor;
+    bool wrote;
+    int writtenSeries[];
+    long writtenValues[];
+    ENUM_FLOOR_ORIGIN writtenOrigins[];
+
+    HistoryRun() : state(RUN_GOING), why(""), error(0), lastError(0), series(0), wrote(false)
+    {
+        ZeroMemory(floor);
+    }
+
+    bool Going() const { return state == RUN_GOING; }
+
+    void Stop(const ENUM_RUN_STATE stopped, const string reason, const int mql5Error)
+    {
+        if (state == RUN_GOING)
+        {
+            state = stopped;
+            why = reason;
+            error = mql5Error;
+        }
+    }
+};
+
+bool IsBars(const HistoryRequest *r)
+{
+    return r.call == HUB_CALL_COPY_RATES_RANGE || r.call == HUB_CALL_COPY_RATES_FROM;
+}
+
+int RowCount(const HistoryRequest *r)
+{
+    if (IsBars(r))
+        return ArraySize(r.rates);
+    else
+        return ArraySize(r.ticks);
+}
+
+string SeriesName(const HistoryRequest *r)
+{
+    string name = HUB_TICK_SERIES;
+    int period = 0;
+    if (IsBars(r))
+        HubSeries(r.timeframe, name, period);
+    return name;
+}
+
+string Described(const HistoryRequest *r)
+{
+    if (r.call == HUB_CALL_COPY_RATES_FROM || r.call == HUB_CALL_COPY_TICKS_FROM)
+        return StringFormat("%s %s %I64d from broker %I64d", r.symbol, SeriesName(r), r.to,
+                            r.from);
+    else
+        return StringFormat("%s %s broker %I64d..%I64d", r.symbol, SeriesName(r), r.from, r.to);
+}
+
+// ── Floors ───────────────────────────────────────────────────────────────────────────────────────
+
+int FloorIndex(const int series)
+{
+    for (int i = 0; i < ArraySize(g_floorSeries); i++)
+        if (g_floorSeries[i] == series)
+            return i;
+    return -1;
+}
+
+void StoredFloor(const int series, Floor &floor)
+{
+    const int index = FloorIndex(series);
+    if (index >= 0)
+        floor = g_floors[index];
+    else
+        ZeroMemory(floor);
+}
+
+bool IsFresh(const Floor &floor)
+{
+    return floor.held && GetTickCount64() - floor.measuredAt < (ulong)FLOOR_TTL_SECONDS * 1000;
+}
+
+// The floor a measurement leaves in force: the stub of a series served with a coarse prefix is that
+// prefix's first row, so a stub never moves a coarse floor back.
+void Measured(Floor &floor, const long value, const ENUM_FLOOR_ORIGIN origin)
+{
+    const bool coarseStands = floor.held && floor.origin == FLOOR_ORIGIN_COARSE
+                              && origin == FLOOR_ORIGIN_STUB && value <= floor.value;
+    if (!coarseStands)
+    {
+        floor.value = value;
+        floor.origin = origin;
+    }
+    floor.held = true;
+    floor.measuredAt = GetTickCount64();
+    floor.published = false;
+}
+
+// Records a measurement of a series in the run, and answers the floor then in force in `floor`.
+void WriteFloor(HistoryRun &run, const int series, const long value,
+                const ENUM_FLOOR_ORIGIN origin, Floor &floor)
+{
+    if (series == run.series)
+    {
+        Measured(run.floor, value, origin);
+        floor = run.floor;
     }
     else
     {
-        RequestArguments arguments;
-        if (!arguments.Read((ENUM_HUB_CALL)code, count, reader))
+        StoredFloor(series, floor);
+        Measured(floor, value, origin);
+    }
+    const int n = ArraySize(run.writtenValues);
+    ArrayResize(run.writtenSeries, n + 1);
+    ArrayResize(run.writtenValues, n + 1);
+    ArrayResize(run.writtenOrigins, n + 1);
+    run.writtenSeries[n] = series;
+    run.writtenValues[n] = value;
+    run.writtenOrigins[n] = origin;
+    run.wrote = true;
+}
+
+// The run's measurements into the store, each by the store's rule.
+void CommitFloors(const HistoryRun &run)
+{
+    for (int i = 0; i < ArraySize(run.writtenValues); i++)
+    {
+        int index = FloorIndex(run.writtenSeries[i]);
+        if (index < 0)
         {
-            answer.Fail("arguments out of the call's layout", ERR_INVALID_PARAMETER);
+            index = ArraySize(g_floorSeries);
+            ArrayResize(g_floorSeries, index + 1);
+            ArrayResize(g_floors, index + 1);
+            g_floorSeries[index] = run.writtenSeries[i];
+            ZeroMemory(g_floors[index]);
+        }
+        Measured(g_floors[index], run.writtenValues[i], run.writtenOrigins[i]);
+    }
+}
+
+int SeriesOf(const HistoryRequest *r)
+{
+    if (IsBars(r))
+        return r.timeframe;
+    else
+        return TICK_SERIES;
+}
+
+// A hub that reconnects may be a new one, which holds no floor.
+void UnpublishFloors()
+{
+    for (int i = 0; i < ArraySize(g_floors); i++)
+        g_floors[i].published = false;
+}
+
+// ── Windows synced and needed ────────────────────────────────────────────────────────────────────
+
+void SetWindow(HistoryWindow &window, const ENUM_HUB_EVENT ask, const int timeframe,
+               const long from, const long to)
+{
+    window.ask = ask;
+    window.timeframe = timeframe;
+    window.from = from;
+    window.to = to;
+    window.answered = false;
+    window.rows = 0;
+    window.first = 0;
+}
+
+bool SameWindow(const HistoryWindow &a, const HistoryWindow &b)
+{
+    return a.ask == b.ask && a.timeframe == b.timeframe && a.from == b.from && a.to == b.to;
+}
+
+// Whether the windows synced for the request hold the window: a range within their union, a start
+// and count by the same ask.
+bool Covered(const HistoryRequest *r, const HistoryWindow &window)
+{
+    bool covered = false;
+    if (window.ask == HUB_EVENT_ASK_RATES_FROM)
+    {
+        for (int i = 0; i < ArraySize(r.synced) && !covered; i++)
+            covered = SameWindow(r.synced[i], window);
+    }
+    else
+    {
+        // The first second of the window no synced range holds yet.
+        long cursor = window.from;
+        bool moved = true;
+        while (cursor <= window.to && moved)
+        {
+            moved = false;
+            for (int i = 0; i < ArraySize(r.synced); i++)
+            {
+                const HistoryWindow synced = r.synced[i];
+                if (synced.ask == window.ask && synced.timeframe == window.timeframe
+                    && synced.from <= cursor && cursor <= synced.to)
+                {
+                    cursor = synced.to + 1;
+                    moved = true;
+                }
+            }
+        }
+        covered = cursor > window.to;
+    }
+    return covered;
+}
+
+// Whether the window is synced for the request; one that is not is added to the run's needs, which
+// stops the run until the indicator has synced them.
+bool Need(const HistoryRequest *r, HistoryRun &run, const HistoryWindow &window)
+{
+    const bool covered = Covered(r, window);
+    if (!covered)
+        AskNext(run, window);
+    return covered;
+}
+
+// Adds the window to the run's needs, once, which stops the run until the indicator has synced
+// them.
+void AskNext(HistoryRun &run, const HistoryWindow &window)
+{
+    bool known = false;
+    for (int i = 0; i < ArraySize(run.needed) && !known; i++)
+        known = SameWindow(run.needed[i], window);
+    if (!known)
+    {
+        const int n = ArraySize(run.needed);
+        ArrayResize(run.needed, n + 1);
+        run.needed[n] = window;
+    }
+    run.Stop(RUN_SYNCING, "", 0);
+}
+
+// ── Reads of synced windows ──────────────────────────────────────────────────────────────────────
+
+// The rates opened in [from, to]; false, the run stopped, for a window not synced or a read that
+// does not succeed.
+bool ReadRates(const HistoryRequest *r, HistoryRun &run, const long from, const long to,
+               MqlRates &rows[])
+{
+    HistoryWindow window;
+    SetWindow(window, HUB_EVENT_ASK_RATES, r.timeframe, from, to);
+    bool read = false;
+    if (run.Going() && Need(r, run, window))
+    {
+        ResetLastError();
+        const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)r.timeframe, (datetime)from,
+                                     (datetime)to, rows);
+        run.lastError = GetLastError();
+        read = copied >= 0 && run.lastError == 0;
+        if (!read)
+            run.Stop(RUN_UNPROVEN, StringFormat("%s %s broker %I64d..%I64d: %d rows, last_error %d",
+                                                r.symbol, SeriesName(r), from, to, copied,
+                                                run.lastError),
+                     run.lastError);
+    }
+    return read;
+}
+
+// Whether the indicator's read of the window has answered in a stage of its own, with its rows and
+// its first row's time; one not answered yet is asked alone, which stops the run. The stubs and the
+// probes' single rows are taken from it: the publisher's own read of a window wholly before a
+// series answers -1 with 4401 even once the indicator's read answers it.
+bool NeedAnswer(const HistoryRequest *r, HistoryRun &run, const HistoryWindow &window,
+                     int &rows, long &first)
+{
+    bool answered = false;
+    for (int i = 0; i < ArraySize(r.synced) && !answered && run.Going(); i++)
+    {
+        if (SameWindow(r.synced[i], window) && r.synced[i].answered)
+        {
+            rows = r.synced[i].rows;
+            first = r.synced[i].first;
+            answered = true;
+        }
+    }
+    if (!answered && run.Going())
+        AskNext(run, window);
+    return answered;
+}
+
+void KeepRatesWithin(MqlRates &rows[], const long from, const long to)
+{
+    int kept = 0;
+    for (int i = 0; i < ArraySize(rows); i++)
+    {
+        if ((long)rows[i].time >= from && (long)rows[i].time <= to)
+        {
+            rows[kept] = rows[i];
+            kept++;
+        }
+    }
+    ArrayResize(rows, kept);
+}
+
+void KeepTicksWithin(MqlTick &rows[], const long fromMsc, const long toMsc)
+{
+    int kept = 0;
+    for (int i = 0; i < ArraySize(rows); i++)
+    {
+        if (rows[i].time_msc >= fromMsc && rows[i].time_msc <= toMsc)
+        {
+            rows[kept] = rows[i];
+            kept++;
+        }
+    }
+    ArrayResize(rows, kept);
+}
+
+// ── The rules' facts ─────────────────────────────────────────────────────────────────────────────
+
+bool SelectSymbol(const HistoryRequest *r, HistoryRun &run)
+{
+    if (!SymbolSelect(r.symbol, true))
+        run.Stop(RUN_FAILED, StringFormat("SymbolSelect '%s' failed", r.symbol), GetLastError());
+    return run.Going();
+}
+
+// The widest window one read of the series spans: the terminal answers a wider one with nothing.
+bool SpanSeconds(const HistoryRequest *r, HistoryRun &run, long &span)
+{
+    ResetLastError();
+    const long maxbars = TerminalInfoInteger(TERMINAL_MAXBARS);
+    const int error = GetLastError();
+    if (error != 0)
+        run.Stop(RUN_UNPROVEN, StringFormat("TERMINAL_MAXBARS: last_error %d", error), error);
+    else if (maxbars <= HUB_SPAN_MARGIN)
+        run.Stop(RUN_FAILED, StringFormat("the terminal's maxbars %I64d spans nothing", maxbars),
+                 0);
+    else
+        span = (maxbars - HUB_SPAN_MARGIN) * r.period;
+    return run.Going();
+}
+
+// The broker second of the symbol's last quote at the request's arrival, `quoted` false for the
+// zero tick, which dates nothing.
+void LastQuote(const HistoryRequest *r, HistoryRun &run, bool &quoted, long &lastQuote)
+{
+    if (!r.quoteRead)
+        run.Stop(RUN_UNPROVEN, StringFormat("SymbolInfoTick: last_error %d", r.quoteError),
+                 r.quoteError);
+    quoted = r.quoteRead && r.quoteTime != 0;
+    lastQuote = r.quoteTime;
+}
+
+// The time no bar opens after: the symbol's last quote, or the terminal's time at the request's
+// arrival when it has none.
+long Present(const HistoryRequest *r)
+{
+    if (r.quoteRead && r.quoteTime != 0)
+        return r.quoteTime;
+    else
+        return r.present;
+}
+
+long Earliest(const long a, const long b)
+{
+    if (a < b)
+        return a;
+    else
+        return b;
+}
+
+long Latest(const long a, const long b)
+{
+    if (a > b)
+        return a;
+    else
+        return b;
+}
+
+// [lo, hi] split oldest-first into the fewest equal ranges spanning at most `span` each, so no
+// range is a sliver.
+void Chunks(const long lo, const long hi, const long span, long &los[], long &his[])
+{
+    const long count = Latest(1, (hi - lo + span - 1) / span);
+    ArrayResize(los, (int)count);
+    ArrayResize(his, (int)count);
+    for (long i = 0; i < count; i++)
+    {
+        los[(int)i] = lo + (hi - lo) * i / count;
+        his[(int)i] = lo + (hi - lo) * (i + 1) / count - 1;
+    }
+    his[(int)count - 1] = hi;
+}
+
+// The first row off the grid the first row sets, or not after the row before it; -1 for none.
+int FirstOffGrid(const MqlRates &rows[], const int period)
+{
+    for (int i = 0; i < ArraySize(rows); i++)
+        if (((long)rows[i].time - (long)rows[0].time) % period != 0
+            || (i > 0 && rows[i].time <= rows[i - 1].time))
+            return i;
+    return -1;
+}
+
+int FirstDecrease(const MqlTick &rows[])
+{
+    for (int i = 1; i < ArraySize(rows); i++)
+        if (rows[i].time_msc < rows[i - 1].time_msc)
+            return i;
+    return -1;
+}
+
+// How many leading rows an intraday series serves a whole number of days apart, ahead of its first
+// two rows one period apart.
+int CoarsePrefix(const MqlRates &rows[], const int period)
+{
+    int first = -1;
+    for (int i = 0; i + 1 < ArraySize(rows) && first < 0; i++)
+        if ((long)rows[i + 1].time - (long)rows[i].time == period)
+            first = i;
+    bool daily = true;
+    for (int i = 0; i < first && daily; i++)
+        daily = ((long)rows[i + 1].time - (long)rows[i].time) % DAY_SECONDS == 0;
+    if (period < DAY_SECONDS && first > 0 && daily)
+        return first;
+    else
+        return 0;
+}
+
+// The whole units, counted from `origin`, that [from, to] lies in.
+void Containing(const long from, const long to, const long unit, const long origin, long &lo,
+                long &hi)
+{
+    lo = from - FloorMod(from - origin, unit);
+    hi = to - FloorMod(to - origin, unit) + unit - 1;
+}
+
+long FloorMod(const long value, const long unit)
+{
+    const long remainder = value % unit;
+    if (remainder < 0)
+        return remainder + unit;
+    else
+        return remainder;
+}
+
+// ── Bars ─────────────────────────────────────────────────────────────────────────────────────────
+
+// The series' stub — the one row the terminal answers for a window before any plausible history —
+// recorded, and the floor then in force in `floor`; none when it answers none, which proves
+// nothing.
+void MeasureBarFloor(const HistoryRequest *r, HistoryRun &run, Floor &floor)
+{
+    HistoryWindow window;
+    SetWindow(window, HUB_EVENT_ASK_RATES, r.timeframe, BEFORE_HISTORY_SECONDS,
+              BEFORE_HISTORY_SECONDS + r.period);
+    int rows = 0;
+    long first = 0;
+    if (NeedAnswer(r, run, window, rows, first))
+    {
+        if (rows == 0)
+            ZeroMemory(floor);
+        else
+            WriteFloor(run, run.series, first, FLOOR_ORIGIN_STUB, floor);
+    }
+}
+
+// Whether the last bar the terminal answers as opened at or before the gap's start opened before
+// it.
+bool BarBefore(const HistoryRequest *r, HistoryRun &run, const Gap &gap)
+{
+    // CopyRates reads `count` bars back from its date: this one is the last at or before it.
+    HistoryWindow window;
+    SetWindow(window, HUB_EVENT_ASK_RATES_FROM, r.timeframe, gap.lo, 1);
+    int rows = 0;
+    long first = 0;
+    return NeedAnswer(r, run, window, rows, first) && rows > 0 && first < gap.lo;
+}
+
+// Whether the first bar of the widest read from the gap's end, up to the present, lies after the
+// gap.
+bool BarAfter(const HistoryRequest *r, HistoryRun &run, const Gap &gap, const long span)
+{
+    const long hi = Earliest(gap.hi + span, Present(r));
+    MqlRates rows[];
+    return hi > gap.hi && ReadRates(r, run, gap.hi, hi, rows) && ArraySize(rows) > 0
+           && (long)rows[0].time > gap.hi;
+}
+
+// Every chunk of the window from `lo` on, asked as one stage.
+void NeedChunks(const HistoryRequest *r, HistoryRun &run, const long lo, const long span)
+{
+    HistoryWindow window;
+    long los[];
+    long his[];
+    Chunks(lo, r.to, span, los, his);
+    for (int i = 0; i < ArraySize(los); i++)
+    {
+        SetWindow(window, HUB_EVENT_ASK_RATES, r.timeframe, los[i], his[i]);
+        Need(r, run, window);
+    }
+}
+
+// Seeks the terminal's proof that the gap is empty — reading, or asking the indicator for, the
+// records around it — and answers how it stands: proven when it lies after the second of the
+// symbol's last quote, or rows lie before it and a record after it. The last quote is itself a
+// record, so a gap holding its second is unproven.
+ENUM_GAP_PROOF ProveGap(const HistoryRequest *r, HistoryRun &run, const Gap &gap, const long span)
+{
+    bool quoted = false;
+    long lastQuote = 0;
+    if (!gap.rowsAfter)
+        LastQuote(r, run, quoted, lastQuote);
+    ENUM_GAP_PROOF proof = GAP_PROVEN;
+    // A run its last quote stopped judges nothing more; the live edge proves the gap.
+    if (!run.Going() || (quoted && lastQuote < gap.lo))
+        proof = GAP_PROVEN;
+    else if (quoted && lastQuote <= gap.hi)
+        proof = GAP_HOLDS_LAST_QUOTE;
+    else if (!gap.rowsAfter && !RecordAfter(r, run, gap, span))
+        proof = GAP_NO_RECORD_AFTER;
+    else if (!gap.rowsBefore && !RowBefore(r, run, gap))
+        proof = GAP_NO_ROW_BEFORE;
+    return proof;
+}
+
+string Unproven(const HistoryRequest *r, const ENUM_GAP_PROOF proof)
+{
+    string reason = "";
+    switch (proof)
+    {
+    case GAP_HOLDS_LAST_QUOTE:
+        reason = StringFormat("the last quote, broker %I64d, lies in it", r.quoteTime);
+        break;
+    case GAP_NO_RECORD_AFTER:
+        reason = "no record follows it";
+        break;
+    case GAP_NO_ROW_BEFORE:
+        reason = "no row precedes it";
+        break;
+    }
+    return reason;
+}
+
+bool RecordAfter(const HistoryRequest *r, HistoryRun &run, const Gap &gap, const long span)
+{
+    if (IsBars(r))
+        return BarAfter(r, run, gap, span);
+    else
+        return TickAfter(r, run, gap);
+}
+
+bool RowBefore(const HistoryRequest *r, HistoryRun &run, const Gap &gap)
+{
+    if (IsBars(r))
+        return BarBefore(r, run, gap);
+    else
+        return TicksBefore(r, run, gap);
+}
+
+// Stops the run unproven unless no bar lies in the gap, and leaves the floor then in force in
+// `floor`: a kept floor is measured again for a gap no row precedes, since the terminal answers a
+// window between a stale floor and its own with its own first bar alone.
+void ProveNoBars(const HistoryRequest *r, HistoryRun &run, const Gap &gap, const long span,
+                 Floor &floor, const bool kept)
+{
+    if (kept && !gap.rowsBefore && gap.hi >= floor.value)
+    {
+        Floor measured;
+        ZeroMemory(measured);
+        MeasureBarFloor(r, run, measured);
+        if (run.Going() && measured.held)
+            floor = measured;
+    }
+    if (run.Going() && !(floor.held && gap.hi < floor.value))
+    {
+        const ENUM_GAP_PROOF proof = ProveGap(r, run, gap, span);
+        if (run.Going() && proof != GAP_PROVEN)
+            run.Stop(RUN_UNPROVEN, StringFormat("no %s bar for broker %I64d..%I64d: %s",
+                                                SeriesName(r), gap.lo, gap.hi, Unproven(r, proof)),
+                     run.lastError);
+    }
+}
+
+// The bars opened in [lo, the request's end], read chunk by chunk, on the series' grid and from its
+// floor on, into the request's rates; stops the run unproven for a stretch no chunk answered a bar
+// for that nothing proves empty.
+void ReadBars(HistoryRequest *r, HistoryRun &run, const long lo, const long span, Floor &floor,
+              const bool kept)
+{
+    NeedChunks(r, run, lo, span);
+    long los[];
+    long his[];
+    Chunks(lo, r.to, span, los, his);
+    const int chunks = ArraySize(los);
+    int counts[];
+    ArrayResize(counts, chunks);
+    ArrayInitialize(counts, 0);
+    MqlRates rows[];
+    for (int i = 0; i < chunks && run.Going(); i++)
+    {
+        MqlRates part[];
+        if (ReadRates(r, run, los[i], his[i], part))
+        {
+            KeepRatesWithin(part, los[i], his[i]);
+            counts[i] = ArraySize(part);
+            const int at = ArraySize(rows);
+            ArrayResize(rows, at + counts[i]);
+            ArrayCopy(rows, part, at, 0, counts[i]);
+        }
+    }
+    int offGrid = -1;
+    if (run.Going())
+        offGrid = FirstOffGrid(rows, r.period);
+    if (offGrid >= 0)
+        run.Stop(RUN_FAILED, StringFormat("%s %s: row broker %I64d is off the grid", r.symbol,
+                                          SeriesName(r), (long)rows[offGrid].time),
+                 0);
+    // The chunks before the first that answered rows and those after the last, or the whole window
+    // when none did; a chunk between two that answered rows is bracketed by them.
+    int first = -1;
+    int last = -1;
+    for (int i = 0; i < chunks; i++)
+    {
+        if (counts[i] > 0 && first < 0)
+            first = i;
+        if (counts[i] > 0)
+            last = i;
+    }
+    Gap gap;
+    if (run.Going() && first < 0)
+    {
+        gap.lo = los[0];
+        gap.hi = his[chunks - 1];
+        gap.rowsBefore = false;
+        gap.rowsAfter = false;
+        ProveNoBars(r, run, gap, span, floor, kept);
+    }
+    if (run.Going() && first > 0)
+    {
+        gap.lo = los[0];
+        gap.hi = his[first - 1];
+        gap.rowsBefore = false;
+        gap.rowsAfter = true;
+        ProveNoBars(r, run, gap, span, floor, kept);
+    }
+    if (run.Going() && last >= 0 && last < chunks - 1)
+    {
+        gap.lo = los[last + 1];
+        gap.hi = his[chunks - 1];
+        gap.rowsBefore = true;
+        gap.rowsAfter = false;
+        ProveNoBars(r, run, gap, span, floor, kept);
+    }
+    // A coarse prefix can only lead a series, so it is sought only in an answer beginning at the
+    // floor the gap proofs leave in force.
+    if (run.Going() && floor.held && ArraySize(rows) > 0 && (long)rows[0].time == floor.value)
+    {
+        const int prefix = CoarsePrefix(rows, r.period);
+        if (prefix > 0)
+        {
+            WriteFloor(run, run.series, (long)rows[prefix].time, FLOOR_ORIGIN_COARSE, floor);
+            PrintFormat("ticks: '%s' %s: %d daily-spaced rows dropped; the floor is broker %I64d",
+                        r.symbol, SeriesName(r), prefix, floor.value);
+        }
+    }
+    if (run.Going() && floor.held)
+        KeepRatesWithin(rows, floor.value, r.to);
+    if (run.Going())
+        ArraySwap(r.rates, rows);
+}
+
+void RunBars(HistoryRequest *r, HistoryRun &run)
+{
+    long span = 0;
+    if (SelectSymbol(r, run) && SpanSeconds(r, run, span))
+    {
+        Floor floor;
+        floor = run.floor;
+        const bool kept = IsFresh(floor);
+        if (!kept)
+            MeasureBarFloor(r, run, floor);
+        if (run.Going() && floor.held && r.to < floor.value)
+            ArrayFree(r.rates);
+        else if (run.Going() && floor.held)
+            ReadBars(r, run, Latest(r.from, floor.value), span, floor, kept);
+        else if (run.Going())
+            ReadBars(r, run, r.from, span, floor, kept);
+    }
+}
+
+// ── Ticks ────────────────────────────────────────────────────────────────────────────────────────
+
+// Makes the tick read until the terminal settles its answer, into `rows`, its error the run's
+// lastError: a call answering a loading error is made again, and between calls the hub's frames are
+// read and every busy that falls due renewed; while a call waits, nothing else of this
+// single-threaded EA runs. False, the run stopped unproven, for an answer with an error, a request
+// past its busy's bound, or a connection or chart going meanwhile.
+bool SettleTicks(const HistoryRequest *r, HistoryRun &run, const ENUM_TICK_READ read,
+                 const long fromMsc, const long toOrCount, const uint flags, MqlTick &rows[])
+{
+    const ulong bound = (ulong)HUB_TICK_BUSY_S * 1000;
+    const string unsettled = StringFormat("%s ticks: not settled within %d s", r.symbol,
+                                          HUB_TICK_BUSY_S);
+    bool settled = false;
+    int copied = -1;
+    int attempt = 0;
+    while (run.Going() && !settled)
+    {
+        const ulong now = GetTickCount64();
+        if (now - r.arrivedAt >= bound)
+        {
+            run.Stop(RUN_UNPROVEN, unsettled, ERR_HISTORY_TIMEOUT);
+        }
+        else if (g_closing)
+        {
+            run.Stop(RUN_UNPROVEN, "the chart is closing", 0);
+        }
+        else if (!wss.isConnected())
+        {
+            run.Stop(RUN_UNPROVEN, "the hub connection is lost", 0);
         }
         else
         {
+            for (int i = 0; i < ArraySize(g_history); i++)
+                RenewBusy(g_history[i], now);
+            attempt++;
+            const ulong started = GetMicrosecondCount();
             ResetLastError();
-            switch (Role)
+            if (read == TICK_READ_RANGE)
+                copied = CopyTicksRange(r.symbol, rows, flags, (ulong)fromMsc, (ulong)toOrCount);
+            else
+                copied = CopyTicks(r.symbol, rows, flags, (ulong)fromMsc, (uint)toOrCount);
+            run.lastError = GetLastError();
+            long first = 0;
+            if (copied > 0)
+                first = rows[0].time_msc;
+            PrintFormat("ticks: request %I64u reads %s %I64d,%I64d, call %d: %d rows, error %d, "
+                        "first %I64d, in %.3f s", r.id, EnumToString(read), fromMsc, toOrCount,
+                        attempt, copied, run.lastError, first,
+                        (double)(GetMicrosecondCount() - started) / 1000000.0);
+            const bool loading = run.lastError == ERR_HISTORY_NOT_FOUND
+                                 || run.lastError == ERR_HISTORY_TIMEOUT
+                                 || (copied < 0 && run.lastError == 0);
+            // A call that returns past the bound answers nothing, whatever it read.
+            if (GetTickCount64() - r.arrivedAt >= bound)
             {
-            case ROLE_SPAWNER:
-                ServeAccount((ENUM_HUB_CALL)code, arguments, answer);
-                break;
-            case ROLE_PUBLISHER:
-                ServeSymbol((ENUM_HUB_CALL)code, arguments, answer);
-                break;
+                run.Stop(RUN_UNPROVEN, unsettled, ERR_HISTORY_TIMEOUT);
             }
-            lastError = GetLastError();
+            else if (loading)
+            {
+                const long left = TICK_CALL_SPACING_MS
+                                  - (long)((GetMicrosecondCount() - started) / 1000);
+                if (left > 0)
+                    Sleep((int)left);
+                ReadHub();
+            }
+            else
+            {
+                settled = true;
+            }
         }
     }
-    SendAnswer(requestId, answer, lastError);
+    const bool succeeded = settled && copied >= 0 && run.lastError == 0;
+    if (settled && !succeeded)
+        run.Stop(RUN_UNPROVEN, StringFormat("%s ticks %s %I64d,%I64d: %d rows, last_error %d",
+                                            r.symbol, EnumToString(read), fromMsc, toOrCount,
+                                            copied, run.lastError),
+                 run.lastError);
+    return succeeded;
 }
+
+// The ticks' floor, recorded, and the floor then in force in `floor`: the first tick of every kind
+// the terminal answers from 1970-01-02; none when it answers none.
+void MeasureTickFloor(const HistoryRequest *r, HistoryRun &run, Floor &floor)
+{
+    MqlTick rows[];
+    if (SettleTicks(r, run, TICK_READ_FROM, (long)BEFORE_HISTORY_SECONDS * 1000, 1, COPY_TICKS_ALL,
+                    rows)
+        && ArraySize(rows) > 0)
+        WriteFloor(run, run.series, rows[0].time_msc, FLOOR_ORIGIN_STUB, floor);
+}
+
+// Whether the first tick from the gap's last second lies after it.
+bool TickAfter(const HistoryRequest *r, HistoryRun &run, const Gap &gap)
+{
+    MqlTick rows[];
+    return SettleTicks(r, run, TICK_READ_FROM, gap.hi * 1000, 1, r.flags, rows)
+           && ArraySize(rows) > 0 && rows[0].time_msc > gap.hi * 1000 + 999;
+}
+
+// Whether the day, or failing that the week, of the window the gap is answers a tick before the gap
+// and none in it; each only where it is wider than the read before it.
+bool TicksBefore(const HistoryRequest *r, HistoryRun &run, const Gap &gap)
+{
+    long dayLo = 0;
+    long dayHi = 0;
+    long weekLo = 0;
+    long weekHi = 0;
+    Containing(gap.lo, gap.hi, DAY_SECONDS, 0, dayLo, dayHi);
+    Containing(gap.lo, gap.hi, WEEK_SECONDS, FIRST_MONDAY_SECONDS, weekLo, weekHi);
+    long los[];
+    long his[];
+    if (dayLo != gap.lo || dayHi != gap.hi)
+    {
+        ArrayResize(los, 1);
+        ArrayResize(his, 1);
+        los[0] = dayLo;
+        his[0] = dayHi;
+    }
+    if (weekLo != dayLo || weekHi != dayHi)
+    {
+        const int n = ArraySize(los);
+        ArrayResize(los, n + 1);
+        ArrayResize(his, n + 1);
+        los[n] = weekLo;
+        his[n] = weekHi;
+    }
+    bool before = false;
+    bool decided = false;
+    for (int i = 0; i < ArraySize(los) && !decided; i++)
+    {
+        MqlTick rows[];
+        if (!SettleTicks(r, run, TICK_READ_RANGE, los[i] * 1000, his[i] * 1000 + 999, r.flags,
+                         rows))
+        {
+            decided = true;
+        }
+        else
+        {
+            bool inGap = false;
+            bool earlier = false;
+            for (int k = 0; k < ArraySize(rows); k++)
+            {
+                if (rows[k].time_msc >= gap.lo * 1000 && rows[k].time_msc <= gap.hi * 1000 + 999)
+                    inGap = true;
+                else if (rows[k].time_msc < gap.lo * 1000)
+                    earlier = true;
+            }
+            if (inGap)
+            {
+                decided = true;
+            }
+            else if (earlier)
+            {
+                before = true;
+                decided = true;
+            }
+        }
+    }
+    return before;
+}
+
+// Stops the run unproven unless no tick lies in the gap. The ticks' floor is measured only for a
+// gap no tick precedes, the one gap it can prove, when none is held.
+void ProveNoTicks(const HistoryRequest *r, HistoryRun &run, const Gap &gap, Floor &floor)
+{
+    if (!(floor.held && gap.hi * 1000 + 999 < floor.value))
+    {
+        ENUM_GAP_PROOF proof = ProveGap(r, run, gap, 0);
+        if (run.Going() && proof == GAP_NO_ROW_BEFORE && !floor.held)
+        {
+            MeasureTickFloor(r, run, floor);
+            if (run.Going() && floor.held && gap.hi * 1000 + 999 < floor.value)
+                proof = GAP_PROVEN;
+        }
+        if (run.Going() && proof != GAP_PROVEN)
+            run.Stop(RUN_UNPROVEN, StringFormat("no tick for broker %I64d..%I64d: %s", gap.lo,
+                                                gap.hi, Unproven(r, proof)),
+                     run.lastError);
+    }
+}
+
+// The ticks from the start of second `from` through the end of the request's last second, in time
+// order, into the request's ticks; stops the run unproven when there are none and nothing proves
+// the window empty.
+void ReadTickWindow(HistoryRequest *r, HistoryRun &run, const long from, Floor &floor)
+{
+    MqlTick rows[];
+    if (SettleTicks(r, run, TICK_READ_RANGE, from * 1000, r.to * 1000 + 999, r.flags, rows))
+    {
+        KeepTicksWithin(rows, from * 1000, r.to * 1000 + 999);
+        if (ArraySize(rows) == 0)
+        {
+            Gap gap;
+            gap.lo = from;
+            gap.hi = r.to;
+            gap.rowsBefore = false;
+            gap.rowsAfter = false;
+            ProveNoTicks(r, run, gap, floor);
+        }
+        const int decrease = FirstDecrease(rows);
+        if (run.Going() && decrease >= 0)
+            run.Stop(RUN_FAILED, StringFormat("%s ticks: row broker msc %I64d is out of order",
+                                              r.symbol, rows[decrease].time_msc),
+                     0);
+        if (run.Going())
+            ArraySwap(r.ticks, rows);
+    }
+}
+
+// The window's ticks, read first: the ticks' floor, once held, stands, and a window wholly before
+// it is empty without a read.
+void RunTicks(HistoryRequest *r, HistoryRun &run)
+{
+    if (SelectSymbol(r, run))
+    {
+        Floor floor;
+        floor = run.floor;
+        if (floor.held && r.to * 1000 + 999 < floor.value)
+            ArrayFree(r.ticks);
+        else if (floor.held)
+            ReadTickWindow(r, run, Latest(r.from, floor.value / 1000), floor);
+        else
+            ReadTickWindow(r, run, r.from, floor);
+    }
+}
+
+// ── The count reads, answered as the terminal reads them ─────────────────────────────────────────
+
+void RunCountRead(HistoryRequest *r, HistoryRun &run)
+{
+    if (IsBars(r))
+    {
+        HistoryWindow window;
+        SetWindow(window, HUB_EVENT_ASK_RATES_FROM, r.timeframe, r.from, r.to);
+        if (Need(r, run, window))
+        {
+            ResetLastError();
+            const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)r.timeframe, (datetime)r.from,
+                                         (int)r.to, r.rates);
+            run.lastError = GetLastError();
+            if (copied < 0)
+                run.Stop(RUN_FAILED, StringFormat("%s: the read failed", Described(r)),
+                         run.lastError);
+        }
+    }
+    else
+    {
+        SettleTicks(r, run, TICK_READ_FROM, r.from * 1000, r.to, r.flags, r.ticks);
+    }
+}
+
+// ── A request's stages and answer ────────────────────────────────────────────────────────────────
+
+int HistoryIndex(const HistoryRequest *r)
+{
+    for (int i = 0; i < ArraySize(g_history); i++)
+        if (g_history[i] == r)
+            return i;
+    return -1;
+}
+
+// Takes the request off the ones in flight; the indicator forgets what it still syncs for it.
+void DropHistory(HistoryRequest *r)
+{
+    if (ArraySize(r.stage) > r.readies
+        && !EventChartCustom(0, (ushort)HUB_EVENT_FORGET, (long)r.id, 0.0, ""))
+        PrintFormat("ticks: the indicator was not told to forget request %I64u: %d", r.id,
+                    GetLastError());
+    const int index = HistoryIndex(r);
+    if (index >= 0)
+        ArrayRemove(g_history, index, 1);
+    delete r;
+}
+
+void DropAllHistory()
+{
+    for (int i = ArraySize(g_history) - 1; i >= 0; i--)
+        DropHistory(g_history[i]);
+}
+
+void AnswerSyncing(HistoryRequest *r, const string reason, const int error)
+{
+    PrintFormat("ticks: request %I64u, %s: syncing: %s", r.id, Described(r), reason);
+    SendError(r.id, HUB_ERROR_SYNCING, Described(r) + ": syncing", error);
+    DropHistory(r);
+}
+
+// Asks the indicator to sync the windows as the request's next stage; the hub hears the request is
+// busy for at most the history deadline.
+void AskIndicator(HistoryRequest *r, const HistoryWindow &windows[])
+{
+    ArrayFree(r.stage);
+    r.readies = 0;
+    r.stageError = 0;
+    r.askedAt = GetTickCount64();
+    int failed = 0;
+    for (int i = 0; i < ArraySize(windows) && failed == 0; i++)
+    {
+        const string text = StringFormat("%d,%I64d,%I64d", windows[i].timeframe, windows[i].from,
+                                         windows[i].to);
+        ResetLastError();
+        if (EventChartCustom(0, (ushort)windows[i].ask, (long)r.id, 0.0, text))
+        {
+            const int n = ArraySize(r.stage);
+            ArrayResize(r.stage, n + 1);
+            r.stage[n] = windows[i];
+            PrintFormat("ticks: request %I64u asks the indicator: %s %s", r.id,
+                        EnumToString(windows[i].ask), text);
+        }
+        else
+        {
+            failed = GetLastError();
+        }
+    }
+    if (failed != 0)
+    {
+        SendError(r.id, HUB_ERROR_EA_ERROR, "EventChartCustom failed", failed);
+        DropHistory(r);
+    }
+    else
+    {
+        SendBusy(r.id, HUB_HISTORY_DEADLINE_S);
+    }
+}
+
+// The floor fact a range read's last part carries: the series' floor as the store holds it when the
+// hub has not heard it, whichever request measured it; none for a count read.
+int FloorFact(const HistoryRequest *r, uchar &fact[])
+{
+    const int index = FloorIndex(SeriesOf(r));
+    const bool range = r.call == HUB_CALL_COPY_RATES_RANGE || r.call == HUB_CALL_COPY_TICKS_RANGE;
+    BinaryWriter writer;
+    int carried = -1;
+    if (range && index >= 0 && g_floors[index].held && !g_floors[index].published)
+    {
+        writer.U8(1);
+        writer.I64(g_floors[index].value);
+        writer.String(FloorOriginName(g_floors[index].origin));
+        carried = index;
+    }
+    else
+    {
+        writer.U8(0);
+    }
+    writer.Take(fact);
+    return carried;
+}
+
+// Sends the request's next part; true once the last is sent. The last carries the floor fact as the
+// store stands when it goes, and the floor it carries is the hub's from then on.
+bool SendRowsPart(HistoryRequest *r)
+{
+    int size = HUB_TICK_SIZE;
+    if (IsBars(r))
+        size = HUB_RATES_SIZE;
+    uchar fact[];
+    const int carried = FloorFact(r, fact);
+    const int rows = RowCount(r);
+    const int count = (int)Earliest((HUB_PART_BYTES - ArraySize(fact)) / size, rows - r.sent);
+    const bool last = r.sent + count == rows;
+    ushort flags = HUB_FLAG_OK;
+    if (last)
+        flags = HUB_FLAG_OK | HUB_FLAG_LAST;
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_ANSWER, flags, r.id);
+    frame.U32(r.part);
+    frame.I32(r.lastError);
+    if (IsBars(r))
+        frame.Rows(r.rates, r.sent, count);
+    else
+        frame.Rows(r.ticks, r.sent, count);
+    if (last)
+        frame.Bytes(fact, 0, ArraySize(fact));
+    frame.Seal((uint)count);
+    Send(frame);
+    if (last && carried >= 0)
+        g_floors[carried].published = true;
+    r.sent += count;
+    r.part++;
+    return last;
+}
+
+// Starts the request's answer. Rows past one part go out a part per timer pass, so no pass waits on
+// them, under a busy: a bar request's sent now, a tick request's the one it holds while in flight.
+void StartAnswer(HistoryRequest *r, const HistoryRun &run)
+{
+    r.answering = true;
+    r.lastError = run.lastError;
+    PrintFormat("ticks: request %I64u, %s: %d rows", r.id, Described(r), RowCount(r));
+    if (SendRowsPart(r))
+    {
+        DropHistory(r);
+    }
+    else if (IsBars(r))
+    {
+        SendBusy(r.id, HUB_HISTORY_DEADLINE_S);
+        r.busyAt = GetTickCount64();
+    }
+}
+
+// Runs the request's rules — a bar request's over the windows synced for it, a tick request's over
+// its reads — and acts on where they end: asks the indicator for the windows they need, answers
+// syncing or the failure, or starts the answer.
+void Evaluate(HistoryRequest *r)
+{
+    HistoryRun run;
+    run.series = SeriesOf(r);
+    StoredFloor(run.series, run.floor);
+    switch (r.call)
+    {
+    case HUB_CALL_COPY_RATES_RANGE:
+        RunBars(r, run);
+        break;
+    case HUB_CALL_COPY_TICKS_RANGE:
+        RunTicks(r, run);
+        break;
+    default:
+        RunCountRead(r, run);
+        break;
+    }
+    if (run.state != RUN_SYNCING)
+        CommitFloors(run);
+    switch (run.state)
+    {
+    case RUN_SYNCING:
+        AskIndicator(r, run.needed);
+        break;
+    case RUN_UNPROVEN:
+        AnswerSyncing(r, run.why, run.error);
+        break;
+    case RUN_FAILED:
+        PrintFormat("ticks: request %I64u, %s: %s", r.id, Described(r), run.why);
+        SendError(r.id, HUB_ERROR_EA_ERROR, run.why, run.error);
+        DropHistory(r);
+        break;
+    case RUN_GOING:
+        StartAnswer(r, run);
+        break;
+    }
+}
+
+// Takes a history request: refused at once when out of what this EA serves or a window that starts
+// after it ends or after the terminal's time; otherwise a bar request is run at once, and a tick
+// request, whose reads wait, from the timer — never inside another's — busy from its arrival.
+void StartHistory(const ulong requestId, const ENUM_HUB_CALL call, RequestArguments &arguments)
+{
+    HistoryRequest *r = new HistoryRequest(requestId, call);
+    switch (call)
+    {
+    case HUB_CALL_COPY_RATES_RANGE:
+        r.symbol = arguments.String(HUB_ARG_COPY_RATES_RANGE_SYMBOL);
+        r.timeframe = (int)arguments.Integer(HUB_ARG_COPY_RATES_RANGE_TIMEFRAME);
+        r.from = arguments.Integer(HUB_ARG_COPY_RATES_RANGE_DATE_FROM);
+        r.to = arguments.Integer(HUB_ARG_COPY_RATES_RANGE_DATE_TO);
+        break;
+    case HUB_CALL_COPY_RATES_FROM:
+        r.symbol = arguments.String(HUB_ARG_COPY_RATES_FROM_SYMBOL);
+        r.timeframe = (int)arguments.Integer(HUB_ARG_COPY_RATES_FROM_TIMEFRAME);
+        r.from = arguments.Integer(HUB_ARG_COPY_RATES_FROM_DATE_FROM);
+        r.to = arguments.Integer(HUB_ARG_COPY_RATES_FROM_COUNT);
+        break;
+    case HUB_CALL_COPY_TICKS_RANGE:
+        r.symbol = arguments.String(HUB_ARG_COPY_TICKS_RANGE_SYMBOL);
+        r.from = arguments.Integer(HUB_ARG_COPY_TICKS_RANGE_DATE_FROM);
+        r.to = arguments.Integer(HUB_ARG_COPY_TICKS_RANGE_DATE_TO);
+        r.flags = (uint)arguments.Integer(HUB_ARG_COPY_TICKS_RANGE_FLAGS);
+        break;
+    case HUB_CALL_COPY_TICKS_FROM:
+        r.symbol = arguments.String(HUB_ARG_COPY_TICKS_FROM_SYMBOL);
+        r.from = arguments.Integer(HUB_ARG_COPY_TICKS_FROM_DATE_FROM);
+        r.to = arguments.Integer(HUB_ARG_COPY_TICKS_FROM_COUNT);
+        r.flags = (uint)arguments.Integer(HUB_ARG_COPY_TICKS_FROM_FLAGS);
+        break;
+    }
+    const bool range = call == HUB_CALL_COPY_RATES_RANGE || call == HUB_CALL_COPY_TICKS_RANGE;
+    const long now = (long)TimeTradeServer();
+    string series = "";
+    if (r.symbol != _Symbol)
+    {
+        SendError(requestId, HUB_ERROR_EA_ERROR,
+                  StringFormat("the history of '%s' is not this chart's", r.symbol),
+                  ERR_INVALID_PARAMETER);
+        delete r;
+    }
+    else if (IsBars(r) && !HubSeries(r.timeframe, series, r.period))
+    {
+        SendError(requestId, HUB_ERROR_EA_ERROR,
+                  StringFormat("timeframe %d has no history series", r.timeframe),
+                  ERR_INVALID_PARAMETER);
+        delete r;
+    }
+    else if (!range && (r.to < 0 || r.to > INT_MAX))
+    {
+        SendError(requestId, HUB_ERROR_EA_ERROR, StringFormat("count %I64d is out of range", r.to),
+                  ERR_INVALID_PARAMETER);
+        delete r;
+    }
+    else if (range && r.from > r.to)
+    {
+        SendError(requestId, HUB_ERROR_INVALID_WINDOW, "the window starts after it ends", 0);
+        delete r;
+    }
+    else if (range && r.from > now)
+    {
+        SendError(requestId, HUB_ERROR_INVALID_WINDOW,
+                  StringFormat("the window starts at broker %I64d, after the terminal's time %I64d",
+                               r.from, now),
+                  0);
+        delete r;
+    }
+    else
+    {
+        MqlTick tick;
+        ZeroMemory(tick);
+        ResetLastError();
+        r.quoteRead = SymbolInfoTick(r.symbol, tick);
+        r.quoteError = GetLastError();
+        r.quoteTime = (long)tick.time;
+        r.present = now;
+        const int n = ArraySize(g_history);
+        ArrayResize(g_history, n + 1);
+        g_history[n] = r;
+        if (IsBars(r))
+        {
+            Evaluate(r);
+        }
+        else
+        {
+            r.arrivedAt = GetTickCount64();
+            r.busyAt = r.arrivedAt;
+            SendBusy(r.id, HUB_TICK_BUSY_S);
+            PrintFormat("ticks: request %I64u, %s: busy for %d s", r.id, Described(r),
+                        HUB_TICK_BUSY_S);
+        }
+    }
+}
+
+// A ready the indicator signalled for a request: once every window of its stage is ready, the rules
+// run again; a window that carried an error leaves the request unproven.
+void OnHistoryReady(const ENUM_HUB_EVENT kind, const long requestId, const double rows,
+                    const string answer)
+{
+    HistoryRequest *r = NULL;
+    for (int i = 0; i < ArraySize(g_history) && r == NULL; i++)
+        if (g_history[i].id == (ulong)requestId && !g_history[i].answering)
+            r = g_history[i];
+    if (r == NULL || r.readies >= ArraySize(r.stage))
+    {
+        PrintFormat("ticks: %s for request %I64d, which waits for none", EnumToString(kind),
+                    requestId);
+    }
+    else
+    {
+        // "<error>,<first row's time>"
+        string fields[];
+        int carried = ERR_INVALID_PARAMETER;
+        long first = 0;
+        if (StringSplit(answer, ',', fields) == 2)
+        {
+            carried = (int)StringToInteger(fields[0]);
+            first = StringToInteger(fields[1]);
+        }
+        r.readies++;
+        if (r.stageError == 0)
+            r.stageError = carried;
+        // Readies name no window, so only a stage of one window keeps what its read answered.
+        if (ArraySize(r.stage) == 1)
+        {
+            r.stage[0].answered = true;
+            r.stage[0].rows = (int)rows;
+            r.stage[0].first = first;
+        }
+        PrintFormat("ticks: request %I64u: %s, %d rows, error %d, first %I64d (%d of %d)", r.id,
+                    EnumToString(kind), (int)rows, carried, first, r.readies, ArraySize(r.stage));
+        if (r.readies == ArraySize(r.stage) && r.stageError != 0)
+        {
+            AnswerSyncing(r, StringFormat("the indicator's read left error %d", r.stageError),
+                          r.stageError);
+        }
+        else if (r.readies == ArraySize(r.stage))
+        {
+            for (int k = 0; k < ArraySize(r.stage); k++)
+            {
+                const int n = ArraySize(r.synced);
+                ArrayResize(r.synced, n + 1);
+                r.synced[n] = r.stage[k];
+            }
+            ArrayFree(r.stage);
+            r.readies = 0;
+            Evaluate(r);
+        }
+    }
+}
+
+// Tells the hub again that the request is busy once its last busy falls due: a tick request's at a
+// third of its bound while in flight, since another's reads may hold the EA meanwhile; a bar
+// request's every half deadline while its answer streams.
+void RenewBusy(HistoryRequest *r, const ulong now)
+{
+    if (!IsBars(r) && now - r.busyAt >= (ulong)TICK_BUSY_RENEWAL_S * 1000)
+    {
+        SendBusy(r.id, HUB_TICK_BUSY_S);
+        r.busyAt = now;
+        PrintFormat("ticks: request %I64u: busy again for %d s", r.id, HUB_TICK_BUSY_S);
+    }
+    else if (IsBars(r) && r.answering && now - r.busyAt >= (ulong)HUB_HISTORY_DEADLINE_S * 500)
+    {
+        SendBusy(r.id, HUB_HISTORY_DEADLINE_S);
+        r.busyAt = now;
+    }
+}
+
+// Runs the oldest tick request not yet run, whose reads may hold this pass for minutes; then each
+// request's next answer part, every busy that falls due, and syncing for a stage not ready within
+// the history deadline.
+void ServeHistory()
+{
+    HistoryRequest *waiting = NULL;
+    for (int i = 0; i < ArraySize(g_history) && waiting == NULL; i++)
+        if (!IsBars(g_history[i]) && !g_history[i].answering)
+            waiting = g_history[i];
+    if (waiting != NULL)
+        Evaluate(waiting);
+    const ulong now = GetTickCount64();
+    for (int i = ArraySize(g_history) - 1; i >= 0; i--)
+    {
+        HistoryRequest *r = g_history[i];
+        if (r.answering && SendRowsPart(r))
+        {
+            DropHistory(r);
+        }
+        else if (!r.answering && ArraySize(r.stage) > 0
+                 && now - r.askedAt >= (ulong)HUB_HISTORY_DEADLINE_S * 1000)
+        {
+            AnswerSyncing(r, StringFormat("not synced within %d s", HUB_HISTORY_DEADLINE_S),
+                          ERR_HISTORY_TIMEOUT);
+        }
+        else
+        {
+            RenewBusy(r, now);
+        }
+    }
+}
+
+// The history indicator on the chart, which the publisher's history reads sync through.
+int g_historyIndicator = INVALID_HANDLE;
+
+bool AttachHistoryIndicator()
+{
+    ResetLastError();
+    g_historyIndicator = iCustom(_Symbol, PERIOD_M1, HUB_HISTORY_INDICATOR);
+    bool attached = false;
+    if (g_historyIndicator == INVALID_HANDLE)
+        PrintFormat("ticks: iCustom %s failed: %d", HUB_HISTORY_INDICATOR, GetLastError());
+    else if (!ChartIndicatorAdd(0, 0, g_historyIndicator))
+        PrintFormat("ticks: ChartIndicatorAdd %s failed: %d", HUB_HISTORY_INDICATOR,
+                    GetLastError());
+    else
+        attached = true;
+    return attached;
+}
+
+// Takes the indicator off the chart as well as releasing it, so a re-initialised EA attaches the
+// chart's one indicator again rather than a second.
+void DetachHistoryIndicator()
+{
+    if (g_historyIndicator != INVALID_HANDLE)
+    {
+        if (!ChartIndicatorDelete(0, 0, HUB_HISTORY_INDICATOR))
+            PrintFormat("ticks: ChartIndicatorDelete %s failed: %d", HUB_HISTORY_INDICATOR,
+                        GetLastError());
+        IndicatorRelease(g_historyIndicator);
+        g_historyIndicator = INVALID_HANDLE;
+    }
+}
+
 
 // ── Transactions, as the trade_transaction frame and an outcome carry them ───────────────────────
 
@@ -1164,6 +2710,15 @@ void Deselect(const string symbol, const long closed)
     }
 }
 
+// The template that attaches the EA in the role.
+string TemplateOf(const ENUM_CHART_ROLE role)
+{
+    if (role == ROLE_HISTORY)
+        return HistoryTemplate;
+    else
+        return ChartTemplate;
+}
+
 // Have a chart of the role and symbol open, and tell the hub whether one is: a chart whose EA is
 // gone takes its template again, and a chart the spawner opened is loading its EA, so the open is
 // idempotent
@@ -1181,7 +2736,7 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
     else if (marked >= 0)
     {
         ResetLastError();
-        if (ChartApplyTemplate(marked, ChartTemplate))
+        if (ChartApplyTemplate(marked, TemplateOf(role)))
         {
             RememberOpened(marked, role, symbol);
             PrintFormat("ticks: the %s chart of '%s' takes its template again", ChartRoleName(role),
@@ -1213,7 +2768,7 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
                 failing = "ChartOpen";
                 error = GetLastError();
             }
-            else if (!ChartApplyTemplate(chart, ChartTemplate))
+            else if (!ChartApplyTemplate(chart, TemplateOf(role)))
             {
                 failing = "ChartApplyTemplate";
                 error = GetLastError();
@@ -1518,6 +3073,9 @@ void Reconnect()
     g_helloSent = false;
     g_refused = false;
     ClearWanted();
+    // The hub answered every request of the connection that left.
+    DropAllHistory();
+    UnpublishFloors();
     Print("Reconnecting");
     if (!wss.open())
         Print("Failed to reconnect to server");
@@ -1564,6 +3122,8 @@ int OnInit()
     }
     if (!PodsPackToTheProtocol())
         return INIT_FAILED;
+    if (Role == ROLE_PUBLISHER && !AttachHistoryIndicator())
+        return INIT_FAILED;
     if (!ChartSetString(0, CHART_COMMENT, Marker(Role)))
         PrintFormat("ticks: the chart's role marker is not set: %d", GetLastError());
     // The timer fires whether or not the market ticks, so the EA reconnects, reads the hub and
@@ -1591,6 +3151,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     EventKillTimer();
+    DropAllHistory();
+    DetachHistoryIndicator();
     if (wss != NULL)
     {
         wss.close();
@@ -1620,6 +3182,8 @@ void OnTimer()
             PublishTicks();
             PublishBars();
         }
+        if (Role != ROLE_SPAWNER)
+            ServeHistory();
         if (GetTickCount64() - g_lastRelay >= (ulong)RelaySeconds * 1000)
             Relay();
     }
@@ -1635,6 +3199,14 @@ void OnTick()
         PublishTicks();
         PublishBars();
     }
+}
+
+// The history indicator's readies; the chart's own events and this EA's asks, which come back to
+// it, are not the EA's
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    if (!g_closing && id == CHARTEVENT_CUSTOM + HUB_EVENT_RATES_READY)
+        OnHistoryReady(HUB_EVENT_RATES_READY, lparam, dparam, sparam);
 }
 
 // Every trade transaction of the publisher's symbol, as it arrives, a REQUEST transaction also into

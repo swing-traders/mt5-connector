@@ -15,12 +15,17 @@ from .history_wire import BARS, FloorOrigin, Series
 from .push_wire import ChartRole
 
 # The deadlines a request waits under, which bind the hub and the session alike: a read's answer, a
-# command's answer that it was sent, a history read's without a busy, and the margin past a busy's
-# bound.
+# command's answer that it was sent, a bar history read's without a busy, and the margin past a
+# busy's bound.
 READ_DEADLINE_S = 5.0
 COMMAND_DEADLINE_S = 1.0
 HISTORY_DEADLINE_S = 45.0
 BUSY_MARGIN_S = 10.0
+# A tick read's deadline from the moment it is sent, and the bound of the busy the history EA renews
+# while the read is in flight: the EA repeats the terminal's call until its answer settles, one call
+# can wait past the history deadline, and a read queued behind another's call hears no busy until
+# that call returns.
+TICK_BUSY_S = 900
 # How long a deferred request waits before it is asked again, by default.
 RETRY_AFTER_S = 5.0
 # The most result bytes an EA's answer part carries, which keeps its frame within the hub's 1 MiB
@@ -95,6 +100,8 @@ class Shape(StrEnum):
 
 # The shapes of a result of rows, which alone travels in parts.
 _ROWS = frozenset({Shape.STRUCTS, Shape.TICKS, Shape.RATES, Shape.TRANSACTIONS})
+# The shapes of a history read's result, whose last part carries the floor fact.
+_HISTORY = frozenset({Shape.TICKS, Shape.RATES})
 
 
 class Wait(StrEnum):
@@ -103,6 +110,7 @@ class Wait(StrEnum):
     READ = "read"
     COMMAND = "command"
     HISTORY = "history"
+    TICKS = "ticks"
 
 
 @dataclass(frozen=True)
@@ -175,6 +183,9 @@ def _package(call: Call, name: mirror.FunctionName, role: ChartRole, wait: Wait)
     if name is mirror.FunctionName.ORDER_SEND:
         shape = Shape.STRUCT
         struct_layout = binary.TRADE_RESULT
+    elif name is mirror.FunctionName.SYMBOLS_GET:
+        shape = Shape.STRUCTS
+        struct_layout = binary.SYMBOL_LISTING
     elif function.result is mirror.ResultKind.STRUCT and function.struct is mirror.StructName.TICK:
         shape = Shape.TICK
     elif function.result is mirror.ResultKind.STRUCT:
@@ -249,14 +260,14 @@ CALLS: dict[Call, Row] = {
         _package(
             Call.COPY_TICKS_RANGE,
             mirror.FunctionName.COPY_TICKS_RANGE,
-            ChartRole.PUBLISHER,
-            Wait.HISTORY,
+            ChartRole.HISTORY,
+            Wait.TICKS,
         ),
         _package(
             Call.COPY_TICKS_FROM,
             mirror.FunctionName.COPY_TICKS_FROM,
-            ChartRole.PUBLISHER,
-            Wait.HISTORY,
+            ChartRole.HISTORY,
+            Wait.TICKS,
         ),
         # The hub answers it from the floors it holds and the MaxBars of a terminal_info it asks.
         Row(Call.RANGES, (_SYMBOL,), Shape.RANGES, None, Wait.READ),
@@ -427,7 +438,7 @@ def read_ea_result(row: Row, answer: binary.Answer) -> tuple[object, FloorFact |
     reader = Reader(answer.result)
     value = _read_value(row, reader, answer.count, binary.Sender.EA)
     fact = None
-    if row.wait is Wait.HISTORY and answer.last:
+    if row.shape in _HISTORY and answer.last:
         at = reader.offset
         facts = reader.u8("floors")
         if facts == 1:

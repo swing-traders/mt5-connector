@@ -2,7 +2,8 @@
 //|                                                     wsclient.mqh |
 //|                             Copyright 2020-2022, MetaQuotes Ltd. |
 //|                                             https://www.mql5.com |
-//| Modified for mt5-connector: a message is queued unprinted.       |
+//| Modified for mt5-connector: a message is queued unprinted, and a |
+//| non-blocking read returns at once when nothing has arrived.      |
 //+------------------------------------------------------------------+
 #include <MQL5Book/URL.mqh>
 #include "wsframe.mqh";
@@ -175,7 +176,14 @@ public:
    {
       if(connection == NULL) return;
       
-      uint stop = GetTickCount() + (blocking ? timeOut : 1);
+      // one pass over what the socket holds: an idle read does not spin until the tick count moves
+      if(!blocking)
+      {
+         if(isConnected()) connection.checkMessages();
+         return;
+      }
+      
+      uint stop = GetTickCount() + timeOut;
       while(ArraySize(messages) == 0 && GetTickCount() < stop && isConnected())
       {
          // all frames are collected into corresponding messages (onMessage)

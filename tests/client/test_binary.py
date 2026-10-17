@@ -27,9 +27,8 @@ TABLE = {
     "TerminalInfo": (
         "community_account community_connection connected dlls_allowed trade_allowed "
         "email_enabled ftp_enabled notifications_enabled mqid build maxbars codepage ping_last "
-        "community_balance retransmission company name language path data_path "
-        "commondata_path".split(),
-        "IIIIIIIIIIIIIDDSSSSSS",
+        "retransmission company name language path data_path commondata_path".split(),
+        "IIIIIIIIIIIIIDSSSSSS",
         [
             "community_account",
             "community_connection",
@@ -228,6 +227,40 @@ def test_each_struct_travels_as_the_property_types_table_types_its_members(name)
         _ACCESSORS[code] for code in codes
     ]
     assert sorted(m.name for m in typed if m.declared is mirror.MqlType.BOOL) == bools
+
+
+# A symbol's definition, in SymbolInfo's order: every member but its market state, which the
+# terminal refuses for a symbol outside Market Watch — the sixteen it named first, `visible` to
+# `last`, `bank`, and the market and session values the reference describes beside them.
+LISTING_FIELDS = (
+    "custom chart_mode select digits spread_float ticks_bookdepth trade_calc_mode trade_mode "
+    "start_time expiration_time trade_stops_level trade_freeze_level trade_exemode swap_mode "
+    "swap_rollover3days margin_hedged_use_leg expiration_mode filling_mode order_mode "
+    "order_gtc_mode option_mode option_right option_strike point trade_tick_value "
+    "trade_tick_value_profit trade_tick_value_loss trade_tick_size trade_contract_size "
+    "trade_accrued_interest trade_face_value trade_liquidity_rate volume_min volume_max "
+    "volume_step volume_limit swap_long swap_short margin_initial margin_maintenance "
+    "margin_hedged basis category currency_base currency_profit currency_margin description "
+    "exchange formula isin name page path".split()
+)
+
+
+def test_a_symbol_listing_carries_a_symbols_name_and_its_definition_in_order():
+    listing = binary.SYMBOL_LISTING
+    values = zeroed(listing, name="EURUSD.a", digits=5, trade_mode=4, currency_profit="USD")
+    writer = binary.Writer()
+
+    binary.write_record(writer, listing, values)
+    raw = writer.payload()
+
+    assert (listing.name, listing.key) == ("SymbolListing", "name")
+    assert listing.fields == tuple(LISTING_FIELDS)
+    assert listing.epochs == {
+        "start_time": mirror.EpochUnit.SECONDS,
+        "expiration_time": mirror.EpochUnit.SECONDS,
+    }
+    assert raw[:10] == struct.pack("<H", 8) + b"EURUSD.a"
+    assert binary.read_record(binary.Reader(raw), listing) == values
 
 
 def test_a_symbols_name_travels_as_the_key_ahead_of_its_typed_members():

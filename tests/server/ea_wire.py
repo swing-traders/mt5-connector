@@ -112,7 +112,7 @@ def ea_result(call: calls.Call, value, floor: calls.FloorFact | None = None, *, 
         count, body = len(rows), rows.tobytes()
     else:
         count, body = calls.write_result(row, value)
-    if row.wait is calls.Wait.HISTORY and last:
+    if row.shape in (calls.Shape.RATES, calls.Shape.TICKS) and last:
         writer = Writer()
         if floor is None:
             writer.u8(0)

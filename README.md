@@ -425,7 +425,14 @@ The image tier runs against a built image when `MT5_IMAGE_TEST` names it, as the
 
 The conformance suite's static tier downloads the pinned `MetaTrader5` wheel once into pytest's cache and checks it by sha256; set `MT5_WHEEL_PATH` to a local copy to run without network. Its live tier runs on a Windows host with a terminal and the pinned `MetaTrader5` package installed when `MT5_LIVE_CONFORMANCE=1`. Its live server test, `tests/conformance/test_live_trade_request.py`, runs from any host when `MT5_LIVE_SERVER_URL` names a running server, and checks a market request on the symbol the server's `/health` names through the client shim without placing it.
 
-The live hub tier, `tests/live/`, runs from any host when `MT5_LIVE_HUB_URL` names a running image's hub (`ws://host:port`) and `MT5_LIVE_HUB_SYMBOL` a symbol its account trades: every read the spawner and a publisher serve, the symbol's ticks and M1 bars, and a pending order whose expiration has passed, which the venue refuses, so every case leaves the account flat:
+The live hub tier, `tests/live/`, runs from any host when `MT5_LIVE_HUB_URL` names a running image's hub (`ws://host:port`) and `MT5_LIVE_HUB_SYMBOL` a symbol its account trades, weekends included. Every case leaves the account flat:
+
+- every read the spawner and a publisher serve, and a deal read by its ticket;
+- the symbol's ticks and M1 bars;
+- a pending order whose expiration has passed, which the venue refuses, and a command for a symbol no publisher serves;
+- its history: a cold M1 window and the floor it measures, a window before that floor, one starting after the terminal's time, a window one period over the span cap where the terminal's `MaxBars` leaves one, a day of ticks, and a week of ticks, timing a publisher read every second while it downloads.
+
+Run it with:
 
 ```bash
 MT5_LIVE_HUB_URL=ws://<host>:9000 MT5_LIVE_HUB_SYMBOL=<symbol> pytest tests/live -q

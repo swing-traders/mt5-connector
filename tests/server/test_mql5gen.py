@@ -4,28 +4,41 @@ is written from."""
 import re
 import subprocess
 import sys
+from enum import StrEnum
 
 import pytest
 
 from mt5connector.server import mql5gen
 from mt5connector.server.wire import binary, calls, mirror
-from mt5connector.server.wire.push_wire import ChartRole
+from mt5connector.server.wire.history_wire import BAR_PERIOD_S, BAR_TIMEFRAME, FloorOrigin
+from mt5connector.server.wire.push_wire import ChartRole, HistoryEvent
 
 Call = calls.Call
 
+
+class Failure(StrEnum):
+    """How a property read tells its failure: the checked overload's answer, or, for a family with
+    none, the error the read leaves."""
+
+    ANSWERED = "answered"
+    LEFT = "left"
+
+
 # Each record an EA writes: its layout's name, and how MQL5 reads a member of it — a family's
-# property functions with the arguments ahead of the property, or a struct variable's fields.
+# property functions with the arguments ahead of the property and how a failed read tells, or a
+# struct variable's fields.
 WRITERS = {
-    "WriteAccountInfo": ("AccountInfo", "AccountInfo", ""),
-    "WriteTerminalInfo": ("TerminalInfo", "TerminalInfo", ""),
-    "WriteSymbolInfo": ("SymbolInfo", "SymbolInfo", "symbol, "),
-    "WritePosition": ("TradePosition", "PositionGet", ""),
-    "WriteOrder": ("TradeOrder", "OrderGet", ""),
-    "WriteHistoryOrder": ("TradeOrder", "HistoryOrderGet", "ticket, "),
-    "WriteDeal": ("TradeDeal", "HistoryDealGet", "ticket, "),
-    "WriteTradeRequest": ("MqlTradeRequest", "request", None),
-    "WriteTradeResult": ("MqlTradeResult", "result", None),
-    "WriteTradeTransaction": ("MqlTradeTransaction", "trans", None),
+    "WriteAccountInfo": ("AccountInfo", "AccountInfo", "", Failure.LEFT),
+    "WriteTerminalInfo": ("TerminalInfo", "TerminalInfo", "", Failure.LEFT),
+    "WriteSymbolInfo": ("SymbolInfo", "SymbolInfo", "symbol, ", Failure.ANSWERED),
+    "WriteSymbolListing": ("SymbolListing", "SymbolInfo", "symbol, ", Failure.ANSWERED),
+    "WritePosition": ("TradePosition", "PositionGet", "", Failure.ANSWERED),
+    "WriteOrder": ("TradeOrder", "OrderGet", "", Failure.ANSWERED),
+    "WriteHistoryOrder": ("TradeOrder", "HistoryOrderGet", "ticket, ", Failure.ANSWERED),
+    "WriteDeal": ("TradeDeal", "HistoryDealGet", "ticket, ", Failure.ANSWERED),
+    "WriteTradeRequest": ("MqlTradeRequest", "request", None, None),
+    "WriteTradeResult": ("MqlTradeResult", "result", None, None),
+    "WriteTradeTransaction": ("MqlTradeTransaction", "trans", None, None),
 }
 _LAYOUTS = {
     layout.name: layout
@@ -40,11 +53,18 @@ _FAMILY = {
     mirror.Accessor.DOUBLE: "Double",
     mirror.Accessor.STRING: "String",
 }
+# The variable a property writer reads each accessor family's members into, and its MQL5 type.
+_VARIABLES = {
+    mirror.Accessor.INTEGER: ("integer", "long"),
+    mirror.Accessor.DOUBLE: ("real", "double"),
+    mirror.Accessor.STRING: ("text", "string"),
+}
 _FUNCTION = re.compile(r"^(\w+) (\w+)\(([^)]*)\)\n\{\n(.*?)^\}", re.MULTILINE | re.DOTALL)
-_WRITE = re.compile(
-    r"w\.(I64|I64Bool|F64|String)\((?:\(long\))?"
-    r"(?:(\w+?)(Integer|Double|String)\((\w+, )?(\w+)\)|(\w+)\.(\w+)|(\w+))\);"
-)
+_DECLARE = re.compile(r"(long|double|string) (\w+) = (?:0|0\.0|\"\");")
+_WRITE = re.compile(r"w\.(I64|I64Bool|F64|String)\((?:\(long\))?(?:(\w+)\.(\w+)|(\w+))\);")
+_ANSWERED = re.compile(r"if \((\w+?)(Integer|Double|String)\((\w+, )?(\w+), (\w+)\)\)")
+_LEFT = re.compile(r"(\w+) = (\w+?)(Integer|Double|String)\((\w+, )?(\w+)\);")
+_FAILED = re.compile(r'HubPropertyFailed\(failures, "(\w+)"\);')
 _READ = re.compile(r"request\.(\w+) = (?:\((\w+)\))?r\.(I64|F64|String)\(\);")
 
 
@@ -53,9 +73,12 @@ def text() -> str:
     return mql5gen.render()
 
 
-def functions(text: str) -> dict[str, tuple[str, str]]:
-    """Each generated function by its name: its parameters and its body."""
-    return {name: (parameters, body) for _, name, parameters, body in _FUNCTION.findall(text)}
+def functions(text: str) -> dict[str, tuple[str, str, str]]:
+    """Each generated function by its name: its return type, its parameters and its body."""
+    return {
+        name: (returns, parameters, body)
+        for returns, name, parameters, body in _FUNCTION.findall(text)
+    }
 
 
 def enum(text: str, name: str) -> dict[str, int]:
@@ -80,37 +103,79 @@ def wire_type(member: mirror.Member) -> str:
         return "I64"
 
 
-def written(body: str) -> list[tuple]:
-    """Each write of a writer's body: the writer method, and the family, accessor, leading arguments
-    and property it reads, or the struct variable and field, or the parameter it writes whole."""
+def written(body: str) -> tuple[dict[str, str], list[tuple]]:
+    """A writer's declared variables by name with their types, and each write of its body: the key
+    it writes first; for a property read — written when it succeeds, recorded as failed and passed
+    over when it does not — the writer method, the family, accessor, leading arguments and property
+    it reads, how a failed read tells, and the variable it reads into; or the struct variable and
+    field it writes."""
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    declared = {}
     writes = []
-    for line in body.splitlines():
-        if line.strip():
-            match = _WRITE.fullmatch(line.strip())
-            assert match is not None, line
-            method, family, accessor, leading, prop, variable, field, whole = match.groups()
-            if family is not None:
-                writes.append((method, family, accessor, leading or "", prop))
-            elif variable is not None:
-                writes.append((method, variable, field))
+    at = 0
+    while at < len(lines) and _DECLARE.fullmatch(lines[at]):
+        kind, name = _DECLARE.fullmatch(lines[at]).groups()
+        declared[name] = kind
+        at += 1
+    while at < len(lines) and lines[at] != "return failures.count == 0;":
+        if lines[at] == "w.String(symbol);":
+            writes.append(("key", "symbol"))
+            at += 1
+        elif lines[at] == "ResetLastError();":
+            # The read's own error, whichever way the family tells it.
+            answered = _ANSWERED.fullmatch(lines[at + 1])
+            if answered is not None:
+                family, accessor, leading, prop, variable = answered.groups()
+                how = Failure.ANSWERED
+                at += 2
             else:
-                writes.append((method, whole))
-    return writes
+                left = _LEFT.fullmatch(lines[at + 1])
+                assert left is not None and lines[at + 2] == "if (GetLastError() == 0)", lines[at:]
+                variable, family, accessor, leading, prop = left.groups()
+                how = Failure.LEFT
+                at += 3
+            write = _WRITE.fullmatch(lines[at])
+            failed = _FAILED.fullmatch(lines[at + 2])
+            assert write is not None and write.group(4) == variable, lines[at]
+            assert lines[at + 1] == "else", lines[at + 1]
+            assert failed is not None and failed.group(1) == prop, lines[at + 2]
+            writes.append((write.group(1), family, accessor, leading or "", prop, how, variable))
+            at += 3
+        else:
+            write = _WRITE.fullmatch(lines[at])
+            assert write is not None, lines[at]
+            method, struct, field, _ = write.groups()
+            writes.append((method, struct, field))
+            at += 1
+    return declared, writes
 
 
-def expected_writes(layout: binary.Layout, family: str, leading: str | None) -> list[tuple]:
+def expected_writes(
+    layout: binary.Layout, family: str, leading: str | None, how: Failure | None
+) -> list[tuple]:
     """The writes of a layout's record: its key first, the symbol it is read for, then every typed
-    member in order."""
+    member in order, a property read into the variable of its accessor family."""
     writes = []
     if layout.key is not None:
-        writes.append(("String", "symbol"))
+        writes.append(("key", "symbol"))
     for member in layout.members:
         if member.declared is not None:
             kind = mirror.accessor(member.declared)
             if leading is None:
                 writes.append((wire_type(member), family, member.property))
             else:
-                writes.append((wire_type(member), family, _FAMILY[kind], leading, member.property))
+                variable, _ = _VARIABLES[kind]
+                writes.append(
+                    (
+                        wire_type(member),
+                        family,
+                        _FAMILY[kind],
+                        leading,
+                        member.property,
+                        how,
+                        variable,
+                    )
+                )
     return writes
 
 
@@ -126,15 +191,48 @@ def test_every_struct_an_ea_sends_has_its_writer(text):
     generated = functions(text)
 
     assert set(WRITERS) <= set(generated)
-    assert served <= {layout for layout, _, _ in WRITERS.values()}
+    assert served <= {layout for layout, _, _, _ in WRITERS.values()}
 
 
 @pytest.mark.parametrize("name", WRITERS)
 def test_a_writer_reads_each_typed_member_once_in_order_by_its_property(text, name):
-    layout_name, family, leading = WRITERS[name]
-    _, body = functions(text)[name]
+    layout_name, family, leading, how = WRITERS[name]
+    _, _, body = functions(text)[name]
 
-    assert written(body) == expected_writes(_LAYOUTS[layout_name], family, leading)
+    _, writes = written(body)
+
+    assert writes == expected_writes(_LAYOUTS[layout_name], family, leading, how)
+
+
+@pytest.mark.parametrize(
+    "name", [name for name, writer in WRITERS.items() if writer[3] is not None]
+)
+def test_a_property_writer_reads_past_a_failed_read_and_answers_whether_every_one_succeeded(
+    text, name
+):
+    returns, parameters, body = functions(text)[name]
+
+    declared, writes = written(body)
+
+    assert returns == "bool"
+    assert parameters.startswith("BinaryWriter &w")
+    assert parameters.endswith("HubPropertyFailures &failures")
+    assert body.rstrip().endswith("return failures.count == 0;")
+    # Each variable declared is read into, as its family's type.
+    assert declared == {
+        variable: kind
+        for variable, kind in _VARIABLES.values()
+        if variable in {write[-1] for write in writes if len(write) == 7}
+    }
+
+
+@pytest.mark.parametrize("name", [name for name, writer in WRITERS.items() if writer[3] is None])
+def test_a_struct_writer_reads_fields_that_cannot_fail(text, name):
+    layout_name, variable, _, _ = WRITERS[name]
+    returns, parameters, _ = functions(text)[name]
+
+    assert returns == "void"
+    assert parameters == f"BinaryWriter &w, const {layout_name} &{variable}"
 
 
 def test_every_typed_member_of_a_struct_an_ea_sends_names_its_mql5_property():
@@ -153,7 +251,7 @@ def test_a_symbols_greeks_are_read_by_their_price_properties():
 
 
 def test_the_trade_request_is_read_member_by_member_as_its_mql5_type(text):
-    parameters, body = functions(text)["ReadTradeRequest"]
+    _, parameters, body = functions(text)["ReadTradeRequest"]
     expected = []
     for member in binary.TRADE_REQUEST.members:
         kind = mirror.accessor(member.declared)
@@ -186,20 +284,80 @@ def test_the_protocols_codes_are_the_wire_packages(text):
     assert values["HUB_ROLE_EA"] == '"ea"'
 
 
+def test_the_history_constants_are_the_protocols(text):
+    values = defines(text)
+
+    assert values["HUB_HISTORY_DEADLINE_S"] == "45"
+    assert values["HUB_TICK_BUSY_S"] == "900"
+    assert values["HUB_RETRY_AFTER_MS"] == "5000"
+    assert values["HUB_SPAN_MARGIN"] == "11"
+    assert values["HUB_TICK_SERIES"] == '"ticks"'
+    assert values["HUB_PROPERTY_FAILURES_MAX"] == "128"
+    assert values["HUB_HISTORY_INDICATOR"] == '"hub_history"'
+
+
+def test_the_history_indicators_events_are_push_wires(text):
+    assert enum(text, "ENUM_HUB_EVENT") == {
+        f"HUB_EVENT_{event.name}": event.value for event in HistoryEvent
+    }
+    assert {event.name for event in HistoryEvent} == {
+        "ASK_RATES",
+        "ASK_RATES_FROM",
+        "RATES_READY",
+        "FORGET",
+    }
+    # The terminal delivers a custom event as CHARTEVENT_CUSTOM plus an id it takes as a ushort.
+    assert all(0 <= event.value <= 0xFFFF for event in HistoryEvent)
+
+
+def test_each_bar_series_is_read_by_its_timeframe_with_its_name_and_period(text):
+    _, parameters, body = functions(text)["HubSeries"]
+    cases = re.findall(r'case (\d+):\s+name = "(\w+)";\s+period = (\d+);', body)
+
+    assert parameters == "const int timeframe, string &name, int &period"
+    assert {int(timeframe): (name, int(period)) for timeframe, name, period in cases} == {
+        timeframe: (series.value, BAR_PERIOD_S[series])
+        for series, timeframe in BAR_TIMEFRAME.items()
+    }
+    assert len(cases) == len(BAR_TIMEFRAME)
+
+
+def test_the_floor_origins_travel_by_their_names(text):
+    named = dict(re.findall(r'case (FLOOR_ORIGIN_\w+):\s+name = "(\w+)";', text))
+
+    assert enum(text, "ENUM_FLOOR_ORIGIN") == {
+        f"FLOOR_ORIGIN_{origin.name}": index for index, origin in enumerate(FloorOrigin)
+    }
+    assert named == {f"FLOOR_ORIGIN_{origin.name}": origin.value for origin in FloorOrigin}
+
+
+def test_the_error_kinds_an_ea_defers_carry_their_retry_delay(text):
+    _, parameters, body = functions(text)["HubDefers"]
+
+    assert parameters == "const ENUM_HUB_ERROR kind"
+    assert set(re.findall(r"HUB_ERROR_(\w+)", body)) == {
+        kind.name for kind in binary.EA_ERRORS & binary.DEFERRING
+    }
+
+
 def test_the_chart_roles_are_numbered_as_the_templates_set_them_and_named_as_the_hub_reads_them(
     text,
 ):
     named = dict(re.findall(r'case (ROLE_\w+):\s+name = "(\w+)";', text))
     read = dict(re.findall(r'name == "(\w+)"\)\s+role = (\w+);', text))
 
-    # image/install-ea.sh writes these values into the spawner's and the publisher's templates.
-    assert enum(text, "ENUM_CHART_ROLE") == {"ROLE_SPAWNER": 0, "ROLE_PUBLISHER": 1}
+    # image/install-ea.sh writes these values into the three roles' templates.
+    assert enum(text, "ENUM_CHART_ROLE") == {
+        "ROLE_SPAWNER": 0,
+        "ROLE_PUBLISHER": 1,
+        "ROLE_HISTORY": 2,
+    }
     assert named == {f"ROLE_{role.name}": role.value for role in ChartRole}
     assert read == {role.value: f"ROLE_{role.name}" for role in ChartRole}
 
 
 def test_each_role_serves_the_calls_the_registry_gives_it(text):
-    _, body = functions(text)["HubServes"]
+    _, _, body = functions(text)["HubServes"]
     segments = re.split(r"case (ROLE_\w+):", body)[1:]
     serves = {
         role: set(re.findall(r"HUB_CALL_(\w+)", segment))
@@ -214,7 +372,7 @@ def test_each_role_serves_the_calls_the_registry_gives_it(text):
 
 def test_each_served_calls_arguments_are_read_by_their_registry_index_and_type(text):
     values = defines(text)
-    _, body = functions(text)["HubArgumentType"]
+    _, _, body = functions(text)["HubArgumentType"]
     taken = re.findall(
         r"call == HUB_CALL_(\w+) && index == (HUB_ARG_\w+)\)\s+type = HUB_ARGUMENT_(\w+);", body
     )

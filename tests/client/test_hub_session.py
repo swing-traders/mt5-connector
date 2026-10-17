@@ -546,7 +546,7 @@ async def test_a_call_unanswered_past_the_sessions_deadline_raises_and_a_late_an
 
 
 async def test_a_busy_moves_the_sessions_deadline_to_its_bound(hub, monkeypatch):
-    monkeypatch.setattr(hub_module, "_DEADLINES", {calls.Wait.HISTORY: 0.1})
+    monkeypatch.setattr(hub_module, "_DEADLINES", {calls.Wait.TICKS: 0.1})
     monkeypatch.setattr(hub_module, "_MARGIN_S", 0.05)
     monkeypatch.setattr(calls, "BUSY_MARGIN_S", 0.1)
     hub_session = session(hub, Owner())
@@ -559,6 +559,42 @@ async def test_a_busy_moves_the_sessions_deadline_to_its_bound(hub, monkeypatch)
     await hub.answer(request, np.zeros(0, dtype=_TICKS))
 
     assert len((await asyncio.wait_for(read, 1)).result) == 0
+    await hub_session.disconnect()
+
+
+async def test_a_tick_call_waits_under_the_tick_bound_from_the_moment_it_is_sent(hub):
+    hub_session = session(hub, Owner())
+    await hub_session.connect()
+    loop = asyncio.get_running_loop()
+
+    told = loop.time()
+    read = asyncio.create_task(hub_session.copy_ticks_from("EURUSD", 1, 1, 1))
+    (request,) = await asked(hub)
+    deadline = hub_session._in_flight[request.request_id].timer.when()
+    await hub.answer(request, np.zeros(0, dtype=_TICKS))
+    bound = calls.TICK_BUSY_S + hub_module._MARGIN_S
+
+    assert len((await asyncio.wait_for(read, 1)).result) == 0
+    assert bound <= deadline - told < bound + 1
+    await hub_session.disconnect()
+
+
+async def test_a_tick_reads_busy_holds_the_sessions_deadline_for_its_whole_bound(hub):
+    hub_session = session(hub, Owner())
+    await hub_session.connect()
+    loop = asyncio.get_running_loop()
+
+    read = asyncio.create_task(hub_session.copy_ticks_from("EURUSD", 1, 1, 1))
+    (request,) = await asked(hub)
+    told = loop.time()
+    await hub.push(binary.Busy(request.request_id, calls.TICK_BUSY_S))
+    await asyncio.sleep(0.1)
+    deadline = hub_session._in_flight[request.request_id].timer.when()
+    await hub.answer(request, np.zeros(0, dtype=_TICKS))
+    bound = calls.TICK_BUSY_S + calls.BUSY_MARGIN_S + hub_module._MARGIN_S
+
+    assert len((await asyncio.wait_for(read, 1)).result) == 0
+    assert bound <= deadline - told < bound + 1
     await hub_session.disconnect()
 
 

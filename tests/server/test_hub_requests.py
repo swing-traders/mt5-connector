@@ -231,7 +231,7 @@ async def test_a_request_no_ea_of_its_role_serves_is_deferred_at_once_and_its_ch
     server.close()
 
 
-async def test_a_history_read_with_no_publisher_asks_the_spawner_for_its_publisher_chart():
+async def test_a_tick_history_read_with_no_history_ea_asks_the_spawner_for_its_history_chart():
     hub, server, port, _ = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
@@ -242,7 +242,7 @@ async def test_a_history_read_with_no_publisher_asks_the_spawner_for_its_publish
         refused = await consumer.received()
 
         assert error_of(refused) == deferred(ErrorKind.NO_PUBLISHER)
-        assert await spawner.received() == binary.OpenChart(ChartRole.PUBLISHER, "EURUSD")
+        assert await spawner.received() == binary.OpenChart(ChartRole.HISTORY, "EURUSD")
         await consumer.close()
         await spawner.close()
     server.close()
@@ -359,6 +359,63 @@ async def test_a_read_its_ea_never_answers_is_answered_timeout_at_the_read_deadl
     server.close()
 
 
+async def test_a_tick_read_its_ea_sends_no_busy_for_outlives_the_history_deadline_to_the_tick_bound(
+    monkeypatch,
+):
+    monkeypatch.setattr(calls, "HISTORY_DEADLINE_S", 0.1)
+    monkeypatch.setattr(calls, "TICK_BUSY_S", 0.6)
+    hub, server, port, _ = await run_hub()
+    loop = asyncio.get_running_loop()
+    async with verified(port) as spawner:
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+        consumer = await Consumer.connect(port)
+
+        await consumer.ask(
+            5,
+            Call.COPY_TICKS_RANGE,
+            symbol="EURUSD",
+            date_from=UTC_EPOCH,
+            date_to=UTC_EPOCH,
+            flags=1,
+        )
+        await eurusd.request()
+        started = loop.time()
+        timed = await consumer.received()
+        waited = loop.time() - started
+
+        assert 0.55 <= waited < 0.75
+        assert (timed.request_id, error_of(timed)) == (5, (ErrorKind.TIMEOUT, None))
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+async def test_a_tick_read_its_ea_sends_no_busy_for_is_held_at_the_hub_for_the_whole_tick_bound():
+    hub, server, port, _ = await run_hub()
+    async with verified(port) as spawner:
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+        consumer = await Consumer.connect(port)
+
+        asked = time.monotonic()
+        await consumer.ask(
+            5,
+            Call.COPY_TICKS_RANGE,
+            symbol="EURUSD",
+            date_from=UTC_EPOCH,
+            date_to=UTC_EPOCH,
+            flags=1,
+        )
+        await eurusd.request()
+        (pending,) = hub._requests.all()
+
+        assert calls.TICK_BUSY_S <= pending.deadline - asked < calls.TICK_BUSY_S + 1
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
 async def test_a_busy_holds_a_read_past_its_deadline_and_its_answer_within_the_bound_is_delivered(
     monkeypatch,
 ):
@@ -415,6 +472,33 @@ async def test_a_busy_holds_off_the_keepalive_until_its_bound_and_margin_pass(mo
     assert kept
     assert 1.2 <= loop.time() - started < 1.5
     assert _answers(peers[-1]) == [(9, ErrorKind.TIMEOUT)]
+    await _end(peers, tasks)
+
+
+async def test_a_tick_reads_busy_holds_its_request_and_its_eas_keepalive_for_its_whole_bound(
+    monkeypatch,
+):
+    monkeypatch.setattr(ws_server, "PING_INTERVAL_S", 0.02)
+    timeouts = []
+    wait = asyncio.wait
+
+    async def timed_wait(aws, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        timeouts.append(timeout)
+        return await wait(aws, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(asyncio, "wait", timed_wait)
+    hub, peers, tasks, eurusd = await _asked_a_deaf_publisher(settings())
+    told = time.monotonic()
+    eurusd.put_ea(binary.Busy(eurusd.asked, calls.TICK_BUSY_S))
+
+    await asyncio.sleep(0.5)
+    (pending,) = hub._requests.all()
+    bound = calls.TICK_BUSY_S + calls.BUSY_MARGIN_S
+
+    assert eurusd.closed is None
+    assert bound <= pending.deadline - told < bound + 1
+    # The keepalive waits for the deaf EA's pong until the busy's bound and margin pass.
+    assert bound - 1 < max(timeout for timeout in timeouts if timeout is not None) <= bound
     await _end(peers, tasks)
 
 
@@ -541,7 +625,7 @@ async def test_a_bar_window_reaches_the_ea_on_the_brokers_clock_and_its_rows_ret
 async def test_an_answer_in_parts_reaches_the_consumer_part_by_part_in_true_utc():
     hub, server, port, _ = await run_hub()
     async with verified(port) as spawner:
-        eurusd = await FakeEa.connect(port, ChartRole.PUBLISHER, "EURUSD")
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
         await consumer.ask(
             4,
@@ -937,10 +1021,10 @@ SPRING = calendar.timegm((2026, 3, 8, 0, 0, 0))
 
 
 async def _window_read(port, call, date_from, date_to, rows):
-    """The arguments a range read of true-UTC [date_from, date_to] reaches its publisher with, and
-    the rows its answer carrying `rows` reaches the consumer with."""
+    """The arguments a range read of true-UTC [date_from, date_to] reaches the EA of its call's role
+    with, and the rows its answer carrying `rows` reaches the consumer with."""
     async with verified(port) as spawner:
-        eurusd = await FakeEa.connect(port, ChartRole.PUBLISHER, "EURUSD")
+        eurusd = await FakeEa.connect(port, calls.CALLS[call].role, "EURUSD")
         consumer = await Consumer.connect(port)
         if call is Call.COPY_RATES_RANGE:
             await consumer.ask(

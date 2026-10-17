@@ -137,5 +137,7 @@ def _deadline_s(wait: calls.Wait) -> float:
         return calls.READ_DEADLINE_S
     elif wait is calls.Wait.COMMAND:
         return calls.COMMAND_DEADLINE_S
-    else:
+    elif wait is calls.Wait.HISTORY:
         return calls.HISTORY_DEADLINE_S
+    else:
+        return calls.TICK_BUSY_S

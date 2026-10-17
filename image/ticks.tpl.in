@@ -72,6 +72,7 @@ ReconnectIntervalSec=3
 RelaySeconds=5
 PollMilliseconds=16
 ChartTemplate=ticks.tpl
+HistoryTemplate=ticks_history.tpl
 HubPingTimeoutSec=50
 </inputs>
 </expert>
