@@ -1,5 +1,5 @@
-# The MT5 server: the terminal under Wine with the connector's EA compiled in, the connector's HTTP
-# server under the Windows Python and its push hub under the environment's Linux Python, headless.
+# The MT5 server: the terminal under Wine with the connector's EA compiled in, and the connector's
+# hub under the environment's Linux Python, headless.
 # Build context: the repository root. The Wine apt version is the one version held here; every
 # downloaded artifact is versioned by its row in image/artifacts.txt.
 ARG VERSION_WINE=11.19~trixie-1
@@ -18,7 +18,7 @@ RUN set -e; \
         printf '%s  %s\n' "$sha256" "$name" >> SHA256SUMS; \
     done < artifacts.txt; \
     sha256sum -c SHA256SUMS
-COPY image/requirements-wine.txt image/first-start.sh ./
+COPY image/first-start.sh ./
 
 
 FROM docker.io/mambaorg/micromamba:2.8-debian13-slim
@@ -63,14 +63,13 @@ RUN groupadd --gid 65532 mt5 \
 
 USER mt5
 WORKDIR /home/mt5
-# The EA templates are written against MT5_HUB_PORT, so the ports are the image's, not a run's.
+# The EA templates are written against MT5_HUB_PORT, so the port is the image's, not a run's.
 ENV HOME=/home/mt5 \
     WINEPREFIX=/home/mt5/.wine \
     WINEARCH=win64 \
     WINEDEBUG=-all \
     MT5_TERMINAL_PATH="C:\\Program Files\\MetaTrader 5\\terminal64.exe" \
     MT5_PYTHON_DIR="C:\\Python" \
-    MT5_API_PORT=5000 \
     MT5_HUB_PORT=9000
 
 # The base's shell runs a RUN's lone command as PID 1, which Xvfb never tells it is ready, so a RUN
@@ -84,13 +83,12 @@ RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
             /i "Z:\\artifacts\\wine-mono.msi" /qn; \
         wineserver -w'
 
+# The Windows Python runs the driver of the terminal's dialogs, image/terminal_gui.py, on its
+# standard library alone.
 RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
     tini -- xvfb-run -a sh -ec ' \
         wine /artifacts/python-windows.exe /quiet InstallAllUsers=1 \
             PrependPath=1 Include_test=0 Include_launcher=0 "TargetDir=$MT5_PYTHON_DIR"; \
-        wineserver -w; \
-        wine python -m pip install --no-cache-dir --require-hashes \
-            -r Z:/artifacts/requirements-wine.txt; \
         wineserver -w'
 
 # The web installer fetches whatever terminal is current. It exits 1 after a successful install, so
@@ -123,7 +121,7 @@ RUN export HOME=/root PIP_ROOT_USER_ACTION=ignore PIP_NO_CACHE_DIR=1 \
     && chown -R root:root "$MAMBA_ROOT_PREFIX" \
     && chmod -R go-w "$MAMBA_ROOT_PREFIX"
 
-# One wheel of the checkout's server installs into both Pythons; the hub runs from this one.
+# The wheel of the checkout's server: the hub runs from it, and the EA builds from its MQL5 sources.
 COPY packages/server /opt/mt5-connector/packages/server
 RUN export HOME=/root PIP_ROOT_USER_ACTION=ignore PIP_NO_CACHE_DIR=1 \
     && python -m pip wheel --no-deps --wheel-dir /opt/mt5-connector/dist \
@@ -134,15 +132,7 @@ RUN export HOME=/root PIP_ROOT_USER_ACTION=ignore PIP_NO_CACHE_DIR=1 \
 ENV PATH="${MAMBA_ROOT_PREFIX}/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1
 
-# The hashed dependencies stand as installed; pip check fails the build where they no longer satisfy
-# the server's own pins.
 USER mt5
-RUN tini -- xvfb-run -a sh -ec ' \
-        wine python -m pip install --no-cache-dir --no-deps --no-index \
-            --find-links Z:/opt/mt5-connector/dist mt5-connector-server; \
-        wine python -m pip check; \
-        wineserver -w'
-
 COPY image/ /opt/mt5/
 
 RUN tini -- xvfb-run -a sh /opt/mt5/install-ea.sh
@@ -177,5 +167,9 @@ RUN case "$DEBUG" in \
         *) echo "DEBUG is 0 or 1, not $DEBUG" >&2; exit 1 ;; \
     esac
 USER mt5
+
+# The start period covers a cold boot of the terminal and the broker clock's first verification.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=360s \
+    CMD python3 /opt/mt5/healthcheck.py
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/mt5/entrypoint.sh"]

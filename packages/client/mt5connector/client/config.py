@@ -12,7 +12,6 @@ from mt5connector.client.constants import (
     DEFAULT_EXEC_POLL_INTERVAL_MS,
     MT5_VENUE,
     RECONNECT_INITIAL_DELAY_S,
-    RECONNECT_MAX_ATTEMPTS,
     RECONNECT_MAX_DELAY_S,
 )
 from mt5connector.client.errors import MT5ConfigError
@@ -54,7 +53,6 @@ class MT5Config:
     history_lookback_mins: int = 60
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
     reconnect_max_delay_s: float = RECONNECT_MAX_DELAY_S
-    reconnect_max_attempts: int = RECONNECT_MAX_ATTEMPTS
     timeout_s: float = 10.0
 
     # Required: defaulted only so that a config without one is refused as an MT5ConfigError.
@@ -85,10 +83,6 @@ class MT5Config:
             raise ValueError("history_lookback_mins must be positive.")
         if not (math.isfinite(self.timeout_s) and self.timeout_s > 0):
             raise ValueError(f"MT5Config.timeout_s {self.timeout_s} is not finite and positive")
-        if self.reconnect_max_attempts < 1:
-            raise ValueError(
-                f"MT5Config.reconnect_max_attempts {self.reconnect_max_attempts} is below 1"
-            )
         if not (
             math.isfinite(self.reconnect_initial_delay_s) and self.reconnect_initial_delay_s >= 0
         ):
@@ -100,6 +94,21 @@ class MT5Config:
             raise ValueError(
                 f"MT5Config.reconnect_max_delay_s {self.reconnect_max_delay_s} is not finite and "
                 "non-negative"
+            )
+        # NT's WebSocketClient takes the delays in whole milliseconds.
+        if int(self.reconnect_initial_delay_s * 1000) < 1:
+            raise MT5ConfigError(
+                f"MT5Config.reconnect_initial_delay_s {self.reconnect_initial_delay_s} is below "
+                "1 ms"
+            )
+        if int(self.reconnect_max_delay_s * 1000) < 1:
+            raise MT5ConfigError(
+                f"MT5Config.reconnect_max_delay_s {self.reconnect_max_delay_s} is below 1 ms"
+            )
+        if self.reconnect_initial_delay_s > self.reconnect_max_delay_s:
+            raise MT5ConfigError(
+                f"MT5Config.reconnect_initial_delay_s {self.reconnect_initial_delay_s} is above "
+                f"reconnect_max_delay_s {self.reconnect_max_delay_s}"
             )
 
         if not self.server_url:

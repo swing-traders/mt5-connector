@@ -1,5 +1,5 @@
-"""The MetaTrader5 package's call surface at one release: its functions, the structs and arrays they
-return with their epoch fields, and its constants."""
+"""The MetaTrader5 package's call surface the repository uses, at one release: its functions, the
+structs and arrays they return with their epoch fields, and its constants."""
 
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -33,7 +33,6 @@ class FunctionName(StrEnum):
     ORDER_CALC_PROFIT = "order_calc_profit"
     SYMBOL_INFO = "symbol_info"
     SYMBOL_INFO_TICK = "symbol_info_tick"
-    SYMBOL_SELECT = "symbol_select"
     SYMBOLS_TOTAL = "symbols_total"
     SYMBOLS_GET = "symbols_get"
     MARKET_BOOK_ADD = "market_book_add"
@@ -99,7 +98,6 @@ class Failure(StrEnum):
 
     NONE = "none"
     FALSE = "false"
-    FALSE_IS_RESULT = "false_is_result"
     NEVER = "never"
 
 
@@ -130,16 +128,94 @@ class Function:
     server_session: bool = False
 
 
+class MqlType(StrEnum):
+    """A struct member's type as MQL5 declares it."""
+
+    BOOL = "bool"
+    INT = "int"
+    UINT = "uint"
+    LONG = "long"
+    ULONG = "ulong"
+    DATETIME = "datetime"
+    DOUBLE = "double"
+    STRING = "string"
+    ENUM_ACCOUNT_MARGIN_MODE = "ENUM_ACCOUNT_MARGIN_MODE"
+    ENUM_ACCOUNT_STOPOUT_MODE = "ENUM_ACCOUNT_STOPOUT_MODE"
+    ENUM_ACCOUNT_TRADE_MODE = "ENUM_ACCOUNT_TRADE_MODE"
+    ENUM_DAY_OF_WEEK = "ENUM_DAY_OF_WEEK"
+    ENUM_DEAL_ENTRY = "ENUM_DEAL_ENTRY"
+    ENUM_DEAL_REASON = "ENUM_DEAL_REASON"
+    ENUM_DEAL_TYPE = "ENUM_DEAL_TYPE"
+    ENUM_ORDER_REASON = "ENUM_ORDER_REASON"
+    ENUM_ORDER_STATE = "ENUM_ORDER_STATE"
+    ENUM_ORDER_TYPE = "ENUM_ORDER_TYPE"
+    ENUM_ORDER_TYPE_FILLING = "ENUM_ORDER_TYPE_FILLING"
+    ENUM_ORDER_TYPE_TIME = "ENUM_ORDER_TYPE_TIME"
+    ENUM_POSITION_REASON = "ENUM_POSITION_REASON"
+    ENUM_POSITION_TYPE = "ENUM_POSITION_TYPE"
+    ENUM_SYMBOL_CALC_MODE = "ENUM_SYMBOL_CALC_MODE"
+    ENUM_SYMBOL_CHART_MODE = "ENUM_SYMBOL_CHART_MODE"
+    ENUM_SYMBOL_OPTION_MODE = "ENUM_SYMBOL_OPTION_MODE"
+    ENUM_SYMBOL_OPTION_RIGHT = "ENUM_SYMBOL_OPTION_RIGHT"
+    ENUM_SYMBOL_ORDER_GTC_MODE = "ENUM_SYMBOL_ORDER_GTC_MODE"
+    ENUM_SYMBOL_SWAP_MODE = "ENUM_SYMBOL_SWAP_MODE"
+    ENUM_SYMBOL_TRADE_EXECUTION = "ENUM_SYMBOL_TRADE_EXECUTION"
+    ENUM_SYMBOL_TRADE_MODE = "ENUM_SYMBOL_TRADE_MODE"
+    ENUM_TRADE_REQUEST_ACTIONS = "ENUM_TRADE_REQUEST_ACTIONS"
+    ENUM_TRADE_TRANSACTION_TYPE = "ENUM_TRADE_TRANSACTION_TYPE"
+
+
+class Accessor(StrEnum):
+    """The family of MQL5 functions that reads a member — *InfoInteger, *InfoDouble, *InfoString —
+    which fixes how it travels in a hub frame: an int64, a float64, or a length-prefixed UTF-8
+    string."""
+
+    INTEGER = "integer"
+    DOUBLE = "double"
+    STRING = "string"
+
+
+def accessor(declared: MqlType) -> Accessor:
+    """The accessor family that reads a member of the declared type: every integer, bool, enum and
+    datetime as an integer."""
+    if declared is MqlType.DOUBLE:
+        return Accessor.DOUBLE
+    elif declared is MqlType.STRING:
+        return Accessor.STRING
+    else:
+        return Accessor.INTEGER
+
+
+@dataclass(frozen=True)
+class Member:
+    """A struct's field, its MQL5 type, and the MQL5 property an EA reads it by — an `*Info*` or
+    `*Get*` property identifier, or the MQL5 struct's own field name; type and property are None for
+    a field no hub frame's field sequence carries."""
+
+    name: str
+    declared: MqlType | None
+    property: str | None = None
+    # A symbol's market state, which the terminal refuses to read for a symbol outside Market Watch.
+    selected: bool = False
+
+
 @dataclass(frozen=True)
 class Struct:
-    """A package struct."""
+    """A package struct; each member's type is the one the MQL5 reference declares for it."""
 
     name: StructName
-    fields: tuple[str, ...]
+    members: tuple[Member, ...]
     # The fields that hold another struct.
     nested: dict[str, StructName] = field(default_factory=dict)
     # The fields that hold an epoch on the broker's clock.
     epochs: dict[str, EpochUnit] = field(default_factory=dict)
+    # The field naming the record: a hub frame carries it as a key string ahead of the typed
+    # members.
+    key: str | None = None
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        return tuple(member.name for member in self.members)
 
 
 @dataclass(frozen=True)
@@ -168,7 +244,7 @@ def is_failure(function: Function, value: object) -> bool:
 
 def failure_value(function: Function) -> bool | None:
     """The value the package answers when this function fails."""
-    if function.failure in (Failure.FALSE, Failure.FALSE_IS_RESULT):
+    if function.failure is Failure.FALSE:
         return False
     else:
         return None
@@ -410,13 +486,6 @@ FUNCTIONS: dict[FunctionName, Function] = {
             Failure.NONE,
             struct=StructName.TICK,
         ),
-        Function(
-            FunctionName.SYMBOL_SELECT,
-            Calling.POSITIONAL,
-            (_SYMBOL, Param("enable", ParamKind.BOOL)),
-            ResultKind.BOOL,
-            Failure.FALSE_IS_RESULT,
-        ),
         Function(FunctionName.SYMBOLS_TOTAL, Calling.NO_ARGS, (), ResultKind.SCALAR, Failure.NONE),
         Function(
             FunctionName.SYMBOLS_GET,
@@ -455,28 +524,29 @@ FUNCTIONS: dict[FunctionName, Function] = {
 STRUCTS: dict[StructName, Struct] = {
     struct.name: struct
     for struct in (
+        # https://www.mql5.com/en/docs/constants/tradingconstants/positionproperties
         Struct(
             StructName.TRADE_POSITION,
             (
-                "ticket",
-                "time",
-                "time_msc",
-                "time_update",
-                "time_update_msc",
-                "type",
-                "magic",
-                "identifier",
-                "reason",
-                "volume",
-                "price_open",
-                "sl",
-                "tp",
-                "price_current",
-                "swap",
-                "profit",
-                "symbol",
-                "comment",
-                "external_id",
+                Member("ticket", MqlType.LONG, "POSITION_TICKET"),
+                Member("time", MqlType.DATETIME, "POSITION_TIME"),
+                Member("time_msc", MqlType.LONG, "POSITION_TIME_MSC"),
+                Member("time_update", MqlType.DATETIME, "POSITION_TIME_UPDATE"),
+                Member("time_update_msc", MqlType.LONG, "POSITION_TIME_UPDATE_MSC"),
+                Member("type", MqlType.ENUM_POSITION_TYPE, "POSITION_TYPE"),
+                Member("magic", MqlType.LONG, "POSITION_MAGIC"),
+                Member("identifier", MqlType.LONG, "POSITION_IDENTIFIER"),
+                Member("reason", MqlType.ENUM_POSITION_REASON, "POSITION_REASON"),
+                Member("volume", MqlType.DOUBLE, "POSITION_VOLUME"),
+                Member("price_open", MqlType.DOUBLE, "POSITION_PRICE_OPEN"),
+                Member("sl", MqlType.DOUBLE, "POSITION_SL"),
+                Member("tp", MqlType.DOUBLE, "POSITION_TP"),
+                Member("price_current", MqlType.DOUBLE, "POSITION_PRICE_CURRENT"),
+                Member("swap", MqlType.DOUBLE, "POSITION_SWAP"),
+                Member("profit", MqlType.DOUBLE, "POSITION_PROFIT"),
+                Member("symbol", MqlType.STRING, "POSITION_SYMBOL"),
+                Member("comment", MqlType.STRING, "POSITION_COMMENT"),
+                Member("external_id", MqlType.STRING, "POSITION_EXTERNAL_ID"),
             ),
             epochs={
                 "time": EpochUnit.SECONDS,
@@ -485,33 +555,34 @@ STRUCTS: dict[StructName, Struct] = {
                 "time_update_msc": EpochUnit.MILLISECONDS,
             },
         ),
+        # https://www.mql5.com/en/docs/constants/tradingconstants/orderproperties
         Struct(
             StructName.TRADE_ORDER,
             (
-                "ticket",
-                "time_setup",
-                "time_setup_msc",
-                "time_done",
-                "time_done_msc",
-                "time_expiration",
-                "type",
-                "type_time",
-                "type_filling",
-                "state",
-                "magic",
-                "position_id",
-                "position_by_id",
-                "reason",
-                "volume_initial",
-                "volume_current",
-                "price_open",
-                "sl",
-                "tp",
-                "price_current",
-                "price_stoplimit",
-                "symbol",
-                "comment",
-                "external_id",
+                Member("ticket", MqlType.LONG, "ORDER_TICKET"),
+                Member("time_setup", MqlType.DATETIME, "ORDER_TIME_SETUP"),
+                Member("time_setup_msc", MqlType.LONG, "ORDER_TIME_SETUP_MSC"),
+                Member("time_done", MqlType.DATETIME, "ORDER_TIME_DONE"),
+                Member("time_done_msc", MqlType.LONG, "ORDER_TIME_DONE_MSC"),
+                Member("time_expiration", MqlType.DATETIME, "ORDER_TIME_EXPIRATION"),
+                Member("type", MqlType.ENUM_ORDER_TYPE, "ORDER_TYPE"),
+                Member("type_time", MqlType.ENUM_ORDER_TYPE_TIME, "ORDER_TYPE_TIME"),
+                Member("type_filling", MqlType.ENUM_ORDER_TYPE_FILLING, "ORDER_TYPE_FILLING"),
+                Member("state", MqlType.ENUM_ORDER_STATE, "ORDER_STATE"),
+                Member("magic", MqlType.LONG, "ORDER_MAGIC"),
+                Member("position_id", MqlType.LONG, "ORDER_POSITION_ID"),
+                Member("position_by_id", MqlType.LONG, "ORDER_POSITION_BY_ID"),
+                Member("reason", MqlType.ENUM_ORDER_REASON, "ORDER_REASON"),
+                Member("volume_initial", MqlType.DOUBLE, "ORDER_VOLUME_INITIAL"),
+                Member("volume_current", MqlType.DOUBLE, "ORDER_VOLUME_CURRENT"),
+                Member("price_open", MqlType.DOUBLE, "ORDER_PRICE_OPEN"),
+                Member("sl", MqlType.DOUBLE, "ORDER_SL"),
+                Member("tp", MqlType.DOUBLE, "ORDER_TP"),
+                Member("price_current", MqlType.DOUBLE, "ORDER_PRICE_CURRENT"),
+                Member("price_stoplimit", MqlType.DOUBLE, "ORDER_PRICE_STOPLIMIT"),
+                Member("symbol", MqlType.STRING, "ORDER_SYMBOL"),
+                Member("comment", MqlType.STRING, "ORDER_COMMENT"),
+                Member("external_id", MqlType.STRING, "ORDER_EXTERNAL_ID"),
             ),
             epochs={
                 "time_setup": EpochUnit.SECONDS,
@@ -521,272 +592,333 @@ STRUCTS: dict[StructName, Struct] = {
                 "time_expiration": EpochUnit.SECONDS,
             },
         ),
+        # https://www.mql5.com/en/docs/constants/tradingconstants/dealproperties
         Struct(
             StructName.TRADE_DEAL,
             (
-                "ticket",
-                "order",
-                "time",
-                "time_msc",
-                "type",
-                "entry",
-                "magic",
-                "position_id",
-                "reason",
-                "volume",
-                "price",
-                "commission",
-                "swap",
-                "profit",
-                "fee",
-                "symbol",
-                "comment",
-                "external_id",
+                Member("ticket", MqlType.LONG, "DEAL_TICKET"),
+                Member("order", MqlType.LONG, "DEAL_ORDER"),
+                Member("time", MqlType.DATETIME, "DEAL_TIME"),
+                Member("time_msc", MqlType.LONG, "DEAL_TIME_MSC"),
+                Member("type", MqlType.ENUM_DEAL_TYPE, "DEAL_TYPE"),
+                Member("entry", MqlType.ENUM_DEAL_ENTRY, "DEAL_ENTRY"),
+                Member("magic", MqlType.LONG, "DEAL_MAGIC"),
+                Member("position_id", MqlType.LONG, "DEAL_POSITION_ID"),
+                Member("reason", MqlType.ENUM_DEAL_REASON, "DEAL_REASON"),
+                Member("volume", MqlType.DOUBLE, "DEAL_VOLUME"),
+                Member("price", MqlType.DOUBLE, "DEAL_PRICE"),
+                Member("commission", MqlType.DOUBLE, "DEAL_COMMISSION"),
+                Member("swap", MqlType.DOUBLE, "DEAL_SWAP"),
+                Member("profit", MqlType.DOUBLE, "DEAL_PROFIT"),
+                Member("fee", MqlType.DOUBLE, "DEAL_FEE"),
+                Member("symbol", MqlType.STRING, "DEAL_SYMBOL"),
+                Member("comment", MqlType.STRING, "DEAL_COMMENT"),
+                Member("external_id", MqlType.STRING, "DEAL_EXTERNAL_ID"),
             ),
-            epochs={"time": EpochUnit.SECONDS, "time_msc": EpochUnit.MILLISECONDS},
+            epochs={
+                "time": EpochUnit.SECONDS,
+                "time_msc": EpochUnit.MILLISECONDS,
+            },
         ),
+        # https://www.mql5.com/en/docs/constants/structures/mqltraderequest
         Struct(
             StructName.TRADE_REQUEST,
             (
-                "action",
-                "magic",
-                "order",
-                "symbol",
-                "volume",
-                "price",
-                "stoplimit",
-                "sl",
-                "tp",
-                "deviation",
-                "type",
-                "type_filling",
-                "type_time",
-                "expiration",
-                "comment",
-                "position",
-                "position_by",
+                Member("action", MqlType.ENUM_TRADE_REQUEST_ACTIONS, "action"),
+                Member("magic", MqlType.ULONG, "magic"),
+                Member("order", MqlType.ULONG, "order"),
+                Member("symbol", MqlType.STRING, "symbol"),
+                Member("volume", MqlType.DOUBLE, "volume"),
+                Member("price", MqlType.DOUBLE, "price"),
+                Member("stoplimit", MqlType.DOUBLE, "stoplimit"),
+                Member("sl", MqlType.DOUBLE, "sl"),
+                Member("tp", MqlType.DOUBLE, "tp"),
+                Member("deviation", MqlType.ULONG, "deviation"),
+                Member("type", MqlType.ENUM_ORDER_TYPE, "type"),
+                Member("type_filling", MqlType.ENUM_ORDER_TYPE_FILLING, "type_filling"),
+                Member("type_time", MqlType.ENUM_ORDER_TYPE_TIME, "type_time"),
+                Member("expiration", MqlType.DATETIME, "expiration"),
+                Member("comment", MqlType.STRING, "comment"),
+                Member("position", MqlType.ULONG, "position"),
+                Member("position_by", MqlType.ULONG, "position_by"),
             ),
-            epochs={"expiration": EpochUnit.SECONDS},
+            epochs={
+                "expiration": EpochUnit.SECONDS,
+            },
         ),
+        # https://www.mql5.com/en/docs/constants/structures/mqltraderesult
         Struct(
             StructName.ORDER_SEND_RESULT,
             (
-                "retcode",
-                "deal",
-                "order",
-                "volume",
-                "price",
-                "bid",
-                "ask",
-                "comment",
-                "request_id",
-                "retcode_external",
-                "request",
+                Member("retcode", MqlType.UINT, "retcode"),
+                Member("deal", MqlType.ULONG, "deal"),
+                Member("order", MqlType.ULONG, "order"),
+                Member("volume", MqlType.DOUBLE, "volume"),
+                Member("price", MqlType.DOUBLE, "price"),
+                Member("bid", MqlType.DOUBLE, "bid"),
+                Member("ask", MqlType.DOUBLE, "ask"),
+                Member("comment", MqlType.STRING, "comment"),
+                Member("request_id", MqlType.UINT, "request_id"),
+                Member("retcode_external", MqlType.INT, "retcode_external"),
+                Member("request", None),
             ),
             nested={"request": StructName.TRADE_REQUEST},
         ),
         Struct(
             StructName.ORDER_CHECK_RESULT,
             (
-                "retcode",
-                "balance",
-                "equity",
-                "profit",
-                "margin",
-                "margin_free",
-                "margin_level",
-                "comment",
-                "request",
+                Member("retcode", None),
+                Member("balance", None),
+                Member("equity", None),
+                Member("profit", None),
+                Member("margin", None),
+                Member("margin_free", None),
+                Member("margin_level", None),
+                Member("comment", None),
+                Member("request", None),
             ),
             nested={"request": StructName.TRADE_REQUEST},
         ),
         Struct(
             StructName.TICK,
             (
-                "time",
-                "bid",
-                "ask",
-                "last",
-                "volume",
-                "time_msc",
-                "flags",
-                "volume_real",
+                Member("time", None),
+                Member("bid", None),
+                Member("ask", None),
+                Member("last", None),
+                Member("volume", None),
+                Member("time_msc", None),
+                Member("flags", None),
+                Member("volume_real", None),
             ),
-            epochs={"time": EpochUnit.SECONDS, "time_msc": EpochUnit.MILLISECONDS},
+            epochs={
+                "time": EpochUnit.SECONDS,
+                "time_msc": EpochUnit.MILLISECONDS,
+            },
         ),
+        # https://www.mql5.com/en/docs/constants/environment_state/terminalstatus
         Struct(
             StructName.TERMINAL_INFO,
             (
-                "community_account",
-                "community_connection",
-                "connected",
-                "dlls_allowed",
-                "trade_allowed",
-                "tradeapi_disabled",
-                "email_enabled",
-                "ftp_enabled",
-                "notifications_enabled",
-                "mqid",
-                "build",
-                "maxbars",
-                "codepage",
-                "ping_last",
-                "community_balance",
-                "retransmission",
-                "company",
-                "name",
-                "language",
-                "path",
-                "data_path",
-                "commondata_path",
+                Member("community_account", MqlType.BOOL, "TERMINAL_COMMUNITY_ACCOUNT"),
+                Member("community_connection", MqlType.BOOL, "TERMINAL_COMMUNITY_CONNECTION"),
+                Member("connected", MqlType.BOOL, "TERMINAL_CONNECTED"),
+                Member("dlls_allowed", MqlType.BOOL, "TERMINAL_DLLS_ALLOWED"),
+                Member("trade_allowed", MqlType.BOOL, "TERMINAL_TRADE_ALLOWED"),
+                Member("tradeapi_disabled", None),
+                Member("email_enabled", MqlType.BOOL, "TERMINAL_EMAIL_ENABLED"),
+                Member("ftp_enabled", MqlType.BOOL, "TERMINAL_FTP_ENABLED"),
+                Member("notifications_enabled", MqlType.BOOL, "TERMINAL_NOTIFICATIONS_ENABLED"),
+                Member("mqid", MqlType.BOOL, "TERMINAL_MQID"),
+                Member("build", MqlType.INT, "TERMINAL_BUILD"),
+                Member("maxbars", MqlType.INT, "TERMINAL_MAXBARS"),
+                Member("codepage", MqlType.INT, "TERMINAL_CODEPAGE"),
+                Member("ping_last", MqlType.INT, "TERMINAL_PING_LAST"),
+                # TERMINAL_COMMUNITY_BALANCE is refused without an MQL5 community login.
+                Member("community_balance", None),
+                Member("retransmission", MqlType.DOUBLE, "TERMINAL_RETRANSMISSION"),
+                Member("company", MqlType.STRING, "TERMINAL_COMPANY"),
+                Member("name", MqlType.STRING, "TERMINAL_NAME"),
+                Member("language", MqlType.STRING, "TERMINAL_LANGUAGE"),
+                Member("path", MqlType.STRING, "TERMINAL_PATH"),
+                Member("data_path", MqlType.STRING, "TERMINAL_DATA_PATH"),
+                Member("commondata_path", MqlType.STRING, "TERMINAL_COMMONDATA_PATH"),
             ),
         ),
+        # https://www.mql5.com/en/docs/constants/environment_state/marketinfoconstants
         Struct(
             StructName.SYMBOL_INFO,
             (
-                "custom",
-                "chart_mode",
-                "select",
-                "visible",
-                "session_deals",
-                "session_buy_orders",
-                "session_sell_orders",
-                "volume",
-                "volumehigh",
-                "volumelow",
-                "time",
-                "digits",
-                "spread",
-                "spread_float",
-                "ticks_bookdepth",
-                "trade_calc_mode",
-                "trade_mode",
-                "start_time",
-                "expiration_time",
-                "trade_stops_level",
-                "trade_freeze_level",
-                "trade_exemode",
-                "swap_mode",
-                "swap_rollover3days",
-                "margin_hedged_use_leg",
-                "expiration_mode",
-                "filling_mode",
-                "order_mode",
-                "order_gtc_mode",
-                "option_mode",
-                "option_right",
-                "bid",
-                "bidhigh",
-                "bidlow",
-                "ask",
-                "askhigh",
-                "asklow",
-                "last",
-                "lasthigh",
-                "lastlow",
-                "volume_real",
-                "volumehigh_real",
-                "volumelow_real",
-                "option_strike",
-                "point",
-                "trade_tick_value",
-                "trade_tick_value_profit",
-                "trade_tick_value_loss",
-                "trade_tick_size",
-                "trade_contract_size",
-                "trade_accrued_interest",
-                "trade_face_value",
-                "trade_liquidity_rate",
-                "volume_min",
-                "volume_max",
-                "volume_step",
-                "volume_limit",
-                "swap_long",
-                "swap_short",
-                "margin_initial",
-                "margin_maintenance",
-                "session_volume",
-                "session_turnover",
-                "session_interest",
-                "session_buy_orders_volume",
-                "session_sell_orders_volume",
-                "session_open",
-                "session_close",
-                "session_aw",
-                "session_price_settlement",
-                "session_price_limit_min",
-                "session_price_limit_max",
-                "margin_hedged",
-                "price_change",
-                "price_volatility",
-                "price_theoretical",
-                "price_greeks_delta",
-                "price_greeks_theta",
-                "price_greeks_gamma",
-                "price_greeks_vega",
-                "price_greeks_rho",
-                "price_greeks_omega",
-                "price_sensitivity",
-                "basis",
-                "category",
-                "currency_base",
-                "currency_profit",
-                "currency_margin",
-                "bank",
-                "description",
-                "exchange",
-                "formula",
-                "isin",
-                "name",
-                "page",
-                "path",
+                Member("custom", MqlType.BOOL, "SYMBOL_CUSTOM"),
+                Member("chart_mode", MqlType.ENUM_SYMBOL_CHART_MODE, "SYMBOL_CHART_MODE"),
+                Member("select", MqlType.BOOL, "SYMBOL_SELECT"),
+                Member("visible", MqlType.BOOL, "SYMBOL_VISIBLE", selected=True),
+                Member("session_deals", MqlType.LONG, "SYMBOL_SESSION_DEALS", selected=True),
+                Member(
+                    "session_buy_orders", MqlType.LONG, "SYMBOL_SESSION_BUY_ORDERS", selected=True
+                ),
+                Member(
+                    "session_sell_orders", MqlType.LONG, "SYMBOL_SESSION_SELL_ORDERS", selected=True
+                ),
+                Member("volume", MqlType.LONG, "SYMBOL_VOLUME", selected=True),
+                Member("volumehigh", MqlType.LONG, "SYMBOL_VOLUMEHIGH", selected=True),
+                Member("volumelow", MqlType.LONG, "SYMBOL_VOLUMELOW", selected=True),
+                Member("time", MqlType.DATETIME, "SYMBOL_TIME", selected=True),
+                Member("digits", MqlType.INT, "SYMBOL_DIGITS"),
+                Member("spread", MqlType.INT, "SYMBOL_SPREAD", selected=True),
+                Member("spread_float", MqlType.BOOL, "SYMBOL_SPREAD_FLOAT"),
+                Member("ticks_bookdepth", MqlType.INT, "SYMBOL_TICKS_BOOKDEPTH"),
+                Member("trade_calc_mode", MqlType.ENUM_SYMBOL_CALC_MODE, "SYMBOL_TRADE_CALC_MODE"),
+                Member("trade_mode", MqlType.ENUM_SYMBOL_TRADE_MODE, "SYMBOL_TRADE_MODE"),
+                Member("start_time", MqlType.DATETIME, "SYMBOL_START_TIME"),
+                Member("expiration_time", MqlType.DATETIME, "SYMBOL_EXPIRATION_TIME"),
+                Member("trade_stops_level", MqlType.INT, "SYMBOL_TRADE_STOPS_LEVEL"),
+                Member("trade_freeze_level", MqlType.INT, "SYMBOL_TRADE_FREEZE_LEVEL"),
+                Member(
+                    "trade_exemode", MqlType.ENUM_SYMBOL_TRADE_EXECUTION, "SYMBOL_TRADE_EXEMODE"
+                ),
+                Member("swap_mode", MqlType.ENUM_SYMBOL_SWAP_MODE, "SYMBOL_SWAP_MODE"),
+                Member("swap_rollover3days", MqlType.ENUM_DAY_OF_WEEK, "SYMBOL_SWAP_ROLLOVER3DAYS"),
+                Member("margin_hedged_use_leg", MqlType.BOOL, "SYMBOL_MARGIN_HEDGED_USE_LEG"),
+                Member("expiration_mode", MqlType.INT, "SYMBOL_EXPIRATION_MODE"),
+                Member("filling_mode", MqlType.INT, "SYMBOL_FILLING_MODE"),
+                Member("order_mode", MqlType.INT, "SYMBOL_ORDER_MODE"),
+                Member(
+                    "order_gtc_mode", MqlType.ENUM_SYMBOL_ORDER_GTC_MODE, "SYMBOL_ORDER_GTC_MODE"
+                ),
+                Member("option_mode", MqlType.ENUM_SYMBOL_OPTION_MODE, "SYMBOL_OPTION_MODE"),
+                Member("option_right", MqlType.ENUM_SYMBOL_OPTION_RIGHT, "SYMBOL_OPTION_RIGHT"),
+                Member("bid", MqlType.DOUBLE, "SYMBOL_BID", selected=True),
+                Member("bidhigh", MqlType.DOUBLE, "SYMBOL_BIDHIGH", selected=True),
+                Member("bidlow", MqlType.DOUBLE, "SYMBOL_BIDLOW", selected=True),
+                Member("ask", MqlType.DOUBLE, "SYMBOL_ASK", selected=True),
+                Member("askhigh", MqlType.DOUBLE, "SYMBOL_ASKHIGH", selected=True),
+                Member("asklow", MqlType.DOUBLE, "SYMBOL_ASKLOW", selected=True),
+                Member("last", MqlType.DOUBLE, "SYMBOL_LAST", selected=True),
+                Member("lasthigh", MqlType.DOUBLE, "SYMBOL_LASTHIGH", selected=True),
+                Member("lastlow", MqlType.DOUBLE, "SYMBOL_LASTLOW", selected=True),
+                Member("volume_real", MqlType.DOUBLE, "SYMBOL_VOLUME_REAL", selected=True),
+                Member("volumehigh_real", MqlType.DOUBLE, "SYMBOL_VOLUMEHIGH_REAL", selected=True),
+                Member("volumelow_real", MqlType.DOUBLE, "SYMBOL_VOLUMELOW_REAL", selected=True),
+                Member("option_strike", MqlType.DOUBLE, "SYMBOL_OPTION_STRIKE"),
+                Member("point", MqlType.DOUBLE, "SYMBOL_POINT"),
+                Member("trade_tick_value", MqlType.DOUBLE, "SYMBOL_TRADE_TICK_VALUE"),
+                Member("trade_tick_value_profit", MqlType.DOUBLE, "SYMBOL_TRADE_TICK_VALUE_PROFIT"),
+                Member("trade_tick_value_loss", MqlType.DOUBLE, "SYMBOL_TRADE_TICK_VALUE_LOSS"),
+                Member("trade_tick_size", MqlType.DOUBLE, "SYMBOL_TRADE_TICK_SIZE"),
+                Member("trade_contract_size", MqlType.DOUBLE, "SYMBOL_TRADE_CONTRACT_SIZE"),
+                Member("trade_accrued_interest", MqlType.DOUBLE, "SYMBOL_TRADE_ACCRUED_INTEREST"),
+                Member("trade_face_value", MqlType.DOUBLE, "SYMBOL_TRADE_FACE_VALUE"),
+                Member("trade_liquidity_rate", MqlType.DOUBLE, "SYMBOL_TRADE_LIQUIDITY_RATE"),
+                Member("volume_min", MqlType.DOUBLE, "SYMBOL_VOLUME_MIN"),
+                Member("volume_max", MqlType.DOUBLE, "SYMBOL_VOLUME_MAX"),
+                Member("volume_step", MqlType.DOUBLE, "SYMBOL_VOLUME_STEP"),
+                Member("volume_limit", MqlType.DOUBLE, "SYMBOL_VOLUME_LIMIT"),
+                Member("swap_long", MqlType.DOUBLE, "SYMBOL_SWAP_LONG"),
+                Member("swap_short", MqlType.DOUBLE, "SYMBOL_SWAP_SHORT"),
+                Member("margin_initial", MqlType.DOUBLE, "SYMBOL_MARGIN_INITIAL"),
+                Member("margin_maintenance", MqlType.DOUBLE, "SYMBOL_MARGIN_MAINTENANCE"),
+                Member("session_volume", MqlType.DOUBLE, "SYMBOL_SESSION_VOLUME", selected=True),
+                Member(
+                    "session_turnover", MqlType.DOUBLE, "SYMBOL_SESSION_TURNOVER", selected=True
+                ),
+                Member(
+                    "session_interest", MqlType.DOUBLE, "SYMBOL_SESSION_INTEREST", selected=True
+                ),
+                Member(
+                    "session_buy_orders_volume",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_BUY_ORDERS_VOLUME",
+                    selected=True,
+                ),
+                Member(
+                    "session_sell_orders_volume",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_SELL_ORDERS_VOLUME",
+                    selected=True,
+                ),
+                Member("session_open", MqlType.DOUBLE, "SYMBOL_SESSION_OPEN", selected=True),
+                Member("session_close", MqlType.DOUBLE, "SYMBOL_SESSION_CLOSE", selected=True),
+                Member("session_aw", MqlType.DOUBLE, "SYMBOL_SESSION_AW", selected=True),
+                Member(
+                    "session_price_settlement",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_PRICE_SETTLEMENT",
+                    selected=True,
+                ),
+                Member(
+                    "session_price_limit_min",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_PRICE_LIMIT_MIN",
+                    selected=True,
+                ),
+                Member(
+                    "session_price_limit_max",
+                    MqlType.DOUBLE,
+                    "SYMBOL_SESSION_PRICE_LIMIT_MAX",
+                    selected=True,
+                ),
+                Member("margin_hedged", MqlType.DOUBLE, "SYMBOL_MARGIN_HEDGED"),
+                Member("price_change", MqlType.DOUBLE, "SYMBOL_PRICE_CHANGE", selected=True),
+                Member(
+                    "price_volatility", MqlType.DOUBLE, "SYMBOL_PRICE_VOLATILITY", selected=True
+                ),
+                Member(
+                    "price_theoretical", MqlType.DOUBLE, "SYMBOL_PRICE_THEORETICAL", selected=True
+                ),
+                Member("price_greeks_delta", MqlType.DOUBLE, "SYMBOL_PRICE_DELTA", selected=True),
+                Member("price_greeks_theta", MqlType.DOUBLE, "SYMBOL_PRICE_THETA", selected=True),
+                Member("price_greeks_gamma", MqlType.DOUBLE, "SYMBOL_PRICE_GAMMA", selected=True),
+                Member("price_greeks_vega", MqlType.DOUBLE, "SYMBOL_PRICE_VEGA", selected=True),
+                Member("price_greeks_rho", MqlType.DOUBLE, "SYMBOL_PRICE_RHO", selected=True),
+                Member("price_greeks_omega", MqlType.DOUBLE, "SYMBOL_PRICE_OMEGA", selected=True),
+                Member(
+                    "price_sensitivity", MqlType.DOUBLE, "SYMBOL_PRICE_SENSITIVITY", selected=True
+                ),
+                Member("basis", MqlType.STRING, "SYMBOL_BASIS"),
+                Member("category", MqlType.STRING, "SYMBOL_CATEGORY"),
+                Member("currency_base", MqlType.STRING, "SYMBOL_CURRENCY_BASE"),
+                Member("currency_profit", MqlType.STRING, "SYMBOL_CURRENCY_PROFIT"),
+                Member("currency_margin", MqlType.STRING, "SYMBOL_CURRENCY_MARGIN"),
+                Member("bank", MqlType.STRING, "SYMBOL_BANK", selected=True),
+                Member("description", MqlType.STRING, "SYMBOL_DESCRIPTION"),
+                Member("exchange", MqlType.STRING, "SYMBOL_EXCHANGE"),
+                Member("formula", MqlType.STRING, "SYMBOL_FORMULA"),
+                Member("isin", MqlType.STRING, "SYMBOL_ISIN"),
+                Member("name", None),
+                Member("page", MqlType.STRING, "SYMBOL_PAGE"),
+                Member("path", MqlType.STRING, "SYMBOL_PATH"),
             ),
             epochs={
                 "time": EpochUnit.SECONDS,
                 "start_time": EpochUnit.SECONDS,
                 "expiration_time": EpochUnit.SECONDS,
             },
+            key="name",
         ),
+        # https://www.mql5.com/en/docs/constants/environment_state/accountinformation
         Struct(
             StructName.ACCOUNT_INFO,
             (
-                "login",
-                "trade_mode",
-                "leverage",
-                "limit_orders",
-                "margin_so_mode",
-                "trade_allowed",
-                "trade_expert",
-                "margin_mode",
-                "currency_digits",
-                "fifo_close",
-                "balance",
-                "credit",
-                "profit",
-                "equity",
-                "margin",
-                "margin_free",
-                "margin_level",
-                "margin_so_call",
-                "margin_so_so",
-                "margin_initial",
-                "margin_maintenance",
-                "assets",
-                "liabilities",
-                "commission_blocked",
-                "name",
-                "server",
-                "currency",
-                "company",
+                Member("login", MqlType.LONG, "ACCOUNT_LOGIN"),
+                Member("trade_mode", MqlType.ENUM_ACCOUNT_TRADE_MODE, "ACCOUNT_TRADE_MODE"),
+                Member("leverage", MqlType.LONG, "ACCOUNT_LEVERAGE"),
+                Member("limit_orders", MqlType.INT, "ACCOUNT_LIMIT_ORDERS"),
+                Member(
+                    "margin_so_mode", MqlType.ENUM_ACCOUNT_STOPOUT_MODE, "ACCOUNT_MARGIN_SO_MODE"
+                ),
+                Member("trade_allowed", MqlType.BOOL, "ACCOUNT_TRADE_ALLOWED"),
+                Member("trade_expert", MqlType.BOOL, "ACCOUNT_TRADE_EXPERT"),
+                Member("margin_mode", MqlType.ENUM_ACCOUNT_MARGIN_MODE, "ACCOUNT_MARGIN_MODE"),
+                Member("currency_digits", MqlType.INT, "ACCOUNT_CURRENCY_DIGITS"),
+                Member("fifo_close", MqlType.BOOL, "ACCOUNT_FIFO_CLOSE"),
+                Member("balance", MqlType.DOUBLE, "ACCOUNT_BALANCE"),
+                Member("credit", MqlType.DOUBLE, "ACCOUNT_CREDIT"),
+                Member("profit", MqlType.DOUBLE, "ACCOUNT_PROFIT"),
+                Member("equity", MqlType.DOUBLE, "ACCOUNT_EQUITY"),
+                Member("margin", MqlType.DOUBLE, "ACCOUNT_MARGIN"),
+                Member("margin_free", MqlType.DOUBLE, "ACCOUNT_MARGIN_FREE"),
+                Member("margin_level", MqlType.DOUBLE, "ACCOUNT_MARGIN_LEVEL"),
+                Member("margin_so_call", MqlType.DOUBLE, "ACCOUNT_MARGIN_SO_CALL"),
+                Member("margin_so_so", MqlType.DOUBLE, "ACCOUNT_MARGIN_SO_SO"),
+                Member("margin_initial", MqlType.DOUBLE, "ACCOUNT_MARGIN_INITIAL"),
+                Member("margin_maintenance", MqlType.DOUBLE, "ACCOUNT_MARGIN_MAINTENANCE"),
+                Member("assets", MqlType.DOUBLE, "ACCOUNT_ASSETS"),
+                Member("liabilities", MqlType.DOUBLE, "ACCOUNT_LIABILITIES"),
+                Member("commission_blocked", MqlType.DOUBLE, "ACCOUNT_COMMISSION_BLOCKED"),
+                Member("name", MqlType.STRING, "ACCOUNT_NAME"),
+                Member("server", MqlType.STRING, "ACCOUNT_SERVER"),
+                Member("currency", MqlType.STRING, "ACCOUNT_CURRENCY"),
+                Member("company", MqlType.STRING, "ACCOUNT_COMPANY"),
             ),
         ),
         Struct(
             StructName.BOOK_INFO,
             (
-                "type",
-                "price",
-                "volume",
-                "volume_dbl",
+                Member("type", None),
+                Member("price", None),
+                Member("volume", None),
+                Member("volume_dbl", None),
             ),
         ),
     )

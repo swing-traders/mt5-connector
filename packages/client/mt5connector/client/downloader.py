@@ -1,5 +1,5 @@
-"""Downloads a symbol's bars and ticks through the MT5 server's history routes into a NautilusTrader
-Parquet catalog, walking back from the end of a range until its start or the series' floor."""
+"""Downloads a symbol's bars and ticks through the hub's history reads into a NautilusTrader Parquet
+catalog, walking back from the end of a range until its start or the series' floor."""
 
 from __future__ import annotations
 
@@ -14,18 +14,18 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connector.client import history
 from mt5connector.client.errors import (
+    HubAnswerError,
     MT5InstrumentError,
     MT5SymbolNotFoundError,
     ServerUnreachable,
 )
-from mt5connector.client.history import HistoryRanges
 from mt5connector.client.parsing import (
     InstrumentAny,
     parse_quote_tick,
     venue_bar,
     venue_bar_type,
 )
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 from mt5connector.wire.history_wire import BAR_PERIOD_S, SPAN_MARGIN, Series, bar_series
 
 if TYPE_CHECKING:
@@ -46,13 +46,13 @@ _DAY_S = 86_400
 
 @dataclass
 class DownloadResult:
-    """What one download wrote, the windows it asked the server for, and what failed."""
+    """What one download wrote, the windows it asked the hub for, and what failed."""
 
     symbol: str
     data_type: str
     total_written: int = 0
     chunks_processed: int = 0
-    # Windows the server answered with no rows.
+    # Windows the hub answered with no rows.
     chunks_empty: int = 0
     errors: list[str] = field(default_factory=list)
     start: datetime | None = None
@@ -80,7 +80,7 @@ class DownloadResult:
 
 
 class MT5DataDownloader:
-    """Downloads a symbol's history from the MT5 server into a Parquet catalog."""
+    """Downloads a symbol's history from the hub into a Parquet catalog."""
 
     def __init__(
         self,
@@ -178,9 +178,10 @@ class MT5DataDownloader:
         self, result: DownloadResult, instrument: InstrumentAny, start: datetime, end: datetime
     ) -> None:
         """Walks the symbol's ticks back from end, a UTC day per window."""
-        ranges = history.ranges(self._conn, result.symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
+        try:
+            ranges = self._conn.run(history.ranges(self._conn.session, result.symbol))
+        except (HubAnswerError, ServerUnreachable) as exc:
+            _record_error(result, f"Ranges failed: {exc}")
         else:
             logger.info(f"Downloader: downloading ticks for {result.symbol} from {start} to {end}")
             first = int(start.timestamp())
@@ -196,7 +197,9 @@ class MT5DataDownloader:
                 first,
                 windows,
                 _advertised_floor(ranges, Series.TICKS),
-                lambda lo, hi: history.ticks(self._conn, result.symbol, lo, hi),
+                lambda lo, hi: self._conn.run(
+                    history.ticks(self._conn.session, result.symbol, lo, hi)
+                ),
                 lambda rows: [parse_quote_tick(row, instrument) for row in rows],
             )
 
@@ -211,15 +214,16 @@ class MT5DataDownloader:
     ) -> None:
         """Walks the symbol's bars of `series` back from the one closing at end, as many periods per
         window as the terminal answers in one read."""
-        ranges = history.ranges(self._conn, result.symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
+        try:
+            ranges = self._conn.run(history.ranges(self._conn.session, result.symbol))
+        except (HubAnswerError, ServerUnreachable) as exc:
+            _record_error(result, f"Ranges failed: {exc}")
         else:
             logger.info(
                 f"Downloader: downloading {series} bars for {result.symbol} closing from {start} "
                 f"to {end}"
             )
-            # The range names closes; the server serves bars by their open.
+            # The range names closes; the hub serves bars by their open.
             first_close = int(start.timestamp())
             last_close = int(end.timestamp())
             first, window_end = history.opens_closing(series, first_close, last_close)
@@ -230,12 +234,11 @@ class MT5DataDownloader:
                 windows.append((window_start, window_end))
                 window_end = window_start - 1
 
-            def read(lo: int, hi: int) -> np.ndarray | None:
-                rows = history.bars(self._conn, result.symbol, series, lo, hi)
-                if rows is None:
-                    return None
-                else:
-                    return history.closing(rows, first_close, last_close)
+            def read(lo: int, hi: int) -> np.ndarray:
+                rows = self._conn.run(
+                    history.bars(self._conn.session, result.symbol, series, lo, hi)
+                )
+                return history.closing(rows, first_close, last_close)
 
             self._walk_back(
                 result,
@@ -255,13 +258,13 @@ class MT5DataDownloader:
         first: int,
         windows: list[tuple[int, int]],
         floor: int | None,
-        read: Callable[[int, int], np.ndarray | None],
+        read: Callable[[int, int], np.ndarray],
         convert: Callable[[np.ndarray], list],
     ) -> None:
         """Requests the windows newest-first, writing the rows each answers, until the next lies
         wholly before the series' floor, and records the floor when it lies after `first`. A window
-        the server fails or leaves unanswered is recorded as an error and the walk goes on. The
-        floor is read again after a window answered no rows and once the walk ends, since the server
+        the hub fails or whose answer is lost is recorded as an error and the walk goes on. The
+        floor is read again after a window answered no rows and once the walk ends, since the hub
         measures one while answering."""
         for lo, hi in windows:
             if floor is not None and hi < floor:
@@ -270,12 +273,10 @@ class MT5DataDownloader:
             label = f"{_iso(lo)}..{_iso(hi)}"
             try:
                 rows = read(lo, hi)
-            except ServerUnreachable as exc:
+            except (HubAnswerError, ServerUnreachable) as exc:
                 _record_error(result, f"Window {label} failed: {exc}")
                 continue
-            if rows is None:
-                _record_error(result, f"Window {label} failed: {self._conn.mt5.last_error()}")
-            elif len(rows) == 0:
+            if len(rows) == 0:
                 result.chunks_empty += 1
                 floor = self._refresh_floor(result, series, floor)
             else:
@@ -290,11 +291,12 @@ class MT5DataDownloader:
     def _refresh_floor(
         self, result: DownloadResult, series: Series, floor: int | None
     ) -> int | None:
-        """Reads the series' floor the server advertises now; a failed read is recorded as an error
-        and leaves the floor known before."""
-        ranges = history.ranges(self._conn, result.symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
+        """Reads the series' floor the hub holds now; a failed read is recorded as an error and
+        leaves the floor known before."""
+        try:
+            ranges = self._conn.run(history.ranges(self._conn.session, result.symbol))
+        except (HubAnswerError, ServerUnreachable) as exc:
+            _record_error(result, f"Ranges failed: {exc}")
             return floor
         else:
             return _advertised_floor(ranges, series)
@@ -323,8 +325,8 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt
 
 
-def _advertised_floor(ranges: HistoryRanges, series: Series) -> int | None:
-    """The series' floor among the ranges the server advertises, or None before it measures one."""
+def _advertised_floor(ranges: calls.Ranges, series: Series) -> int | None:
+    """The series' floor among the ranges the hub holds, or None before it measures one."""
     if series in ranges.series:
         return ranges.series[series].floor
     else:

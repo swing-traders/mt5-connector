@@ -1,5 +1,5 @@
 """An execution client wired to real NT components over doubles of its connection's transport and of
-its push channel, recording what the client emits and logs."""
+its hub session, recording what the client emits and logs."""
 
 import asyncio
 from dataclasses import dataclass
@@ -26,7 +26,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
-from push_double import PushDouble, deal_added
+from session_double import SessionDouble, deal_added
 from venue_doubles import account_info, trade_deal, trade_order, trade_position
 
 from mt5connector.client import execution
@@ -125,7 +125,7 @@ class Harness:
     """One client under test, with what it emitted."""
 
     client: RecordedExecClient
-    push: PushDouble
+    push: SessionDouble
     venue: MagicMock
     conn: MagicMock
     cache: object
@@ -244,14 +244,13 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
     conn.mt5 = venue
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
-    conn.reconnect_async = AsyncMock(return_value=True)
 
     provider = MagicMock(spec=MT5InstrumentProvider)
     provider.initialize = AsyncMock()
     provider.list_all.return_value = list(loaded.values())
     provider.get_instrument.side_effect = loaded.get
 
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = RecordedExecClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -262,7 +261,7 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
             config=config(**settings),
         )
     factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
-    return Harness(client, client._push, venue, conn, cache, factory, ledger, loaded)
+    return Harness(client, client._hub, venue, conn, cache, factory, ledger, loaded)
 
 
 def _history_holding(deal, venue):

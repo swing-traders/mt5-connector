@@ -1,6 +1,6 @@
-"""The history routes' vocabulary, shared by the server and its client: their paths, the series and
-their periods, a bar's row, the tick selections, and the codes the server answers beside the
-package's own."""
+"""The history routes' vocabulary, shared by the server, the hub and their client: their paths, the
+series and their periods, a bar's row, the tick selections, what sets a floor, and the codes the
+server answers beside the package's own."""
 
 from enum import IntEnum, StrEnum
 
@@ -46,6 +46,14 @@ class TickFlags(StrEnum):
     ALL = "ALL"
     INFO = "INFO"
     TRADE = "TRADE"
+
+
+class FloorOrigin(StrEnum):
+    """What set a floor: the stub, the one row the terminal answers for a window before any
+    plausible history, or the first authentic row past a coarse prefix at the series' start."""
+
+    STUB = "stub"
+    COARSE = "coarse"
 
 
 class ServerCode(IntEnum):

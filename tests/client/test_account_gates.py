@@ -3,11 +3,13 @@ it books under, the instruments it loads and the currencies it registers, and th
 its orders."""
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from exec_harness import account_id_of
+from hub_double import zeroed
 from nautilus_trader.cache.transformers import transform_instrument_to_pyo3
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
@@ -27,8 +29,8 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from push_double import PushDouble
-from venue_doubles import account_info, relayed_sessions, symbol_info, trade_position
+from session_double import SessionDouble
+from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
 from mt5connector.client.config import MT5Config
@@ -37,7 +39,7 @@ from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 
 EURUSD_ONLY = InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("EURUSD.MT5")}))
 
@@ -95,7 +97,7 @@ def _client(
         "trade_allowed": terminal_trade_allowed,
     }
     clock = LiveClock()
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = MT5LiveExecutionClient(
             loop=loop,
             connection=conn,
@@ -205,12 +207,14 @@ def test_the_snapshots_money_is_decimal_from_the_boundary_on():
     assert all(isinstance(value, Decimal) for value in money)
 
 
-def test_the_terminal_info_exposes_trading_permission_and_connection(config, mock_mt5):
-    mock_mt5.terminal_info.return_value.trade_allowed = True
-    mock_mt5.terminal_info.return_value.connected = True
-    conn = MT5Connection(config)
-    conn.connect()
-    info = conn.get_terminal_info()
+async def test_the_terminal_info_exposes_trading_permission_and_connection(config, hub, mock_mt5):
+    terminal = calls.CALLS[calls.Call.TERMINAL_INFO].layout
+    hub.answers[calls.Call.ACCOUNT_INFO] = [account_info()._asdict()]
+    hub.answers[calls.Call.TERMINAL_INFO] = [zeroed(terminal, trade_allowed=True, connected=True)]
+    conn = MT5Connection(replace(config, ws_url=f"ws://127.0.0.1:{hub.port}"))
+    await asyncio.to_thread(conn.connect)
+    info = await asyncio.to_thread(conn.get_terminal_info)
+    await asyncio.to_thread(conn.disconnect)
     assert info["trade_allowed"] is True
     assert info["connected"] is True
 
@@ -243,7 +247,7 @@ async def test_a_non_hedging_account_fails_the_connect_naming_both_modes_before_
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
     assert client._account_task is None
-    assert not client._push.connected
+    assert not client._hub.connected
 
 
 async def test_a_hedging_account_connects(venue):
@@ -251,7 +255,7 @@ async def test_a_hedging_account_connects(venue):
     await client._connect()
     client.generate_account_state.assert_called_once()
     assert not client._account_task.done()
-    assert client._push.connected
+    assert client._hub.connected
     await _stop_account_loop(client)
 
 
@@ -267,14 +271,14 @@ async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue)
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
     assert client._account_task is None
-    assert not client._push.connected
+    assert not client._hub.connected
 
 
 async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(venue):
     client = _client(venue, account_info(trade_allowed=True), terminal_trade_allowed=True)
     await client._connect()
     assert not client._account_task.done()
-    assert client._push.connected
+    assert client._hub.connected
     await _stop_account_loop(client)
 
 
@@ -335,7 +339,7 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
         account_info(login=7654321, currency="EUR")
     )
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -378,22 +382,27 @@ async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(v
     await _stop_account_loop(client)
 
 
+def _serve_symbols(conn, symbols: SymbolVenue) -> None:
+    """Hands the connection's hub session reads to `symbols`."""
+    conn.session = symbols
+    conn.run = run_apart
+
+
 @pytest.fixture
-def settlement_venue(venue):
-    venue.symbol_select.return_value = True
-    venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    venue.trading_sessions.return_value = relayed_sessions()
-    venue.symbol_info.return_value = symbol_info(
-        currency_base="XPT", currency_profit="UST", currency_margin="BHD"
-    )
-    venue.symbols_get.side_effect = lambda: (venue.symbol_info.return_value,)
-    return venue
+def settlement_symbols():
+    """EURUSD, settling in UST, with no commission."""
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(currency_base="XPT", currency_profit="UST", currency_margin="BHD"))
+    return symbols
 
 
-async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments(settlement_venue):
+async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments(
+    venue, settlement_symbols
+):
     seen = []
     for digits in (8, 2):
-        client = _client(settlement_venue, account_info(currency="UST", currency_digits=digits))
+        client = _client(venue, account_info(currency="UST", currency_digits=digits))
+        _serve_symbols(client._conn, settlement_symbols)
         client._provider = MT5InstrumentProvider(
             connection=client._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
         )
@@ -418,16 +427,17 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
 
 @pytest.mark.parametrize(("code", "precision"), [("XYZ", None), ("CLP", 0), ("KWD", 3)])
 async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
-    settlement_venue, code, precision
+    venue, settlement_symbols, code, precision
 ):
-    first = _client(settlement_venue, account_info(currency=code, currency_digits=8))
+    first = _client(venue, account_info(currency=code, currency_digits=8))
     try:
         await first._connect()
     finally:
         await _stop_account_loop(first)
 
-    settlement_venue.symbol_info.return_value = symbol_info(currency_profit=code)
-    later = _client(settlement_venue, account_info(currency="USD"))
+    settlement_symbols.add(symbol_info(currency_profit=code))
+    later = _client(venue, account_info(currency="USD"))
+    _serve_symbols(later._conn, settlement_symbols)
     later._provider = MT5InstrumentProvider(
         connection=later._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
     )
@@ -497,32 +507,27 @@ async def test_the_currencies_register_before_the_first_account_state(venue):
 
 
 @pytest.fixture
-def terminal(venue):
-    """The venue serving EURUSD and GBPUSD, neither charging a commission."""
-    definitions = {
-        "EURUSD": symbol_info(name="EURUSD"),
-        "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
-    }
-    venue.symbol_select.side_effect = lambda name, enable: name in definitions
-    venue.symbol_info.side_effect = definitions.get
-    venue.symbols_get.return_value = tuple(definitions.values())
-    venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    venue.trading_sessions.return_value = relayed_sessions()
-    return venue
+def terminal():
+    """The hub session serving EURUSD and GBPUSD, neither charging a commission."""
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(name="EURUSD"))
+    symbols.add(symbol_info(name="GBPUSD", currency_base="GBP"))
+    return symbols
 
 
-def _served_client(transport, provider_config: InstrumentProviderConfig):
+def _served_client(transport, symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
     """A client over a real provider whose config is `provider_config`, its connection's transport
-    `transport`."""
+    `transport` and its hub session's reads `symbols`."""
     conn = MagicMock(spec=MT5Connection)
     conn.mt5 = transport
+    _serve_symbols(conn, symbols)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
     provider = MT5InstrumentProvider(
         connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
     )
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", SessionDouble):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -536,8 +541,9 @@ def _served_client(transport, provider_config: InstrumentProviderConfig):
     return client, provider
 
 
-async def test_connect_loads_exactly_the_ids_its_provider_config_names(terminal):
+async def test_connect_loads_exactly_the_ids_its_provider_config_names(venue, terminal):
     client, provider = _served_client(
+        venue,
         terminal,
         InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("GBPUSD.MT5")})),
     )
@@ -551,12 +557,14 @@ async def test_connect_loads_exactly_the_ids_its_provider_config_names(terminal)
     [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
     ids=["no-ids", "empty-ids"],
 )
-async def test_connect_refuses_a_provider_config_that_names_nothing(terminal, provider_config):
-    client, provider = _served_client(terminal, provider_config)
+async def test_connect_refuses_a_provider_config_that_names_nothing(
+    venue, terminal, provider_config
+):
+    client, provider = _served_client(venue, terminal, provider_config)
     with pytest.raises(MT5ConfigError, match="instrument_provider"):
         await client._connect()
     assert provider.list_all() == []
-    assert not client._push.connected
+    assert not client._hub.connected
     client.generate_account_state.assert_not_called()
 
 

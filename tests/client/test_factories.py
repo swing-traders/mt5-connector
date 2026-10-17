@@ -8,7 +8,7 @@ import pytest
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.objects import Currency
-from venue_doubles import account_info, relayed_sessions, symbol_info
+from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot
@@ -369,21 +369,15 @@ class TestBuildMt5NodeConfig:
 
 @pytest.fixture
 def terminal(mock_mt5_conn):
-    """The transport of the shared connection, serving EURUSD and GBPUSD, neither charging a
+    """The hub session of the shared connection, serving EURUSD and GBPUSD, neither charging a
     commission."""
     _, conn = mock_mt5_conn
-    definitions = {
-        "EURUSD": symbol_info(name="EURUSD"),
-        "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
-    }
-    package = MagicMock()
-    package.symbol_select.side_effect = lambda name, enable: name in definitions
-    package.symbol_info.side_effect = definitions.get
-    package.symbols_get.return_value = tuple(definitions.values())
-    package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    package.trading_sessions.return_value = relayed_sessions()
-    conn.mt5 = package
-    return package
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(name="EURUSD"))
+    symbols.add(symbol_info(name="GBPUSD", currency_base="GBP"))
+    conn.session = symbols
+    conn.run = run_apart
+    return symbols
 
 
 def loaded_ids(provider) -> set[InstrumentId]:

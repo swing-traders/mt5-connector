@@ -14,14 +14,13 @@ import pytest
 from venue_doubles import relayed_sessions
 
 import mt5connector.client.remote_mt5 as rmt5
-from mt5connector.client import errors, history
+from mt5connector.client import errors
 from mt5connector.client.errors import (
     MT5ConnectionError,
     MT5InstrumentError,
     ServerBusy,
     ServerUnreachable,
 )
-from mt5connector.wire.history_wire import Series
 
 JSON = "application/json"
 
@@ -194,14 +193,6 @@ def test_the_unverified_clock_gate_raises_server_unreachable_not_a_lost_response
     with pytest.raises(ServerUnreachable, match="server not ready") as refused:
         shim.order_send({"action": 1})
     assert not isinstance(refused.value, errors.ResponseLost)
-
-
-def test_a_history_read_refused_not_ready_without_a_retry_after_raises_at_once(stand_in, shim):
-    message = "the broker clock is not verified"
-    stand_in.reply(503, {"ok": False, "error": {"code": -1, "message": message}})
-    with pytest.raises(ServerUnreachable, match=f"^history/bars: server not ready — {message}$"):
-        history.bars(SimpleNamespace(mt5=shim), "EURUSD", Series.H1, 1_752_570_000, 1_752_573_600)
-    assert len(stand_in.received) == 1
 
 
 def test_a_busy_server_raises_server_busy_carrying_its_retry_after(stand_in, shim):

@@ -1,10 +1,12 @@
-"""Shared fixtures: a valid MT5Config, the transport an MT5Connection builds, mocked, and a
-transport for the execution client's connection."""
+"""Shared fixtures: a valid MT5Config, the transport an MT5Connection builds, mocked, a transport
+for the execution client's connection, and a hub double on a free loopback port."""
 
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
+from hub_double import HubDouble
 from venue_doubles import account_info, send_result, tick
+from websockets.asyncio.server import serve
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.remote_mt5 import RemoteMT5
@@ -26,7 +28,6 @@ def config():
         ws_url="ws://127.0.0.1:9000",
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
-        reconnect_max_attempts=3,
         timeout_s=5.0,
     )
 
@@ -89,3 +90,12 @@ def exec_shim():
     shim.order_send.return_value = send_result()
     shim.last_error.return_value = mirror.SUCCESS
     return shim
+
+
+@pytest.fixture
+async def hub():
+    double = HubDouble()
+    server = await serve(double.handler, "127.0.0.1", 0)
+    double.port = server.sockets[0].getsockname()[1]
+    yield double
+    server.close()

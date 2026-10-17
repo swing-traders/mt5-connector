@@ -1,7 +1,6 @@
 #!/bin/bash
-# Boots the MT5 terminal, the connector's push hub and its HTTP server, and ends the container with
-# whichever of them exits first, or on a stop request. It prints its own steps and the terminal's
-# logs.
+# Boots the MT5 terminal and the connector's hub, and ends the container with whichever of them
+# exits first, or on a stop request. It prints its own steps and the terminal's logs.
 set -euo pipefail
 
 readonly terminal_dir="$WINEPREFIX/drive_c/Program Files/MetaTrader 5"
@@ -11,9 +10,9 @@ readonly runtime_dir=/tmp/mt5
 readonly startup_ini="$runtime_dir/setup.ini"
 readonly search_ini="$runtime_dir/search.ini"
 readonly window_wait_seconds=120
-# A stop's bounds together — a call in flight, the terminal's close, the log tail's, the server's
-# and the hub's, the display's and the kill — stay under the stop timeout the server README asks the
-# container to be given.
+# A stop's bounds together — a call in flight, the terminal's close, the log tail's, the hub's, the
+# display's and the kill — stay under the stop timeout the server README asks the container to be
+# given.
 readonly close_wait_seconds=60
 readonly stop_wait_seconds=10
 readonly call_seconds=10
@@ -228,14 +227,6 @@ start_hub() {
     process_names[$!]=hub
 }
 
-# The server exits when no EA sample verifies the broker clock within its bootstrap window: the loud
-# end of a start whose login failed.
-start_server() {
-    step "starting the server"
-    wine "$MT5_PYTHON_DIR\\Scripts\\mt5-connector-server.exe" &
-    process_names[$!]=server
-}
-
 # Sends SIGTERM to `pids` and waits up to `stop_wait_seconds` for them all to exit.
 terminate() {
     local deadline=$((SECONDS + stop_wait_seconds)) pid
@@ -248,8 +239,8 @@ terminate() {
 }
 
 # Closes the terminal as a user would, so it writes out what it holds and its last lines reach the
-# log, then stops the log tail, the server and the hub, and the display last; whatever outlasts its
-# bound is killed.
+# log, then stops the log tail and the hub, and the display last; whatever outlasts its bound is
+# killed.
 stop_everything() {
     local pid services=() display=() remaining=()
     if [[ -n "$terminal_pid" ]] && kill -0 "$terminal_pid" 2>/dev/null; then
@@ -265,7 +256,7 @@ stop_everything() {
     fi
     for pid in "${!process_names[@]}"; do
         case "${process_names[$pid]}" in
-            server | hub) services+=("$pid") ;;
+            hub) services+=("$pid") ;;
             Xvfb) display+=("$pid") ;;
         esac
     done
@@ -345,5 +336,4 @@ start_log_tail
 await_terminal_window
 allow_webrequest
 start_hub
-start_server
 supervise

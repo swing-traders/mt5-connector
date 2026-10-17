@@ -25,17 +25,19 @@ class CommissionRule:
 
 def parse_schedule(schedule: dict) -> CommissionRule | None:
     """The first rule of a relayed schedule with its first tier; None when it holds no rule. Raises
-    MT5InstrumentError for a failed read or a mode MQL5 does not name."""
+    MT5InstrumentError for a failed read or a rule with no tier."""
     if schedule["ret"] < 0:
         raise MT5InstrumentError(f"the commission schedule read failed: {schedule['last_error']}")
     elif not schedule["rules"]:
         return None
+    elif not schedule["rules"][0]["tiers"]:
+        raise MT5InstrumentError("the commission rule has no tier")
     else:
         rule = schedule["rules"][0]
         tier = rule["tiers"][0]
         return CommissionRule(
-            entry=_member(CommissionEntryMode, rule["mode_entry"], "commission entry mode"),
-            mode=_member(CommissionMode, tier["mode"], "commission mode"),
+            entry=rule["mode_entry"],
+            mode=tier["mode"],
             value=finite_decimal(tier["value"], "commission value"),
             currency=tier["currency"],
         )
@@ -70,12 +72,3 @@ def taker_fee(
         return fee / 2
     else:
         raise MT5InstrumentError(f"commission entry mode {rule.entry} derives no fee")
-
-
-def _member(members, name: str, field: str):
-    """The member of `members` the venue's name is; raises MT5InstrumentError for a name MQL5 does
-    not give one."""
-    try:
-        return members(name)
-    except ValueError:
-        raise MT5InstrumentError(f"{field} {name!r} is unknown") from None
