@@ -691,6 +691,7 @@ async def test_the_account_is_reported_on_the_configs_refresh_period(exec_shim):
         errors.ServerBusy("account_info: server busy", 5),
         errors.ServerUnreachable("account_info: unavailable"),
         errors.ResponseLost("account_info: unavailable"),
+        errors.MT5ConnectionError("MT5 not connected (state=DISCONNECTED)"),
     ],
 )
 async def test_an_account_report_the_server_does_not_answer_stays_owed_and_warns_once(
@@ -715,27 +716,3 @@ async def test_an_account_report_the_server_does_not_answer_stays_owed_and_warns
     assert [line for line in h.logged(LogLevel.INFO) if "answers again" in line] == [
         "account report: the server answers again"
     ]
-    h.conn.reconnect_async.assert_not_called()
-
-
-async def test_a_lost_terminal_session_is_reconnected_and_the_account_loop_resumes(exec_shim):
-    h = await connected(exec_shim, account_refresh_seconds=1, exec_poll_interval_ms=50)
-    h.conn.ensure_connected.side_effect = [errors.MT5ConnectionError("not connected")] + [
-        None
-    ] * 100
-    h.client._account_owed = True
-    task = asyncio.get_running_loop().create_task(h.client._account_loop())
-    await asyncio.sleep(0.3)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    h.conn.reconnect_async.assert_awaited_once()
-    assert h.names() == ["AccountState"]
-
-
-async def test_a_reconnect_that_gives_up_ends_the_account_loop(exec_shim):
-    h = await connected(exec_shim, exec_poll_interval_ms=50)
-    h.conn.ensure_connected.side_effect = errors.MT5ConnectionError("not connected")
-    h.conn.reconnect_async.return_value = False
-    await asyncio.wait_for(h.client._account_loop(), timeout=1.0)
-    h.conn.reconnect_async.assert_awaited_once()
-    assert len(h.logged(LogLevel.ERROR)) == 1

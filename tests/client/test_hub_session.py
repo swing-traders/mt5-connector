@@ -2,13 +2,14 @@
 under their correlation ids, their typed errors, its deadlines, and what a reconnect resends."""
 
 import asyncio
+import gc
 import inspect
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from hub_double import HubDouble, asked, eventually, zeroed
 from websockets.asyncio.server import serve
-from websockets.exceptions import ConnectionClosed
 
 from mt5connector.client import hub as hub_module
 from mt5connector.client.config import MT5Config
@@ -36,20 +37,6 @@ HELLO = binary.AdapterHello()
 _TICKS = np.dtype(list(mirror.TICKS.dtype))
 
 
-def zeroed(layout: binary.Layout, **values) -> dict:
-    record = {}
-    for member in layout.members:
-        if member.declared is mirror.MqlType.STRING:
-            record[member.name] = ""
-        elif member.declared is mirror.MqlType.DOUBLE:
-            record[member.name] = 0.0
-        elif member.declared is mirror.MqlType.BOOL:
-            record[member.name] = False
-        elif member.declared is not None:
-            record[member.name] = 0
-    return record | values
-
-
 def tick(msc=0):
     return {
         "time": 1_752_570_000,
@@ -61,61 +48,6 @@ def tick(msc=0):
         "flags": 6,
         "volume_real": 0.0,
     }
-
-
-class HubDouble:
-    """A hub on a free loopback port that records what each connection sends, acknowledges every op,
-    and sends what a test hands it to the latest connection."""
-
-    def __init__(self):
-        self.received: list[list] = []
-        self.connections = []
-
-    async def handler(self, ws):
-        self.connections.append(ws)
-        frames = []
-        self.received.append(frames)
-        try:
-            async for raw in ws:
-                if not frames:
-                    frame = binary.decode_hello(raw)
-                else:
-                    frame = binary.decode(raw, Sender.ADAPTER)
-                frames.append(frame)
-                if isinstance(frame, binary.Subscribe | binary.Unsubscribe):
-                    await ws.send(binary.encode(binary.Ack(frame.op_id)))
-        except ConnectionClosed:
-            pass
-
-    async def push(self, frame):
-        await self.connections[-1].send(binary.encode(frame))
-
-    def requests(self, connection=-1) -> list[binary.Request]:
-        return [frame for frame in self.received[connection] if isinstance(frame, binary.Request)]
-
-    async def answer(self, request: binary.Request, value, *, part=0, last=True, last_error=0):
-        count, body = calls.write_result(calls.CALLS[calls.Call(request.call)], value)
-        await self.push(binary.Answer(request.request_id, part, last, last_error, count, body))
-
-    async def fail(self, request: binary.Request, error: binary.AnswerError, last_error=0):
-        await self.push(binary.Answer(request.request_id, 0, True, last_error, error=error))
-
-
-async def eventually(predicate, timeout=3.0):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not predicate():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("the condition never held")
-        await asyncio.sleep(0.01)
-
-
-@pytest.fixture
-async def hub():
-    double = HubDouble()
-    server = await serve(double.handler, "127.0.0.1", 0)
-    double.port = server.sockets[0].getsockname()[1]
-    yield double
-    server.close()
 
 
 def config(port):
@@ -152,11 +84,6 @@ def session(hub, owner):
     return HubSession(
         config(hub.port), asyncio.get_running_loop(), owner.on_frame, owner.on_reconnect, owner.log
     )
-
-
-async def asked(hub, count=1, connection=-1) -> list[binary.Request]:
-    await eventually(lambda: len(hub.received) > 0 and len(hub.requests(connection)) >= count)
-    return hub.requests(connection)
 
 
 # ── Streams ───────────────────────────────────────────────────────────────────
@@ -519,6 +446,91 @@ async def test_deferring_stops_when_its_caller_cancels(hub):
     await hub_session.disconnect()
 
 
+def recorded(loop) -> list:
+    """Every context the loop's exception handler is called with from now on."""
+    reported = []
+    loop.set_exception_handler(lambda loop, context: reported.append(context))
+    return reported
+
+
+async def collected(loop) -> None:
+    """Lets the loop run a few turns and collects garbage, so an exception nothing retrieved is
+    reported, then restores the loop's handler."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gc.collect()
+    loop.set_exception_handler(None)
+
+
+async def test_a_call_cancelled_while_its_request_is_sent_leaves_nothing_to_fail(hub, monkeypatch):
+    hub_session = session(hub, Owner())
+    await hub_session.connect()
+    loop = asyncio.get_running_loop()
+    reported = recorded(loop)
+    sending = asyncio.Event()
+    never = asyncio.Event()
+
+    async def held(raw):
+        sending.set()
+        await never.wait()
+
+    monkeypatch.setattr(hub_session, "_send", held)
+    read = asyncio.create_task(hub_session.account_info())
+    await sending.wait()
+    read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await read
+
+    assert hub_session._in_flight == {}
+    await hub_session.disconnect()
+    await collected(loop)
+    assert reported == []
+
+
+async def cancelled_once_sent(hub, hub_session, monkeypatch, call) -> binary.Request:
+    """Runs a call, cancels it once its request was sent, and gives the request the hub received."""
+    sent_once = asyncio.Event()
+    send = hub_session._send
+
+    async def sending(raw):
+        await send(raw)
+        sent_once.set()
+
+    monkeypatch.setattr(hub_session, "_send", sending)
+    task = asyncio.create_task(call)
+    await sent_once.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (request,) = await asked(hub)
+    return request
+
+
+@pytest.mark.parametrize(
+    "error", [binary.AnswerError(ErrorKind.EA_ERROR, "failed"), None], ids=["failed", "unanswered"]
+)
+async def test_a_read_cancelled_once_sent_stays_in_flight_and_leaves_nothing_unretrieved(
+    hub, monkeypatch, error
+):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    loop = asyncio.get_running_loop()
+    reported = recorded(loop)
+
+    request = await cancelled_once_sent(hub, hub_session, monkeypatch, hub_session.account_info())
+
+    assert request.request_id in hub_session._in_flight
+    if error is not None:
+        await hub.fail(request, error)
+        await eventually(lambda: request.request_id not in hub_session._in_flight)
+    await hub_session.disconnect()
+    await collected(loop)
+    assert hub_session._in_flight == {}
+    assert not owner.log.warning.called
+    assert reported == []
+
+
 async def test_a_call_unanswered_past_the_sessions_deadline_raises_and_a_late_answer_is_dropped(
     hub, monkeypatch
 ):
@@ -769,6 +781,37 @@ async def test_an_outcome_whose_transaction_arrived_meanwhile_is_not_handed_twic
     await hub_session.disconnect()
 
 
+async def test_an_outcomes_answer_that_does_not_decode_is_logged_and_its_commands_stay_outstanding(
+    hub,
+):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    await send_orders(hub, hub_session, ((41, "EURUSD"),))
+    loop = asyncio.get_running_loop()
+    reported = recorded(loop)
+
+    await hub.connections[0].close()
+    ((request, _),) = outcomes_asked(await asked(hub, 1, connection=1)).values()
+    # An answer's payload opens with its part and last_error, eight bytes; this one carries three.
+    await hub.connections[-1].send(
+        raw_header(
+            binary.FrameKind.ANSWER, b"\x00\x00\x00", flags=3, correlation=request.request_id
+        )
+    )
+    await eventually(lambda: not hub_session._tasks)
+
+    errors = [call.args[0] for call in owner.log.error.call_args_list]
+    unanswered = "hub session: the outcomes of EURUSD were not answered: hub session: outcomes: "
+    assert [error for error in errors if error.startswith(unanswered)] == [
+        f"{unanswered}answer frame: offset 20: part runs past the payload"
+    ]
+    assert hub_session._outstanding == {41: "EURUSD"}
+    await hub_session.disconnect()
+    await collected(loop)
+    assert reported == []
+
+
 async def test_a_command_its_transaction_settles_before_its_sender_resumes_is_not_asked_again(hub):
     owner = Owner()
     hub_session = session(hub, owner)
@@ -790,6 +833,26 @@ async def test_a_command_its_transaction_settles_before_its_sender_resumes_is_no
     assert hub.requests(connection=1) == []
     assert owner.frames == [request_transaction(41)]
     await hub_session.disconnect()
+
+
+async def test_an_order_cancelled_once_sent_and_answered_sent_stays_outstanding(hub, monkeypatch):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    loop = asyncio.get_running_loop()
+    reported = recorded(loop)
+
+    request = await cancelled_once_sent(
+        hub, hub_session, monkeypatch, hub_session.order_send({"symbol": "EURUSD"})
+    )
+    await hub.answer(request, sent(41))
+    await eventually(lambda: 41 in hub_session._outstanding)
+
+    await hub_session.disconnect()
+    await collected(loop)
+    assert hub_session._outstanding == {41: "EURUSD"}
+    assert not owner.log.warning.called
+    assert reported == []
 
 
 async def test_a_resend_a_reconnect_overtakes_does_not_open_the_next_connection_to_requests():

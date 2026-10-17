@@ -1,5 +1,5 @@
 """The NT data client of an MT5 terminal: its quote ticks, a mark at the mid of each, and its closed
-venue bars pushed over the hub, and its history read over HTTP.
+venue bars pushed over the hub, and its history read on the same hub session.
 
 State: the symbols whose quotes and whose marks NT subscribes, which share one tick stream; per
 venue bar type, the earliest close the next bar handed to NT may have, and from a reconnect until
@@ -8,8 +8,6 @@ the bars it missed are read back, the bars pushed since."""
 from __future__ import annotations
 
 import asyncio
-import threading
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -37,7 +35,7 @@ from nautilus_trader.model.identifiers import ClientId
 
 from mt5connector.client import history
 from mt5connector.client.currencies import register_venue_currency
-from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.errors import HubAnswerError, MT5InstrumentError, ServerUnreachable
 from mt5connector.client.hub import HubSession
 from mt5connector.client.parsing import (
     InstrumentAny,
@@ -52,8 +50,6 @@ from mt5connector.wire.history_wire import BAR_CLOSE
 from mt5connector.wire.push_wire import Stream, Subscription
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from mt5connector.client.config import MT5Config
     from mt5connector.client.connection import MT5Connection
     from mt5connector.client.providers import MT5InstrumentProvider
@@ -242,23 +238,17 @@ class MT5DataClient(LiveMarketDataClient):
 
     async def _missed_bars(self, bar_type: BarType, first_close: int, last_close: int):
         """The bars of `bar_type` closing from `first_close` through `last_close` as the history
-        serves them; none, with an error logged, when the read fails or the server does not
-        answer."""
+        serves them; none, with an error logged, when the hub fails the read or its answer is lost
+        or undecodable."""
         series = _bar_subscription(bar_type).timeframe
         symbol = bar_type.instrument_id.symbol.value
         first_open, last_open = history.opens_closing(series, first_close, last_close)
         try:
-            rows = await _read_in_thread(
-                history.bars, self._conn, symbol, series, first_open, last_open
-            )
-            failure = self._conn.mt5.last_error()
-        except MT5ConnectionError as exc:
-            rows = None
-            failure = exc
-        if rows is None:
+            rows = await history.bars(self._hub, symbol, series, first_open, last_open)
+        except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: {bar_type} bars closing {_iso(first_close)}..{_iso(last_close)} "
-                f"not read back: {failure}"
+                f"not read back: {exc}"
             )
             return ()
         else:
@@ -358,11 +348,11 @@ class MT5DataClient(LiveMarketDataClient):
         self._conn.ensure_connected()
         start = _epoch_s(request.start)
         end = self._end_s(request.end)
-        rows = await _read_in_thread(history.ticks, self._conn, symbol, start, end)
-        if rows is None:
+        try:
+            rows = await history.ticks(self._hub, symbol, start, end)
+        except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
-                f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: "
-                f"{self._conn.mt5.last_error()}"
+                f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: {exc}"
             )
         else:
             ticks = [parse_quote_tick(row, instrument) for row in rows]
@@ -378,17 +368,16 @@ class MT5DataClient(LiveMarketDataClient):
         series = venue_series(request.bar_type)
         instrument = self._instrument(symbol)
         self._conn.ensure_connected()
-        # The request names closes; the server serves bars by their open.
+        # The request names closes; the hub serves bars by their open.
         first_close = _epoch_s(request.start)
         last_close = self._end_s(request.end)
         first_open, last_open = history.opens_closing(series, first_close, last_close)
-        rows = await _read_in_thread(
-            history.bars, self._conn, symbol, series, first_open, last_open
-        )
-        if rows is None:
+        try:
+            rows = await history.bars(self._hub, symbol, series, first_open, last_open)
+        except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: {request.bar_type} bars closing "
-                f"{_iso(first_close)}..{_iso(last_close)} failed: {self._conn.mt5.last_error()}"
+                f"{_iso(first_close)}..{_iso(last_close)} failed: {exc}"
             )
         else:
             bars = [
@@ -420,17 +409,6 @@ class MT5DataClient(LiveMarketDataClient):
 def _bar_subscription(bar_type: BarType) -> Subscription:
     """The push stream of a venue bar type: its symbol's bars of the terminal's series."""
     return Subscription(Stream.BARS, bar_type.instrument_id.symbol.value, venue_series(bar_type))
-
-
-async def _read_in_thread(read: Callable[..., np.ndarray | None], *args) -> np.ndarray | None:
-    """A history read run off the event loop, its retries stopped when the awaiting task is
-    cancelled, since the thread outlives the task."""
-    cancel = threading.Event()
-    try:
-        return await asyncio.to_thread(read, *args, cancel=cancel)
-    except asyncio.CancelledError:
-        cancel.set()
-        raise
 
 
 def _epoch_s(value) -> int:

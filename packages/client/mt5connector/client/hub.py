@@ -226,7 +226,15 @@ class HubSession:
         if call is calls.Call.ORDER_SEND:
             flight.symbol = arguments["request"]["symbol"]
         self._in_flight[request_id] = flight
-        await self._send(binary.encode(binary.Request(request_id, call, count, body)))
+        try:
+            await self._send(binary.encode(binary.Request(request_id, call, count, body)))
+        except asyncio.CancelledError:
+            # A flight whose request may not have gone out is withdrawn; one whose request went out
+            # is the session's to finish, its answer taken as any other once its caller has gone.
+            if request_id in self._in_flight:
+                self._end(request_id)
+            flight.future.cancel()
+            raise
         return await flight.future
 
     async def deferring(self, call: calls.Call, **arguments: object) -> Answered:
@@ -421,7 +429,7 @@ class HubSession:
             answered = await self.deferring(
                 calls.Call.OUTCOMES, symbol=symbol, request_ids=request_ids
             )
-        except (HubAnswerError, ResponseLost) as failure:
+        except (HubAnswerError, ServerUnreachable) as failure:
             self._log.error(f"hub session: the outcomes of {symbol} were not answered: {failure}")
         else:
             held = {transaction.result["request_id"] for transaction in answered.result}

@@ -3,11 +3,13 @@ it books under, the instruments it loads and the currencies it registers, and th
 its orders."""
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from exec_harness import account_id_of
+from hub_double import zeroed
 from nautilus_trader.cache.transformers import transform_instrument_to_pyo3
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
@@ -37,7 +39,7 @@ from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 
 EURUSD_ONLY = InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("EURUSD.MT5")}))
 
@@ -205,12 +207,14 @@ def test_the_snapshots_money_is_decimal_from_the_boundary_on():
     assert all(isinstance(value, Decimal) for value in money)
 
 
-def test_the_terminal_info_exposes_trading_permission_and_connection(config, mock_mt5):
-    mock_mt5.terminal_info.return_value.trade_allowed = True
-    mock_mt5.terminal_info.return_value.connected = True
-    conn = MT5Connection(config)
-    conn.connect()
-    info = conn.get_terminal_info()
+async def test_the_terminal_info_exposes_trading_permission_and_connection(config, hub, mock_mt5):
+    terminal = calls.CALLS[calls.Call.TERMINAL_INFO].layout
+    hub.answers[calls.Call.ACCOUNT_INFO] = [account_info()._asdict()]
+    hub.answers[calls.Call.TERMINAL_INFO] = [zeroed(terminal, trade_allowed=True, connected=True)]
+    conn = MT5Connection(replace(config, ws_url=f"ws://127.0.0.1:{hub.port}"))
+    await asyncio.to_thread(conn.connect)
+    info = await asyncio.to_thread(conn.get_terminal_info)
+    await asyncio.to_thread(conn.disconnect)
     assert info["trade_allowed"] is True
     assert info["connected"] is True
 

@@ -489,26 +489,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     # ── The account ───────────────────────────────────────────────────────────
 
     async def _account_loop(self) -> None:
-        """Takes an account turn every poll interval, reconnecting a terminal session the connection
-        reports lost; ends when a reconnect gives up."""
         while True:
-            try:
-                self._conn.ensure_connected()
-            except MT5ConnectionError as exc:
-                if not await self._reconnect(exc):
-                    return
-            else:
-                self._account_turn()
+            self._account_turn()
             await asyncio.sleep(self._config.exec_poll_interval_s)
-
-    async def _reconnect(self, cause: MT5ConnectionError) -> bool:
-        self._log.warning(f"terminal session lost: {cause}")
-        reconnected = await self._conn.reconnect_async()
-        if reconnected:
-            self._log.info("terminal session reconnected")
-        else:
-            self._log.error("reconnect gave up: the account loop stops")
-        return reconnected
 
     def _account_turn(self) -> None:
         """Reports the account when an event owes a report or the refresh period is up. A report the

@@ -3,10 +3,9 @@ tests/client/test_data_push.py's."""
 
 import asyncio
 import calendar
-import threading
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -26,7 +25,14 @@ from mt5connector.client import data
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient, _epoch_s
-from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.errors import (
+    EaError,
+    MT5ConfigError,
+    MT5ConnectionError,
+    MT5InstrumentError,
+    ProtocolError,
+    ResponseLost,
+)
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import mirror
 from mt5connector.wire.history_wire import Series
@@ -97,7 +103,6 @@ def make_config(ws_url="ws://127.0.0.1:9000", venue=MT5_VENUE):
         venue=venue,
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
-        reconnect_max_attempts=2,
     )
 
 
@@ -106,7 +111,6 @@ def make_conn(connected=True):
     conn.ensure_connected = (
         MagicMock() if connected else MagicMock(side_effect=MT5ConnectionError("not connected"))
     )
-    conn.reconnect_async = AsyncMock(return_value=connected)
     return conn
 
 
@@ -415,6 +419,14 @@ def closed_rows(*opens_and_closes):
     )
 
 
+# What a history read raises when the hub fails it, or its answer is lost or undecodable.
+FAILURES = [
+    ResponseLost("hub session: copy_rates_range unanswered past the session's deadline"),
+    ProtocolError("hub session: part 1 of request 7, not 0"),
+    EaError("copy_rates_range: the terminal's read failed", 4401),
+]
+
+
 def ticks_request(start, end):
     request = MagicMock()
     request.instrument_id.symbol.value = "EURUSDm"
@@ -439,9 +451,7 @@ class TestRequestQuoteTicks:
         with patch("mt5connector.client.history.ticks", return_value=rows) as ticks:
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        ticks.assert_called_once_with(
-            recorded._conn, "EURUSDm", 1_752_570_000, 1_752_573_600, cancel=ANY
-        )
+        ticks.assert_awaited_once_with(recorded._hub, "EURUSDm", 1_752_570_000, 1_752_573_600)
         delivered = recorded._handle_quote_ticks.call_args[0][1]
         assert [tick.ts_event for tick in delivered] == [
             ((1_752_570_000 + i) * 1000 + 250) * 1_000_000 for i in range(10)
@@ -458,17 +468,17 @@ class TestRequestQuoteTicks:
         assert recorded._handle_quote_ticks.call_args[0][1] == []
         assert recorded._log.warning.call_count == 0
 
+    @pytest.mark.parametrize("failure", FAILURES, ids=lambda failure: type(failure).__name__)
     @pytest.mark.asyncio
-    async def test_a_failed_window_is_an_error_naming_its_connections_last_error(self, recorded):
-        recorded._conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
-        with patch("mt5connector.client.history.ticks", return_value=None):
+    async def test_a_failed_window_is_an_error_naming_the_failure(self, recorded, failure):
+        with patch("mt5connector.client.history.ticks", side_effect=failure):
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
         recorded._handle_quote_ticks.assert_not_called()
         assert recorded._log.error.call_count == 1
         error = recorded._log.error.call_args[0][0]
         assert "2025-07-15T09:00:00+00:00" in error
-        assert error.endswith("failed: (-4, 'Terminal: Not found')")
+        assert error.endswith(f"failed: {failure}")
 
     @pytest.mark.asyncio
     async def test_both_sizes_are_the_instruments_largest_order(self, recorded):
@@ -505,9 +515,7 @@ class TestRequestBars:
             await recorded._request_bars(minute_bars_request(c0, c1))
 
         # Every bar closing in the request opened from two periods before its first close on.
-        bars.assert_called_once_with(
-            recorded._conn, "EURUSDm", Series.M1, c0 - 120, c1 - 1, cancel=ANY
-        )
+        bars.assert_awaited_once_with(recorded._hub, "EURUSDm", Series.M1, c0 - 120, c1 - 1)
         delivered = recorded._handle_bars.call_args[0][1]
         assert [bar.ts_event for bar in delivered] == [
             close * 1_000_000_000 for close in range(c0, c1 + 1, 60)
@@ -524,39 +532,41 @@ class TestRequestBars:
         assert recorded._handle_bars.call_args[0][1] == []
         assert recorded._log.warning.call_count == 0
 
+    @pytest.mark.parametrize("failure", FAILURES, ids=lambda failure: type(failure).__name__)
     @pytest.mark.asyncio
-    async def test_a_failed_window_is_an_error_naming_its_connections_last_error(self, recorded):
-        recorded._conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
-        with patch("mt5connector.client.history.bars", return_value=None):
+    async def test_a_failed_window_is_an_error_naming_the_failure(self, recorded, failure):
+        with patch("mt5connector.client.history.bars", side_effect=failure):
             await recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
 
         recorded._handle_bars.assert_not_called()
         assert recorded._log.error.call_count == 1
         error = recorded._log.error.call_args[0][0]
         assert "2025-07-15T09:01:00+00:00" in error and "2025-07-15T09:05:00+00:00" in error
-        assert error.endswith("failed: (-4, 'Terminal: Not found')")
+        assert error.endswith(f"failed: {failure}")
 
     @pytest.mark.asyncio
-    async def test_cancelling_the_request_stops_the_history_calls_retries(self, recorded):
-        handed = []
-        reading = threading.Event()
+    async def test_cancelling_the_request_cancels_the_history_read(self, recorded):
+        reading = asyncio.Event()
+        cancelled = []
 
-        def syncing(*args, cancel):
-            handed.append(cancel)
+        async def syncing(*args):
             reading.set()
-            cancel.wait(5)
-            return None
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
 
         with patch("mt5connector.client.history.bars", side_effect=syncing):
             request = asyncio.ensure_future(
                 recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
             )
-            await asyncio.to_thread(reading.wait, 5)
+            await asyncio.wait_for(reading.wait(), 5)
             request.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await request
 
-        assert handed[0].is_set()
+        assert cancelled == [True]
         recorded._handle_bars.assert_not_called()
 
     @pytest.mark.asyncio
@@ -584,7 +594,7 @@ class TestRequestBars:
     async def test_a_request_answers_the_bars_whose_real_closes_it_names(
         self, recorded, first_close, last_close, closes
     ):
-        def served(connection, symbol, series, start, end, cancel):
+        def served(session, symbol, series, start, end):
             return closed_rows(*((t, c) for t, c in AUTUMN_WEEKS if start <= t <= end))
 
         with patch("mt5connector.client.history.bars", side_effect=served):

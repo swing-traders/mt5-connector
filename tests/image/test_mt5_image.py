@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import http.server
 import importlib.util
 import json
 import os
@@ -13,10 +14,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -288,6 +291,72 @@ def test_a_stop_on_a_half_written_character_streams_the_whole_lines(terminal, tm
     assert out.read_bytes().decode().splitlines() == ["terminal: whole"]
 
 
+_PROBE = _IMAGE_FILES / "healthcheck.py"
+
+
+@contextlib.contextmanager
+def _answering(status: int):
+    """A loopback HTTP server answering every GET with ``status``, yielding its port and the paths
+    asked."""
+    asked = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            asked.append(self.path)
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], asked
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _probe(port: int) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(_PROBE)],
+        env={**os.environ, "MT5_HUB_PORT": str(port)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_the_health_probe_passes_on_a_200_from_the_hubs_health() -> None:
+    with _answering(200) as (port, asked):
+        probe = _probe(port)
+
+    assert (probe.returncode, probe.stdout, probe.stderr) == (0, "", "")
+    assert asked == ["/health"]
+
+
+def test_the_health_probe_fails_on_a_503_naming_it() -> None:
+    with _answering(503) as (port, asked):
+        probe = _probe(port)
+
+    assert probe.returncode == 1
+    (line,) = probe.stdout.splitlines()
+    assert "503" in line
+    assert asked == ["/health"]
+
+
+def test_the_health_probe_fails_on_a_hub_not_listening_naming_why() -> None:
+    with _answering(200) as (port, _):
+        pass
+    probe = _probe(port)
+
+    assert probe.returncode == 1
+    (line,) = probe.stdout.splitlines()
+    assert "Connection refused" in line
+
+
 def _runtime() -> str:
     runtime = shutil.which("docker") or shutil.which("podman")
     assert runtime is not None, "no container runtime on PATH"
@@ -308,6 +377,30 @@ def _await_log(runtime: str, name: str, line: str, *, count: int, seconds: float
     while _logs(runtime, name).count(line) < count:
         assert time.monotonic() < deadline, f"no {line!r} #{count} within {seconds}s"
         time.sleep(1)
+
+
+@_needs_image
+def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
+    runtime = _runtime()
+    inspected = subprocess.run(
+        [runtime, "image", "inspect", _IMAGE],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    (image,) = json.loads(inspected.stdout)
+    # Docker reports it under Config, podman beside it.
+    healthcheck = image["Config"].get("Healthcheck") or image.get("Healthcheck")
+
+    assert healthcheck, f"{_IMAGE} declares no healthcheck"
+    command = " ".join(healthcheck["Test"])
+    assert "python3 /opt/mt5/healthcheck.py" in command, command
+    assert (healthcheck["Interval"], healthcheck["Timeout"], healthcheck["Retries"]) == (
+        30_000_000_000,
+        5_000_000_000,
+        3,
+    )
 
 
 @_needs_image
@@ -765,6 +858,16 @@ def _published_port(runtime: str, name: str, port: int) -> int:
     return int(reply.split()[0].rpartition(":")[2])
 
 
+def _health_log(runtime: str, name: str) -> list[dict]:
+    """The healthcheck probes the runtime logged for the container ``name``, oldest first."""
+    reply = subprocess.run(
+        [runtime, "inspect", name], capture_output=True, text=True, timeout=30, check=True
+    ).stdout
+    (container,) = json.loads(reply)
+    health = container["State"].get("Health") or {}
+    return health.get("Log") or []
+
+
 def _health(port: int) -> tuple[int, dict] | None:
     """The hub's /health status and body, or None while nothing answers on the port."""
     try:
@@ -806,6 +909,7 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
             answered = _health(hub)
 
         assert answered is not None, "the hub never answered /health"
+        answered_at = datetime.now(UTC)
         status, body = answered
         assert status == 503
         assert (body["ok"], body["result"]["spawner"], body["result"]["clock"]) == (
@@ -813,5 +917,16 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
             False,
             None,
         )
+
+        # A probe started once the hub answered reached it: the image's healthcheck runs.
+        deadline = time.monotonic() + 60
+        probes = _health_log(runtime, name)
+        while not (probes and datetime.fromisoformat(probes[-1]["Start"]) > answered_at):
+            assert time.monotonic() < deadline, "no healthcheck probe within 60s of the hub"
+            time.sleep(1)
+            probes = _health_log(runtime, name)
+        latest = probes[-1]
+        assert latest["ExitCode"] == 1, latest
+        assert "503" in latest["Output"] and "not found" not in latest["Output"], latest
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)

@@ -272,6 +272,7 @@ The credentials reach the processes as environment variables at start; the image
 
 - The Linux Python installs the one wheel of `mt5-connector-server` the build makes from the checkout. Nothing of this repository's runs under the Windows Python but the dialogs' driver, `image/terminal_gui.py`, on its standard library alone.
 - The hub's `/health` answers HTTP 200 while its spawner is connected and its verification of the clock stands, and 503 otherwise; the hub never exits on its clock.
+- The image's `HEALTHCHECK` runs `/opt/mt5/healthcheck.py` under the Linux Python every 30 s under a 5 s timeout: it asks `/health`, passes on HTTP 200 alone and otherwise prints what it got. The container is marked unhealthy after 3 failures in a row; failures within its first 360 s, which cover a cold boot of the terminal and the clock's first verification, do not count.
 
 ### Boot
 
@@ -578,6 +579,7 @@ It pins that:
 - a restart restores the baked state — a file added under `Config\` or the AppData tree removed, a same-length rewrite of a baked file with its timestamp undone, a value written into the terminal's registry key gone — and leaves `Bases` alone;
 - the terminal's journal and experts log reach the container log as UTF-8 under their prefixes, a journal line naming the login and the server arriving as the terminal wrote it;
 - the driver fails naming a control a dialog lacks;
-- the hub boots and answers `/health` 503, with no spawner connected and no clock verified, on the loopback port the runtime published it at.
+- the hub boots and answers `/health` 503, with no spawner connected and no clock verified, on the loopback port the runtime published it at, and the image's healthcheck reaches it and fails on that 503;
+- the image declares its healthcheck as the health probe, every 30 s under a 5 s timeout and unhealthy after 3 failures.
 
-Its tests of the driver's menu and tab lookups and of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — run without an image.
+Its tests of the driver's menu and tab lookups, of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — and of the health probe, passing on HTTP 200 alone and naming a 503 or a hub not listening, run without an image.

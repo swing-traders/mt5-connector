@@ -97,7 +97,6 @@ def test_an_execution_setting_at_its_bound_is_kept(field, value):
         ("timeout_s", -1.0),
         ("timeout_s", float("nan")),
         ("timeout_s", float("inf")),
-        ("reconnect_max_attempts", 0),
         ("reconnect_initial_delay_s", -0.5),
         ("reconnect_initial_delay_s", float("nan")),
         ("reconnect_initial_delay_s", float("inf")),
@@ -115,14 +114,42 @@ def test_a_connection_setting_out_of_range_is_refused_naming_it(field, value):
     ("field", "value"),
     [
         ("timeout_s", 0.001),
-        ("reconnect_max_attempts", 1),
-        ("reconnect_initial_delay_s", 0),
-        ("reconnect_max_delay_s", 0),
+        ("reconnect_initial_delay_s", 0.001),
     ],
 )
 def test_a_connection_setting_at_its_bound_is_kept(field, value):
     c = _config(**{field: value})
     assert getattr(c, field) == value
+
+
+@pytest.mark.parametrize(
+    ("delays", "named"),
+    [
+        ({"reconnect_initial_delay_s": 0.0}, r"reconnect_initial_delay_s 0\.0 is below 1 ms$"),
+        (
+            {"reconnect_initial_delay_s": 0.0005},
+            r"reconnect_initial_delay_s 0\.0005 is below 1 ms$",
+        ),
+        (
+            {"reconnect_initial_delay_s": 0.001, "reconnect_max_delay_s": 0.0},
+            r"reconnect_max_delay_s 0\.0 is below 1 ms$",
+        ),
+        (
+            {"reconnect_initial_delay_s": 2.0, "reconnect_max_delay_s": 1.0},
+            r"reconnect_initial_delay_s 2\.0 is above reconnect_max_delay_s 1\.0$",
+        ),
+    ],
+)
+def test_a_reconnect_delay_under_a_millisecond_or_an_initial_one_past_the_max_is_refused(
+    delays, named
+):
+    with pytest.raises(MT5ConfigError, match=named):
+        _config(**delays)
+
+
+def test_reconnect_delays_of_one_millisecond_are_kept():
+    c = _config(reconnect_initial_delay_s=0.001, reconnect_max_delay_s=0.001)
+    assert (c.reconnect_initial_delay_s, c.reconnect_max_delay_s) == (0.001, 0.001)
 
 
 @pytest.mark.parametrize(

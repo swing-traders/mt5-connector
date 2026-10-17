@@ -168,4 +168,8 @@ RUN case "$DEBUG" in \
     esac
 USER mt5
 
+# The start period covers a cold boot of the terminal and the broker clock's first verification.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=360s \
+    CMD python3 /opt/mt5/healthcheck.py
+
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/mt5/entrypoint.sh"]

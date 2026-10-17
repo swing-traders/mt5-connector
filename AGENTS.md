@@ -278,7 +278,7 @@ NT TradingNode ──> mt5connector.client (data + exec clients, provider, facto
                      the EAs inside the terminal ──> the broker
 ```
 
-The adapter reaches the terminal through the server alone, every call on the transport of the connection it belongs to (`MT5Connection.mt5`); no module holds a server, a session or a last error. The shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
+The adapter reaches the terminal through the server and the hub alone, every call on a transport of the connection or client it belongs to — the connection's server transport (`MT5Connection.mt5`) or hub session (`MT5Connection.session`), or a client's own hub session; no module holds a server, a session or a last error. The shim reproduces the package's signatures and types, so a call site reads as a package call. A config is refused when built without a server URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
 
 The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `environment.yml`, the hub and the EA from `packages/server`. The image's Windows Python runs the dialogs' driver, `image/terminal_gui.py`, on its standard library alone; nothing is installed into it. Every apt package the `Dockerfile` pins takes its version from an `ARG VERSION_<PACKAGE>` used at every pin, never a literal, and every file it downloads is versioned by its row in `image/artifacts.txt` alone — the URL carries the version, the SHA-256 pins the bytes.
 
@@ -400,7 +400,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ## Test tiers
 
-- **Every test but the image tier and the live hub tier runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, or patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
+- **Every test but the image tier and the live hub tier runs without a terminal.** Client tests (`tests/client/`) hand a client's connection a transport double, patch the transport an `MT5Connection` builds (`tests/client/conftest.py`'s `mock_mt5`), or serve its sessions a hub double on a loopback port (`hub_double.py`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
 - **The image tier** (`tests/image/`) starts a built image on a made-up account and runs only when asked for, its GUI-driver and log-tail tests aside; the server README says how to run it.
 - **The live hub tier** (`tests/live/`) needs a running image's hub; it runs only when asked for, and `README.md` says how to run it.

@@ -244,7 +244,6 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
     conn.mt5 = venue
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
-    conn.reconnect_async = AsyncMock(return_value=True)
 
     provider = MagicMock(spec=MT5InstrumentProvider)
     provider.initialize = AsyncMock()

@@ -86,10 +86,6 @@ class EaError(HubAnswerError):
     """Raised for a request its EA could not perform, with the MQL5 error it left."""
 
 
-class MT5LoginError(MT5Error):
-    """Raised when the login to the broker account fails."""
-
-
 class MT5SymbolNotFoundError(MT5Error):
     """Raised when the venue cannot select a symbol or read its definition."""
 

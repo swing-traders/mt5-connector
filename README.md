@@ -120,11 +120,15 @@ just test
 **2. Test the connection:**
 
 ```python
-from mt5connector.client.remote_mt5 import RemoteMT5
+from mt5connector.client.config import MT5Config
+from mt5connector.client.connection import MT5Connection
 
-mt5 = RemoteMT5("http://127.0.0.1:5000")
-info = mt5.account_info()
-print(info.currency, info.balance)
+config = MT5Config(
+    account=12345678, password="your_password", server="YourBroker-Demo",
+    server_url="http://127.0.0.1:5000", ws_url="ws://127.0.0.1:9000",
+)
+with MT5Connection(config) as conn:
+    print(conn.get_account_info())
 ```
 
 ---
@@ -168,7 +172,7 @@ config = MT5Config(
     # The NautilusTrader venue the account's instruments, clients and account id carry
     venue = Venue("MT5"),          # default: MT5
 
-    # How often the execution client checks its terminal session and reports an owed account
+    # How often the execution client checks for an account report owed or due
     exec_poll_interval_ms = 250,   # default: 250ms
 
     # Execution
@@ -176,12 +180,11 @@ config = MT5Config(
     account_refresh_seconds = 10,  # the longest the account goes unreported between events
     history_lookback_mins   = 60,  # the venue history read when NT names no window, and at connect
 
-    # Reconnection: the terminal session's, and the hub session's backoff (which never gives up)
-    reconnect_initial_delay_s = 1.0,
-    reconnect_max_delay_s     = 60.0,
-    reconnect_max_attempts    = 20,
+    # The hub sessions' reconnect backoff, which never gives up
+    reconnect_initial_delay_s = 1.0,   # at least 0.001, and at most reconnect_max_delay_s
+    reconnect_max_delay_s     = 60.0,  # at least 0.001
 
-    # Connection timeout
+    # How long connect() waits for the hub to answer the account, its deferrals included
     timeout_s = 10.0,
 )
 ```
@@ -239,14 +242,14 @@ The provider also answers what a consumer discovers its settlement currencies by
 
 ## Downloading history
 
-`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the MT5 server's [history routes](packages/server/mt5connector/server/README.md#history).
+`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the hub's [history calls](packages/server/mt5connector/server/README.md#history) on its connection's hub session.
 
-The downloader walks back from `end`, one request per window, until `start` or the floor `/history/ranges` advertises for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
+The downloader walks back from `end`, one request per window, until `start` or the floor the hub's `ranges` holds for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
 
-- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at the close the server answers for it — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
+- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at the close the hub answers for it — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
 - ticks one UTC day at a time, both sizes of each the instrument's largest order.
 
-A window the server answers with a failure, or leaves unanswered, is recorded among the result's errors and the walk goes on; any other error reading it raises.
+A window the hub answers with an error, or whose answer is lost, is recorded among the result's errors and the walk goes on, and so is a `ranges` read the hub answers with an error; any other error reading it raises.
 
 ```python
 from mt5connector.client.config import MT5Config
@@ -370,28 +373,32 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 ```
 
 - `MT5Config` requires the server's `server_url`, an `http` or `https` URL naming a host, and the hub's `ws_url`, a `ws` or `wss` URL naming a host; a port either URL names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
-- Each `MT5Connection` calls its server through its own transport, `connection.mt5`: a `RemoteMT5` of the shim `mt5connector.client.remote_mt5` on the config's `server_url`, built with the connection and closed by its `disconnect()`. A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit.
-- A reconnect asks a call the server refuses busy again after the delay the refusal gives, costing none of its attempts and tearing nothing down; `connect()` raises `ServerBusy` like any other failure.
+- Each `MT5Connection` owns a hub session of its own, on an event loop it runs on its own thread while connected, and calls its server through its own transport, `connection.mt5`: a `RemoteMT5` of the shim `mt5connector.client.remote_mt5` on the config's `server_url`, built with the connection and closed by its `disconnect()`.
+  - `connect()` starts the thread, connects the session and confirms the terminal's login by reading `account_info`, asked again after each deferring answer's delay. The terminal logs in at the container's boot and the hub answers `not_ready` until it has verified the broker clock, so `timeout_s` bounds that wait: past it, `connect()` raises `MT5ConnectionError` naming the last deferral, such as `not_ready`. A hub it cannot reach raises `MT5ConnectionError` naming the hub's URL, and an account read answered with any other error raises that error. A failed connect leaves the connection disconnected with no thread running.
+  - `get_account_info()` and `get_terminal_info()` read through the session and raise the hub's error for a read it fails. `disconnect()` disconnects the session and stops the thread.
+  - `run(coroutine)` runs a coroutine on the session's loop and blocks for its result, raising what it raised, and `session` is the session such a coroutine is handed; both raise `RuntimeError` on a connection not connected.
+  - A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit. A lost hub leaves the connection connected: NautilusTrader's client reconnects its session, as it does a client's.
 - Each client holds a hub session, `mt5connector.client.hub.HubSession`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the session says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
 - A session also asks the hub's calls: `request(call, **arguments)`, or the method named after each call with its arguments, answers `Answered(result, last_error)` once every part of the answer arrived — a struct as its record type, rows as numpy arrays, transactions as `TradeTransaction` frames.
   - It raises the `HubAnswerError` of the answer's error kind. `Syncing`, `NotReady` and `NoPublisher` carry `retry_after_s`, and `deferring(call, **arguments)` asks again after each such delay until it is answered otherwise or its caller cancels.
   - A request unanswered past the hub's deadline and a margin, or in flight when the connection drops, raises `ResponseLost`.
   - A frame of the hub's the session cannot decode is logged as an error: an answer fails the request it answers with `ProtocolError`, a frame whose header breaks fails every request in flight with it, and a stream frame fails nothing.
   - An `order_send` answered sent stays outstanding, across a disconnect too, until its `REQUEST` transaction reaches the session. A reconnect, and a connect after a disconnect, ask each symbol's publisher for the outstanding ones' `REQUEST` transactions, hand each to the owner as the `TradeTransaction` a live one arrives as, and drop with one warning those the publisher no longer holds.
-  - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. Its history requests answer quote ticks sized the same way, and the venue's bars as the bar type requested. After a reconnect it holds the bars pushed until the first one arrives, then reads back over HTTP, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
+  - The data client subscribes a symbol's ticks while NautilusTrader subscribes its quotes or its mark prices: each tick is a `QuoteTick`, both sizes the instrument's largest order since the venue publishes no depth, and a `MarkPriceUpdate` at its mid. It subscribes an `EXTERNAL` bar type's series and hands NautilusTrader each closed venue bar. Its history requests answer quote ticks sized the same way, and the venue's bars as the bar type requested. After a reconnect it holds the bars pushed until the first one arrives, then reads back on its session, once, the bars that closed between the last one it handed and that one, and hands them in order before the held ones.
   - The execution client subscribes the account's trade transactions: a `DEAL_ADD` is a fill, read from the venue's history by its ticket; an `ORDER_DELETE` or `HISTORY_ADD` ends the order the venue cancelled, expired or rejected; a `TRADE_TRANSACTION_REQUEST` links the ticket of an order whose submit got no answer through its comment's digest, and accepts it. A transaction naming a ticket the client cannot resolve is left to NautilusTrader's reconciliation, never booked as an external order.
   - Each symbol's publisher publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
-- The execution client polls nothing for events: what the hub session misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop checks the terminal session and reports the account.
+- The execution client polls nothing for events: what the hub session misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop reports the account.
 - The account state carries the login's margin as one account-level margin balance in the account currency: the margin the venue states as used as initial, and the maintenance floor as maintenance.
 - There is no authentication: the server trusts its network. Its image publishes no host port, loopback included, so the API and the hub are reachable on the container network alone.
 
 The shim raises `ServerUnreachable` when the server cannot be reached or answers outside its contract, and when it refuses a call while it is not ready — HTTP 503 with no `last_error`, the terminal never asked — naming the function and the server's message. It raises `ServerBusy`, naming the function and carrying the delay the server's `Retry-After` gives as `retry_after_s`, when the server refuses a call with every slot taken: the server is up, and the caller decides whether to ask again. Every call sets its transport's `last_error()` to the pair its answer carries, and a failed call returns the package's failure value, as the package does.
 
-`mt5connector.client.history` calls the server's history routes on the transport of the connection each read is handed as its first argument, with no read timeout:
+`mt5connector.client.history` reads history as coroutines on the hub session each is handed as its first argument, every epoch true-UTC seconds:
 
-- `bars(connection, symbol, series, start, end)` and `ticks(connection, symbol, start, end)` answer the rows as the package's arrays, each bar with its `time_close`, and `ranges(connection, symbol)` the advertised floors and `maxbars`.
-- On a 503 — the window not proven yet, every slot taken, or the server not ready with a `Retry-After` — each waits that delay and asks again, with no deadline of its own, until the server answers otherwise or the `cancel` event it was handed is set. A not-ready answer still standing then raises `ServerUnreachable`, as the shim does.
-- They answer `None` for a failure, a 400 among them, and for a cancellation, with the connection's `mt5.last_error()` set to the pair the server last answered.
+- `bars(session, symbol, series, first_open_s, last_open_s)` answers the bars of a `Series` opened in that window as a numpy array of `MqlRates`' fields and each bar's `time_close`; `ticks(session, symbol, start_s, end_s, flags=TickFlags.INFO)` the ticks of those seconds as the package's array; and `ranges(session, symbol)` the hub's `Ranges`: the terminal's `maxbars` and each series' `SeriesRange` floor.
+- Each reads through the session's `deferring`: a `syncing`, `not_ready` or `no_publisher` answer is asked again after its delay, with no deadline of its own, until the hub answers otherwise or the caller cancels. Any other error is the hub's `HubAnswerError` raised — `InvalidWindow` for a window starting after the terminal's time — and an answer lost to the session's deadline or a reconnect raises `ResponseLost`.
+- `opens_closing(series, first_close, last_close)` gives the opens a window of closes is read by, and `closing(rows, first_close, last_close)` keeps the bars closing in it.
+- A synchronous caller runs one on its connection: `conn.run(history.bars(conn.session, "EURUSDm", Series.H1, first_open_s, last_open_s))`.
 
 ---
 
@@ -451,7 +458,7 @@ mt5-connector/
 │   │       ├── client/
 │   │       │   ├── commissions.py   # the relayed commission rule and the taker fee it implies
 │   │       │   ├── config.py        # MT5Config — all user-facing configuration
-│   │       │   ├── connection.py    # MT5Connection — server connection lifecycle
+│   │       │   ├── connection.py    # MT5Connection — its lifecycle, hub session and server transport
 │   │       │   ├── constants.py     # venue, account-loop and reconnect defaults
 │   │       │   ├── currencies.py    # the precision ladder a venue currency code is built by
 │   │       │   ├── data.py          # MT5DataClient — pushed ticks, marks and venue bars, and history requests
@@ -459,7 +466,7 @@ mt5-connector/
 │   │       │   ├── errors.py        # custom exceptions
 │   │       │   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
 │   │       │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
-│   │       │   ├── history.py       # the server's history routes, as a client
+│   │       │   ├── history.py       # the hub's history reads on a session
 │   │       │   ├── parsing.py       # symbol_info → NautilusTrader Instrument conversion
 │   │       │   ├── providers.py     # MT5InstrumentProvider
 │   │       │   ├── sessions.py      # the relayed trading sessions an instrument's info carries
@@ -508,13 +515,9 @@ Find your exact server name in MT5 → File → Open Account → search your bro
 
 ## Troubleshooting
 
-**`mt5.initialize() failed — error -6: Terminal: Authorization failed`**
+**`hub at ws://…: not ready within 10.0s, the last answer not_ready: account_info: the broker clock is not verified`**
 
-The server's MT5 terminal is not running, or is not logged in. Check the server's log and its terminal (see [The MT5 server](#the-mt5-server)), wait for the green connection indicator in the terminal's bottom-right corner, then run the script again.
-
-**`mt5.login() failed — error -6: Terminal: Authorization failed`**
-
-Wrong account number, password, or server name. Double-check all three against your broker's welcome email or the MT5 terminal itself (the account number is shown in the top-left of the terminal).
+The hub has not verified the broker clock: the terminal is still booting, or it never logged in — a wrong account number, password or server name in the container's environment. Check the container's log and the hub's `/health` (see [its README](packages/server/mt5connector/server/README.md#boot)), then connect again; a longer `timeout_s` waits out a boot still in progress.
 
 **An order rejected with `TRADE_RETCODE_CLIENT_DISABLES_AT: AutoTrading disabled by client`**
 
