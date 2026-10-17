@@ -320,16 +320,15 @@ async def test_a_call_resolves_with_its_typed_result_and_the_error_its_answer_fo
     hub_session = session(hub, Owner())
     await hub_session.connect()
 
-    selected = asyncio.create_task(hub_session.symbol_select("EURUSD", False))
+    ticked = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
     (request,) = await asked(hub)
-    await hub.answer(request, True, last_error=4301)
-    answered = await asyncio.wait_for(selected, 1)
+    await hub.answer(request, tick(), last_error=4301)
+    answered = await asyncio.wait_for(ticked, 1)
 
-    assert calls.decode_arguments(calls.CALLS[Call.SYMBOL_SELECT], request) == {
-        "symbol": "EURUSD",
-        "enable": False,
+    assert calls.decode_arguments(calls.CALLS[Call.SYMBOL_INFO_TICK], request) == {
+        "symbol": "EURUSD"
     }
-    assert (answered.result, answered.last_error) == (True, 4301)
+    assert (answered.result, answered.last_error) == (calls.Tick(**tick()), 4301)
     await hub_session.disconnect()
 
 

@@ -365,10 +365,6 @@ private:
         case HUB_ARGUMENT_STRING:
             m_strings[index] = reader.String();
             break;
-        case HUB_ARGUMENT_BOOL:
-            m_integers[index] = reader.U8();
-            fits = m_integers[index] <= 1;
-            break;
         case HUB_ARGUMENT_TRADE_REQUEST:
             ReadTradeRequest(reader, request);
             break;
@@ -425,7 +421,6 @@ public:
     bool Has(const int index) const { return m_has[index]; }
     long Integer(const int index) const { return m_integers[index]; }
     string String(const int index) const { return m_strings[index]; }
-    bool Bool(const int index) const { return m_integers[index] != 0; }
 };
 
 // A request's answer, built by its call's handler: its result's records back to back in rows, each
@@ -779,26 +774,13 @@ void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer 
 
 // ── The publisher's calls: its symbol ────────────────────────────────────────────────────────────
 
-void AnswerSymbolSelect(RequestArguments &arguments, Answer &answer)
-{
-    // The package's enable defaults to true.
-    bool enable = true;
-    if (arguments.Has(HUB_ARG_SYMBOL_SELECT_ENABLE))
-        enable = arguments.Bool(HUB_ARG_SYMBOL_SELECT_ENABLE);
-    if (SymbolSelect(arguments.String(HUB_ARG_SYMBOL_SELECT_SYMBOL), enable))
-        answer.rows.U8(1);
-    else
-        answer.rows.U8(0);
-    answer.Record();
-}
-
 void AnswerSymbolInfo(RequestArguments &arguments, Answer &answer)
 {
     const string symbol = arguments.String(HUB_ARG_SYMBOL_INFO_SYMBOL);
     bool custom = false;
     HubPropertyFailures failures;
     if (!SymbolExist(symbol, custom))
-        answer.Fail("SymbolExist found no such symbol", GetLastError());
+        answer.Fail("SymbolExist found no such symbol", ERR_MARKET_UNKNOWN_SYMBOL);
     else if (WriteSymbolInfo(answer.rows, symbol, failures))
         answer.Record();
     else
@@ -864,9 +846,6 @@ void ServeSymbol(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &
 {
     switch (call)
     {
-    case HUB_CALL_SYMBOL_SELECT:
-        AnswerSymbolSelect(arguments, answer);
-        break;
     case HUB_CALL_SYMBOL_INFO:
         AnswerSymbolInfo(arguments, answer);
         break;
@@ -2754,8 +2733,14 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
     }
     else
     {
+        bool custom = false;
         ResetLastError();
-        if (!SymbolSelect(symbol, true))
+        if (!SymbolExist(symbol, custom))
+        {
+            failing = "SymbolExist";
+            error = ERR_MARKET_UNKNOWN_SYMBOL;
+        }
+        else if (!SymbolSelect(symbol, true))
         {
             failing = "SymbolSelect";
             error = GetLastError();

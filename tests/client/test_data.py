@@ -19,7 +19,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from session_double import SessionDouble
-from venue_doubles import account_info, relayed_sessions, symbol_info
+from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info
 
 from mt5connector.client import data
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
@@ -762,27 +762,21 @@ USDJPY = InstrumentId.from_str("USDJPY.MT5")
 
 @pytest.fixture
 def terminal():
-    """The transport of the served client's connection, serving EURUSD, GBPUSD and USDJPY, none of
-    them charging a commission."""
-    definitions = {
-        "EURUSD": symbol_info(name="EURUSD"),
-        "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
-        "USDJPY": symbol_info(name="USDJPY", currency_base="USD", currency_profit="JPY"),
-    }
-    package = MagicMock()
-    package.symbol_select.side_effect = lambda name, enable: name in definitions
-    package.symbol_info.side_effect = definitions.get
-    package.symbols_get.return_value = tuple(definitions.values())
-    package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    package.trading_sessions.return_value = relayed_sessions()
-    return package
+    """The hub session of the served client's connection, serving EURUSD, GBPUSD and USDJPY, none
+    of them charging a commission."""
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(name="EURUSD"))
+    symbols.add(symbol_info(name="GBPUSD", currency_base="GBP"))
+    symbols.add(symbol_info(name="USDJPY", currency_base="USD", currency_profit="JPY"))
+    return symbols
 
 
-def served_client(transport, provider_config: InstrumentProviderConfig):
-    """A data client over a real provider whose config is `provider_config`, its connection's
-    transport `transport`, what it hands NT as data recorded."""
+def served_client(symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
+    """A data client over a real provider whose config is `provider_config`, its connection's hub
+    session reads `symbols`, what it hands NT as data recorded."""
     conn = MagicMock(spec=MT5Connection)
-    conn.mt5 = transport
+    conn.session = symbols
+    conn.run = run_apart
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     provider = MT5InstrumentProvider(
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config

@@ -626,10 +626,10 @@ class TestInstruments:
     def test_a_load_the_server_does_not_answer_is_raised_not_recorded(self, conn, catalog):
         provider = MagicMock()
         provider.get_instrument.return_value = None
-        provider.load_symbol.side_effect = ServerUnreachable("symbol_select: refused")
+        provider.load_symbol.side_effect = ServerUnreachable("symbol_info: refused")
         downloader = MT5DataDownloader(conn, provider, catalog)
 
-        with pytest.raises(ServerUnreachable, match="symbol_select"):
+        with pytest.raises(ServerUnreachable, match="symbol_info"):
             downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
     def test_raises_when_not_connected(self, catalog, provider):

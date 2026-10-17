@@ -243,6 +243,42 @@ async def test_a_tick_history_read_with_no_history_ea_asks_the_spawner_for_its_h
     server.close()
 
 
+async def test_a_request_on_a_chart_that_failed_to_open_carries_the_spawners_error():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        consumer = await Consumer.connect(port)
+        await consumer.ask(1, Call.SYMBOL_INFO, symbol="NOSUCH")
+        await consumer.received()
+        assert await spawner.received() == binary.OpenChart(ChartRole.PUBLISHER, "NOSUCH")
+
+        await spawner.send(binary.ChartFailed(ChartRole.PUBLISHER, "NOSUCH", 4301))
+        await eventually(lambda: (ChartRole.PUBLISHER, "NOSUCH") in hub._failed)
+        await consumer.ask(2, Call.SYMBOL_INFO, symbol="NOSUCH")
+        await consumer.ask(3, Call.COMMISSION_SCHEDULE, symbol="NOSUCH")
+        refused = [await consumer.received(), await consumer.received()]
+
+        assert [
+            (reply.request_id, error_of(reply), reply.last_error, reply.error.message)
+            for reply in refused
+        ] == [
+            (
+                2,
+                (ErrorKind.EA_ERROR, None),
+                4301,
+                "the publisher chart of NOSUCH failed to open: MQL5 error 4301",
+            ),
+            (
+                3,
+                (ErrorKind.EA_ERROR, None),
+                4301,
+                "the publisher chart of NOSUCH failed to open: MQL5 error 4301",
+            ),
+        ]
+        await consumer.close()
+        await spawner.close()
+    server.close()
+
+
 async def test_an_account_read_with_no_spawner_is_deferred_and_asks_for_no_chart():
     hub, server, port = await run_hub()
     async with verified(port) as spawner:
@@ -278,19 +314,19 @@ async def test_two_requests_an_ea_answers_in_reverse_order_resolve_each_with_its
         await session.connect()
 
         tick_read = asyncio.create_task(session.symbol_info_tick("EURUSD"))
-        select = asyncio.create_task(session.symbol_select("EURUSD", True))
+        outcomes_read = asyncio.create_task(session.outcomes("EURUSD", (7,)))
         asked = {}
         for _ in range(2):
             request = await eurusd.request()
             asked[arguments_of(request)[0]] = request
-        await eurusd.send(answer(asked[Call.SYMBOL_SELECT].request_id, Call.SYMBOL_SELECT, True))
+        await eurusd.send(answer(asked[Call.OUTCOMES].request_id, Call.OUTCOMES, []))
         await eurusd.send(
             answer(asked[Call.SYMBOL_INFO_TICK].request_id, Call.SYMBOL_INFO_TICK, tick())
         )
 
-        selected = await asyncio.wait_for(select, 1)
+        outcomes = await asyncio.wait_for(outcomes_read, 1)
         ticked = await asyncio.wait_for(tick_read, 1)
-        assert (selected.result, selected.last_error) == (True, 0)
+        assert (outcomes.result, outcomes.last_error) == ((), 0)
         assert ticked.result._asdict() == tick(UTC_EPOCH)
         await session.disconnect()
         await eurusd.close()

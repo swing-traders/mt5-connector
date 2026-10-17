@@ -215,7 +215,7 @@ Different brokers use different symbol names. Always use the **exact name shown 
 | IC Markets | `EURUSD` | `XAUUSD` | `BTCUSD` |
 | Pepperstone | `EURUSD` | `XAUUSD` | `BTCUSD` |
 
-The instrument provider loads a symbol by this exact name — one a client's `instrument_provider` config names, or one requested later — and builds it from the venue's own definition; nothing is inferred from a symbol's name:
+The instrument provider loads a symbol by this exact name — one a client's `instrument_provider` config names, or one requested later — and builds it from the venue's own definition, read over its connection's hub session; nothing is inferred from a symbol's name:
 
 - **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
 - **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
@@ -226,7 +226,7 @@ The instrument provider loads a symbol by this exact name — one a client's `in
   - An instrument's settlement currency is registered with NT before every instrument NT receives.
   - The account currency, with every loaded settlement currency, is registered before the first account state.
   - Base-only codes are never registered.
-- **Taker fee** from the commission schedule the server relays for the symbol, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the server has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, a conversion symbol the venue refuses to select, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
+- **Taker fee** from the commission schedule the symbol's EA relays, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency through the venue's own quote; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the hub has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
 - **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, where the bar day and the bar week open (`bar_tz`, `bar_day_open`, `bar_week_open`), `bar_volume` (`tick_count`), and the symbol's sessions:
   - `quote_sessions` — the broker's quote sessions, as `SymbolInfoSessionQuote` states them: seven days, Sunday first, each a list of `[from, to]` in seconds from the broker day's 00:00, unconverted;
   - `trade_sessions` — the broker's trade sessions, as `SymbolInfoSessionTrade` states them, in the same shape.
@@ -235,7 +235,7 @@ The instrument provider loads a symbol by this exact name — one a client's `in
 
 The provider also answers what a consumer discovers its settlement currencies by:
 
-- `quoted_pairs() -> dict[tuple[str, str], str]` — the venue symbol quoting each `(base, profit)` currency pair the venue's FOREX symbols cover, as the last load found it: a symbol the run loads, else one fully tradable, else the first that prices once selected, each rung in alphabetical order.
+- `quoted_pairs() -> dict[tuple[str, str], str]` — the venue symbol quoting each `(base, profit)` currency pair the venue's FOREX symbols cover, as the last load found it: a symbol the run loads, else one fully tradable, else the first whose quote is not the all-zero struct, each rung in alphabetical order.
 - `account_currency() -> str` — the account's currency code, as the account reports it at the call.
 
 ---
@@ -309,7 +309,7 @@ conn.disconnect()
 The data and execution clients run in NautilusTrader's `TradingNode`, and the node's instrument set is NT's own: each client loads what its `instrument_provider` config names, as NT's adapters do.
 
 - `build_mt5_node_config` makes both clients the node's default route and gives each its `InstrumentProviderConfig(load_ids=...)`: the data client the instruments the node reads, those it trades and those it follows; the execution client those it trades.
-- A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — each selected in Market Watch, the commission read of one no EA publishes opening its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
+- A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — reading each opens its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
 - A symbol no config names is loaded when it is requested (`request_instrument`): the server serves any symbol the account has, so another deployment's instruments need no change to it.
 - The factories, registered before `node.build()` under the config's venue, build the clients on one connection per account and server, and one instrument provider per connection, venue and `instrument_provider` config.
 

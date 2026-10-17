@@ -33,7 +33,6 @@ HISTORY_CALLS = {
 # The tick history, which the history EA reads in its own thread.
 TICK_CALLS = {Call.COPY_TICKS_RANGE, Call.COPY_TICKS_FROM}
 PUBLISHER_CALLS = {
-    Call.SYMBOL_SELECT,
     Call.SYMBOL_INFO,
     Call.SYMBOL_INFO_TICK,
     Call.ORDER_SEND,
@@ -65,13 +64,12 @@ def ticks(*milliseconds):
 # ── The registry ──────────────────────────────────────────────────────────────
 
 
-def test_the_registry_serves_the_twenty_calls():
+def test_the_registry_serves_the_nineteen_calls():
     assert {call.name.lower() for call in calls.CALLS} == {
         "account_info",
         "terminal_info",
         "symbols_get",
         "symbols_total",
-        "symbol_select",
         "symbol_info",
         "symbol_info_tick",
         "positions_get",
@@ -149,10 +147,6 @@ def test_a_command_waits_under_the_command_deadline_a_copy_under_its_historys_th
                 ("position", ArgType.INTEGER, False),
             ],
         ),
-        (
-            Call.SYMBOL_SELECT,
-            [("symbol", ArgType.STRING, True), ("enable", ArgType.BOOL, False)],
-        ),
         (Call.ORDER_SEND, [("request", ArgType.TRADE_REQUEST, True)]),
         (
             Call.OUTCOMES,
@@ -186,7 +180,6 @@ def test_a_calls_arguments_travel_by_their_wire_types(call, arguments):
         (Call.COPY_TICKS_RANGE, calls.Shape.TICKS, None),
         (Call.COPY_RATES_FROM, calls.Shape.RATES, None),
         (Call.SYMBOLS_TOTAL, calls.Shape.INTEGER, None),
-        (Call.SYMBOL_SELECT, calls.Shape.BOOL, None),
         (Call.RANGES, calls.Shape.RANGES, None),
         (Call.COMMISSION_SCHEDULE, calls.Shape.SCHEDULE, None),
         (Call.TRADING_SESSIONS, calls.Shape.SESSIONS, None),
@@ -197,6 +190,22 @@ def test_a_calls_answer_has_the_shape_of_its_result(call, shape, layout):
     row = calls.CALLS[call]
 
     assert (row.shape, None if row.layout is None else row.layout.name) == (shape, layout)
+
+
+@pytest.mark.parametrize(
+    ("function", "kind"),
+    [
+        (mirror.FunctionName.MARKET_BOOK_ADD, "bool"),
+        (mirror.FunctionName.VERSION, "tuple"),
+        (mirror.FunctionName.SHUTDOWN, "none"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else "",
+)
+def test_a_package_function_of_a_result_kind_the_registry_serves_no_shape_for_is_refused(
+    function, kind
+):
+    with pytest.raises(ValueError, match=f"{function}: .*{kind}"):
+        calls._package(Call.ACCOUNT_INFO, function, ChartRole.SPAWNER, calls.Wait.READ)
 
 
 def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_its_request():
@@ -268,7 +277,6 @@ def test_a_request_is_routed_by_its_calls_symbol(call, arguments, symbol):
     [
         (Call.ACCOUNT_INFO, {}),
         (Call.SYMBOLS_GET, {"group": "*USD*"}),
-        (Call.SYMBOL_SELECT, {"symbol": "EURUSD", "enable": False}),
         (Call.HISTORY_DEALS_GET, {"date_from": 1_752_570_000, "date_to": 1_752_573_600}),
         (Call.HISTORY_ORDERS_GET, {"position": 9001}),
         (Call.POSITIONS_GET, {"ticket": 2**62}),
@@ -300,7 +308,6 @@ def test_a_calls_arguments_round_trip(call, arguments):
         (Call.HISTORY_DEALS_GET, {"date_from": 1}, "history_deals_get: the arguments name none"),
         (Call.SYMBOL_INFO, {"symbol": 7}, "symbol_info.symbol: 7 is not a string"),
         (Call.POSITIONS_GET, {"ticket": True}, "positions_get.ticket: True is not an integer"),
-        (Call.SYMBOL_SELECT, {"symbol": "X", "enable": 1}, "symbol_select.enable: 1 is not a"),
         (Call.ORDER_SEND, {"request": {"symbol": "X"}}, "order_send.request: not a whole"),
         (Call.OUTCOMES, {"symbol": "X", "request_ids": (-1,)}, "outcomes.request_ids: \\(-1,\\)"),
     ],
@@ -310,7 +317,6 @@ def test_a_calls_arguments_round_trip(call, arguments):
         "no-form",
         "string",
         "integer",
-        "bool",
         "partial-request",
         "negative-id",
     ],
@@ -470,7 +476,6 @@ def test_bars_reach_a_consumer_with_their_close():
     ("call", "value"),
     [
         (Call.SYMBOLS_TOTAL, 1_234),
-        (Call.SYMBOL_SELECT, False),
         (
             Call.RANGES,
             calls.Ranges(
@@ -488,7 +493,7 @@ def test_bars_reach_a_consumer_with_their_close():
             {"quote": [[] for _ in range(7)], "trade": [[[0, 0]]] * 7, "last_error": 0},
         ),
     ],
-    ids=["integer", "bool", "ranges", "no-floors", "schedule", "sessions"],
+    ids=["integer", "ranges", "no-floors", "schedule", "sessions"],
 )
 def test_a_single_record_result_round_trips(call, value):
     row = calls.CALLS[call]

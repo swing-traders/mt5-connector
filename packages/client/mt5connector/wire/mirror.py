@@ -1,5 +1,5 @@
-"""The MetaTrader5 package's call surface at one release: its functions, the structs and arrays they
-return with their epoch fields, and its constants."""
+"""The MetaTrader5 package's call surface the repository uses, at one release: its functions, the
+structs and arrays they return with their epoch fields, and its constants."""
 
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -33,7 +33,6 @@ class FunctionName(StrEnum):
     ORDER_CALC_PROFIT = "order_calc_profit"
     SYMBOL_INFO = "symbol_info"
     SYMBOL_INFO_TICK = "symbol_info_tick"
-    SYMBOL_SELECT = "symbol_select"
     SYMBOLS_TOTAL = "symbols_total"
     SYMBOLS_GET = "symbols_get"
     MARKET_BOOK_ADD = "market_book_add"
@@ -99,7 +98,6 @@ class Failure(StrEnum):
 
     NONE = "none"
     FALSE = "false"
-    FALSE_IS_RESULT = "false_is_result"
     NEVER = "never"
 
 
@@ -246,7 +244,7 @@ def is_failure(function: Function, value: object) -> bool:
 
 def failure_value(function: Function) -> bool | None:
     """The value the package answers when this function fails."""
-    if function.failure in (Failure.FALSE, Failure.FALSE_IS_RESULT):
+    if function.failure is Failure.FALSE:
         return False
     else:
         return None
@@ -487,13 +485,6 @@ FUNCTIONS: dict[FunctionName, Function] = {
             ResultKind.STRUCT,
             Failure.NONE,
             struct=StructName.TICK,
-        ),
-        Function(
-            FunctionName.SYMBOL_SELECT,
-            Calling.POSITIONAL,
-            (_SYMBOL, Param("enable", ParamKind.BOOL)),
-            ResultKind.BOOL,
-            Failure.FALSE_IS_RESULT,
         ),
         Function(FunctionName.SYMBOLS_TOTAL, Calling.NO_ARGS, (), ResultKind.SCALAR, Failure.NONE),
         Function(

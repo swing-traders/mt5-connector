@@ -45,7 +45,6 @@ class Call(IntEnum):
     TERMINAL_INFO = 2
     SYMBOLS_GET = 3
     SYMBOLS_TOTAL = 4
-    SYMBOL_SELECT = 5
     SYMBOL_INFO = 6
     SYMBOL_INFO_TICK = 7
     POSITIONS_GET = 8
@@ -67,9 +66,7 @@ class ArgType(StrEnum):
     """How an argument travels."""
 
     INTEGER = "integer"
-    DOUBLE = "double"
     STRING = "string"
-    BOOL = "bool"
     # An int64 of epoch seconds: true UTC from a consumer, the broker's clock to the EA.
     EPOCH = "epoch"
     # MqlTradeRequest's field sequence.
@@ -90,7 +87,6 @@ class Shape(StrEnum):
     # MqlRates from the EA; to a consumer each bar with its close.
     RATES = "rates"
     INTEGER = "integer"
-    BOOL = "bool"
     RANGES = "ranges"
     SCHEDULE = "schedule"
     SESSIONS = "sessions"
@@ -163,9 +159,7 @@ class FloorFact:
 
 _ARG_TYPES = {
     mirror.ParamKind.INT: ArgType.INTEGER,
-    mirror.ParamKind.FLOAT: ArgType.DOUBLE,
     mirror.ParamKind.STR: ArgType.STRING,
-    mirror.ParamKind.BOOL: ArgType.BOOL,
     mirror.ParamKind.DATETIME: ArgType.EPOCH,
     mirror.ParamKind.REQUEST: ArgType.TRADE_REQUEST,
 }
@@ -201,7 +195,7 @@ def _package(call: Call, name: mirror.FunctionName, role: ChartRole, wait: Wait)
     elif function.result is mirror.ResultKind.SCALAR:
         shape = Shape.INTEGER
     else:
-        shape = Shape.BOOL
+        raise ValueError(f"{name}: the call registry has no shape for a {function.result} result")
     return Row(call, arguments, shape, role, wait, struct_layout, function.forms)
 
 
@@ -215,9 +209,6 @@ CALLS: dict[Call, Row] = {
         _package(Call.SYMBOLS_GET, mirror.FunctionName.SYMBOLS_GET, ChartRole.SPAWNER, Wait.READ),
         _package(
             Call.SYMBOLS_TOTAL, mirror.FunctionName.SYMBOLS_TOTAL, ChartRole.SPAWNER, Wait.READ
-        ),
-        _package(
-            Call.SYMBOL_SELECT, mirror.FunctionName.SYMBOL_SELECT, ChartRole.PUBLISHER, Wait.READ
         ),
         _package(Call.SYMBOL_INFO, mirror.FunctionName.SYMBOL_INFO, ChartRole.PUBLISHER, Wait.READ),
         _package(
@@ -387,18 +378,10 @@ def _write_argument(writer: Writer, row: Row, argument: Argument, value: object)
         if not _is_integer(value):
             raise ValueError(f"{where}: {value!r} is not an integer")
         writer.i64(value)
-    elif argument.type is ArgType.DOUBLE:
-        if not (_is_integer(value) or isinstance(value, float)):
-            raise ValueError(f"{where}: {value!r} is not a number")
-        writer.f64(value)
     elif argument.type is ArgType.STRING:
         if not isinstance(value, str):
             raise ValueError(f"{where}: {value!r} is not a string")
         writer.string(value)
-    elif argument.type is ArgType.BOOL:
-        if not isinstance(value, bool):
-            raise ValueError(f"{where}: {value!r} is not a boolean")
-        writer.boolean(value)
     elif argument.type is ArgType.TRADE_REQUEST:
         if not (isinstance(value, dict) and set(value) == set(binary.TRADE_REQUEST.fields)):
             raise ValueError(f"{where}: not a whole MqlTradeRequest")
@@ -414,12 +397,8 @@ def _write_argument(writer: Writer, row: Row, argument: Argument, value: object)
 def _read_argument(reader: Reader, argument: Argument) -> object:
     if argument.type is ArgType.INTEGER or argument.type is ArgType.EPOCH:
         return reader.i64(argument.name)
-    elif argument.type is ArgType.DOUBLE:
-        return reader.f64(argument.name)
     elif argument.type is ArgType.STRING:
         return reader.string(argument.name)
-    elif argument.type is ArgType.BOOL:
-        return reader.boolean(argument.name)
     elif argument.type is ArgType.TRADE_REQUEST:
         return binary.read_record(reader, binary.TRADE_REQUEST)
     else:
@@ -480,9 +459,6 @@ def write_result(row: Row, value: object) -> tuple[int, bytes]:
     elif row.shape is Shape.INTEGER:
         count = 1
         writer.i64(value)
-    elif row.shape is Shape.BOOL:
-        count = 1
-        writer.boolean(value)
     elif row.shape is Shape.RANGES:
         count = len(value.series)
         writer.i64(value.maxbars)
@@ -548,9 +524,6 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
     elif row.shape is Shape.INTEGER:
         _one(row, count)
         return reader.i64("result")
-    elif row.shape is Shape.BOOL:
-        _one(row, count)
-        return reader.boolean("result")
     elif row.shape is Shape.RANGES:
         maxbars = reader.i64("maxbars")
         series = {}

@@ -30,7 +30,7 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from session_double import SessionDouble
-from venue_doubles import account_info, relayed_sessions, symbol_info, trade_position
+from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
 from mt5connector.client.config import MT5Config
@@ -382,22 +382,27 @@ async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(v
     await _stop_account_loop(client)
 
 
+def _serve_symbols(conn, symbols: SymbolVenue) -> None:
+    """Hands the connection's hub session reads to `symbols`."""
+    conn.session = symbols
+    conn.run = run_apart
+
+
 @pytest.fixture
-def settlement_venue(venue):
-    venue.symbol_select.return_value = True
-    venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    venue.trading_sessions.return_value = relayed_sessions()
-    venue.symbol_info.return_value = symbol_info(
-        currency_base="XPT", currency_profit="UST", currency_margin="BHD"
-    )
-    venue.symbols_get.side_effect = lambda: (venue.symbol_info.return_value,)
-    return venue
+def settlement_symbols():
+    """EURUSD, settling in UST, with no commission."""
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(currency_base="XPT", currency_profit="UST", currency_margin="BHD"))
+    return symbols
 
 
-async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments(settlement_venue):
+async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments(
+    venue, settlement_symbols
+):
     seen = []
     for digits in (8, 2):
-        client = _client(settlement_venue, account_info(currency="UST", currency_digits=digits))
+        client = _client(venue, account_info(currency="UST", currency_digits=digits))
+        _serve_symbols(client._conn, settlement_symbols)
         client._provider = MT5InstrumentProvider(
             connection=client._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
         )
@@ -422,16 +427,17 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
 
 @pytest.mark.parametrize(("code", "precision"), [("XYZ", None), ("CLP", 0), ("KWD", 3)])
 async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
-    settlement_venue, code, precision
+    venue, settlement_symbols, code, precision
 ):
-    first = _client(settlement_venue, account_info(currency=code, currency_digits=8))
+    first = _client(venue, account_info(currency=code, currency_digits=8))
     try:
         await first._connect()
     finally:
         await _stop_account_loop(first)
 
-    settlement_venue.symbol_info.return_value = symbol_info(currency_profit=code)
-    later = _client(settlement_venue, account_info(currency="USD"))
+    settlement_symbols.add(symbol_info(currency_profit=code))
+    later = _client(venue, account_info(currency="USD"))
+    _serve_symbols(later._conn, settlement_symbols)
     later._provider = MT5InstrumentProvider(
         connection=later._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
     )
@@ -501,25 +507,20 @@ async def test_the_currencies_register_before_the_first_account_state(venue):
 
 
 @pytest.fixture
-def terminal(venue):
-    """The venue serving EURUSD and GBPUSD, neither charging a commission."""
-    definitions = {
-        "EURUSD": symbol_info(name="EURUSD"),
-        "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
-    }
-    venue.symbol_select.side_effect = lambda name, enable: name in definitions
-    venue.symbol_info.side_effect = definitions.get
-    venue.symbols_get.return_value = tuple(definitions.values())
-    venue.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    venue.trading_sessions.return_value = relayed_sessions()
-    return venue
+def terminal():
+    """The hub session serving EURUSD and GBPUSD, neither charging a commission."""
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(name="EURUSD"))
+    symbols.add(symbol_info(name="GBPUSD", currency_base="GBP"))
+    return symbols
 
 
-def _served_client(transport, provider_config: InstrumentProviderConfig):
+def _served_client(transport, symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
     """A client over a real provider whose config is `provider_config`, its connection's transport
-    `transport`."""
+    `transport` and its hub session's reads `symbols`."""
     conn = MagicMock(spec=MT5Connection)
     conn.mt5 = transport
+    _serve_symbols(conn, symbols)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
@@ -540,8 +541,9 @@ def _served_client(transport, provider_config: InstrumentProviderConfig):
     return client, provider
 
 
-async def test_connect_loads_exactly_the_ids_its_provider_config_names(terminal):
+async def test_connect_loads_exactly_the_ids_its_provider_config_names(venue, terminal):
     client, provider = _served_client(
+        venue,
         terminal,
         InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("GBPUSD.MT5")})),
     )
@@ -555,8 +557,10 @@ async def test_connect_loads_exactly_the_ids_its_provider_config_names(terminal)
     [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
     ids=["no-ids", "empty-ids"],
 )
-async def test_connect_refuses_a_provider_config_that_names_nothing(terminal, provider_config):
-    client, provider = _served_client(terminal, provider_config)
+async def test_connect_refuses_a_provider_config_that_names_nothing(
+    venue, terminal, provider_config
+):
+    client, provider = _served_client(venue, terminal, provider_config)
     with pytest.raises(MT5ConfigError, match="instrument_provider"):
         await client._connect()
     assert provider.list_all() == []

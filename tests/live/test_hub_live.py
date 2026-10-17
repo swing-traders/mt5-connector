@@ -201,11 +201,9 @@ async def test_every_spawner_read_answers_as_its_row_types_it(session):
 async def test_every_publisher_read_of_the_symbol_answers_as_its_row_types_it(session):
     hub_session, _ = session
 
-    selected = (await ask(hub_session, Call.SYMBOL_SELECT, symbol=SYMBOL, enable=True)).result
     info = (await ask(hub_session, Call.SYMBOL_INFO, symbol=SYMBOL)).result
     tick = (await ask(hub_session, Call.SYMBOL_INFO_TICK, symbol=SYMBOL)).result
 
-    assert selected is True
     assert is_struct(info, "SymbolInfo")
     assert (info.name, info.digits > 0) == (SYMBOL, True)
     assert isinstance(tick, calls.Tick)

@@ -81,6 +81,12 @@ class TransactionType(IntEnum):
     REQUEST = 10
 
 
+class MqlError(IntEnum):
+    """An MQL5 runtime error an answer's `last_error` carries, by its code in the MQL5 reference."""
+
+    MARKET_UNKNOWN_SYMBOL = 4301
+
+
 # The enums of SymbolInfoCommissions' MqlCommission and MqlCommissionTier, as the MQL5 reference's
 # SymbolInfoCommissions page lists them: each member by the name EnumToString gives it, since the
 # reference names the members without their values.

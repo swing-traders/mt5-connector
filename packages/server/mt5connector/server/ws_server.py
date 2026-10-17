@@ -6,12 +6,12 @@ the spawner opens and closes for the roles and symbols in use.
 State: the connections that said hello — each consumer's subscriptions, each EA's chart role and
 symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
 wanted frame last told each publisher; the spawner; the chart requests held for a role and symbol no
-EA serves, and those the spawner was sent; the spawner's reason for each chart it failed to open,
-standing until that chart opens or its EA says hello; when each chart was last in use, and those the
-spawner was told to close; the true-UTC open of the last bar fanned out of each series; the latest
-commission schedule and trading sessions relayed for each symbol; the floors learned from history
-answers; the pending requests and the clock gate. Nothing is persisted, and nothing is replayed to a
-consumer that reconnects."""
+EA serves, and those the spawner was sent; the MQL5 error the spawner met on each chart it failed to
+open, standing until that chart opens or its EA says hello; when each chart was last in use, and
+those the spawner was told to close; the true-UTC open of the last bar fanned out of each series;
+the latest commission schedule and trading sessions relayed for each symbol; the floors learned from
+history answers; the pending requests and the clock gate. Nothing is persisted, and nothing is
+replayed to a consumer that reconnects."""
 
 import asyncio
 import dataclasses
@@ -121,7 +121,7 @@ class Hub:
         self._spawner: object | None = None
         self._requested: set[ChartKey] = set()
         self._sent: set[ChartKey] = set()
-        self._failed: dict[ChartKey, str] = {}
+        self._failed: dict[ChartKey, int] = {}
         self._used: dict[ChartKey, float] = {}
         self._close_sent: set[ChartKey] = set()
         self._bar_opens: dict[Subscription, int] = {}
@@ -431,14 +431,13 @@ class Hub:
             logger.info("the spawner opened the %s chart of %s", frame.chart_role, frame.symbol)
             self._failed.pop(key, None)
         elif isinstance(frame, binary.ChartFailed):
-            reason = f"MQL5 error {frame.error}"
             logger.warning(
-                "the spawner cannot open the %s chart of %s: %s",
+                "the spawner cannot open the %s chart of %s: MQL5 error %d",
                 frame.chart_role,
                 frame.symbol,
-                reason,
+                frame.error,
             )
-            self._failed[key] = reason
+            self._failed[key] = frame.error
         else:
             logger.info(
                 "the spawner keeps the %s chart of %s open: %d positions, %d pending orders",
@@ -537,8 +536,7 @@ class Hub:
             message = f"{self._settings.ea_queue_bound} frames queued for the EA"
             self._error(ws, client_id, 0, ErrorKind.OVERFLOW, message)
         elif state is ChartState.FAILED:
-            message = f"the {served.role} chart of {symbol} failed to open: {self._failed[key]}"
-            self._error(ws, client_id, 0, ErrorKind.EA_ERROR, message)
+            self._chart_failed(ws, client_id, key)
         elif served.role is ChartRole.SPAWNER:
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no spawner is connected")
         else:
@@ -562,8 +560,7 @@ class Hub:
             message = f"no publisher for {symbol}; chart requested"
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
         elif state is ChartState.FAILED:
-            message = f"the publisher chart of {symbol} failed to open: {self._failed[key]}"
-            self._error(ws, client_id, 0, ErrorKind.EA_ERROR, message)
+            self._chart_failed(ws, client_id, key)
         elif relay is None:
             message = f"no {row.call.name.lower()} relayed for {symbol}"
             self._deferred(ws, client_id, ErrorKind.SYNCING, message)
@@ -680,6 +677,15 @@ class Hub:
     def _error(self, ws, client_id: int, part: int, kind: ErrorKind, message: str) -> None:
         error = binary.AnswerError(kind, message)
         self._to_consumer(ws, binary.Answer(client_id, part, True, 0, error=error))
+
+    def _chart_failed(self, ws, client_id: int, key: ChartKey) -> None:
+        """Answers a request ea_error naming its chart that failed to open, with the MQL5 error the
+        spawner met."""
+        chart_role, symbol = key
+        mql5_error = self._failed[key]
+        message = f"the {chart_role} chart of {symbol} failed to open: MQL5 error {mql5_error}"
+        error = binary.AnswerError(ErrorKind.EA_ERROR, message)
+        self._to_consumer(ws, binary.Answer(client_id, 0, True, mql5_error, error=error))
 
     # ── Sending ───────────────────────────────────────────────────────────────
 
