@@ -1,5 +1,5 @@
-"""MT5InstrumentProvider: loads the symbols a run names into NT's instrument cache, each built from
-the venue's own definition, and finds the venue symbol that quotes each currency pair.
+"""MT5InstrumentProvider: the venue's own symbol definitions as NT instruments, and the venue symbol
+quoting each currency pair.
 
 State: the loaded instruments, and the quoting symbol per currency pair the last load found; a load
 replaces both together, or neither when it fails."""
@@ -14,15 +14,11 @@ from typing import TYPE_CHECKING
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 
-from mt5connector.client.commissions import (
-    MONEY_MODES,
-    CommissionRule,
-    parse_schedule,
-    taker_fee,
-)
+from mt5connector.client.commissions import CommissionRule, parse_schedule, taker_fee
+from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.errors import (
+    EaError,
     MT5ConfigError,
-    MT5ConnectionError,
     MT5InstrumentError,
     MT5SymbolNotFoundError,
 )
@@ -36,13 +32,15 @@ from mt5connector.client.parsing import (
     trade_mode,
 )
 from mt5connector.client.sessions import parse_sessions
+from mt5connector.wire import calls
+from mt5connector.wire.push_wire import MqlError
 
 if TYPE_CHECKING:
     from nautilus_trader.common.component import Clock
     from nautilus_trader.config import InstrumentProviderConfig
 
-    from mt5connector.client.connection import AccountSnapshot, MT5Connection
-    from mt5connector.client.remote_mt5 import RemoteMT5
+    from mt5connector.client.connection import MT5Connection
+    from mt5connector.client.hub import HubSession
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +74,11 @@ class MT5InstrumentProvider(InstrumentProvider):
         await super().initialize(reload)
 
     async def load_all_async(self, filters: dict | None = None) -> None:
-        """Loads every symbol the terminal serves, selecting each in Market Watch; the commission
-        read of a symbol no EA publishes opens its chart, and the terminal holds at most CHARTS_MAX
-        charts."""
-        self._load(sorted(info.name for info in _venue_symbols(self._conn.mt5)))
+        """Loads every symbol the terminal serves; reading a symbol opens its chart, and the
+        terminal holds at most CHARTS_MAX charts."""
+        self._conn.ensure_connected()
+        listing = await _asked(self._conn.session, calls.Call.SYMBOLS_GET)
+        await self._load(sorted(info.name for info in listing), listing)
 
     async def load_ids_async(
         self,
@@ -87,88 +86,74 @@ class MT5InstrumentProvider(InstrumentProvider):
         filters: dict | None = None,
     ) -> None:
         """Loads the symbols the instrument ids name."""
-        self._load([instrument_id.symbol.value for instrument_id in instrument_ids])
+        await self._load([instrument_id.symbol.value for instrument_id in instrument_ids])
 
-    def load_symbol(self, symbol: str) -> InstrumentAny:
+    async def load_symbol(self, symbol: str) -> InstrumentAny:
         """Loads one symbol, by its exact broker name, and returns its instrument."""
-        return self._load([symbol])[0]
+        instruments = await self._load([symbol])
+        return instruments[0]
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
-    def _load(self, symbols: list[str]) -> list[InstrumentAny]:
-        """Selects and reads each symbol's definition, builds its instrument and adds them all;
-        raises naming the first symbol the venue does not know or whose definition is refused."""
+    async def _load(self, symbols: list[str], listing: tuple | None = None) -> list[InstrumentAny]:
+        """Reads `symbols`, adds the instruments they build and answers them; `listing` holds the
+        terminal's symbols when the caller has read them."""
         self._conn.ensure_connected()
-        account = self._conn.get_account_info()
-        ts = self._clock.timestamp_ns()
-        definitions = []
-        for symbol in symbols:
-            definitions.append(self._select_and_read(symbol))
         loaded = {instrument.raw_symbol.value for instrument in self._instruments.values()}
-        pairs = self._select_quoted_pairs(loaded | set(symbols))
-        instruments = []
-        for info in definitions:
-            try:
-                instruments.append(self._load_definition(info, account, pairs, ts))
-            except MT5InstrumentError as exc:
-                raise MT5InstrumentError(f"{info.name}: {exc}") from exc
+        instruments, pairs = await self._read(symbols, loaded, listing)
         self._quoted_pairs = pairs
         for instrument in instruments:
             self.add(instrument)
         logger.info(f"MT5InstrumentProvider: loaded {', '.join(symbols)}")
         return instruments
 
-    def _select_and_read(self, symbol: str):
-        """Selects a symbol in Market Watch and reads its definition."""
-        if not self._conn.mt5.symbol_select(symbol, True):
-            raise MT5SymbolNotFoundError(symbol)
-        info = self._conn.mt5.symbol_info(symbol)
-        if info is None:
-            raise MT5SymbolNotFoundError(symbol)
-        return info
+    async def _read(
+        self, symbols: list[str], loaded: set[str], listing: tuple | None
+    ) -> tuple[list[InstrumentAny], _Pairs]:
+        """The instrument of each symbol, built from its definition, and the quoting symbol per
+        pair, `loaded` the symbols already held; the terminal's symbols are listed unless `listing`
+        holds them. Raises naming the first symbol the venue does not know or whose definition is
+        refused."""
+        session = self._conn.session
+        account = AccountSnapshot.from_mt5((await session.account_info()).result)
+        ts = self._clock.timestamp_ns()
+        definitions = []
+        for symbol in symbols:
+            definitions.append(await _definition(session, symbol))
+        if listing is None:
+            listing = await _asked(session, calls.Call.SYMBOLS_GET)
+        pairs = await _select_quoted_pairs(session, listing, loaded | set(symbols))
+        instruments = []
+        for info in definitions:
+            try:
+                instruments.append(await self._load_definition(session, info, account, pairs, ts))
+            except MT5InstrumentError as exc:
+                raise MT5InstrumentError(f"{info.name}: {exc}") from exc
+        return instruments, pairs
 
-    def _load_definition(self, info, account: AccountSnapshot, pairs: _Pairs, ts: int):
-        """Builds the instrument a selected symbol's definition describes, its taker fee from the
-        commission rule the server relays, selecting first the symbol that converts a money rule's
-        currency into the quote currency, and its trading sessions as the server relays them; raises
-        MT5InstrumentError when the venue refuses that selection."""
-        rule = parse_schedule(self._conn.mt5.commission_schedule(info.name))
-        sessions = parse_sessions(self._conn.mt5.trading_sessions(info.name))
-        if rule is not None and rule.mode in MONEY_MODES and rule.currency != info.currency_profit:
-            converter, _ = _conversion(rule.currency, info.currency_profit, pairs)
-            if not self._conn.mt5.symbol_select(converter, True):
-                raise MT5InstrumentError(f"{converter} cannot be selected")
-        fee = _taker_fee(self._conn.mt5, info, rule, pairs)
+    async def _load_definition(
+        self, session: HubSession, info, account: AccountSnapshot, pairs: _Pairs, ts: int
+    ):
+        """Builds the instrument a symbol's definition describes, its taker fee from the commission
+        rule its publisher relays and its trading sessions as relayed."""
+        rule = parse_schedule(
+            await _asked(session, calls.Call.COMMISSION_SCHEDULE, symbol=info.name)
+        )
+        sessions = parse_sessions(
+            await _asked(session, calls.Call.TRADING_SESSIONS, symbol=info.name)
+        )
+        fee = await _taker_fee(session, info, rule, pairs)
         return parse_symbol_info(info, self._venue, account, fee, sessions, ts)
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
-
-    def _select_quoted_pairs(self, loaded: set[str]) -> _Pairs:
-        """The venue symbol quoting each (base, profit) pair its FOREX symbols cover: one the run
-        loads, else one fully tradable, else the first that prices once selected, each in
-        alphabetical order."""
-        buckets: dict[tuple[str, str], list[tuple[str, TradeMode]]] = {}
-        for info in sorted(_venue_symbols(self._conn.mt5), key=attrgetter("name")):
-            try:
-                if calc_mode(info) in FOREX_MODES:
-                    pair = (info.currency_base, info.currency_profit)
-                    buckets.setdefault(pair, []).append((info.name, trade_mode(info)))
-            except MT5InstrumentError as exc:
-                raise MT5InstrumentError(f"{info.name}: {exc}") from exc
-        pairs = {}
-        for pair, candidates in buckets.items():
-            symbol = _select_quoting_symbol(self._conn.mt5, candidates, loaded)
-            if symbol is not None:
-                pairs[pair] = symbol
-        return pairs
 
     def quoted_pairs(self) -> _Pairs:
         """The venue symbol quoting each (base, profit) currency pair, as the last load found it."""
         return dict(self._quoted_pairs)
 
-    def account_currency(self) -> str:
-        """The account's currency code."""
-        return self._conn.get_account_info().currency
+    async def account_currency(self) -> str:
+        """The account's currency code, as the account reports it now."""
+        return (await self._conn.account_info()).currency
 
     # ── Convenience accessors ─────────────────────────────────────────────────
 
@@ -180,17 +165,45 @@ class MT5InstrumentProvider(InstrumentProvider):
         return f"MT5InstrumentProvider(loaded={len(self._instruments)})"
 
 
-def _venue_symbols(mt5: RemoteMT5) -> tuple:
-    """Every symbol the terminal serves; raises MT5ConnectionError for a listing that reads None."""
-    venue_symbols = mt5.symbols_get()
-    if venue_symbols is None:
-        code, msg = mt5.last_error()
-        raise MT5ConnectionError(f"mt5.symbols_get() returned None — error {code}: {msg}")
-    return venue_symbols
+async def _asked(session: HubSession, call: calls.Call, **arguments: object) -> object:
+    """The result of a call on the hub session, asked again after each deferring answer's delay."""
+    return (await session.deferring(call, **arguments)).result
 
 
-def _select_quoting_symbol(
-    mt5: RemoteMT5, candidates: list[tuple[str, TradeMode]], loaded: set[str]
+async def _definition(session: HubSession, symbol: str):
+    """A symbol's definition; raises MT5SymbolNotFoundError for one the broker does not list, and
+    the hub's error for any other failure."""
+    try:
+        return await _asked(session, calls.Call.SYMBOL_INFO, symbol=symbol)
+    except EaError as exc:
+        if exc.last_error == MqlError.MARKET_UNKNOWN_SYMBOL:
+            raise MT5SymbolNotFoundError(symbol) from exc
+        else:
+            raise
+
+
+async def _select_quoted_pairs(session: HubSession, listing: tuple, loaded: set[str]) -> _Pairs:
+    """The venue symbol quoting each (base, profit) pair the FOREX symbols of `listing` cover: one
+    the run loads, else one fully tradable, else the first that quotes, each in alphabetical
+    order."""
+    buckets: dict[tuple[str, str], list[tuple[str, TradeMode]]] = {}
+    for info in sorted(listing, key=attrgetter("name")):
+        try:
+            if calc_mode(info) in FOREX_MODES:
+                pair = (info.currency_base, info.currency_profit)
+                buckets.setdefault(pair, []).append((info.name, trade_mode(info)))
+        except MT5InstrumentError as exc:
+            raise MT5InstrumentError(f"{info.name}: {exc}") from exc
+    pairs = {}
+    for pair, candidates in buckets.items():
+        symbol = await _select_quoting_symbol(session, candidates, loaded)
+        if symbol is not None:
+            pairs[pair] = symbol
+    return pairs
+
+
+async def _select_quoting_symbol(
+    session: HubSession, candidates: list[tuple[str, TradeMode]], loaded: set[str]
 ) -> str | None:
     for symbol, _ in candidates:
         if symbol in loaded:
@@ -199,39 +212,40 @@ def _select_quoting_symbol(
         if mode == TradeMode.FULL:
             return symbol
     for symbol, _ in candidates:
-        # An unselected symbol quotes the all-zero struct.
-        if mt5.symbol_select(symbol, True):
-            quote = mt5.symbol_info_tick(symbol)
-            if quote is not None and quote.time != 0:
-                return symbol
+        # A closed symbol quotes the all-zero struct.
+        quote = await _asked(session, calls.Call.SYMBOL_INFO_TICK, symbol=symbol)
+        if quote.time != 0:
+            return symbol
     return None
 
 
-def _taker_fee(mt5: RemoteMT5, info, rule: CommissionRule | None, pairs: _Pairs) -> Decimal:
+async def _taker_fee(
+    session: HubSession, info, rule: CommissionRule | None, pairs: _Pairs
+) -> Decimal:
     """The symbol's taker fee under its commission rule, zero without one; the conversion into its
     quote currency is the venue's own quote, never NT's."""
     if rule is None:
         return Decimal(0)
     else:
-        return taker_fee(
+        return await taker_fee(
             rule,
-            price=_mid(mt5, info.name),
+            price=await _mid(session, info.name),
             contract_size=finite_decimal(info.trade_contract_size, "trade_contract_size"),
             point=finite_decimal(info.point, "point"),
-            rate=lambda currency: _rate(mt5, currency, info.currency_profit, pairs),
+            rate=lambda currency: _rate(session, currency, info.currency_profit, pairs),
         )
 
 
-def _rate(mt5: RemoteMT5, source: str, target: str, pairs: _Pairs) -> Decimal:
+async def _rate(session: HubSession, source: str, target: str, pairs: _Pairs) -> Decimal:
     """`target` units per `source` unit at the mid of the venue's quote for the pair."""
     if source == target:
         return Decimal(1)
     else:
         symbol, inverse = _conversion(source, target, pairs)
         if inverse:
-            return 1 / _mid(mt5, symbol)
+            return 1 / await _mid(session, symbol)
         else:
-            return _mid(mt5, symbol)
+            return await _mid(session, symbol)
 
 
 def _conversion(source: str, target: str, pairs: _Pairs) -> tuple[str, bool]:
@@ -245,10 +259,10 @@ def _conversion(source: str, target: str, pairs: _Pairs) -> tuple[str, bool]:
         raise MT5InstrumentError(f"no venue symbol converts {source} into {target}")
 
 
-def _mid(mt5: RemoteMT5, symbol: str) -> Decimal:
-    """The mid of a selected symbol's last quote; raises MT5InstrumentError while it has none."""
-    quote = mt5.symbol_info_tick(symbol)
-    if quote is None or quote.time == 0:
+async def _mid(session: HubSession, symbol: str) -> Decimal:
+    """The mid of a symbol's last quote; raises MT5InstrumentError while it has none."""
+    quote = await _asked(session, calls.Call.SYMBOL_INFO_TICK, symbol=symbol)
+    if quote.time == 0:
         raise MT5InstrumentError(f"{symbol} has no quote")
     bid = finite_decimal(quote.bid, f"{symbol} bid")
     ask = finite_decimal(quote.ask, f"{symbol} ask")

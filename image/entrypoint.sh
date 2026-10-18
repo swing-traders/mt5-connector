@@ -1,7 +1,6 @@
 #!/bin/bash
-# Boots the MT5 terminal, the connector's push hub and its HTTP server, and ends the container with
-# whichever of them exits first, or on a stop request. It prints its own steps and the terminal's
-# logs.
+# Boots the MT5 terminal and the connector's hub, and ends the container with whichever of them
+# exits first, or on a stop request. It prints its own steps and the terminal's logs.
 set -euo pipefail
 
 readonly terminal_dir="$WINEPREFIX/drive_c/Program Files/MetaTrader 5"
@@ -10,10 +9,12 @@ readonly baked_dir=/opt/mt5-baked
 readonly runtime_dir=/tmp/mt5
 readonly startup_ini="$runtime_dir/setup.ini"
 readonly search_ini="$runtime_dir/search.ini"
+# Unset, the terminal's ceiling: it clamps a larger MaxBars to it. Set empty, it is refused.
+readonly max_bars="${MT5_MAX_BARS-100000000}"
 readonly window_wait_seconds=120
-# A stop's bounds together — a call in flight, the terminal's close, the log tail's, the server's
-# and the hub's, the display's and the kill — stay under the stop timeout the server README asks the
-# container to be given.
+# A stop's bounds together — a call in flight, the terminal's close, the log tail's, the hub's, the
+# display's and the kill — stay under the stop timeout the server README asks the container to be
+# given.
 readonly close_wait_seconds=60
 readonly stop_wait_seconds=10
 readonly call_seconds=10
@@ -89,6 +90,9 @@ require_settings() {
             fail "$name is not set"
         fi
     done
+    if [[ ! "$max_bars" =~ ^[1-9][0-9]*$ ]]; then
+        fail "MT5_MAX_BARS is not a positive integer"
+    fi
 }
 
 # The display is up once its socket is: a start removes whatever socket and lock a killed X server
@@ -158,8 +162,9 @@ acquire_server_list() {
     close_terminal
 }
 
-# The baked ini plus the account's credentials and the spawner's symbol, taken from the environment
-# and written where only this user reads them; the search session's copy runs no startup script.
+# The baked ini plus the account's credentials, MaxBars and the spawner's symbol, taken from the
+# environment and written where only this user reads them; the search session's copy runs no startup
+# script.
 write_inis() {
     mkdir -p -m 0700 "$runtime_dir"
     (
@@ -170,7 +175,7 @@ write_inis() {
 }
 
 write_ini() {
-    awk -v session="$1" '
+    awk -v session="$1" -v max_bars="$max_bars" '
         /^\[/ { skipping = (session == "search" && $0 == "[StartUp]") }
         skipping { next }
         { print $0 "\r" }
@@ -179,6 +184,7 @@ write_ini() {
             print "Password=\"" ENVIRON["MT5_PASSWORD"] "\"\r"
             print "Server=" ENVIRON["MT5_SERVER"] "\r"
         }
+        $0 == "[Charts]" { print "MaxBars=" max_bars "\r" }
         $0 == "[StartUp]" { print "Symbol=" ENVIRON["MT5_SPAWNER_SYMBOL"] "\r" }
     ' /opt/mt5/setup.ini
 }
@@ -228,14 +234,6 @@ start_hub() {
     process_names[$!]=hub
 }
 
-# The server exits when no EA sample verifies the broker clock within its bootstrap window: the loud
-# end of a start whose login failed.
-start_server() {
-    step "starting the server"
-    wine "$MT5_PYTHON_DIR\\Scripts\\mt5-connector-server.exe" &
-    process_names[$!]=server
-}
-
 # Sends SIGTERM to `pids` and waits up to `stop_wait_seconds` for them all to exit.
 terminate() {
     local deadline=$((SECONDS + stop_wait_seconds)) pid
@@ -248,8 +246,8 @@ terminate() {
 }
 
 # Closes the terminal as a user would, so it writes out what it holds and its last lines reach the
-# log, then stops the log tail, the server and the hub, and the display last; whatever outlasts its
-# bound is killed.
+# log, then stops the log tail and the hub, and the display last; whatever outlasts its bound is
+# killed.
 stop_everything() {
     local pid services=() display=() remaining=()
     if [[ -n "$terminal_pid" ]] && kill -0 "$terminal_pid" 2>/dev/null; then
@@ -265,7 +263,7 @@ stop_everything() {
     fi
     for pid in "${!process_names[@]}"; do
         case "${process_names[$pid]}" in
-            server | hub) services+=("$pid") ;;
+            hub) services+=("$pid") ;;
             Xvfb) display+=("$pid") ;;
         esac
     done
@@ -345,5 +343,4 @@ start_log_tail
 await_terminal_window
 allow_webrequest
 start_hub
-start_server
 supervise

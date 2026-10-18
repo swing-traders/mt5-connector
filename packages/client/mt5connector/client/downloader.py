@@ -1,10 +1,10 @@
-"""Downloads a symbol's bars and ticks through the MT5 server's history routes into a NautilusTrader
-Parquet catalog, walking back from the end of a range until its start or the series' floor."""
+"""Downloads a symbol's bars and ticks through the hub's history reads into a NautilusTrader Parquet
+catalog, walking back from the end of a range until its start or the series' floor."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -14,18 +14,18 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from mt5connector.client import history
 from mt5connector.client.errors import (
+    HubAnswerError,
     MT5InstrumentError,
     MT5SymbolNotFoundError,
     ServerUnreachable,
 )
-from mt5connector.client.history import HistoryRanges
 from mt5connector.client.parsing import (
     InstrumentAny,
     parse_quote_tick,
     venue_bar,
     venue_bar_type,
 )
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 from mt5connector.wire.history_wire import BAR_PERIOD_S, SPAN_MARGIN, Series, bar_series
 
 if TYPE_CHECKING:
@@ -46,13 +46,13 @@ _DAY_S = 86_400
 
 @dataclass
 class DownloadResult:
-    """What one download wrote, the windows it asked the server for, and what failed."""
+    """What one download wrote, the windows it asked the hub for, and what failed."""
 
     symbol: str
     data_type: str
     total_written: int = 0
     chunks_processed: int = 0
-    # Windows the server answered with no rows.
+    # Windows the hub answered with no rows.
     chunks_empty: int = 0
     errors: list[str] = field(default_factory=list)
     start: datetime | None = None
@@ -80,7 +80,7 @@ class DownloadResult:
 
 
 class MT5DataDownloader:
-    """Downloads a symbol's history from the MT5 server into a Parquet catalog."""
+    """Downloads a symbol's history from the hub into a Parquet catalog."""
 
     def __init__(
         self,
@@ -94,7 +94,7 @@ class MT5DataDownloader:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def download_ticks(self, symbol: str, start: datetime, end: datetime) -> DownloadResult:
+    async def download_ticks(self, symbol: str, start: datetime, end: datetime) -> DownloadResult:
         """Writes the symbol's quote ticks between start and end, one UTC day per request, each day
         as it arrives."""
         symbol = symbol.strip()  # preserve broker casing (EURUSDm, EURUSD, etc.)
@@ -104,13 +104,13 @@ class MT5DataDownloader:
 
         self._conn.ensure_connected()
 
-        instrument = self._ensure_instrument(symbol, result)
+        instrument = await self._ensure_instrument(symbol, result)
         if instrument is not None:
-            self._walk_ticks(result, instrument, start, end)
+            await self._walk_ticks(result, instrument, start, end)
         logger.info(f"Downloader: {result}")
         return result
 
-    def download_bars(
+    async def download_bars(
         self,
         symbol: str,
         start: datetime,
@@ -130,14 +130,14 @@ class MT5DataDownloader:
 
         self._conn.ensure_connected()
 
-        instrument = self._ensure_instrument(symbol, result)
+        instrument = await self._ensure_instrument(symbol, result)
         if instrument is not None:
             bar_type = venue_bar_type(instrument, timeframe)
-            self._walk_bars(result, instrument, series, bar_type, start, end)
+            await self._walk_bars(result, instrument, series, bar_type, start, end)
         logger.info(f"Downloader: {result}")
         return result
 
-    def download_all(
+    async def download_all(
         self,
         symbols: list[str],
         start: datetime,
@@ -156,12 +156,12 @@ class MT5DataDownloader:
             symbol_results = []
 
             if include_ticks:
-                r = self.download_ticks(symbol, start, end)
+                r = await self.download_ticks(symbol, start, end)
                 symbol_results.append(r)
 
             if include_bars:
                 for tf in timeframes:
-                    r = self.download_bars(symbol, start, end, timeframe=tf)
+                    r = await self.download_bars(symbol, start, end, timeframe=tf)
                     symbol_results.append(r)
 
             results[symbol] = symbol_results
@@ -174,13 +174,14 @@ class MT5DataDownloader:
 
     # ── Private ───────────────────────────────────────────────────────────────
 
-    def _walk_ticks(
+    async def _walk_ticks(
         self, result: DownloadResult, instrument: InstrumentAny, start: datetime, end: datetime
     ) -> None:
         """Walks the symbol's ticks back from end, a UTC day per window."""
-        ranges = history.ranges(self._conn, result.symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
+        try:
+            ranges = await history.ranges(self._conn.session, result.symbol)
+        except (HubAnswerError, ServerUnreachable) as exc:
+            _record_error(result, f"Ranges failed: {exc}")
         else:
             logger.info(f"Downloader: downloading ticks for {result.symbol} from {start} to {end}")
             first = int(start.timestamp())
@@ -190,17 +191,17 @@ class MT5DataDownloader:
                 window_start = max(first, window_end - window_end % _DAY_S)
                 windows.append((window_start, window_end))
                 window_end = window_start - 1
-            self._walk_back(
+            await self._walk_back(
                 result,
                 Series.TICKS,
                 first,
                 windows,
                 _advertised_floor(ranges, Series.TICKS),
-                lambda lo, hi: history.ticks(self._conn, result.symbol, lo, hi),
+                lambda lo, hi: history.ticks(self._conn.session, result.symbol, lo, hi),
                 lambda rows: [parse_quote_tick(row, instrument) for row in rows],
             )
 
-    def _walk_bars(
+    async def _walk_bars(
         self,
         result: DownloadResult,
         instrument: InstrumentAny,
@@ -211,15 +212,16 @@ class MT5DataDownloader:
     ) -> None:
         """Walks the symbol's bars of `series` back from the one closing at end, as many periods per
         window as the terminal answers in one read."""
-        ranges = history.ranges(self._conn, result.symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
+        try:
+            ranges = await history.ranges(self._conn.session, result.symbol)
+        except (HubAnswerError, ServerUnreachable) as exc:
+            _record_error(result, f"Ranges failed: {exc}")
         else:
             logger.info(
                 f"Downloader: downloading {series} bars for {result.symbol} closing from {start} "
                 f"to {end}"
             )
-            # The range names closes; the server serves bars by their open.
+            # The range names closes; the hub serves bars by their open.
             first_close = int(start.timestamp())
             last_close = int(end.timestamp())
             first, window_end = history.opens_closing(series, first_close, last_close)
@@ -230,14 +232,11 @@ class MT5DataDownloader:
                 windows.append((window_start, window_end))
                 window_end = window_start - 1
 
-            def read(lo: int, hi: int) -> np.ndarray | None:
-                rows = history.bars(self._conn, result.symbol, series, lo, hi)
-                if rows is None:
-                    return None
-                else:
-                    return history.closing(rows, first_close, last_close)
+            async def read(lo: int, hi: int) -> np.ndarray:
+                rows = await history.bars(self._conn.session, result.symbol, series, lo, hi)
+                return history.closing(rows, first_close, last_close)
 
-            self._walk_back(
+            await self._walk_back(
                 result,
                 series,
                 # A floor opening at the range's start leaves out the bar that would close there.
@@ -248,20 +247,20 @@ class MT5DataDownloader:
                 lambda rows: [venue_bar(row, bar_type, instrument) for row in rows],
             )
 
-    def _walk_back(
+    async def _walk_back(
         self,
         result: DownloadResult,
         series: Series,
         first: int,
         windows: list[tuple[int, int]],
         floor: int | None,
-        read: Callable[[int, int], np.ndarray | None],
+        read: Callable[[int, int], Awaitable[np.ndarray]],
         convert: Callable[[np.ndarray], list],
     ) -> None:
         """Requests the windows newest-first, writing the rows each answers, until the next lies
         wholly before the series' floor, and records the floor when it lies after `first`. A window
-        the server fails or leaves unanswered is recorded as an error and the walk goes on. The
-        floor is read again after a window answered no rows and once the walk ends, since the server
+        the hub fails or whose answer is lost is recorded as an error and the walk goes on. The
+        floor is read again after a window answered no rows and once the walk ends, since the hub
         measures one while answering."""
         for lo, hi in windows:
             if floor is not None and hi < floor:
@@ -269,43 +268,42 @@ class MT5DataDownloader:
             result.chunks_processed += 1
             label = f"{_iso(lo)}..{_iso(hi)}"
             try:
-                rows = read(lo, hi)
-            except ServerUnreachable as exc:
+                rows = await read(lo, hi)
+            except (HubAnswerError, ServerUnreachable) as exc:
                 _record_error(result, f"Window {label} failed: {exc}")
                 continue
-            if rows is None:
-                _record_error(result, f"Window {label} failed: {self._conn.mt5.last_error()}")
-            elif len(rows) == 0:
+            if len(rows) == 0:
                 result.chunks_empty += 1
-                floor = self._refresh_floor(result, series, floor)
+                floor = await self._refresh_floor(result, series, floor)
             else:
                 data = convert(rows)
                 self._catalog.write_data(data)
                 result.total_written += len(data)
                 logger.debug(f"Downloader: {result.symbol} {label} → {len(data):,} written")
-        floor = self._refresh_floor(result, series, floor)
+        floor = await self._refresh_floor(result, series, floor)
         if floor is not None and floor > first:
             result.floor = datetime.fromtimestamp(floor, UTC)
 
-    def _refresh_floor(
+    async def _refresh_floor(
         self, result: DownloadResult, series: Series, floor: int | None
     ) -> int | None:
-        """Reads the series' floor the server advertises now; a failed read is recorded as an error
-        and leaves the floor known before."""
-        ranges = history.ranges(self._conn, result.symbol)
-        if ranges is None:
-            _record_error(result, f"Ranges failed: {self._conn.mt5.last_error()}")
+        """Reads the series' floor the hub holds now; a failed read is recorded as an error and
+        leaves the floor known before."""
+        try:
+            ranges = await history.ranges(self._conn.session, result.symbol)
+        except (HubAnswerError, ServerUnreachable) as exc:
+            _record_error(result, f"Ranges failed: {exc}")
             return floor
         else:
             return _advertised_floor(ranges, series)
 
-    def _ensure_instrument(self, symbol: str, result: DownloadResult) -> InstrumentAny | None:
+    async def _ensure_instrument(self, symbol: str, result: DownloadResult) -> InstrumentAny | None:
         """The symbol's instrument, loaded when the provider holds none; a definition the venue
         refuses is recorded as the symbol's error, by its type, and answers None."""
         instrument = self._provider.get_instrument(symbol)
         if instrument is None:
             try:
-                instrument = self._provider.load_symbol(symbol)
+                instrument = await self._provider.load_symbol(symbol)
             except (MT5SymbolNotFoundError, MT5InstrumentError) as exc:
                 _record_error(result, f"{type(exc).__name__}: {exc}")
         return instrument
@@ -323,8 +321,8 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt
 
 
-def _advertised_floor(ranges: HistoryRanges, series: Series) -> int | None:
-    """The series' floor among the ranges the server advertises, or None before it measures one."""
+def _advertised_floor(ranges: calls.Ranges, series: Series) -> int | None:
+    """The series' floor among the ranges the hub holds, or None before it measures one."""
     if series in ranges.series:
         return ranges.series[series].floor
     else:

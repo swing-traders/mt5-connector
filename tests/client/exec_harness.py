@@ -1,9 +1,10 @@
-"""An execution client wired to real NT components over doubles of its connection's transport and of
-its push channel, recording what the client emits and logs."""
+"""An execution client wired to real NT components over doubles of its connection and of its hub
+session, recording what the client emits and logs."""
 
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import partial
 from hashlib import sha256
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,6 +17,7 @@ from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.identifiers import (
     AccountId,
     InstrumentId,
+    PositionId,
     StrategyId,
     Symbol,
     TradeId,
@@ -26,7 +28,7 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
-from push_double import PushDouble, deal_added
+from session_double import ExecSession, deal_added, verdict_of
 from venue_doubles import account_info, trade_deal, trade_order, trade_position
 
 from mt5connector.client import execution
@@ -34,6 +36,7 @@ from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
+from mt5connector.wire import mirror
 
 
 def account_id_of(login: int, trader_id: str, venue: str = "MT5") -> AccountId:
@@ -113,9 +116,7 @@ class RecordedExecClient(MT5LiveExecutionClient):
 def config(**fields) -> MT5Config:
     return MT5Config(
         account=12345678,
-        password="p",
         server="Broker-Demo",
-        server_url="http://127.0.0.1:5000",
         **{"ws_url": "ws://127.0.0.1:9000", **fields},
     )
 
@@ -125,7 +126,7 @@ class Harness:
     """One client under test, with what it emitted."""
 
     client: RecordedExecClient
-    push: PushDouble
+    push: ExecSession
     venue: MagicMock
     conn: MagicMock
     cache: object
@@ -152,7 +153,7 @@ class Harness:
         await self.connect_keeping_events()
         self.ledger.clear()
         self.venue.reset_mock()
-        self.conn.get_account_info.reset_mock()
+        self.conn.account_info.reset_mock()
 
     async def connect_keeping_events(self) -> None:
         """Connects the client and stops its account loop, keeping what connecting emitted."""
@@ -163,21 +164,42 @@ class Harness:
         except asyncio.CancelledError:
             pass
 
-    def deals_added(self, *deals) -> None:
+    async def drained(self) -> None:
+        """Waits until every task the client runs for the frames delivered has ended."""
+        while self.client._handlers:
+            await asyncio.gather(*self.client._handlers, return_exceptions=True)
+
+    async def delivered(self, *frames) -> None:
+        """Delivers each frame in turn, each one's handling ended before the next is delivered."""
+        for frame in frames:
+            self.push.deliver(frame)
+            await self.drained()
+
+    async def deals_added(self, *deals) -> None:
         """The venue adding each deal to its history and pushing its DEAL_ADD, in turn; its history
         answers every other read as it did."""
         previous = self.venue.history_deals_get.side_effect
         try:
             for deal in deals:
                 self.venue.history_deals_get.side_effect = _history_holding(deal, self.venue)
-                self.push.deliver(deal_added(deal))
+                await self.delivered(deal_added(deal))
         finally:
             self.venue.history_deals_get.side_effect = previous
 
-    def place(self, order, status: OrderStatus = OrderStatus.ACCEPTED, ticket=None):
-        """Adds an NT order to the cache, advanced to SUBMITTED, ACCEPTED under `ticket`, or FILLED
-        under `ticket`."""
-        self.cache.add_order(order)
+    async def verdict(self, retcode=mirror.TRADE_RETCODE_DONE, *, request_id=None, **result):
+        """The venue's verdict on the last command answered sent, or on the one sent under
+        `request_id`: the REQUEST transaction carrying the request whole and `retcode`."""
+        if request_id is None:
+            request_id = list(self.push.sent)[-1]
+        await self.delivered(verdict_of(self.push.sent[request_id], request_id, retcode, **result))
+
+    def place(self, order, status: OrderStatus = OrderStatus.ACCEPTED, ticket=None, position=None):
+        """Adds an NT order to the cache, sent against `position` when one is named, advanced to
+        SUBMITTED, ACCEPTED under `ticket`, or FILLED under `ticket`."""
+        position_id = None
+        if position is not None:
+            position_id = PositionId(str(position))
+        self.cache.add_order(order, position_id)
         if status in (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.FILLED):
             order.apply(TestEventStubs.order_submitted(order, account_id=ACCOUNT_ID))
         if status in (OrderStatus.ACCEPTED, OrderStatus.FILLED):
@@ -229,32 +251,34 @@ def gtd(day: str = "2026-10-04T00:00:00Z") -> dict:
     return {"time_in_force": TimeInForce.GTD, "expire_time": pd.Timestamp(day)}
 
 
-def build(venue, *, instruments=None, account=None, **settings) -> Harness:
-    """A client of the trader TRADER_ID over `venue`, with EURUSD loaded unless `instruments` names
-    others, its connection reporting `account`."""
+def build(venue, *, instruments=None, account=None, cache=None, **settings) -> Harness:
+    """A client of the trader TRADER_ID whose hub session `venue` answers, with EURUSD loaded unless
+    `instruments` names others, its connection and its session reporting `account`, over `cache`
+    when one is given: a restart's client over what NT kept."""
     clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
     ledger = []
     msgbus.register(endpoint="ExecEngine.process", handler=ledger.append)
     msgbus.register(endpoint="Portfolio.update_account", handler=ledger.append)
-    cache = TestComponentStubs.cache()
+    if cache is None:
+        cache = TestComponentStubs.cache()
     loaded = {item.raw_symbol.value: item for item in (instruments or [instrument()])}
 
     conn = MagicMock(spec=MT5Connection)
-    conn.mt5 = venue
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
-    conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
-    conn.reconnect_async = AsyncMock(return_value=True)
+    conn.account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
+    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    venue.account_info.return_value = account or account_info()
 
     provider = MagicMock(spec=MT5InstrumentProvider)
     provider.initialize = AsyncMock()
     provider.list_all.return_value = list(loaded.values())
     provider.get_instrument.side_effect = loaded.get
 
-    with patch.object(execution, "PushClient", PushDouble):
+    with patch.object(execution, "HubSession", partial(ExecSession, venue)):
         client = RecordedExecClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
+            account=AccountSnapshot.from_mt5(account or account_info()),
             msgbus=msgbus,
             cache=cache,
             clock=clock,
@@ -262,7 +286,7 @@ def build(venue, *, instruments=None, account=None, **settings) -> Harness:
             config=config(**settings),
         )
     factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
-    return Harness(client, client._push, venue, conn, cache, factory, ledger, loaded)
+    return Harness(client, client._hub, venue, conn, cache, factory, ledger, loaded)
 
 
 def _history_holding(deal, venue):

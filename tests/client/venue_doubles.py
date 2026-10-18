@@ -1,9 +1,14 @@
-"""The terminal's account, symbol and tick structs as the shim decodes them, every field the package
-carries present, and the trading sessions the server relays, for tests that feed the client a
-venue."""
+"""The venue's structs and relayed answers as the hub session hands them back, and a hub session
+serving an instrument provider's reads, for the client's tests to feed it a venue."""
 
-from mt5connector.client.remote_mt5 import STRUCT_TYPES
-from mt5connector.wire import mirror
+from unittest.mock import MagicMock
+
+from mt5connector.client.errors import EaError
+from mt5connector.client.hub import Answered, HubSession
+from mt5connector.wire import binary, calls, mirror
+from mt5connector.wire.push_wire import MqlError
+
+Call = calls.Call
 
 _ACCOUNT_STRINGS = frozenset({"name", "server", "currency", "company"})
 _SYMBOL_STRINGS = frozenset(
@@ -27,7 +32,7 @@ _SYMBOL_STRINGS = frozenset(
 
 def account_info(**fields):
     """A hedging account in USD with two currency digits that may trade, under `fields`."""
-    struct = STRUCT_TYPES[mirror.StructName.ACCOUNT_INFO]
+    struct = calls.STRUCT_TYPES[mirror.StructName.ACCOUNT_INFO]
     values = {name: "" if name in _ACCOUNT_STRINGS else 0 for name in struct._fields}
     values |= {
         "login": 12345678,
@@ -50,7 +55,7 @@ def account_info(**fields):
 
 def symbol_info(**fields):
     """EURUSD as a FOREX pair a run may fully trade, under `fields`."""
-    struct = STRUCT_TYPES[mirror.StructName.SYMBOL_INFO]
+    struct = calls.STRUCT_TYPES[mirror.StructName.SYMBOL_INFO]
     values = {name: "" if name in _SYMBOL_STRINGS else 0 for name in struct._fields}
     values |= {
         "name": "EURUSD",
@@ -77,8 +82,7 @@ def symbol_info(**fields):
 def tick(bid: float, ask: float, time: int = 1_760_000_000):
     """A quote the terminal answers for a selected symbol; `time` 0 is the all-zero struct an
     unselected or closed symbol answers."""
-    struct = STRUCT_TYPES[mirror.StructName.TICK]
-    return struct(
+    return calls.Tick(
         time=time,
         bid=bid,
         ask=ask,
@@ -90,8 +94,8 @@ def tick(bid: float, ask: float, time: int = 1_760_000_000):
     )
 
 
-def _struct(name: mirror.StructName, strings: frozenset[str], fields: dict):
-    struct = STRUCT_TYPES[name]
+def _struct(name: str, strings: frozenset[str], fields: dict):
+    struct = calls.STRUCT_TYPES[name]
     values = {field: "" if field in strings else 0 for field in struct._fields}
     return struct(**(values | fields))
 
@@ -162,18 +166,18 @@ def trade_position(**fields):
     )
 
 
-def send_result(**fields):
-    """The venue's answer to a trade request that completed, under `fields`."""
-    request = _struct(mirror.StructName.TRADE_REQUEST, frozenset({"symbol", "comment"}), {})
+def trade_result(**fields):
+    """The terminal's immediate answer to a trade request it sent, retcode 10008, under `fields`; a
+    session double gives it a request id when `fields` names none."""
     return _struct(
-        mirror.StructName.ORDER_SEND_RESULT,
+        binary.TRADE_RESULT.name,
         frozenset({"comment"}),
-        {"retcode": mirror.TRADE_RETCODE_DONE, "order": 9001, "request": request} | fields,
+        {"retcode": mirror.TRADE_RETCODE_PLACED} | fields,
     )
 
 
 def week() -> list[list[list[int]]]:
-    """A week of sessions, Sunday first, as the server relays one: open from 18:00 on Sunday to
+    """A week of sessions, Sunday first, as a publisher relays one: open from 18:00 on Sunday to
     16:57 on Friday, with a break from 16:59 to 18:00 every day between."""
     return [
         [[64800, 0]],
@@ -187,5 +191,73 @@ def week() -> list[list[list[int]]]:
 
 
 def relayed_sessions() -> dict:
-    """The server's answer for a symbol whose quote and trade sessions are both week()."""
+    """The relayed answer for a symbol whose quote and trade sessions are both week()."""
     return {"quote": week(), "trade": week(), "last_error": 0}
+
+
+def listing(info):
+    """A symbol's record in the terminal's listing: its definition without the market state."""
+    struct = calls.STRUCT_TYPES[calls.CALLS[Call.SYMBOLS_GET].layout.name]
+    return struct(**{field: getattr(info, field) for field in struct._fields})
+
+
+class SymbolVenue:
+    """The hub session of an instrument provider's connection, answering the reads a provider asks
+    from the account, symbols and refusals a test hands it."""
+
+    account_info = HubSession.account_info
+    deferring = HubSession.deferring
+
+    def __init__(self) -> None:
+        self.account = account_info()
+        self.definitions = {}
+        self.ticks = {}
+        self.schedules = {}
+        self.sessions = {}
+        self.refusals: dict[tuple[calls.Call, str | None], list[Exception]] = {}
+        self.asked: list[tuple[calls.Call, str | None]] = []
+        self._log = MagicMock()
+
+    def add(self, info, bid=None, ask=None, schedule=None, sessions=None):
+        self.definitions[info.name] = info
+        if bid is not None:
+            self.ticks[info.name] = tick(bid, ask)
+        if schedule is not None:
+            self.schedules[info.name] = schedule
+        if sessions is not None:
+            self.sessions[info.name] = sessions
+
+    def asked_of(self, symbol: str) -> list[calls.Call]:
+        return [call for call, asked in self.asked if asked == symbol]
+
+    async def request(self, call: calls.Call, **arguments) -> Answered:
+        symbol = arguments.get("symbol")
+        self.asked.append((call, symbol))
+        refusals = self.refusals.get((call, symbol), [])
+        if refusals:
+            raise refusals.pop(0)
+        elif call is Call.ACCOUNT_INFO:
+            return Answered(self.account, 0)
+        elif call is Call.SYMBOLS_GET:
+            return Answered(tuple(listing(info) for info in self.definitions.values()), 0)
+        elif symbol not in self.definitions:
+            raise EaError(
+                f"{call.name.lower()}: the publisher chart of {symbol} failed to open: "
+                f"MQL5 error {MqlError.MARKET_UNKNOWN_SYMBOL.value}",
+                MqlError.MARKET_UNKNOWN_SYMBOL.value,
+            )
+        elif call is Call.SYMBOL_INFO:
+            return Answered(self.definitions[symbol], 0)
+        elif call is Call.SYMBOL_INFO_TICK:
+            return Answered(self.ticks.get(symbol, tick(0.0, 0.0, time=0)), 0)
+        elif call is Call.COMMISSION_SCHEDULE:
+            return Answered(self.schedules.get(symbol, {"ret": 0, "last_error": 0, "rules": []}), 0)
+        elif call is Call.TRADING_SESSIONS:
+            return Answered(self.sessions.get(symbol, relayed_sessions()), 0)
+        else:
+            raise ValueError(f"{call.name.lower()}: not a call an instrument provider asks")
+
+
+def serve(conn: MagicMock, venue: SymbolVenue) -> None:
+    """Hands a connection double's hub session to `venue`."""
+    conn.session = venue

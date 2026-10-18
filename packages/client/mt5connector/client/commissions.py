@@ -1,16 +1,13 @@
 """A symbol's commission rule as the server relays it from the terminal, typed, and the taker fee
 per fill it implies."""
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
 from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.client.parsing import finite_decimal
 from mt5connector.wire.push_wire import CommissionEntryMode, CommissionMode
-
-# The modes that state money in the rule's currency, which the fee converts into the quote currency.
-MONEY_MODES = frozenset({CommissionMode.MONEY_DEPOSIT, CommissionMode.MONEY_SPECIFIED})
 
 
 @dataclass(frozen=True)
@@ -25,38 +22,40 @@ class CommissionRule:
 
 def parse_schedule(schedule: dict) -> CommissionRule | None:
     """The first rule of a relayed schedule with its first tier; None when it holds no rule. Raises
-    MT5InstrumentError for a failed read or a mode MQL5 does not name."""
+    MT5InstrumentError for a failed read or a rule with no tier."""
     if schedule["ret"] < 0:
         raise MT5InstrumentError(f"the commission schedule read failed: {schedule['last_error']}")
     elif not schedule["rules"]:
         return None
+    elif not schedule["rules"][0]["tiers"]:
+        raise MT5InstrumentError("the commission rule has no tier")
     else:
         rule = schedule["rules"][0]
         tier = rule["tiers"][0]
         return CommissionRule(
-            entry=_member(CommissionEntryMode, rule["mode_entry"], "commission entry mode"),
-            mode=_member(CommissionMode, tier["mode"], "commission mode"),
+            entry=rule["mode_entry"],
+            mode=tier["mode"],
             value=finite_decimal(tier["value"], "commission value"),
             currency=tier["currency"],
         )
 
 
-def taker_fee(
+async def taker_fee(
     rule: CommissionRule,
     *,
     price: Decimal,
     contract_size: Decimal,
     point: Decimal,
-    rate: Callable[[str], Decimal],
+    rate: Callable[[str], Awaitable[Decimal]],
 ) -> Decimal:
     """The fee per fill as a fraction of notional at `price`: money per lot of `contract_size` or
-    per unit, converted at `rate` — quote units per unit of the rule's currency, read for a money
+    per unit, converted at `rate` — quote units per unit of the rule's currency, awaited for a money
     rule alone — a percentage, or points of `point` in price. Raises MT5InstrumentError for a mode
     or entry no fee derives from."""
     if rule.mode == CommissionMode.MONEY_DEPOSIT:
-        fee = rule.value * rate(rule.currency) / (contract_size * price)
+        fee = rule.value * await rate(rule.currency) / (contract_size * price)
     elif rule.mode == CommissionMode.MONEY_SPECIFIED:
-        fee = rule.value * rate(rule.currency) / price
+        fee = rule.value * await rate(rule.currency) / price
     elif rule.mode == CommissionMode.PERCENT:
         fee = rule.value / 100
     elif rule.mode == CommissionMode.PIPS:
@@ -70,12 +69,3 @@ def taker_fee(
         return fee / 2
     else:
         raise MT5InstrumentError(f"commission entry mode {rule.entry} derives no fee")
-
-
-def _member(members, name: str, field: str):
-    """The member of `members` the venue's name is; raises MT5InstrumentError for a name MQL5 does
-    not give one."""
-    try:
-        return members(name)
-    except ValueError:
-        raise MT5InstrumentError(f"{field} {name!r} is unknown") from None

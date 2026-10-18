@@ -5,26 +5,24 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import http.server
 import importlib.util
+import json
 import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
+import threading
 import time
 import types
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from nautilus_trader.model.identifiers import InstrumentId, Venue
-
-from mt5connector.client import factories as mt5_factories
-from mt5connector.client import remote_mt5
-from mt5connector.client.config import MT5Config
-from mt5connector.client.connection import ConnectionState, MT5Connection
-from mt5connector.client.errors import MT5ConnectionError
 
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
@@ -36,14 +34,9 @@ _ACCOUNT = {
     "MT5_SERVER": "MT5ImageTest-Not-A-Server",
     "MT5_SPAWNER_SYMBOL": "EURUSD",
 }
-# The boot steps, the server's login timeout and its clock-bootstrap window, with room to spare.
-_START_BOUND_SECONDS = 600
 # The stop timeout the image's contract asks for, over the entrypoint's own stop bounds together.
 _STOP_TIMEOUT_SECONDS = 190
-_API_PORT = 5000
 _HUB_PORT = 9000
-# On the host's loopback, at host ports the runtime picks.
-_PUBLISHED_PORTS = (f"127.0.0.1::{_API_PORT}", f"127.0.0.1::{_HUB_PORT}")
 _IMAGE_FILES = Path(__file__).resolve().parents[2] / "image"
 _BASES = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
 _CONFIG = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Config"
@@ -53,8 +46,8 @@ _TERMINAL_KEY = "HKCU\\Software\\MetaQuotes Software"
 _WRITTEN_VALUE = "mt5-image-test-written-by-a-run"
 _SCRIPTS = "/mt5-image-test"
 # A file the terminal never writes, and its baked copy.
-_INCLUDE = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Include/JAson.mqh"
-_BAKED_INCLUDE = "/opt/mt5-baked/terminal/MQL5/Include/JAson.mqh"
+_INCLUDE = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Include/hub_codec.mqh"
+_BAKED_INCLUDE = "/opt/mt5-baked/terminal/MQL5/Include/hub_codec.mqh"
 # Overwrites the first byte of "$1" with another, then gives "$1" the timestamp of "$2".
 _REWRITE_IN_PLACE = """
 first=$(head -c 1 "$1")
@@ -298,6 +291,72 @@ def test_a_stop_on_a_half_written_character_streams_the_whole_lines(terminal, tm
     assert out.read_bytes().decode().splitlines() == ["terminal: whole"]
 
 
+_PROBE = _IMAGE_FILES / "healthcheck.py"
+
+
+@contextlib.contextmanager
+def _answering(status: int):
+    """A loopback HTTP server answering every GET with ``status``, yielding its port and the paths
+    asked."""
+    asked = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            asked.append(self.path)
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], asked
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _probe(port: int) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(_PROBE)],
+        env={**os.environ, "MT5_HUB_PORT": str(port)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_the_health_probe_passes_on_a_200_from_the_hubs_health() -> None:
+    with _answering(200) as (port, asked):
+        probe = _probe(port)
+
+    assert (probe.returncode, probe.stdout, probe.stderr) == (0, "", "")
+    assert asked == ["/health"]
+
+
+def test_the_health_probe_fails_on_a_503_naming_it() -> None:
+    with _answering(503) as (port, asked):
+        probe = _probe(port)
+
+    assert probe.returncode == 1
+    (line,) = probe.stdout.splitlines()
+    assert "503" in line
+    assert asked == ["/health"]
+
+
+def test_the_health_probe_fails_on_a_hub_not_listening_naming_why() -> None:
+    with _answering(200) as (port, _):
+        pass
+    probe = _probe(port)
+
+    assert probe.returncode == 1
+    (line,) = probe.stdout.splitlines()
+    assert "Connection refused" in line
+
+
 def _runtime() -> str:
     runtime = shutil.which("docker") or shutil.which("podman")
     assert runtime is not None, "no container runtime on PATH"
@@ -321,24 +380,112 @@ def _await_log(runtime: str, name: str, line: str, *, count: int, seconds: float
 
 
 @_needs_image
-def test_a_start_on_an_unknown_account_ends_through_the_server_and_prints_no_password() -> None:
-    result = subprocess.run(
-        [_runtime(), "run", "--rm", *_account_env(), _IMAGE],
-        env={**os.environ, **_ACCOUNT},
+def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
+    runtime = _runtime()
+    inspected = subprocess.run(
+        [runtime, "image", "inspect", _IMAGE],
         capture_output=True,
         text=True,
-        timeout=_START_BOUND_SECONDS,
+        timeout=60,
+        check=True,
+    )
+    (image,) = json.loads(inspected.stdout)
+    # Docker reports it under Config, podman beside it.
+    healthcheck = image["Config"].get("Healthcheck") or image.get("Healthcheck")
+
+    assert healthcheck, f"{_IMAGE} declares no healthcheck"
+    command = " ".join(healthcheck["Test"])
+    assert "python3 /opt/mt5/healthcheck.py" in command, command
+    assert (healthcheck["Interval"], healthcheck["Timeout"], healthcheck["Retries"]) == (
+        30_000_000_000,
+        5_000_000_000,
+        3,
     )
 
-    output = result.stdout + result.stderr
-    assert result.returncode != 0
+
+@_needs_image
+def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password() -> None:
+    runtime = _runtime()
+    name = f"mt5-image-boot-test-{os.getpid()}"
+    try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        output = _logs(runtime, name)
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+
     assert "mt5: restored the terminal's baked state, its history store aside" in output
     assert "mt5: fetching the trade server's broker into the server list" in output
     assert "mt5: the account dialog searched the trade server" in output
     assert "mt5: adding 127.0.0.1 to the WebRequest allowlist" in output
     assert "mt5: the WebRequest allowlist holds 127.0.0.1 alone" in output
-    assert "mt5: server exited with status" in output
     assert _ACCOUNT["MT5_PASSWORD"] not in output
+
+
+def _startup_ini(max_bars: str | None) -> str:
+    """The startup ini the entrypoint writes on the unknown account, `MT5_MAX_BARS` set to
+    `max_bars` unless it is None; the container is removed once the ini is read."""
+    runtime = _runtime()
+    name = f"mt5-image-ini-test-{os.getpid()}"
+    environment = {**os.environ, **_ACCOUNT}
+    settings = _account_env()
+    if max_bars is not None:
+        environment["MT5_MAX_BARS"] = max_bars
+        settings += ["-e", "MT5_MAX_BARS"]
+    try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *settings, _IMAGE],
+            env=environment,
+            check=True,
+            timeout=60,
+        )
+        fetching = "mt5: fetching the trade server's broker into the server list"
+        _await_log(runtime, name, fetching, count=1, seconds=120)
+        read = subprocess.run(
+            [runtime, "exec", name, "cat", "/tmp/mt5/setup.ini"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+    return read.stdout
+
+
+@_needs_image
+@pytest.mark.parametrize(
+    ("max_bars", "written"), [(None, "100000000"), ("100000", "100000")], ids=["unset", "set"]
+)
+def test_the_startup_ini_carries_max_bars_the_terminals_ceiling_unless_set(max_bars, written):
+    lines = _startup_ini(max_bars).splitlines()
+
+    assert [line for line in lines if line.startswith("MaxBars=")] == [f"MaxBars={written}"]
+
+
+@_needs_image
+@pytest.mark.parametrize("max_bars", ["0", "abc", ""], ids=["zero", "word", "empty"])
+def test_a_max_bars_that_is_no_positive_integer_fails_the_start_naming_it(max_bars) -> None:
+    runtime = _runtime()
+    name = f"mt5-image-max-bars-test-{os.getpid()}"
+    try:
+        result = subprocess.run(
+            [runtime, "run", "--rm", "--name", name, *_account_env(), "-e", "MT5_MAX_BARS", _IMAGE],
+            env={**os.environ, **_ACCOUNT, "MT5_MAX_BARS": max_bars},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+
+    assert result.returncode == 1
+    assert "mt5: MT5_MAX_BARS is not a positive integer" in result.stdout + result.stderr
 
 
 def _start_with(tmp_path, stub_at: str, stub: str, *, timeout: int) -> subprocess.CompletedProcess:
@@ -438,13 +585,13 @@ done
 def test_a_terminal_that_exits_during_the_boot_ends_the_container_with_its_status() -> None:
     runtime = _runtime()
     name = f"mt5-image-test-{os.getpid()}"
-    subprocess.run(
-        [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
         _await_log(runtime, name, "mt5: launching the terminal", count=1, seconds=120)
         subprocess.run([runtime, "exec", name, "sh", "-c", _KILL_TERMINAL], check=True, timeout=60)
         status = subprocess.run(
@@ -463,24 +610,24 @@ def test_a_stop_closes_the_terminal_and_ends_the_container_within_the_stop_timeo
     runtime = _runtime()
     name = f"mt5-image-stop-test-{os.getpid()}"
     stop_timeout = _STOP_TIMEOUT_SECONDS
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--stop-timeout",
-            str(stop_timeout),
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+        subprocess.run(
+            [
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--stop-timeout",
+                str(stop_timeout),
+                *_account_env(),
+                _IMAGE,
+            ],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         started = time.monotonic()
         subprocess.run([runtime, "stop", name], capture_output=True, timeout=stop_timeout + 30)
         stopped_after = time.monotonic() - started
@@ -536,7 +683,7 @@ gui.main()
 
 @contextlib.contextmanager
 def _booted(runtime: str, tmp_path, name: str):
-    """A container of the image booted up to its server, its history store a volume of its own and
+    """A container of the image booted up to its hub, its history store a volume of its own and
     the scripts above mounted; removed with its volume on exit."""
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -544,28 +691,28 @@ def _booted(runtime: str, tmp_path, name: str):
     for script, text in (("read_allowlist.py", _READ_ALLOWLIST), ("absent.py", _ABSENT_CHECKBOX)):
         (scripts / script).write_text(text)
         (scripts / script).chmod(0o644)
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--stop-timeout",
-            str(_STOP_TIMEOUT_SECONDS),
-            "-v",
-            _BASES,
-            "-v",
-            f"{scripts}:{_SCRIPTS}:ro,z",
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+        subprocess.run(
+            [
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--stop-timeout",
+                str(_STOP_TIMEOUT_SECONDS),
+                "-v",
+                _BASES,
+                "-v",
+                f"{scripts}:{_SCRIPTS}:ro,z",
+                *_account_env(),
+                _IMAGE,
+            ],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         yield name
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
@@ -691,7 +838,7 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
             capture_output=True,
             timeout=_STOP_TIMEOUT_SECONDS + 60,
         )
-        _await_log(runtime, name, "mt5: starting the server", count=2, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=300)
         after = _allowlist(runtime, name)
         kept = subprocess.run(
             [runtime, "exec", name, "ls", _CONFIG, _COMMON_FILES, _BASES],
@@ -760,92 +907,6 @@ def test_a_dialog_without_the_expected_control_fails_the_driver_naming_it(tmp_pa
     assert "mt5: the Options dialog's Experts page has no Button 32767" in result.stderr
 
 
-# ── the client against the image, whose server no made-up account brings up ──
-
-_EURUSD = InstrumentId.from_str("EURUSD.MT5_TEST")
-
-
-def _client_config(server_url: str) -> MT5Config:
-    return MT5Config(
-        account=int(_ACCOUNT["MT5_LOGIN"]),
-        password=_ACCOUNT["MT5_PASSWORD"],
-        server=_ACCOUNT["MT5_SERVER"],
-        server_url=server_url,
-        ws_url=f"ws://127.0.0.1:{_HUB_PORT}",
-        venue=Venue("MT5_TEST"),
-    )
-
-
-def _loopback_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def _refused_at_once(connection: MT5Connection) -> None:
-    """`connection`'s connect raises the client's error for a request no server answered, within the
-    client's own bound on reaching a server, carrying no credential, and leaves it disconnected."""
-    started = time.monotonic()
-    with pytest.raises(MT5ConnectionError) as refused:
-        connection.connect()
-    assert time.monotonic() - started < remote_mt5.CONNECT_TIMEOUT_S
-    said = " ".join([str(refused.value), *getattr(refused.value, "__notes__", [])])
-    for name in ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"):
-        assert _ACCOUNT[name] not in said
-    assert connection._state is ConnectionState.DISCONNECTED
-
-
-@_needs_image
-def test_a_client_is_refused_at_once_by_a_server_that_never_comes_up(monkeypatch) -> None:
-    # The terminal cannot log the made-up account in, so the server exits without ever serving: a
-    # connect meets no server while the image boots or once it has exited.
-    runtime = _runtime()
-    port = _loopback_port()
-    name = f"mt5-image-client-test-{os.getpid()}"
-    monkeypatch.setattr(mt5_factories, "_mt5_config_registry", {})
-    transports: list[remote_mt5.RemoteMT5] = []
-
-    class _RecordedTransport(remote_mt5.RemoteMT5):
-        def __init__(self, server_url: str) -> None:
-            super().__init__(server_url)
-            transports.append(self)
-
-    monkeypatch.setattr("mt5connector.client.connection.RemoteMT5", _RecordedTransport)
-    config = _client_config(f"http://127.0.0.1:{port}")
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-p",
-            f"127.0.0.1:{port}:{_API_PORT}",
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
-    try:
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
-        _refused_at_once(MT5Connection(config))
-
-        subprocess.run([runtime, "wait", name], check=True, timeout=_START_BOUND_SECONDS)
-        _refused_at_once(MT5Connection(config))
-
-        # Building the clients' configs asks no server at all.
-        node = mt5_factories.build_mt5_node_config(
-            config, data_instruments=frozenset({_EURUSD}), exec_instruments=frozenset({_EURUSD})
-        )
-        assert node.data_clients["MT5_TEST"].instrument_provider.load_ids == frozenset({_EURUSD})
-        assert node.exec_clients["MT5_TEST"].instrument_provider.load_ids == frozenset({_EURUSD})
-        assert len(transports) == 2
-    finally:
-        subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
-
-
 def _published_port(runtime: str, name: str, port: int) -> int:
     """The host port the runtime published the container `name`'s `port` on."""
     reply = subprocess.run(
@@ -858,25 +919,75 @@ def _published_port(runtime: str, name: str, port: int) -> int:
     return int(reply.split()[0].rpartition(":")[2])
 
 
-@_needs_image
-def test_a_published_server_is_reachable_on_the_loopback_at_the_port_the_runtime_picked() -> None:
-    runtime = _runtime()
-    name = f"mt5-image-publish-test-{os.getpid()}"
-    publishes = [token for spec in _PUBLISHED_PORTS for token in ("--publish", spec)]
-    subprocess.run(
-        [runtime, "run", "-d", "--name", name, *publishes, *_account_env(), _IMAGE],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
-    try:
-        rest = _published_port(runtime, name, _API_PORT)
-        hub = _published_port(runtime, name, _HUB_PORT)
-        _await_log(runtime, name, "mt5: starting the server", count=1, seconds=300)
+def _health_log(runtime: str, name: str) -> list[dict]:
+    """The healthcheck probes the runtime logged for the container ``name``, oldest first."""
+    reply = subprocess.run(
+        [runtime, "inspect", name], capture_output=True, text=True, timeout=30, check=True
+    ).stdout
+    (container,) = json.loads(reply)
+    health = container["State"].get("Health") or {}
+    return health.get("Log") or []
 
-        assert rest != hub
-        # The runtime holds the host side of the REST port on the loopback while the server boots.
-        with socket.create_connection(("127.0.0.1", rest), timeout=5):
-            pass
+
+def _health(port: int) -> tuple[int, dict] | None:
+    """The hub's /health status and body, or None while nothing answers on the port."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as refused:
+        return refused.code, json.loads(refused.read())
+    except OSError:
+        return None
+
+
+@_needs_image
+def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> None:
+    runtime = _runtime()
+    name = f"mt5-image-hub-test-{os.getpid()}"
+    try:
+        subprocess.run(
+            [
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--publish",
+                f"127.0.0.1::{_HUB_PORT}",
+                *_account_env(),
+                _IMAGE,
+            ],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
+        hub = _published_port(runtime, name, _HUB_PORT)
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        deadline = time.monotonic() + 30
+        answered = _health(hub)
+        while answered is None and time.monotonic() < deadline:
+            time.sleep(0.5)
+            answered = _health(hub)
+
+        assert answered is not None, "the hub never answered /health"
+        answered_at = datetime.now(UTC)
+        status, body = answered
+        assert status == 503
+        assert (body["ok"], body["result"]["spawner"], body["result"]["clock"]) == (
+            False,
+            False,
+            None,
+        )
+
+        # A probe started once the hub answered reached it: the image's healthcheck runs.
+        deadline = time.monotonic() + 60
+        probes = _health_log(runtime, name)
+        while not (probes and datetime.fromisoformat(probes[-1]["Start"]) > answered_at):
+            assert time.monotonic() < deadline, "no healthcheck probe within 60s of the hub"
+            time.sleep(1)
+            probes = _health_log(runtime, name)
+        latest = probes[-1]
+        assert latest["ExitCode"] == 1, latest
+        assert "503" in latest["Output"] and "not found" not in latest["Output"], latest
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)

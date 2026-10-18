@@ -2,11 +2,11 @@
 and the account it reports."""
 
 import asyncio
-from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 from exec_harness import ACCOUNT_ID, MAGIC, STRATEGY_ID, TRADER_ID, build, ours_deal, ours_order
+from hub_double import eventually
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.core.uuid import UUID4
@@ -16,17 +16,16 @@ from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, O
 from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
-from push_double import order_left, request_done, transaction_frame
-from venue_doubles import account_info, send_result, trade_deal
+from session_double import deal_added, order_left, request_done, transaction_frame
+from venue_doubles import account_info, trade_deal
 
 from mt5connector.client import errors, execution
-from mt5connector.client.connection import AccountSnapshot
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
 
-async def connected(exec_shim, **settings):
-    h = build(exec_shim, **settings)
+async def connected(exec_venue, **settings):
+    h = build(exec_venue, **settings)
     await h.connect()
     return h
 
@@ -60,8 +59,8 @@ async def fill_reports(h):
 # ── The channel ──────────────────────────────────────────────────────────────
 
 
-async def test_connect_subscribes_the_accounts_trade_transactions_on_the_push_channel(exec_shim):
-    h = await connected(exec_shim)
+async def test_connect_subscribes_the_accounts_trade_transactions_on_the_push_channel(exec_venue):
+    h = await connected(exec_venue)
 
     assert h.push.connected
     assert h.push.wanted == [Subscription(Stream.TRADE_TRANSACTIONS)]
@@ -69,28 +68,104 @@ async def test_connect_subscribes_the_accounts_trade_transactions_on_the_push_ch
     assert not h.push.connected
 
 
-async def test_connect_logs_the_push_channel_without_its_credentials(exec_shim):
-    h = await connected(exec_shim, ws_url="wss://hub:SYNTHETIC_SECRET@127.0.0.1:9000/push")
+async def test_connect_takes_in_the_venue_on_its_session_before_subscribing_its_transactions(
+    exec_venue,
+):
+    h = build(exec_venue)
+    seen = []
+
+    def history_deals_get(**window):
+        seen.append((h.push.connected, list(h.push.wanted)))
+        return ()
+
+    exec_venue.history_deals_get.side_effect = history_deals_get
+    await h.connect()
+
+    assert seen == [(True, [])]
+    assert h.push.wanted == [Subscription(Stream.TRADE_TRANSACTIONS)]
+
+
+async def test_a_disconnect_drops_the_transaction_subscription_the_next_connect_renews(exec_venue):
+    h = await connected(exec_venue)
+
+    await h.client._disconnect()
+    dropped = list(h.push.wanted)
+    await h.connect()
+
+    assert dropped == []
+    assert h.push.wanted == [Subscription(Stream.TRADE_TRANSACTIONS)]
+
+
+async def test_a_connect_whose_take_in_fails_disconnects_its_session(exec_venue):
+    h = build(exec_venue)
+    exec_venue.history_deals_get.side_effect = errors.EaError("history_deals_get: failed", 4401)
+
+    with pytest.raises(errors.EaError):
+        await h.client._connect()
+
+    assert not h.push.connected
+    assert h.client._account_task is None
+
+
+async def test_a_verdict_replayed_after_a_reconnect_settles_its_command(exec_venue):
+    h = await connected(exec_venue)
+    order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
+    await h.client._submit_order(
+        SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+    )
+    await h.client._disconnect()
+    await h.connect()
+
+    await h.verdict(mirror.TRADE_RETCODE_PLACED, order=9401)
+
+    assert h.names() == ["OrderAccepted", "AccountState"]
+    assert (h.events[0].client_order_id, h.events[0].venue_order_id) == (
+        order.client_order_id,
+        VenueOrderId("9401"),
+    )
+
+
+async def test_a_disconnect_cancels_the_handling_of_a_transaction_still_reading(exec_venue):
+    h = build(exec_venue)
+    h.place(h.limit(), ticket=9001)
+    await h.connect()
+    h.venue.history_deals_get.return_value = (ours_deal(ticket=7001, order=9001),)
+
+    h.push.deliver(deal_added(ours_deal(ticket=7001, order=9001)))
+    await h.client._disconnect()
+    await h.drained()
+
+    assert h.names() == []
+
+
+async def test_connect_logs_the_push_channel_without_its_credentials(exec_venue):
+    h = await connected(exec_venue, ws_url="wss://hub:SYNTHETIC_SECRET@127.0.0.1:9000/push")
     await h.client._disconnect()
 
     assert not any("SYNTHETIC_SECRET" in str(call) for call in h.client.recorded_log.mock_calls)
-    assert "connected, the push channel at wss://127.0.0.1:9000/push" in h.logged(LogLevel.INFO)
+    assert "connected, the hub session at wss://127.0.0.1:9000/push" in h.logged(LogLevel.INFO)
 
 
 # ── The ticket index ─────────────────────────────────────────────────────────
 
 
-async def test_fills_book_through_the_index_rebuilt_from_nts_orders(exec_shim):
-    h = build(exec_shim)
+async def test_fills_book_through_the_index_rebuilt_from_nts_orders(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), ticket=9001)
     await h.connect()
-    h.deals_added(ours_deal(ticket=7001, order=9001))
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
     assert [fill.client_order_id for fill in fills(h)] == [order.client_order_id]
     h.venue.history_orders_get.assert_not_called()
 
 
-async def test_a_venue_order_id_that_is_not_a_ticket_is_left_out_of_the_index(exec_shim):
-    h = build(exec_shim)
+async def test_a_venue_order_id_that_is_not_a_ticket_is_left_out_of_the_index(exec_venue):
+    h = build(exec_venue)
     h.place(h.limit(), ticket="9001-SL-1")
     await h.connect()
     debug = h.logged(LogLevel.DEBUG)
@@ -100,12 +175,12 @@ async def test_a_venue_order_id_that_is_not_a_ticket_is_left_out_of_the_index(ex
 # ── Pushed deals ─────────────────────────────────────────────────────────────
 
 
-async def test_a_deal_added_fills_at_once_under_the_venues_position_and_the_deals_time(exec_shim):
-    h = build(exec_shim)
+async def test_a_deal_added_fills_at_once_under_the_venues_position_and_the_deals_time(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), ticket=9001)
     await h.connect()
 
-    h.deals_added(
+    await h.deals_added(
         ours_deal(ticket=7001, order=9001, position_id=8133477, time_msc=1_760_000_000_123)
     )
 
@@ -119,8 +194,8 @@ async def test_a_deal_added_fills_at_once_under_the_venues_position_and_the_deal
     h.venue.history_deals_get.assert_called_once_with(ticket=7001)
 
 
-async def test_deals_already_in_the_history_at_connect_are_never_emitted(exec_shim):
-    h = build(exec_shim)
+async def test_deals_already_in_the_history_at_connect_are_never_emitted(exec_venue):
+    h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     windows = []
 
@@ -128,19 +203,19 @@ async def test_deals_already_in_the_history_at_connect_are_never_emitted(exec_sh
         windows.append((date_from, date_to))
         return (ours_deal(ticket=7001, order=9001),)
 
-    exec_shim.history_deals_get.side_effect = history_deals_get
+    exec_venue.history_deals_get.side_effect = history_deals_get
     await h.connect()
-    h.deals_added(ours_deal(ticket=7001, order=9001))
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
     assert fills(h) == []
-    assert windows[0][1] - windows[0][0] == timedelta(minutes=60)
+    assert windows[0][1] - windows[0][0] == 3600
 
 
-async def test_two_deals_on_two_positions_fill_with_their_own_venue_position_ids(exec_shim):
-    h = build(exec_shim)
+async def test_two_deals_on_two_positions_fill_with_their_own_venue_position_ids(exec_venue):
+    h = build(exec_venue)
     buy = h.place(h.limit(OrderSide.BUY), ticket=9001)
     sell = h.place(h.market(OrderSide.SELL, "0.02"), ticket=9002)
     await h.connect()
-    h.deals_added(
+    await h.deals_added(
         ours_deal(
             ticket=7001,
             order=9001,
@@ -163,7 +238,7 @@ async def test_two_deals_on_two_positions_fill_with_their_own_venue_position_ids
             fee=-0.1,
         ),
     )
-    h.client._account_turn()
+    await h.client._account_turn()
     assert h.names() == ["OrderFilled", "OrderFilled", "AccountState"]
     first, second = fills(h)
     assert (
@@ -228,30 +303,124 @@ async def test_two_deals_on_two_positions_fill_with_their_own_venue_position_ids
     ids=["charge-and-fee", "rebate", "free"],
 )
 async def test_a_fills_commission_is_the_charge_the_deal_carries(
-    exec_shim, commission, fee, charged
+    exec_venue, commission, fee, charged
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     await h.connect()
-    h.deals_added(ours_deal(ticket=7001, order=9001, commission=commission, fee=fee))
+    await h.deals_added(ours_deal(ticket=7001, order=9001, commission=commission, fee=fee))
     assert fills(h)[0].commission == Money(Decimal(charged), USD)
 
 
-async def test_two_identical_deal_adds_fill_once(exec_shim):
-    h = build(exec_shim)
+async def test_two_identical_deal_adds_fill_once(exec_venue):
+    h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     await h.connect()
     deal = ours_deal(ticket=7001, order=9001)
-    h.deals_added(deal, deal)
+    await h.deals_added(deal, deal)
     assert [fill.trade_id for fill in fills(h)] == [TradeId("7001")]
 
 
-async def test_a_deal_the_history_does_not_hold_yet_is_left_to_reconciliation(exec_shim):
-    h = build(exec_shim)
+async def test_a_deal_add_delivered_again_while_the_first_reads_its_deal_fills_once(exec_venue):
+    h = build(exec_venue)
+    h.place(h.limit(), ticket=9001)
+    await h.connect()
+    deal = ours_deal(ticket=7001, order=9001)
+    h.venue.history_deals_get.return_value = (deal,)
+
+    h.push.deliver(deal_added(deal))
+    h.push.deliver(deal_added(deal))
+    await h.drained()
+
+    assert [fill.trade_id for fill in fills(h)] == [TradeId("7001")]
+    h.venue.history_deals_get.assert_called_once_with(ticket=7001)
+
+
+@pytest.mark.parametrize(
+    ("volume", "status"),
+    [(0.02, OrderStatus.FILLED), (0.01, OrderStatus.PARTIALLY_FILLED)],
+    ids=["filled", "partly-filled"],
+)
+async def test_a_submit_whose_fill_nt_booked_before_its_verdict_is_not_accepted_late(
+    exec_venue, volume, status
+):
+    h = await connected(exec_venue)
+    order = h.place(h.market(quantity="0.02"), status=OrderStatus.SUBMITTED)
+    await h.client._submit_order(
+        SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+    )
+    h.venue.history_orders_get.return_value = (
+        ours_order(
+            ticket=9500,
+            type=mirror.ORDER_TYPE_BUY,
+            state=mirror.ORDER_STATE_FILLED,
+            comment=execution.order_comment(order.client_order_id),
+        ),
+    )
+    await h.deals_added(ours_deal(ticket=7501, order=9500, volume=volume))
+    (fill,) = fills(h)
+    order.apply(fill)
+    h.cache.update_order(order)
+    assert order.status == status
+
+    await h.verdict(order=9500, deal=7501)
+
+    assert h.names() == ["OrderSubmitted", "OrderFilled", "AccountState"]
+
+
+@pytest.mark.parametrize(
+    ("state", "end"),
+    [
+        (mirror.ORDER_STATE_EXPIRED, "OrderExpired"),
+        (mirror.ORDER_STATE_CANCELED, "OrderCanceled"),
+        (mirror.ORDER_STATE_REJECTED, "OrderRejected"),
+    ],
+    ids=["expired", "canceled", "rejected"],
+)
+async def test_an_entry_the_history_ends_before_its_verdict_is_not_accepted_by_the_verdict(
+    exec_venue, state, end
+):
+    h = await connected(exec_venue)
+    order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
+    await h.client._submit_order(
+        SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+    )
+    ended = ours_order(
+        ticket=9600, comment=execution.order_comment(order.client_order_id), state=state
+    )
+    h.venue.history_orders_get.return_value = (ended,)
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
+    assert h.names()[-1] == end
+    # As the engine applies the end the client emitted.
+    for event in h.events[1:]:
+        order.apply(event)
+    h.cache.update_order(order)
+    h.ledger.clear()
+
+    await h.verdict(order=9600)
+
+    assert h.names() == ["AccountState"]
+    assert [line for line in h.logged(LogLevel.DEBUG) if repr(order.client_order_id) in line]
+
+
+async def test_a_deal_the_history_does_not_hold_yet_is_left_to_reconciliation(exec_venue):
+    h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     await h.connect()
 
-    h.push.deliver(transaction_frame(TransactionType.DEAL_ADD, deal=7001, order=9001))
+    await h.delivered(transaction_frame(TransactionType.DEAL_ADD, deal=7001, order=9001))
 
     assert h.names() == []
     assert [line for line in h.logged(LogLevel.INFO) if "7001" in line] == [
@@ -259,10 +428,21 @@ async def test_a_deal_the_history_does_not_hold_yet_is_left_to_reconciliation(ex
     ]
 
 
+async def test_a_deal_the_history_did_not_hold_yet_fills_on_its_next_delivery(exec_venue):
+    h = build(exec_venue)
+    h.place(h.limit(), ticket=9001)
+    await h.connect()
+    await h.delivered(transaction_frame(TransactionType.DEAL_ADD, deal=7001, order=9001))
+
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
+
+    assert [fill.trade_id for fill in fills(h)] == [TradeId("7001")]
+
+
 async def test_a_deal_of_an_unindexed_order_books_to_the_in_flight_order_its_comment_digests(
-    exec_shim,
+    exec_venue,
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     order = h.place(h.market(), status=OrderStatus.SUBMITTED)
     await h.connect()
     h.venue.history_orders_get.return_value = (
@@ -273,39 +453,39 @@ async def test_a_deal_of_an_unindexed_order_books_to_the_in_flight_order_its_com
             comment=execution.order_comment(order.client_order_id),
         ),
     )
-    h.deals_added(ours_deal(ticket=7101, order=9100), ours_deal(ticket=7102, order=9100))
+    await h.deals_added(ours_deal(ticket=7101, order=9100), ours_deal(ticket=7102, order=9100))
     assert [fill.client_order_id for fill in fills(h)] == [order.client_order_id] * 2
     assert [fill.order_type for fill in fills(h)] == [OrderType.MARKET] * 2
     h.venue.history_orders_get.assert_called_once_with(ticket=9100)
 
 
-async def test_a_partly_filled_resting_orders_comment_is_read_off_the_open_order(exec_shim):
-    h = build(exec_shim)
+async def test_a_partly_filled_resting_orders_comment_is_read_off_the_open_order(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(quantity="0.02"), status=OrderStatus.SUBMITTED)
     await h.connect()
     h.venue.orders_get.side_effect = resting_by_ticket(
         ours_order(ticket=9101, comment=execution.order_comment(order.client_order_id))
     )
-    h.deals_added(ours_deal(ticket=7103, order=9101))
+    await h.deals_added(ours_deal(ticket=7103, order=9101))
     assert [fill.client_order_id for fill in fills(h)] == [order.client_order_id]
 
 
 async def test_a_deal_matching_no_order_emits_nothing_and_logs_one_info_naming_its_ticket(
-    exec_shim,
+    exec_venue,
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     await h.connect()
     h.venue.history_orders_get.return_value = (ours_order(ticket=9200, comment="manual"),)
     deal = ours_deal(ticket=7201, order=9200)
-    h.deals_added(deal, deal)
+    await h.deals_added(deal, deal)
     assert h.names() == []
     assert len([line for line in h.logged(LogLevel.INFO) if "9200" in line]) == 1
 
 
-async def test_another_magics_deal_and_a_balance_deal_are_skipped_silently(exec_shim):
-    h = build(exec_shim)
+async def test_another_magics_deal_and_a_balance_deal_are_skipped_silently(exec_venue):
+    h = build(exec_venue)
     await h.connect()
-    h.deals_added(
+    await h.deals_added(
         trade_deal(ticket=7301, order=9300, magic=MAGIC + 1),
         ours_deal(ticket=7302, order=0, type=mirror.DEAL_TYPE_BALANCE, volume=0.0),
     )
@@ -315,19 +495,19 @@ async def test_another_magics_deal_and_a_balance_deal_are_skipped_silently(exec_
 
 
 async def test_a_deal_whose_fill_cannot_be_built_stays_unseen_so_a_later_delivery_fills_it(
-    exec_shim,
+    exec_venue,
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     await h.connect()
     loaded = h.instruments.pop("EURUSD")
     deal = ours_deal(ticket=7001, order=9001)
-    h.deals_added(deal)
+    await h.deals_added(deal)
     assert h.names() == []
     (failed,) = h.client.recorded_log.exception.call_args_list
     assert isinstance(failed.args[1], errors.MT5InstrumentError)
     h.instruments["EURUSD"] = loaded
-    h.deals_added(deal)
+    await h.deals_added(deal)
     assert [fill.trade_id for fill in fills(h)] == [TradeId("7001")]
 
 
@@ -335,16 +515,16 @@ async def test_a_deal_whose_fill_cannot_be_built_stays_unseen_so_a_later_deliver
 
 
 async def test_a_deal_of_an_unknown_ticket_books_to_its_order_once_the_request_links_the_ticket(
-    exec_shim,
+    exec_venue,
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     order = h.place(h.market(), status=OrderStatus.SUBMITTED)
     await h.connect()
     deal = ours_deal(ticket=7101, order=9100, position_id=9100, type=mirror.DEAL_TYPE_BUY)
 
-    h.deals_added(deal)
+    await h.deals_added(deal)
     unlinked = h.names()
-    h.push.deliver(request_done(9100, execution.order_comment(order.client_order_id), MAGIC))
+    await h.delivered(request_done(9100, execution.order_comment(order.client_order_id), MAGIC))
     h.venue.history_deals_get.return_value = (deal,)
     (report,) = await fill_reports(h)
 
@@ -358,8 +538,8 @@ async def test_a_deal_of_an_unknown_ticket_books_to_its_order_once_the_request_l
     )
 
 
-async def test_a_deal_before_the_accept_fills_and_the_request_then_accepts(exec_shim):
-    h = build(exec_shim)
+async def test_a_deal_before_the_accept_fills_and_the_request_then_accepts(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
     await h.connect()
     comment = execution.order_comment(order.client_order_id)
@@ -367,8 +547,8 @@ async def test_a_deal_before_the_accept_fills_and_the_request_then_accepts(exec_
         ours_order(ticket=9500, comment=comment, time_setup_msc=1_760_000_002_000)
     )
 
-    h.deals_added(ours_deal(ticket=7501, order=9500, volume=0.005))
-    h.push.deliver(request_done(9500, comment, MAGIC, action=mirror.TRADE_ACTION_PENDING))
+    await h.deals_added(ours_deal(ticket=7501, order=9500, volume=0.005))
+    await h.delivered(request_done(9500, comment, MAGIC, action=mirror.TRADE_ACTION_PENDING))
 
     assert h.names() == ["OrderFilled", "OrderAccepted"]
     accepted = h.events[1]
@@ -379,12 +559,41 @@ async def test_a_deal_before_the_accept_fills_and_the_request_then_accepts(exec_
     )
 
 
-async def test_a_request_of_an_order_nt_holds_accepted_emits_nothing(exec_shim):
-    h = build(exec_shim)
+async def test_an_order_filled_while_its_requests_link_reads_the_venue_is_not_accepted(
+    exec_venue,
+):
+    h = build(exec_venue)
+    order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
+    await h.connect()
+    comment = execution.order_comment(order.client_order_id)
+    placed = ours_order(ticket=9500, comment=comment, time_setup_msc=1_760_000_002_000)
+
+    def filled_during_the_read(symbol=None, group=None, ticket=None):
+        # NT applies the order's fill while the link reads the venue order.
+        order.apply(
+            TestEventStubs.order_filled(
+                order,
+                h.instruments["EURUSD"],
+                account_id=ACCOUNT_ID,
+                venue_order_id=VenueOrderId("9500"),
+            )
+        )
+        h.cache.update_order(order)
+        return (placed,)
+
+    h.venue.orders_get.side_effect = filled_during_the_read
+    await h.delivered(request_done(9500, comment, MAGIC, action=mirror.TRADE_ACTION_PENDING))
+
+    assert order.status == OrderStatus.FILLED
+    assert h.names() == []
+
+
+async def test_a_request_of_an_order_nt_holds_accepted_emits_nothing(exec_venue):
+    h = build(exec_venue)
     order = h.place(h.limit(), ticket=9001)
     await h.connect()
 
-    h.push.deliver(request_done(9001, execution.order_comment(order.client_order_id), MAGIC))
+    await h.delivered(request_done(9001, execution.order_comment(order.client_order_id), MAGIC))
 
     assert h.names() == []
     h.venue.orders_get.assert_not_called()
@@ -395,13 +604,13 @@ async def test_a_request_of_an_order_nt_holds_accepted_emits_nothing(exec_shim):
     [(MAGIC + 1, mirror.TRADE_RETCODE_DONE), (MAGIC, mirror.TRADE_RETCODE_REJECT)],
     ids=["another-trader", "refused"],
 )
-async def test_another_traders_or_a_refused_request_links_nothing(exec_shim, magic, retcode):
-    h = build(exec_shim)
+async def test_another_traders_or_a_refused_request_links_nothing(exec_venue, magic, retcode):
+    h = build(exec_venue)
     order = h.place(h.market(), status=OrderStatus.SUBMITTED)
     await h.connect()
     comment = execution.order_comment(order.client_order_id)
 
-    h.push.deliver(request_done(9100, comment, magic, retcode=retcode))
+    await h.delivered(request_done(9100, comment, magic, retcode=retcode))
     h.venue.history_deals_get.return_value = (ours_deal(ticket=7101, order=9100),)
     (report,) = await fill_reports(h)
 
@@ -412,8 +621,8 @@ async def test_another_traders_or_a_refused_request_links_nothing(exec_shim, mag
 # ── Pending orders the venue ends ────────────────────────────────────────────
 
 
-async def resting_at_connect(exec_shim, ticket=9400):
-    h = build(exec_shim)
+async def resting_at_connect(exec_venue, ticket=9400):
+    h = build(exec_venue)
     order = h.place(h.limit(), ticket=ticket)
     await h.connect()
     return h, order
@@ -427,14 +636,14 @@ async def resting_at_connect(exec_shim, ticket=9400):
         (mirror.ORDER_STATE_REJECTED, "OrderRejected"),
     ],
 )
-async def test_a_pending_order_the_venue_ended_emits_its_end_once(exec_shim, state, event):
-    h, order = await resting_at_connect(exec_shim)
+async def test_a_pending_order_the_venue_ended_emits_its_end_once(exec_venue, state, event):
+    h, order = await resting_at_connect(exec_venue)
     ended = ours_order(ticket=9400, state=state, time_done_msc=1_760_000_005_000)
     h.venue.history_orders_get.return_value = (ended,)
 
-    h.push.deliver(order_left(TransactionType.ORDER_DELETE, ended))
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
-    h.client._account_turn()
+    await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.client._account_turn()
 
     assert h.names() == [event, "AccountState"]
     assert h.events[0].client_order_id == order.client_order_id
@@ -442,14 +651,14 @@ async def test_a_pending_order_the_venue_ended_emits_its_end_once(exec_shim, sta
     h.venue.history_orders_get.assert_called_once_with(ticket=9400)
 
 
-async def test_an_order_the_history_does_not_hold_at_its_delete_ends_on_its_history_add(exec_shim):
-    h, _ = await resting_at_connect(exec_shim)
+async def test_an_order_the_history_does_not_hold_at_its_delete_ends_on_its_history_add(exec_venue):
+    h, _ = await resting_at_connect(exec_venue)
     ended = ours_order(ticket=9400, state=mirror.ORDER_STATE_CANCELED)
 
-    h.push.deliver(order_left(TransactionType.ORDER_DELETE, ended))
+    await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
     deleted = h.names()
     h.venue.history_orders_get.return_value = (ended,)
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
 
     assert deleted == []
     assert h.names() == ["OrderCanceled"]
@@ -464,9 +673,9 @@ async def test_an_order_the_history_does_not_hold_at_its_delete_ends_on_its_hist
     ],
 )
 async def test_an_unanswered_submits_order_the_venue_ended_ends_through_its_digest(
-    exec_shim, state, ends
+    exec_venue, state, ends
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
     comment = execution.order_comment(order.client_order_id)
     await h.connect()
@@ -479,8 +688,8 @@ async def test_an_unanswered_submits_order_the_venue_ended_ends_through_its_dige
     )
     h.venue.history_orders_get.return_value = (ended,)
 
-    h.push.deliver(order_left(TransactionType.ORDER_DELETE, ended))
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
 
     assert h.names() == ends
     assert [event.client_order_id for event in h.events] == [order.client_order_id] * len(ends)
@@ -492,42 +701,66 @@ async def test_an_unanswered_submits_order_the_venue_ended_ends_through_its_dige
         )
 
 
-async def test_an_ended_order_matching_no_nt_order_logs_one_info_naming_its_ticket(exec_shim):
-    h = await connected(exec_shim)
-    ended = ours_order(ticket=9601, comment="manual", state=mirror.ORDER_STATE_CANCELED)
+async def test_the_two_frames_of_one_end_read_at_once_end_the_order_once(exec_venue):
+    h, order = await resting_at_connect(exec_venue)
+    ended = ours_order(ticket=9400, state=mirror.ORDER_STATE_CANCELED)
     h.venue.history_orders_get.return_value = (ended,)
 
     h.push.deliver(order_left(TransactionType.ORDER_DELETE, ended))
     h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.drained()
+
+    assert h.names() == ["OrderCanceled"]
+    assert h.events[0].client_order_id == order.client_order_id
+
+
+async def test_a_history_add_read_while_its_delete_finds_nothing_yet_ends_the_order(exec_venue):
+    h, _ = await resting_at_connect(exec_venue)
+    ended = ours_order(ticket=9400, state=mirror.ORDER_STATE_CANCELED)
+    h.venue.history_orders_get.side_effect = [(), (ended,)]
+
+    h.push.deliver(order_left(TransactionType.ORDER_DELETE, ended))
+    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.drained()
+
+    assert h.names() == ["OrderCanceled"]
+
+
+async def test_an_ended_order_matching_no_nt_order_logs_one_info_naming_its_ticket(exec_venue):
+    h = await connected(exec_venue)
+    ended = ours_order(ticket=9601, comment="manual", state=mirror.ORDER_STATE_CANCELED)
+    h.venue.history_orders_get.return_value = (ended,)
+
+    await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
 
     assert h.names() == []
     assert len([line for line in h.logged(LogLevel.INFO) if "9601" in line]) == 1
 
 
-async def test_another_traders_ended_order_is_skipped_silently(exec_shim):
-    h = await connected(exec_shim)
+async def test_another_traders_ended_order_is_skipped_silently(exec_venue):
+    h = await connected(exec_venue)
     ended = ours_order(ticket=9602, magic=MAGIC + 1, state=mirror.ORDER_STATE_CANCELED)
     h.venue.history_orders_get.return_value = (ended,)
 
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
 
     assert h.names() == []
     assert [line for line in h.logged(LogLevel.INFO) if "9602" in line] == []
 
 
-async def test_a_pending_order_that_filled_emits_nothing_for_its_end(exec_shim):
-    h, _ = await resting_at_connect(exec_shim)
+async def test_a_pending_order_that_filled_emits_nothing_for_its_end(exec_venue):
+    h, _ = await resting_at_connect(exec_venue)
     filled = ours_order(ticket=9400, state=mirror.ORDER_STATE_FILLED, volume_current=0.0)
     h.venue.history_orders_get.return_value = (filled,)
 
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, filled))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, filled))
 
     assert h.names() == []
 
 
-async def test_a_pending_order_placed_after_connect_is_ended_by_its_transactions(exec_shim):
-    h = await connected(exec_shim)
-    h.venue.order_send.return_value = send_result(retcode=mirror.TRADE_RETCODE_PLACED, order=9401)
+async def test_a_pending_order_placed_after_connect_is_ended_by_its_transactions(exec_venue):
+    h = await connected(exec_venue)
     order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
     await h.client._submit_order(
         SubmitOrder(
@@ -538,6 +771,7 @@ async def test_a_pending_order_placed_after_connect_is_ended_by_its_transactions
             ts_init=0,
         )
     )
+    await h.verdict(mirror.TRADE_RETCODE_PLACED, order=9401)
     # As the engine applies the acceptance the client emitted.
     order.apply(
         TestEventStubs.order_accepted(
@@ -549,15 +783,15 @@ async def test_a_pending_order_placed_after_connect_is_ended_by_its_transactions
     ended = ours_order(ticket=9401, state=mirror.ORDER_STATE_CANCELED)
     h.venue.history_orders_get.return_value = (ended,)
 
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
 
     assert h.names() == ["OrderCanceled"]
 
 
-async def test_an_order_this_client_cancelled_is_not_cancelled_again_by_its_transactions(
-    exec_shim,
+async def test_an_order_whose_end_the_history_reports_before_its_removals_verdict_ends_once(
+    exec_venue,
 ):
-    h, order = await resting_at_connect(exec_shim)
+    h, order = await resting_at_connect(exec_venue)
     h.venue.orders_get.side_effect = resting_by_ticket(ours_order(ticket=9400))
     await h.client._cancel_order(
         CancelOrder(
@@ -573,8 +807,34 @@ async def test_an_order_this_client_cancelled_is_not_cancelled_again_by_its_tran
     ended = ours_order(ticket=9400, state=mirror.ORDER_STATE_CANCELED)
     h.venue.history_orders_get.return_value = (ended,)
 
-    h.push.deliver(order_left(TransactionType.ORDER_DELETE, ended))
-    h.push.deliver(order_left(TransactionType.HISTORY_ADD, ended))
+    await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
+    await h.verdict(order=9400)
+
+    assert h.names() == ["OrderCanceled", "AccountState"]
+
+
+async def test_an_order_this_client_cancelled_is_not_cancelled_again_by_its_transactions(
+    exec_venue,
+):
+    h, order = await resting_at_connect(exec_venue)
+    h.venue.orders_get.side_effect = resting_by_ticket(ours_order(ticket=9400))
+    await h.client._cancel_order(
+        CancelOrder(
+            trader_id=TRADER_ID,
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+    )
+    await h.verdict(order=9400)
+    ended = ours_order(ticket=9400, state=mirror.ORDER_STATE_CANCELED)
+    h.venue.history_orders_get.return_value = (ended,)
+
+    await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
+    await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
 
     assert h.names() == ["OrderCanceled", "AccountState"]
 
@@ -591,19 +851,21 @@ async def test_an_order_this_client_cancelled_is_not_cancelled_again_by_its_tran
         TransactionType.POSITION,
     ],
 )
-async def test_a_transaction_no_event_follows_from_reads_nothing_and_emits_nothing(exec_shim, kind):
-    h, _ = await resting_at_connect(exec_shim)
+async def test_a_transaction_no_event_follows_from_reads_nothing_and_emits_nothing(
+    exec_venue, kind
+):
+    h, _ = await resting_at_connect(exec_venue)
 
-    h.push.deliver(transaction_frame(kind, order=9400, deal=7400, position=9400))
+    await h.delivered(transaction_frame(kind, order=9400, deal=7400, position=9400))
 
     assert h.names() == []
     assert h.venue.mock_calls == []
 
 
-async def test_a_transaction_of_a_type_mql5_does_not_name_is_refused(exec_shim):
-    h = await connected(exec_shim)
+async def test_a_transaction_of_a_type_mql5_does_not_name_is_refused(exec_venue):
+    h = await connected(exec_venue)
 
-    h.push.deliver(transaction_frame(TransactionType.REQUEST) | {"transaction": {"type": 11}})
+    await h.delivered(transaction_frame(11))
 
     assert h.names() == []
     (failed,) = h.client.recorded_log.exception.call_args_list
@@ -614,17 +876,17 @@ async def test_a_transaction_of_a_type_mql5_does_not_name_is_refused(exec_shim):
 # ── The account ──────────────────────────────────────────────────────────────
 
 
-async def test_the_account_books_balance_and_credit_with_the_margin_locked(exec_shim):
+async def test_the_account_books_balance_and_credit_with_the_margin_locked(exec_venue):
     h = build(
-        exec_shim,
+        exec_venue,
         account=account_info(
             balance=10000.0, credit=50.0, margin=100.0, equity=10075.25, margin_free=9975.25
         ),
     )
     h.place(h.limit(), ticket=9001)
     await h.connect()
-    h.deals_added(ours_deal(ticket=7001, order=9001))
-    h.client._account_turn()
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
+    await h.client._account_turn()
     assert h.names() == ["OrderFilled", "AccountState"]
     state = h.ledger[-1]
     assert state.account_id == ACCOUNT_ID
@@ -637,13 +899,13 @@ async def test_the_account_books_balance_and_credit_with_the_margin_locked(exec_
     )
 
 
-async def test_the_account_reports_its_margin_as_one_account_level_balance(exec_shim):
+async def test_the_account_reports_its_margin_as_one_account_level_balance(exec_venue):
     h = build(
-        exec_shim, account=account_info(margin=100.0, margin_initial=25.5, margin_maintenance=80.0)
+        exec_venue, account=account_info(margin=100.0, margin_initial=25.5, margin_maintenance=80.0)
     )
     await h.connect()
     h.client._account_owed = True
-    h.client._account_turn()
+    await h.client._account_turn()
     (margin,) = h.ledger[-1].margins
     assert margin.instrument_id is None
     assert (margin.initial, margin.maintenance) == (
@@ -652,30 +914,30 @@ async def test_the_account_reports_its_margin_as_one_account_level_balance(exec_
     )
 
 
-async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec_shim):
-    h = build(exec_shim)
+async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec_venue):
+    h = build(exec_venue)
     await h.connect_keeping_events()
     account = MarginAccount(h.ledger[-1])
-    h.conn.get_account_info.return_value = AccountSnapshot.from_mt5(
-        account_info(margin=200.0, margin_initial=40.0, margin_maintenance=150.0)
+    h.venue.account_info.return_value = account_info(
+        margin=200.0, margin_initial=40.0, margin_maintenance=150.0
     )
     h.client._account_owed = True
-    h.client._account_turn()
+    await h.client._account_turn()
     account.apply(h.ledger[-1])
     assert account.account_margins_init() == {USD: Money(Decimal("200.00"), USD)}
     assert account.account_margins_maint() == {USD: Money(Decimal("150.00"), USD)}
 
 
-async def test_a_turn_owing_no_report_and_before_the_refresh_period_reports_nothing(exec_shim):
-    h = await connected(exec_shim)
+async def test_a_turn_owing_no_report_and_before_the_refresh_period_reports_nothing(exec_venue):
+    h = await connected(exec_venue)
 
-    h.client._account_turn()
+    await h.client._account_turn()
 
     assert h.names() == []
 
 
-async def test_the_account_is_reported_on_the_configs_refresh_period(exec_shim):
-    h = await connected(exec_shim, account_refresh_seconds=1, exec_poll_interval_ms=50)
+async def test_the_account_is_reported_on_the_configs_refresh_period(exec_venue):
+    h = await connected(exec_venue, account_refresh_seconds=1, exec_poll_interval_ms=50)
     task = asyncio.get_running_loop().create_task(h.client._account_loop())
     await asyncio.sleep(0.6)
     assert h.names() == []
@@ -685,57 +947,93 @@ async def test_the_account_is_reported_on_the_configs_refresh_period(exec_shim):
     assert h.names() == ["AccountState"]
 
 
+async def test_an_account_turn_reads_the_account_on_its_session_while_the_loop_runs_on(exec_venue):
+    h = await connected(exec_venue, exec_poll_interval_ms=50)
+    exec_venue.account_info.return_value = account_info(balance=20_000.0, margin=0.0)
+    asked = asyncio.Event()
+    answered = asyncio.Event()
+    plain = h.push.request
+
+    async def held(call, **arguments):
+        if call is calls.Call.ACCOUNT_INFO:
+            asked.set()
+            await answered.wait()
+        return await plain(call, **arguments)
+
+    h.push.request = held
+    h.client._account_owed = True
+    account_loop = asyncio.get_running_loop().create_task(h.client._account_loop())
+    try:
+        await eventually(asked.is_set)
+        await asyncio.sleep(0.1)
+        assert h.names() == []
+        answered.set()
+        await eventually(lambda: h.names() == ["AccountState"])
+    finally:
+        account_loop.cancel()
+        await asyncio.gather(account_loop, return_exceptions=True)
+    (balance,) = h.ledger[-1].balances
+    assert balance.total == Money(Decimal("20000.00"), USD)
+
+
+async def test_a_report_an_event_owes_while_the_accounts_read_is_in_flight_stays_owed(exec_venue):
+    h = build(exec_venue)
+    h.place(h.limit(), ticket=9001)
+    await h.connect()
+    asked = asyncio.Event()
+    answered = asyncio.Event()
+    plain = h.push.request
+
+    async def first_held(call, **arguments):
+        if call is calls.Call.ACCOUNT_INFO and not asked.is_set():
+            asked.set()
+            await answered.wait()
+        return await plain(call, **arguments)
+
+    h.push.request = first_held
+    h.client._account_owed = True
+    turn = asyncio.get_running_loop().create_task(h.client._account_turn())
+    await eventually(asked.is_set)
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
+    answered.set()
+    await asyncio.wait_for(turn, 1)
+    exec_venue.account_info.reset_mock()
+
+    await h.client._account_turn()
+
+    assert exec_venue.account_info.call_count == 1
+    assert h.names() == ["OrderFilled", "AccountState", "AccountState"]
+
+
 @pytest.mark.parametrize(
     "failure",
     [
-        errors.ServerBusy("account_info: server busy", 5),
+        errors.NotReady("account_info: the broker clock is not verified", 0, 5.0),
+        errors.HubTimeout("account_info: the EA did not answer within its deadline", 0),
         errors.ServerUnreachable("account_info: unavailable"),
         errors.ResponseLost("account_info: unavailable"),
     ],
+    ids=["not-ready", "timeout", "unreachable", "lost"],
 )
-async def test_an_account_report_the_server_does_not_answer_stays_owed_and_warns_once(
-    exec_shim, failure
+async def test_an_account_report_the_hub_does_not_answer_stays_owed_and_warns_once(
+    exec_venue, failure
 ):
-    h = build(exec_shim)
+    h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     await h.connect()
-    h.deals_added(ours_deal(ticket=7001, order=9001))
-    h.conn.get_account_info.side_effect = failure
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
+    exec_venue.account_info.side_effect = failure
     for _ in range(3):
-        h.client._account_turn()
+        await h.client._account_turn()
     assert h.names() == ["OrderFilled"]
-    assert h.conn.get_account_info.call_count == 3
+    assert exec_venue.account_info.call_count == 3
     assert len(h.logged(LogLevel.WARNING)) == 1
 
-    h.conn.get_account_info.side_effect = None
-    h.client._account_turn()
-    h.client._account_turn()
+    exec_venue.account_info.side_effect = None
+    await h.client._account_turn()
+    await h.client._account_turn()
     assert h.names() == ["OrderFilled", "AccountState"]
     assert len(h.logged(LogLevel.WARNING)) == 1
     assert [line for line in h.logged(LogLevel.INFO) if "answers again" in line] == [
-        "account report: the server answers again"
+        "account report: the hub answers again"
     ]
-    h.conn.reconnect_async.assert_not_called()
-
-
-async def test_a_lost_terminal_session_is_reconnected_and_the_account_loop_resumes(exec_shim):
-    h = await connected(exec_shim, account_refresh_seconds=1, exec_poll_interval_ms=50)
-    h.conn.ensure_connected.side_effect = [errors.MT5ConnectionError("not connected")] + [
-        None
-    ] * 100
-    h.client._account_owed = True
-    task = asyncio.get_running_loop().create_task(h.client._account_loop())
-    await asyncio.sleep(0.3)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    h.conn.reconnect_async.assert_awaited_once()
-    assert h.names() == ["AccountState"]
-
-
-async def test_a_reconnect_that_gives_up_ends_the_account_loop(exec_shim):
-    h = await connected(exec_shim, exec_poll_interval_ms=50)
-    h.conn.ensure_connected.side_effect = errors.MT5ConnectionError("not connected")
-    h.conn.reconnect_async.return_value = False
-    await asyncio.wait_for(h.client._account_loop(), timeout=1.0)
-    h.conn.reconnect_async.assert_awaited_once()
-    assert len(h.logged(LogLevel.ERROR)) == 1

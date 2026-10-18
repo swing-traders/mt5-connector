@@ -50,7 +50,7 @@ def test_both_distributions_report_the_version_file():
     [
         (
             ("mt5connector.client", "mt5connector.wire"),
-            ("mt5connector.server", "flask", "waitress"),
+            ("mt5connector.server",),
         ),
         (
             ("mt5connector.server",),

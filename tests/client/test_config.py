@@ -6,41 +6,29 @@ from nautilus_trader.model.identifiers import Venue
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import MT5ConfigError
 
-_SERVER_URL = "http://192.168.1.10:5000"
 _WS_URL = "ws://192.168.1.10:9001"
 
 
 def _base(**kw):
-    return MT5Config(account=1, password="p", server="s", **kw)
+    return MT5Config(account=1, server="s", **kw)
 
 
 def _config(**kw):
-    return _base(**{"server_url": _SERVER_URL, "ws_url": _WS_URL, **kw})
-
-
-def test_a_config_without_a_server_url_is_refused_naming_the_field():
-    with pytest.raises(MT5ConfigError, match="server_url"):
-        _base(ws_url=_WS_URL)
-
-
-def test_an_empty_server_url_is_refused_naming_the_field():
-    with pytest.raises(MT5ConfigError, match="server_url"):
-        _base(server_url="", ws_url=_WS_URL)
+    return _base(**{"ws_url": _WS_URL, **kw})
 
 
 def test_a_config_without_a_ws_url_is_refused_naming_the_field():
     with pytest.raises(MT5ConfigError, match=r"^MT5Config\.ws_url cannot be empty\.$"):
-        _base(server_url=_SERVER_URL)
+        _base()
 
 
 def test_an_empty_ws_url_is_refused_naming_the_field():
     with pytest.raises(MT5ConfigError, match=r"^MT5Config\.ws_url cannot be empty\.$"):
-        _base(server_url=_SERVER_URL, ws_url="")
+        _base(ws_url="")
 
 
-def test_a_config_with_both_urls_keeps_them():
-    c = _base(server_url=_SERVER_URL, ws_url=_WS_URL)
-    assert (c.server_url, c.ws_url) == (_SERVER_URL, _WS_URL)
+def test_a_config_keeps_its_ws_url():
+    assert _base(ws_url=_WS_URL).ws_url == _WS_URL
 
 
 def test_the_venue_defaults_to_mt5():
@@ -97,7 +85,6 @@ def test_an_execution_setting_at_its_bound_is_kept(field, value):
         ("timeout_s", -1.0),
         ("timeout_s", float("nan")),
         ("timeout_s", float("inf")),
-        ("reconnect_max_attempts", 0),
         ("reconnect_initial_delay_s", -0.5),
         ("reconnect_initial_delay_s", float("nan")),
         ("reconnect_initial_delay_s", float("inf")),
@@ -115,9 +102,7 @@ def test_a_connection_setting_out_of_range_is_refused_naming_it(field, value):
     ("field", "value"),
     [
         ("timeout_s", 0.001),
-        ("reconnect_max_attempts", 1),
-        ("reconnect_initial_delay_s", 0),
-        ("reconnect_max_delay_s", 0),
+        ("reconnect_initial_delay_s", 0.001),
     ],
 )
 def test_a_connection_setting_at_its_bound_is_kept(field, value):
@@ -126,11 +111,33 @@ def test_a_connection_setting_at_its_bound_is_kept(field, value):
 
 
 @pytest.mark.parametrize(
-    "server_url", ["nonsense", "localhost:5000", "http://", "//192.168.1.10:5000"]
+    ("delays", "named"),
+    [
+        ({"reconnect_initial_delay_s": 0.0}, r"reconnect_initial_delay_s 0\.0 is below 1 ms$"),
+        (
+            {"reconnect_initial_delay_s": 0.0005},
+            r"reconnect_initial_delay_s 0\.0005 is below 1 ms$",
+        ),
+        (
+            {"reconnect_initial_delay_s": 0.001, "reconnect_max_delay_s": 0.0},
+            r"reconnect_max_delay_s 0\.0 is below 1 ms$",
+        ),
+        (
+            {"reconnect_initial_delay_s": 2.0, "reconnect_max_delay_s": 1.0},
+            r"reconnect_initial_delay_s 2\.0 is above reconnect_max_delay_s 1\.0$",
+        ),
+    ],
 )
-def test_a_server_url_without_a_scheme_and_host_is_refused_naming_it(server_url):
-    with pytest.raises(MT5ConfigError, match="server_url"):
-        _config(server_url=server_url)
+def test_a_reconnect_delay_under_a_millisecond_or_an_initial_one_past_the_max_is_refused(
+    delays, named
+):
+    with pytest.raises(MT5ConfigError, match=named):
+        _config(**delays)
+
+
+def test_reconnect_delays_of_one_millisecond_are_kept():
+    c = _config(reconnect_initial_delay_s=0.001, reconnect_max_delay_s=0.001)
+    assert (c.reconnect_initial_delay_s, c.reconnect_max_delay_s) == (0.001, 0.001)
 
 
 @pytest.mark.parametrize(
@@ -156,29 +163,6 @@ def test_a_ws_or_wss_url_with_a_host_is_kept(ws_url):
 
 
 @pytest.mark.parametrize(
-    "server_url", ["ftp://127.0.0.1:5000", "ws://127.0.0.1:9000", "wss://127.0.0.1:9000"]
-)
-def test_a_server_url_that_is_no_http_or_https_url_is_refused_naming_it(server_url):
-    with pytest.raises(MT5ConfigError, match="server_url"):
-        _config(server_url=server_url)
-
-
-@pytest.mark.parametrize(
-    "server_url",
-    [
-        "http://127.0.0.1:bad",
-        "http://127.0.0.1:70000",
-        "http://127.0.0.1:0",
-        "https://127.0.0.1:-1",
-        "http://[::1",
-    ],
-)
-def test_a_server_url_that_is_malformed_or_names_no_tcp_port_is_refused_naming_it(server_url):
-    with pytest.raises(MT5ConfigError, match="server_url"):
-        _config(server_url=server_url)
-
-
-@pytest.mark.parametrize(
     "ws_url",
     ["ws://127.0.0.1:bad", "ws://127.0.0.1:70000", "ws://127.0.0.1:0", "wss://127.0.0.1:-1"],
 )
@@ -189,30 +173,16 @@ def test_a_ws_url_that_names_no_tcp_port_is_refused_naming_it(ws_url):
 
 # The parser refuses a full-width colon naming the whole authority, credentials included.
 @pytest.mark.parametrize(
-    ("field", "urls"),
+    "ws_url",
     [
-        ("server_url", {"server_url": "http://review:SYNTHETIC_SECRET@127.0.0.1：5000"}),
-        ("server_url", {"server_url": "http://review:SYNTHETIC_SECRET@127.0.0.1:bad"}),
-        (
-            "ws_url",
-            {
-                "server_url": "http://127.0.0.1:5000",
-                "ws_url": "ws://review:SYNTHETIC_SECRET@127.0.0.1：9000",
-            },
-        ),
+        "ws://review:SYNTHETIC_SECRET@127.0.0.1：9000",
+        "ws://review:SYNTHETIC_SECRET@127.0.0.1:bad",
     ],
 )
-def test_a_malformed_url_is_refused_without_echoing_its_credentials(field, urls):
-    with pytest.raises(MT5ConfigError, match=field) as refused:
-        _config(**urls)
+def test_a_malformed_url_is_refused_without_echoing_its_credentials(ws_url):
+    with pytest.raises(MT5ConfigError, match="ws_url") as refused:
+        _config(ws_url=ws_url)
     assert "SYNTHETIC_SECRET" not in "".join(traceback.format_exception(refused.value))
-
-
-@pytest.mark.parametrize(
-    "server_url", ["http://127.0.0.1:1", "https://127.0.0.1:65535", "http://127.0.0.1"]
-)
-def test_an_http_or_https_server_url_with_a_port_in_range_or_none_is_kept(server_url):
-    assert _config(server_url=server_url).server_url == server_url
 
 
 @pytest.mark.parametrize("ws_url", ["ws://127.0.0.1:1", "wss://127.0.0.1:65535", "ws://127.0.0.1"])

@@ -3,13 +3,13 @@ tests/client/test_data_push.py's."""
 
 import asyncio
 import calendar
-import threading
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from hub_double import eventually
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
@@ -19,16 +19,24 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from push_double import PushDouble
-from venue_doubles import account_info, relayed_sessions, symbol_info
+from session_double import SessionDouble
+from venue_doubles import SymbolVenue, serve, symbol_info
 
 from mt5connector.client import data
-from mt5connector.client.connection import AccountSnapshot, MT5Connection
+from mt5connector.client.connection import MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient, _epoch_s
-from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.errors import (
+    EaError,
+    MT5ConfigError,
+    MT5ConnectionError,
+    MT5InstrumentError,
+    NotReady,
+    ProtocolError,
+    ResponseLost,
+)
 from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 from mt5connector.wire.history_wire import Series
 from mt5connector.wire.push_wire import Stream, Subscription
 
@@ -90,14 +98,11 @@ def make_config(ws_url="ws://127.0.0.1:9000", venue=MT5_VENUE):
 
     return MT5Config(
         account=12345678,
-        password="test",
         server="Exness-MT5Trial1",
-        server_url="http://127.0.0.1:5000",
         ws_url=ws_url,
         venue=venue,
         reconnect_initial_delay_s=0.01,
         reconnect_max_delay_s=0.05,
-        reconnect_max_attempts=2,
     )
 
 
@@ -106,7 +111,6 @@ def make_conn(connected=True):
     conn.ensure_connected = (
         MagicMock() if connected else MagicMock(side_effect=MT5ConnectionError("not connected"))
     )
-    conn.reconnect_async = AsyncMock(return_value=connected)
     return conn
 
 
@@ -127,7 +131,6 @@ def make_provider(instrument=None):
     provider._failed_symbols = []
 
     provider.get_instrument = MagicMock(return_value=inst)
-    provider.load_symbol = MagicMock(return_value=inst)
     provider.list_all = MagicMock(return_value=[inst])
     provider.load_ids_async = AsyncMock()
     provider.load_all_async = AsyncMock()
@@ -175,7 +178,7 @@ def make_client(
     cache = TestComponentStubs.cache()
     clock = LiveClock()
 
-    with patch.object(data, "PushClient", PushDouble):
+    with patch.object(data, "HubSession", SessionDouble):
         client = client_class(
             loop=loop,
             connection=conn,
@@ -273,7 +276,7 @@ class TestConnect:
         await c._disconnect()
         assert not any("SYNTHETIC_SECRET" in str(call) for call in c.recorded_log.mock_calls)
         c.recorded_log.info.assert_any_call(
-            "MT5DataClient: connected, the push channel at ws://127.0.0.1:9000/push"
+            "MT5DataClient: connected, the hub session at ws://127.0.0.1:9000/push"
         )
 
     @pytest.mark.asyncio
@@ -299,7 +302,7 @@ class TestConnect:
         c, conn, prov, loop = make_client()
         await c._connect()
         c._handle_data.assert_called()
-        assert c._push.connected
+        assert c._hub.connected
         await c._disconnect()
 
 
@@ -318,8 +321,8 @@ class TestDisconnect:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await c._subscribe_quote_ticks(cmd)
         await c._disconnect()
-        assert not c._push.connected
-        assert c._push.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        assert not c._hub.connected
+        assert c._hub.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -334,7 +337,7 @@ class TestSubscribeQuoteTicks:
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
-        assert client._push.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        assert client._hub.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_symbols(self, client):
@@ -342,7 +345,7 @@ class TestSubscribeQuoteTicks:
             cmd = MagicMock()
             cmd.instrument_id.symbol.value = sym
             await client._subscribe_quote_ticks(cmd)
-        assert client._push.wanted == [
+        assert client._hub.wanted == [
             Subscription(Stream.TICKS, sym) for sym in ["EURUSDm", "XAUUSDm", "BTCUSDm"]
         ]
 
@@ -352,7 +355,7 @@ class TestSubscribeQuoteTicks:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
         await client._unsubscribe_quote_ticks(cmd)
-        assert client._push.wanted == []
+        assert client._hub.wanted == []
 
     @pytest.mark.asyncio
     async def test_unsubscribe_non_subscribed_does_not_raise(self, client):
@@ -415,6 +418,14 @@ def closed_rows(*opens_and_closes):
     )
 
 
+# What a history read raises when the hub fails it, or its answer is lost or undecodable.
+FAILURES = [
+    ResponseLost("hub session: copy_rates_range unanswered past the session's deadline"),
+    ProtocolError("hub session: part 1 of request 7, not 0"),
+    EaError("copy_rates_range: the terminal's read failed", 4401),
+]
+
+
 def ticks_request(start, end):
     request = MagicMock()
     request.instrument_id.symbol.value = "EURUSDm"
@@ -439,9 +450,7 @@ class TestRequestQuoteTicks:
         with patch("mt5connector.client.history.ticks", return_value=rows) as ticks:
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        ticks.assert_called_once_with(
-            recorded._conn, "EURUSDm", 1_752_570_000, 1_752_573_600, cancel=ANY
-        )
+        ticks.assert_awaited_once_with(recorded._hub, "EURUSDm", 1_752_570_000, 1_752_573_600)
         delivered = recorded._handle_quote_ticks.call_args[0][1]
         assert [tick.ts_event for tick in delivered] == [
             ((1_752_570_000 + i) * 1000 + 250) * 1_000_000 for i in range(10)
@@ -458,17 +467,17 @@ class TestRequestQuoteTicks:
         assert recorded._handle_quote_ticks.call_args[0][1] == []
         assert recorded._log.warning.call_count == 0
 
+    @pytest.mark.parametrize("failure", FAILURES, ids=lambda failure: type(failure).__name__)
     @pytest.mark.asyncio
-    async def test_a_failed_window_is_an_error_naming_its_connections_last_error(self, recorded):
-        recorded._conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
-        with patch("mt5connector.client.history.ticks", return_value=None):
+    async def test_a_failed_window_is_an_error_naming_the_failure(self, recorded, failure):
+        with patch("mt5connector.client.history.ticks", side_effect=failure):
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
         recorded._handle_quote_ticks.assert_not_called()
         assert recorded._log.error.call_count == 1
         error = recorded._log.error.call_args[0][0]
         assert "2025-07-15T09:00:00+00:00" in error
-        assert error.endswith("failed: (-4, 'Terminal: Not found')")
+        assert error.endswith(f"failed: {failure}")
 
     @pytest.mark.asyncio
     async def test_both_sizes_are_the_instruments_largest_order(self, recorded):
@@ -505,9 +514,7 @@ class TestRequestBars:
             await recorded._request_bars(minute_bars_request(c0, c1))
 
         # Every bar closing in the request opened from two periods before its first close on.
-        bars.assert_called_once_with(
-            recorded._conn, "EURUSDm", Series.M1, c0 - 120, c1 - 1, cancel=ANY
-        )
+        bars.assert_awaited_once_with(recorded._hub, "EURUSDm", Series.M1, c0 - 120, c1 - 1)
         delivered = recorded._handle_bars.call_args[0][1]
         assert [bar.ts_event for bar in delivered] == [
             close * 1_000_000_000 for close in range(c0, c1 + 1, 60)
@@ -524,39 +531,41 @@ class TestRequestBars:
         assert recorded._handle_bars.call_args[0][1] == []
         assert recorded._log.warning.call_count == 0
 
+    @pytest.mark.parametrize("failure", FAILURES, ids=lambda failure: type(failure).__name__)
     @pytest.mark.asyncio
-    async def test_a_failed_window_is_an_error_naming_its_connections_last_error(self, recorded):
-        recorded._conn.mt5.last_error.return_value = (-4, "Terminal: Not found")
-        with patch("mt5connector.client.history.bars", return_value=None):
+    async def test_a_failed_window_is_an_error_naming_the_failure(self, recorded, failure):
+        with patch("mt5connector.client.history.bars", side_effect=failure):
             await recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
 
         recorded._handle_bars.assert_not_called()
         assert recorded._log.error.call_count == 1
         error = recorded._log.error.call_args[0][0]
         assert "2025-07-15T09:01:00+00:00" in error and "2025-07-15T09:05:00+00:00" in error
-        assert error.endswith("failed: (-4, 'Terminal: Not found')")
+        assert error.endswith(f"failed: {failure}")
 
     @pytest.mark.asyncio
-    async def test_cancelling_the_request_stops_the_history_calls_retries(self, recorded):
-        handed = []
-        reading = threading.Event()
+    async def test_cancelling_the_request_cancels_the_history_read(self, recorded):
+        reading = asyncio.Event()
+        cancelled = []
 
-        def syncing(*args, cancel):
-            handed.append(cancel)
+        async def syncing(*args):
             reading.set()
-            cancel.wait(5)
-            return None
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
 
         with patch("mt5connector.client.history.bars", side_effect=syncing):
             request = asyncio.ensure_future(
                 recorded._request_bars(minute_bars_request(1_752_570_060, 1_752_570_300))
             )
-            await asyncio.to_thread(reading.wait, 5)
+            await asyncio.wait_for(reading.wait(), 5)
             request.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await request
 
-        assert handed[0].is_set()
+        assert cancelled == [True]
         recorded._handle_bars.assert_not_called()
 
     @pytest.mark.asyncio
@@ -584,7 +593,7 @@ class TestRequestBars:
     async def test_a_request_answers_the_bars_whose_real_closes_it_names(
         self, recorded, first_close, last_close, closes
     ):
-        def served(connection, symbol, series, start, end, cancel):
+        def served(session, symbol, series, start, end):
             return closed_rows(*((t, c) for t, c in AUTUMN_WEEKS if start <= t <= end))
 
         with patch("mt5connector.client.history.bars", side_effect=served):
@@ -655,7 +664,8 @@ class TestRequestInstruments:
 
         [response] = responses
         assert isinstance(response, DataResponse)
-        assert (response.correlation_id, response.data) == (request.id, [provider.load_symbol()])
+        assert (response.correlation_id, response.data) == (request.id, [provider.get_instrument()])
+        provider.load_ids_async.assert_awaited_once_with([request.instrument_id])
 
     @pytest.mark.asyncio
     async def test_an_instruments_request_reaches_the_data_engine_as_its_response(self):
@@ -752,32 +762,24 @@ USDJPY = InstrumentId.from_str("USDJPY.MT5")
 
 @pytest.fixture
 def terminal():
-    """The transport of the served client's connection, serving EURUSD, GBPUSD and USDJPY, none of
-    them charging a commission."""
-    definitions = {
-        "EURUSD": symbol_info(name="EURUSD"),
-        "GBPUSD": symbol_info(name="GBPUSD", currency_base="GBP"),
-        "USDJPY": symbol_info(name="USDJPY", currency_base="USD", currency_profit="JPY"),
-    }
-    package = MagicMock()
-    package.symbol_select.side_effect = lambda name, enable: name in definitions
-    package.symbol_info.side_effect = definitions.get
-    package.symbols_get.return_value = tuple(definitions.values())
-    package.commission_schedule.return_value = {"ret": 0, "last_error": 0, "rules": []}
-    package.trading_sessions.return_value = relayed_sessions()
-    return package
+    """The hub session of the served client's connection, serving EURUSD, GBPUSD and USDJPY, none
+    of them charging a commission."""
+    symbols = SymbolVenue()
+    symbols.add(symbol_info(name="EURUSD"))
+    symbols.add(symbol_info(name="GBPUSD", currency_base="GBP"))
+    symbols.add(symbol_info(name="USDJPY", currency_base="USD", currency_profit="JPY"))
+    return symbols
 
 
-def served_client(transport, provider_config: InstrumentProviderConfig):
-    """A data client over a real provider whose config is `provider_config`, its connection's
-    transport `transport`, what it hands NT as data recorded."""
+def served_client(symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
+    """A data client over a real provider whose config is `provider_config`, its connection's hub
+    session reads `symbols`, what it hands NT as data recorded."""
     conn = MagicMock(spec=MT5Connection)
-    conn.mt5 = transport
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
+    serve(conn, symbols)
     provider = MT5InstrumentProvider(
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
     )
-    with patch.object(data, "PushClient", PushDouble):
+    with patch.object(data, "HubSession", SessionDouble):
         client = MT5DataClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
@@ -813,7 +815,7 @@ class TestInstrumentsNtNames:
 
         assert handed_ids(client) == ["EURUSD.MT5", "GBPUSD.MT5"]
         assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
-        assert client._push.connected
+        assert client._hub.connected
         await client._disconnect()
 
     @pytest.mark.asyncio
@@ -841,7 +843,7 @@ class TestInstrumentsNtNames:
 
         assert provider.list_all() == []
         client._handle_data.assert_not_called()
-        assert not client._push.connected
+        assert not client._hub.connected
 
     @pytest.mark.asyncio
     async def test_a_symbol_no_config_named_is_loaded_and_answered_on_request(self, terminal):
@@ -859,6 +861,48 @@ class TestInstrumentsNtNames:
         assert [instrument.id for instrument in response.data] == [GBPUSD]
         assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
         await client._disconnect()
+
+    @pytest.mark.asyncio
+    async def test_an_instrument_request_the_hub_defers_leaves_the_clients_loop_running(
+        self, terminal
+    ):
+        terminal.refusals[(calls.Call.SYMBOL_INFO, "GBPUSD")] = [
+            NotReady("symbol_info: the broker clock is not verified", 0, 0.25)
+        ]
+        client, provider = served_client(
+            terminal, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        )
+        responses = responses_of(client)
+        order = []
+        asyncio.get_running_loop().call_later(0.025, order.append, "callback")
+
+        await client._request_instrument(instrument_request("GBPUSD"))
+        order.append("answered")
+
+        assert order == ["callback", "answered"]
+        [response] = responses
+        assert [instrument.id for instrument in response.data] == [GBPUSD]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_an_instrument_request_the_hub_defers_ends_its_reads(self, terminal):
+        terminal.refusals[(calls.Call.SYMBOL_INFO, "GBPUSD")] = [
+            NotReady("symbol_info: the broker clock is not verified", 0, 0.25)
+        ]
+        client, provider = served_client(
+            terminal, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        )
+        responses = responses_of(client)
+        request = asyncio.create_task(client._request_instrument(instrument_request("GBPUSD")))
+        await eventually(lambda: calls.Call.SYMBOL_INFO in terminal.asked_of("GBPUSD"))
+
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await asyncio.sleep(0.5)
+
+        assert terminal.asked_of("GBPUSD") == [calls.Call.SYMBOL_INFO]
+        assert responses == []
+        assert loaded_ids(provider) == []
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 """The NT data client of an MT5 terminal: its quote ticks, a mark at the mid of each, and its closed
-venue bars pushed over the hub, and its history read over HTTP.
+venue bars pushed over the hub, and its history read on the same hub session.
 
 State: the symbols whose quotes and whose marks NT subscribes, which share one tick stream; per
 venue bar type, the earliest close the next bar handed to NT may have, and from a reconnect until
@@ -8,8 +8,6 @@ the bars it missed are read back, the bars pushed since."""
 from __future__ import annotations
 
 import asyncio
-import threading
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -37,7 +35,8 @@ from nautilus_trader.model.identifiers import ClientId
 
 from mt5connector.client import history
 from mt5connector.client.currencies import register_venue_currency
-from mt5connector.client.errors import MT5ConnectionError, MT5InstrumentError
+from mt5connector.client.errors import HubAnswerError, MT5InstrumentError, ServerUnreachable
+from mt5connector.client.hub import HubSession
 from mt5connector.client.parsing import (
     InstrumentAny,
     mark_at_mid,
@@ -46,13 +45,11 @@ from mt5connector.client.parsing import (
     venue_bar,
     venue_series,
 )
-from mt5connector.client.push import PushClient
-from mt5connector.wire.history_wire import BAR_CLOSE, Series
-from mt5connector.wire.push_wire import FrameType, Stream, Subscription
+from mt5connector.wire import binary
+from mt5connector.wire.history_wire import BAR_CLOSE
+from mt5connector.wire.push_wire import Stream, Subscription
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from mt5connector.client.config import MT5Config
     from mt5connector.client.connection import MT5Connection
     from mt5connector.client.providers import MT5InstrumentProvider
@@ -67,7 +64,7 @@ class _Recovery:
 
 
 class MT5DataClient(LiveMarketDataClient):
-    """Streams an MT5 terminal's market data into NautilusTrader over the hub's push channel."""
+    """Streams an MT5 terminal's market data into NautilusTrader over the hub session."""
 
     def __init__(
         self,
@@ -91,7 +88,7 @@ class MT5DataClient(LiveMarketDataClient):
         self._conn = connection
         self._config = config
         self._provider = instrument_provider
-        self._push = PushClient(
+        self._hub = HubSession(
             config, loop, self._on_push_frame, self._on_push_reconnect, self._log
         )
         self._quote_symbols: set[str] = set()
@@ -99,29 +96,44 @@ class MT5DataClient(LiveMarketDataClient):
         self._next_closes: dict[BarType, int] = {}
         self._recoveries: dict[BarType, _Recovery] = {}
         self._read_backs: set[asyncio.Task] = set()
+        # The task NT runs `_connect` as, while it runs, for a disconnect to end.
+        self._connecting: asyncio.Task | None = None
 
     async def _connect(self) -> None:
         """Loads what the instrument provider's config names, hands NT every instrument the provider
-        holds and connects the push channel; raises MT5ConfigError for a config that names nothing
-        to load."""
-        self._conn.ensure_connected()
-        await self._provider.initialize()
-        instruments = self._provider.list_all()
-        _register_settlement(instruments)
-        for instrument in instruments:
-            self._handle_data(instrument)
-            self._log.info(f"MT5DataClient: loaded instrument {instrument.raw_symbol}")
-        await self._push.connect()
-        self._log.info(
-            f"MT5DataClient: connected, the push channel at {self._config.ws_display_url}"
-        )
+        holds and connects the hub session; raises MT5ConfigError for a config that names nothing to
+        load."""
+        self._connecting = asyncio.current_task()
+        try:
+            self._conn.ensure_connected()
+            await self._provider.initialize()
+            instruments = self._provider.list_all()
+            _register_settlement(instruments)
+            for instrument in instruments:
+                self._handle_data(instrument)
+                self._log.info(f"MT5DataClient: loaded instrument {instrument.raw_symbol}")
+            await self._hub.connect()
+            self._log.info(
+                f"MT5DataClient: connected, the hub session at {self._config.ws_display_url}"
+            )
+        finally:
+            self._connecting = None
 
     async def _disconnect(self) -> None:
-        """Disconnects the push channel; what NT subscribes stays wanted for the next connect."""
+        """Ends a connect still under way, which connects the hub session last, else disconnects the
+        hub session; what NT subscribes stays wanted for the next connect. Raises RuntimeError on a
+        client never connected."""
         for task in self._read_backs:
             task.cancel()
         self._recoveries.clear()
-        await self._push.disconnect()
+        if self._connecting is not None:
+            self._connecting.cancel()
+            try:
+                await self._connecting
+            except asyncio.CancelledError:
+                pass
+        else:
+            await self._hub.disconnect()
         self._log.info("MT5DataClient: disconnected")
 
     # ── Quotes and marks ──────────────────────────────────────────────────────
@@ -129,24 +141,24 @@ class MT5DataClient(LiveMarketDataClient):
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         symbol = command.instrument_id.symbol.value
         self._quote_symbols.add(symbol)
-        await self._push.subscribe(Subscription(Stream.TICKS, symbol))
+        await self._hub.subscribe(Subscription(Stream.TICKS, symbol))
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         symbol = command.instrument_id.symbol.value
         self._quote_symbols.discard(symbol)
         if symbol not in self._mark_symbols:
-            await self._push.unsubscribe(Subscription(Stream.TICKS, symbol))
+            await self._hub.unsubscribe(Subscription(Stream.TICKS, symbol))
 
     async def _subscribe_mark_prices(self, command: SubscribeMarkPrices) -> None:
         symbol = command.instrument_id.symbol.value
         self._mark_symbols.add(symbol)
-        await self._push.subscribe(Subscription(Stream.TICKS, symbol))
+        await self._hub.subscribe(Subscription(Stream.TICKS, symbol))
 
     async def _unsubscribe_mark_prices(self, command: UnsubscribeMarkPrices) -> None:
         symbol = command.instrument_id.symbol.value
         self._mark_symbols.discard(symbol)
         if symbol not in self._quote_symbols:
-            await self._push.unsubscribe(Subscription(Stream.TICKS, symbol))
+            await self._hub.unsubscribe(Subscription(Stream.TICKS, symbol))
 
     # ── Venue bars ────────────────────────────────────────────────────────────
 
@@ -155,34 +167,33 @@ class MT5DataClient(LiveMarketDataClient):
         history's to serve."""
         subscription = _bar_subscription(command.bar_type)
         self._next_closes[command.bar_type] = self._clock.timestamp_ns() // 1_000_000_000 + 1
-        await self._push.subscribe(subscription)
+        await self._hub.subscribe(subscription)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
         subscription = _bar_subscription(command.bar_type)
         self._next_closes.pop(command.bar_type, None)
         self._recoveries.pop(command.bar_type, None)
         if subscription not in {_bar_subscription(bar_type) for bar_type in self._next_closes}:
-            await self._push.unsubscribe(subscription)
+            await self._hub.unsubscribe(subscription)
 
-    # ── The push channel ──────────────────────────────────────────────────────
+    # ── The hub session ──────────────────────────────────────────────────────
 
-    def _on_push_frame(self, frame: dict) -> None:
-        """Hands NT a pushed tick as a quote tick and a mark at its mid, and a pushed bar as the
+    def _on_push_frame(self, frame: object) -> None:
+        """Hands NT each pushed tick as a quote tick and a mark at its mid, and a pushed bar as the
         venue bar of every bar type subscribed to its series."""
-        kind = FrameType(frame["type"])
-        if kind == FrameType.TICK:
-            quote = quote_tick_from_frame(
-                frame, self._instrument(frame["symbol"]), self._clock.timestamp_ns()
-            )
-            self._handle_data(quote)
-            self._handle_data(mark_at_mid(quote))
-        elif kind == FrameType.BAR:
-            pushed = Subscription(Stream.BARS, frame["symbol"], Series(frame["timeframe"]))
+        if isinstance(frame, binary.Ticks):
+            instrument = self._instrument(frame.symbol)
+            for tick in frame.ticks:
+                quote = quote_tick_from_frame(tick, instrument, self._clock.timestamp_ns())
+                self._handle_data(quote)
+                self._handle_data(mark_at_mid(quote))
+        elif isinstance(frame, binary.Bar):
+            pushed = Subscription(Stream.BARS, frame.symbol, frame.series)
             for bar_type in list(self._next_closes):
                 if _bar_subscription(bar_type) == pushed:
-                    self._on_pushed_bar(bar_type, frame)
+                    self._on_pushed_bar(bar_type, frame.bar)
         else:
-            raise ValueError(f"a {kind} frame on the data channel")
+            raise ValueError(f"a {type(frame).__name__} frame on the data channel")
 
     def _on_pushed_bar(self, bar_type: BarType, frame: dict) -> None:
         """Hands NT a pushed bar, or holds it while the bar type recovers from a reconnect; the
@@ -242,23 +253,17 @@ class MT5DataClient(LiveMarketDataClient):
 
     async def _missed_bars(self, bar_type: BarType, first_close: int, last_close: int):
         """The bars of `bar_type` closing from `first_close` through `last_close` as the history
-        serves them; none, with an error logged, when the read fails or the server does not
-        answer."""
+        serves them; none, with an error logged, when the hub fails the read or its answer is lost
+        or undecodable."""
         series = _bar_subscription(bar_type).timeframe
         symbol = bar_type.instrument_id.symbol.value
         first_open, last_open = history.opens_closing(series, first_close, last_close)
         try:
-            rows = await _read_in_thread(
-                history.bars, self._conn, symbol, series, first_open, last_open
-            )
-            failure = self._conn.mt5.last_error()
-        except MT5ConnectionError as exc:
-            rows = None
-            failure = exc
-        if rows is None:
+            rows = await history.bars(self._hub, symbol, series, first_open, last_open)
+        except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: {bar_type} bars closing {_iso(first_close)}..{_iso(last_close)} "
-                f"not read back: {failure}"
+                f"not read back: {exc}"
             )
             return ()
         else:
@@ -340,7 +345,8 @@ class MT5DataClient(LiveMarketDataClient):
         pass
 
     async def _request_instrument(self, request: RequestInstrument) -> None:
-        instrument = self._provider.load_symbol(request.instrument_id.symbol.value)
+        await self._provider.load_ids_async([request.instrument_id])
+        instrument = self._instrument(request.instrument_id.symbol.value)
         _register_settlement([instrument])
         self._handle_instrument(instrument, request.id, request.start, request.end, request.params)
 
@@ -358,11 +364,11 @@ class MT5DataClient(LiveMarketDataClient):
         self._conn.ensure_connected()
         start = _epoch_s(request.start)
         end = self._end_s(request.end)
-        rows = await _read_in_thread(history.ticks, self._conn, symbol, start, end)
-        if rows is None:
+        try:
+            rows = await history.ticks(self._hub, symbol, start, end)
+        except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
-                f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: "
-                f"{self._conn.mt5.last_error()}"
+                f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: {exc}"
             )
         else:
             ticks = [parse_quote_tick(row, instrument) for row in rows]
@@ -378,17 +384,16 @@ class MT5DataClient(LiveMarketDataClient):
         series = venue_series(request.bar_type)
         instrument = self._instrument(symbol)
         self._conn.ensure_connected()
-        # The request names closes; the server serves bars by their open.
+        # The request names closes; the hub serves bars by their open.
         first_close = _epoch_s(request.start)
         last_close = self._end_s(request.end)
         first_open, last_open = history.opens_closing(series, first_close, last_close)
-        rows = await _read_in_thread(
-            history.bars, self._conn, symbol, series, first_open, last_open
-        )
-        if rows is None:
+        try:
+            rows = await history.bars(self._hub, symbol, series, first_open, last_open)
+        except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: {request.bar_type} bars closing "
-                f"{_iso(first_close)}..{_iso(last_close)} failed: {self._conn.mt5.last_error()}"
+                f"{_iso(first_close)}..{_iso(last_close)} failed: {exc}"
             )
         else:
             bars = [
@@ -420,17 +425,6 @@ class MT5DataClient(LiveMarketDataClient):
 def _bar_subscription(bar_type: BarType) -> Subscription:
     """The push stream of a venue bar type: its symbol's bars of the terminal's series."""
     return Subscription(Stream.BARS, bar_type.instrument_id.symbol.value, venue_series(bar_type))
-
-
-async def _read_in_thread(read: Callable[..., np.ndarray | None], *args) -> np.ndarray | None:
-    """A history read run off the event loop, its retries stopped when the awaiting task is
-    cancelled, since the thread outlives the task."""
-    cancel = threading.Event()
-    try:
-        return await asyncio.to_thread(read, *args, cancel=cancel)
-    except asyncio.CancelledError:
-        cancel.set()
-        raise
 
 
 def _epoch_s(value) -> int:
