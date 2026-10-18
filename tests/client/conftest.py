@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from hub_double import HubDouble
-from venue_doubles import tick, trade_result
+from venue_doubles import account_info, tick, trade_result
 from websockets.asyncio.server import serve
 
 from mt5connector.client.config import MT5Config
@@ -20,7 +20,6 @@ def config():
     """A valid MT5Config with fast reconnect settings for testing."""
     return MT5Config(
         account=12345678,
-        password="test_password",
         server="Exness-MT5Trial1",
         ws_url="ws://127.0.0.1:9000",
         reconnect_initial_delay_s=0.01,
@@ -37,9 +36,10 @@ def config():
 @pytest.fixture
 def exec_venue():
     """The calls the execution client asks its hub session, each answered as the venue answers it:
-    no order, deal or position, a quote, and every trade request sent."""
+    the account, no order, deal or position, a quote, and every trade request sent."""
     venue = MagicMock(
         spec=[
+            "account_info",
             "orders_get",
             "positions_get",
             "history_orders_get",
@@ -48,6 +48,7 @@ def exec_venue():
             "order_send",
         ]
     )
+    venue.account_info.return_value = account_info()
     venue.orders_get.return_value = ()
     venue.positions_get.return_value = ()
     venue.history_deals_get.return_value = ()

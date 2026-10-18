@@ -29,22 +29,6 @@ def test_hub_settings_take_overrides():
     assert settings.chart_idle_seconds == 60
 
 
-@pytest.mark.parametrize(
-    ("variable", "value", "message"),
-    [
-        ("MT5_HUB_PORT", "0", "hub_port"),
-        ("MT5_HUB_PORT", "65536", "hub_port"),
-        ("MT5_HUB_PORT", "nine", "MT5_HUB_PORT is not an integer"),
-        ("MT5_CHART_IDLE_SECONDS", "0", "chart_idle_seconds"),
-        ("MT5_BROKER_OFFSET_HOURS", "7.5", "MT5_BROKER_OFFSET_HOURS is not an integer"),
-        ("MT5_BROKER_TZ", "Mars/Olympus", "MT5_BROKER_TZ"),
-    ],
-)
-def test_hub_settings_refuse_a_bad_value(variable, value, message):
-    with pytest.raises(SettingsError, match=message):
-        read_hub_settings({variable: value})
-
-
 @pytest.mark.parametrize("value", ["Mars/Olympus", "", "../etc/zone"])
 def test_hub_settings_refuse_an_unknown_broker_zone(value):
     with pytest.raises(SettingsError, match="MT5_BROKER_TZ"):
@@ -63,5 +47,33 @@ def test_hub_settings_refuse_an_unknown_broker_zone(value):
 )
 @pytest.mark.parametrize("value", ["7.5", "seven", ""])
 def test_hub_settings_refuse_a_clock_setting_that_is_not_an_integer(variable, value):
-    with pytest.raises(SettingsError, match=f"{variable} is not an integer"):
+    with pytest.raises(SettingsError, match=f"^{variable}=.* is not an integer$"):
         read_hub_settings({variable: value})
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("MT5_HUB_PORT", "0"),
+        ("MT5_HUB_PORT", "65536"),
+        ("MT5_HUB_PORT", "nine"),
+        ("MT5_BROKER_TZ", "Mars/Olympus"),
+        ("MT5_BROKER_OFFSET_HOURS", "7.5"),
+        ("MT5_CHART_IDLE_SECONDS", "0"),
+        ("MT5_CHART_IDLE_SECONDS", "idle"),
+        ("MT5_HISTORY_RETRY_SECONDS", "0"),
+        ("MT5_HISTORY_RETRY_SECONDS", "-5"),
+        ("MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS", "0"),
+        ("MT5_CLOCK_BOOTSTRAP_SECONDS", "0"),
+        ("MT5_CLOCK_CHECK_SECONDS", "0"),
+        ("MT5_HUB_CONSUMER_QUEUE_BOUND", "0"),
+        ("MT5_HUB_CONSUMER_QUEUE_BOUND", "many"),
+        ("MT5_HUB_EA_QUEUE_BOUND", "0"),
+        ("MT5_HUB_PENDING_BOUND", "0"),
+    ],
+)
+def test_hub_settings_name_the_variable_and_its_value_when_refusing(variable, value):
+    with pytest.raises(SettingsError) as refused:
+        read_hub_settings({variable: value})
+    assert str(refused.value).startswith(f"{variable}=")
+    assert value in str(refused.value)

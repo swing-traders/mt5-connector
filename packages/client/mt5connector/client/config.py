@@ -33,9 +33,8 @@ class MT5Config:
     """What the adapter runs with; README.md's configuration reference documents each field."""
 
     # ── Required ──────────────────────────────────────────────────────────────
-    # Credentials: the broker server's name identifies the account as the login does.
+    # The account's identity: the broker server's name identifies it as the login does.
     account: int = field(repr=False)
-    password: str = field(repr=False)
     server: str = field(repr=False)
 
     # ── Optional / defaults ───────────────────────────────────────────────────
@@ -54,8 +53,6 @@ class MT5Config:
     def __post_init__(self) -> None:
         if not self.account or self.account <= 0:
             raise ValueError("MT5Config.account must be a positive integer.")
-        if not self.password:
-            raise ValueError("MT5Config.password cannot be empty.")
         if not self.server:
             raise ValueError("MT5Config.server cannot be empty.")
         if not isinstance(self.venue, Venue):

@@ -83,7 +83,6 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 | `account_info` | 1 | spawner | — | `AccountInfo` | read |
 | `terminal_info` | 2 | spawner | — | `TerminalInfo` | read |
 | `symbols_get` | 3 | spawner | `group` | `SymbolListing` rows | read |
-| `symbols_total` | 4 | spawner | — | int64 | read |
 | `symbol_info` | 6 | publisher | `symbol` | `SymbolInfo` | read |
 | `symbol_info_tick` | 7 | publisher | `symbol` | one `MqlTick` | read |
 | `positions_get` | 8 | spawner | `symbol`, `group`, `ticket` | `TradePosition` rows | read |
@@ -92,9 +91,7 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 | `history_deals_get` | 11 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeDeal` rows | read |
 | `order_send` | 12 | publisher of the request's `symbol` | `request` | `MqlTradeResult` | command |
 | `copy_rates_range` | 13 | publisher | `symbol`, `timeframe`, `date_from`, `date_to` | bars | history |
-| `copy_rates_from` | 14 | publisher | `symbol`, `timeframe`, `date_from`, `count` | bars | history |
 | `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags` | `MqlTick` rows | ticks |
-| `copy_ticks_from` | 16 | history | `symbol`, `date_from`, `count`, `flags` | `MqlTick` rows | ticks |
 | `ranges` | 17 | the hub | `symbol` | the terminal's `maxbars` (int64), then each floor held: `series`, `floor`, `measured_at`, `generation` (int64) | read |
 | `outcomes` | 18 | publisher | `symbol`, `request_ids` | per request id its outcome log holds, the `MqlTradeTransaction`, `MqlTradeRequest` and `MqlTradeResult` of its `REQUEST` transaction, back to back | read |
 | `commission_schedule` | 19 | the hub | `symbol` | the schedule, laid out as a `commissions` frame's after its symbol | read |
@@ -182,8 +179,8 @@ What it does inside the terminal:
 - **Requests** are answered once each, under their correlation id: a result's records in parts as [Calls](#calls) lays them out, each part carrying the `GetLastError()` the call left; or `ea_error` with the error the call met. Every call but a history read waits on nothing beyond a local read and is answered at once, in the order the requests arrive; a history read is answered once its windows are synced, as below.
   - A call its role does not serve, and a `group` filter, are answered `ea_error` with `ERR_FUNCTION_NOT_ALLOWED` (4014); arguments out of the call's layout with `ERR_INVALID_PARAMETER` (4003).
   - A property of a record that cannot be read fails the call: `ea_error` naming the record — the symbol, or the position, order or deal by its ticket — and every property of it that failed, each with its MQL5 error, the first one's error the answer's `last_error`. `symbols_get` fails whole on one symbol whose definition it cannot read.
-  - The spawner serves `account_info`, `terminal_info`, `symbols_total` and `symbols_get`, the definition of every symbol the terminal knows, in Market Watch or not; `positions_get` and `orders_get` by `symbol`, by `ticket`, by both, or every one with neither; and `history_orders_get` and `history_deals_get` by `ticket`, else by `position`, else by window. A `ticket` names the order or the deal itself; one the history does not hold answers no record, the selection's error its `last_error`.
-  - A publisher serves `symbol_info`, `symbol_info_tick`, `order_send`, `outcomes` and the two bar history reads of its own symbol; a history EA the two tick history reads of its own, and nothing else. A `symbol_info` of a symbol `SymbolExist` denies is answered `ea_error` with `ERR_MARKET_UNKNOWN_SYMBOL` (4301).
+  - The spawner serves `account_info`, `terminal_info` and `symbols_get`, the definition of every symbol the terminal knows, in Market Watch or not; `positions_get` and `orders_get` by `symbol`, by `ticket`, by both, or every one with neither; and `history_orders_get` and `history_deals_get` by `ticket`, else by `position`, else by window. A `ticket` names the order or the deal itself; one the history does not hold answers no record, the selection's error its `last_error`.
+  - A publisher serves `symbol_info`, `symbol_info_tick`, `order_send`, `outcomes` and the bar history read of its own symbol; a history EA the tick history read of its own, and nothing else. A `symbol_info` of a symbol `SymbolExist` denies is answered `ea_error` with `ERR_MARKET_UNKNOWN_SYMBOL` (4301).
 - **History.** Bars are synced by the indicator, whose reads never wait, and ticks by the history EA's own reads, which do; no read in a publisher waits on a download:
   - The publisher asks the indicator by chart event, `push_wire.HistoryEvent`, its `lparam` the request id and its `sparam` the window of rates on the broker's clock, `"timeframe,from,to"` or `"timeframe,from,count"`. It sends `busy` for `HISTORY_DEADLINE_S` (45 s) with each stage of asks.
   - The indicator reads each window at once — a read in an indicator answers what the terminal holds and starts the download it lacks — and again on every calculation and every second, until it answers rows, none with no error, or an error other than a loading one (4401, 4403); it then signals the window ready, its `dparam` the rows and its `sparam` `"<error>,<time>"`, the time its first row's in broker seconds, or 0 for none. A window still loading 45 s after its ask is signalled with 4403 and forgotten, and so is every window of a request the publisher has given up on. A window of ticks is not the indicator's: in an indicator one without ticks never settles.
@@ -192,8 +189,7 @@ What it does inside the terminal:
   - A tick request waits under `TICK_BUSY_S` (900 s) from the moment it is sent, hears `busy` for that bound on its arrival at the EA, before anything waits, and again every 300 s while it is in flight, the hub's keepalive and deadlines following that bound. The requests run from the EA's timer, oldest first, one at a time. A request makes no call once 900 s have passed since its arrival, and answers `syncing` then, whatever a call that returned past that bound read.
   - `copy_rates_range` and `copy_ticks_range` follow the rules of [History](#history) over the broker bounds the hub sends: a window that starts after it ends, or after `TimeTradeServer()`, is `invalid_window`; the bars' floor stub is read from 1970-01-02 on the broker's clock, the bar before a gap as the one bar `CopyRates` reads from its start, the tick after it as the one tick `CopyTicks` reads from its last second, and the ticks before it in its broker day, then its broker week. A window nothing proves is `syncing`.
   - A tick window is read first and answered when it holds ticks. An empty one is proven by the live edge, the tick after it and the ticks before it; only when no tick precedes it is the ticks' floor measured — the first tick of every kind `CopyTicks` answers from 1970-01-02 — and the window is empty when it lies wholly before that floor. The ticks' floor stands once measured, and a window wholly before it is answered empty without a read.
-  - `copy_rates_from` and `copy_ticks_from` answer the rows the terminal reads once their read is synced, unproven, as the package answers them; a read that fails is `ea_error`.
-  - The rows go out in parts, more than one part's worth a part per timer pass behind a `busy`; the last part of a range read carries the floor fact: the series' floor when the hub has not heard it on this connection, whichever request measured it, or none. A bar series' floor is used for 900 s, then measured again.
+  - The rows go out in parts, more than one part's worth a part per timer pass behind a `busy`; the last part carries the floor fact: the series' floor when the hub has not heard it on this connection, whichever request measured it, or none. A bar series' floor is used for 900 s, then measured again.
 - **Commands.** A publisher sends an `order_send`'s `MqlTradeRequest` as it came through `OrderSendAsync` and answers the `MqlTradeResult` at once: retcode 10008 and a `request_id` mean sent, and a request the terminal refuses itself answers with the retcode, comment and error that say why. The venue's verdict is the `REQUEST` transaction carrying that `request_id`, which the publisher publishes and keeps in its outcome log of the last 1,000, connected or not.
 - **Transactions.** A publisher publishes one `trade_transaction` frame per `OnTradeTransaction` call whose symbol is its own, in the order the calls arrive, whatever the magic; the spawner each one that names no symbol, such as a pending order's delete or modify sent without one. Every EA receives the account's whole transaction stream, so the filter publishes each transaction once; a transaction of a symbol no chart publishes, naming one, reaches the hub zero times.
 - **Ticks and bars.** While the hub wants a publisher's ticks it publishes them from its tick database — `COPY_TICKS_INFO`, the ticks that change the bid or the ask — from the moment they are wanted, read at every tick and again on its timer, since the terminal queues no tick event while one is queued or handled; each read's new ticks travel in one `tick` frame. It publishes the bar that closed for each wanted timeframe, found on its timer and its ticks when the forming bar's open moves.
@@ -214,7 +210,7 @@ The repository's `Dockerfile` builds one image that runs the terminal and the hu
 | WineHQ devel, amd64 and i386 | `ARG VERSION_WINE` |
 | wine-mono | `image/artifacts.txt` |
 | the Windows Python, python.org's x64 installer, at `C:\Python`, which runs the dialogs' driver | `image/artifacts.txt` |
-| the Linux Python, the base environment at `/opt/conda` | `environment.yml` |
+| the Linux Python, the base environment at `/opt/conda` | `image/environment.yml` |
 | `mt5-connector-server`, one wheel built from the checkout into the Linux Python | `VERSION` |
 | the terminal's web installer, `mt5setup.exe` | `image/artifacts.txt` |
 
@@ -241,14 +237,15 @@ podman run -d --name mt5-alpha \
 - `MT5_SPAWNER_SYMBOL` names a liquid symbol the account has, by the broker's own name, exactly as the terminal lists it: some brokers suffix every symbol (`XAUUSD.r`).
 - The history volume holds `Bases` and nothing else. The image ships the store empty, so a fresh volume starts with nothing from it, and a new image started on the same volume starts with the history the last one synced.
 - The runtime user is `mt5` (UID/GID 65532), with `WINEPREFIX=/home/mt5/.wine`, `WINEARCH=win64` and `WINEDEBUG=-all`. The image sets `MT5_TERMINAL_PATH` to the portable install's `terminal64.exe` and `MT5_PYTHON_DIR` to the Windows Python's directory.
-- The entrypoint refuses to start without `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, naming the first missing, and writes them into the terminal's startup ini ([setup.ini](#setupini)).
+- The entrypoint refuses to start without `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, naming the first missing, or with an `MT5_MAX_BARS` that is no positive integer, and writes them with `MaxBars` into the terminal's startup ini ([setup.ini](#setupini)).
 
 ### Settings
 
-The hub reads its settings from the environment once at start, and stops naming the first that is malformed or out of range:
+The entrypoint reads `MT5_MAX_BARS` and the hub the rest from the environment once at start, each stopping on the first that is malformed or out of range, naming it:
 
 | Variable | Setting | Default |
 |---|---|---|
+| `MT5_MAX_BARS` | the terminal's `MaxBars` ([setup.ini](#setupini)) | `100000000` |
 | `MT5_HUB_PORT` | the hub's port, bound on all interfaces | `9000` |
 | `MT5_BROKER_TZ` | the zone the broker's clock follows, as an IANA name | `America/New_York` |
 | `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
@@ -309,7 +306,7 @@ The terminal is started as `terminal64.exe /config:<setup.ini> /portable`, so it
 
 #### setup.ini
 
-The image bakes the sections without a credential at `/opt/mt5/setup.ini`. At every start the entrypoint writes a copy into `/tmp/mt5`, readable by the runtime user alone, adding `[Common]` `Login`, `Password` and `Server` from the environment and `[StartUp]` `Symbol` from `MT5_SPAWNER_SYMBOL`.
+The image bakes the sections without a credential at `/opt/mt5/setup.ini`. At every start the entrypoint writes a copy into `/tmp/mt5`, readable by the runtime user alone, adding `[Common]` `Login`, `Password` and `Server` from the environment, `[Charts]` `MaxBars` from `MT5_MAX_BARS` and `[StartUp]` `Symbol` from `MT5_SPAWNER_SYMBOL`.
 
 | Section | Key | Value |
 |---|---|---|
@@ -317,7 +314,7 @@ The image bakes the sections without a credential at `/opt/mt5/setup.ini`. At ev
 | | `AutoConfiguration` | `true` |
 | | `ProxyEnable` | `false` |
 | `[Charts]` | `Profile` | `default`, emptied of its charts before every launch, so the terminal starts with none |
-| | `MaxBars` | `100000000`, the terminal's ceiling: a larger value is clamped to it. It also bounds the span one history read covers |
+| | `MaxBars` | `MT5_MAX_BARS`, by default `100000000`, the terminal's ceiling: a larger value is clamped to it. It also bounds the span one history read covers |
 | `[Experts]` | `AllowDllImport` | `1` |
 | | `Enabled` | `1`: algorithmic trading on, without which the terminal refuses every order the adapter sends |
 | | `WebRequest` | `1` |
@@ -516,7 +513,7 @@ Each EA's socket reaches only a host on the terminal's allowlist — Tools → O
 ### Network
 
 - The image serves one port, the hub's `MT5_HUB_PORT`; the adapter's config names it as `ws_url`.
-- There is no authentication: the hub trusts its network. The image publishes no host port, loopback included: the hub is reachable on the container network alone, and publishing its port is a design change.
+- There is no authentication: the hub trusts its network. The image declares no host port, loopback included, and declaring one is a design change; a runtime may publish the hub's port on its own host.
 
 ### Building
 
@@ -525,12 +522,12 @@ podman build --format=docker -t mt5-connector-server .
 podman build --format=docker --build-arg DEBUG=1 -t mt5-connector-server-debug .
 ```
 
-- The build context is the repository root, and `.dockerignore` admits `environment.yml`, `VERSION`, `packages/` and `image/` alone. Podman builds with `--format=docker`: its default OCI format drops the base image's `SHELL`, through which the build's `RUN` steps run in the activated environment. Docker needs no flag.
+- The build context is the repository root, and `.dockerignore` admits `VERSION`, `packages/` and `image/` alone. Podman builds with `--format=docker`: its default OCI format drops the base image's `SHELL`, through which the build's `RUN` steps run in the activated environment. Docker needs no flag.
 - The download stage takes `image/artifacts.txt` and `image/first-start.sh` on their own, and the checkout comes in once the terminal is installed, so a change to a package or a boot script rebuilds neither Wine nor the terminal.
-- The Linux Python is the checkout's `environment.yml`, installed whole as the base environment — Python, the client editable from the checkout's copy at `/opt/mt5-connector`, and its NautilusTrader pin — and then made root-owned and read-only.
-- One wheel of `packages/server`, built with that Python, installs there with its dependencies. Nothing of this repository's own comes from an index, and `pip check` fails the build when the installed dependencies no longer satisfy the server's pins.
+- The Linux Python is `image/environment.yml` — Python and pip alone — installed as the base environment, then made root-owned and read-only.
+- One wheel of `packages/server`, built with that Python from the checkout's copy at `/opt/mt5-connector` with the client's wire vocabulary its `wire` link names, installs there with its dependencies; nothing else of the client enters the image. Nothing of this repository's own comes from an index, and `pip check` fails the build when the installed dependencies no longer satisfy the server's pins.
 - `--build-arg DEBUG=1` adds x11vnc, which the entrypoint starts on the display listening on the container's loopback (`127.0.0.1:5900`) and nowhere else; the default build carries no VNC at all, and any other `DEBUG` value fails the build.
-- The image is about 6.7 GB.
+- The image is about 5.8 GB.
 
 The build also:
 
@@ -557,7 +554,7 @@ podman run --rm --entrypoint cat mt5-connector-server /home/mt5/.terminal-build
 
 `mt5setup.exe` is a web installer: its own bytes are pinned, but it installs whatever terminal build MetaQuotes currently serves, so two builds from identical inputs can carry different terminal builds. Nothing stops the terminal's own update check: it never applies an update by itself, so the build an image baked is the one it runs. The installer exits 1 after a successful install, so the build checks the terminal's first start rather than the installer's exit code; without network access, or with a terminal that cannot start, it hangs instead of failing and ignores a termination signal, so the build kills it after 600 s and fails the step.
 
-The files the build downloads itself are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend both projects build with, resolve at build time as `environment.yml` and the two `pyproject.toml` files declare them.
+The files the build downloads itself are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend the server builds with, resolve at build time as `image/environment.yml` and the server's `pyproject.toml` declare them.
 
 ### The image tests
 
@@ -570,6 +567,7 @@ MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
 It pins that:
 
 - a start on that account boots up to the hub, printing the account's password nowhere;
+- the startup ini carries `MaxBars` as `MT5_MAX_BARS` sets it, the terminal's ceiling when it is unset, and an `MT5_MAX_BARS` that is no positive integer fails the start naming it;
 - the first supervised process to exit — the hub, Xvfb, the terminal during the boot — ends the container with its status, naming it;
 - a display that never comes up, a restore that never returns and a driver action that never returns each fail the start naming the step and its bound;
 - a stop closes the terminal, stops the log tail after it and ends the container within the stop timeout, killing nothing;
@@ -582,3 +580,51 @@ It pins that:
 - the image declares its healthcheck as the health probe, every 30 s under a 5 s timeout and unhealthy after 3 failures.
 
 Its tests of the driver's menu and tab lookups, of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — and of the health probe, passing on HTTP 200 alone and naming a 503 or a hub not listening, run without an image.
+
+### The live hub tier
+
+`tests/live/test_hub_live.py` reads and commands through two running images' hubs on one account, and runs only when `MT5_LIVE_HUB_SYMBOL` names a symbol that account trades, weekends included:
+
+| Variable | What it names | Default |
+|---|---|---|
+| `MT5_LIVE_HUB_SYMBOL` | the symbol every case reads and trades | — |
+| `MT5_LIVE_HUB_URL` | the hub of container 1, its `MaxBars` the ceiling, which every case but the span cap's reads | `ws://127.0.0.1:9000` |
+| `MT5_LIVE_CAPPED_HUB_URL` | the hub of container 2, its `MaxBars` capped, which the span-cap case reads; a case that finds no hub there fails naming it | `ws://127.0.0.1:9001` |
+
+Nothing starts a container for it, and no CI runs it. By hand, from the repository root:
+
+1. Write a `.env` there, which is never committed: one unquoted `NAME=value` per line, holding nothing the shell interprets, since the container runtime reads each value verbatim and step 4 sources the file. It carries the entrypoint's `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, and the tier's `MT5_LIVE_HUB_SYMBOL`.
+2. Start both containers from the image under test, each with its own history volume. The two terminals log into the same account at once. Container 2's `MaxBars` of 100,000 caps one read's span at about 70 days of M1 periods:
+
+   ```bash
+   image=localhost/mt5-connector-server
+   bases="/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
+   podman run -d --name mt5-live-1 --env-file .env -p 127.0.0.1:9000:9000 \
+     -v mt5-live-1-bases:"$bases" --stop-timeout 190 "$image"
+   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=100000 \
+     -p 127.0.0.1:9001:9000 -v mt5-live-2-bases:"$bases" --stop-timeout 190 "$image"
+   ```
+
+3. Wait until each hub's `/health` answers 200, its terminal logged in and its broker clock verified:
+
+   ```bash
+   for port in 9000 9001; do
+     until curl -fsS "http://127.0.0.1:$port/health" >/dev/null; do sleep 10; done
+   done
+   ```
+
+4. Run the tier:
+
+   ```bash
+   set -a; . ./.env; set +a
+   pytest tests/live -q -rA
+   ```
+
+5. Stop and remove both containers:
+
+   ```bash
+   podman stop mt5-live-1 mt5-live-2
+   podman rm mt5-live-1 mt5-live-2
+   ```
+
+`docker` takes the same commands.

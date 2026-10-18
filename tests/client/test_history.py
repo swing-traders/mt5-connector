@@ -34,7 +34,6 @@ def rows(count: int) -> np.ndarray:
 async def session(hub):
     config = MT5Config(
         account=12345678,
-        password="p",
         server="Broker-Demo",
         ws_url=f"ws://127.0.0.1:{hub.port}",
     )

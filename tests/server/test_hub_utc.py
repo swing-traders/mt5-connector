@@ -244,10 +244,6 @@ def test_a_range_reads_window_reaches_the_ea_as_the_broker_bounds_it_reads_acros
     }
 
 
-def test_results_without_epochs_pass_through():
-    assert Results(calls.CALLS[Call.SYMBOLS_TOTAL], {}, CLOCK, RepeatedHours()).part(42) == 42
-
-
 class CountingClock:
     """The broker clock, counting every question asked of it."""
 
@@ -366,6 +362,11 @@ def test_the_window_filter_equals_the_clock_read_element_by_element(span, start,
     )
 
 
+def window_about(timeframe, opens):
+    """A bar read's arguments, its window a day wider than the broker opens on either side."""
+    return {"timeframe": timeframe, "date_from": opens[0] - 86_400, "date_to": opens[-1] + 86_400}
+
+
 def bars_one_by_one(series, opens):
     """Each bar's true-UTC open and close as the clock reads its broker open, of two opening at one
     true-UTC second the first."""
@@ -385,9 +386,10 @@ def test_converted_bars_equal_the_clock_read_bar_by_bar(span, timeframe):
     first = SPANS[span] - SPANS[span] % period
     opens = first + np.arange(0, 4 * 3_600, period, dtype=np.int64)
     rates = rates_rows(*opens.tolist())
-    row = calls.CALLS[Call.COPY_RATES_FROM]
+    row = calls.CALLS[Call.COPY_RATES_RANGE]
+    arguments = window_about(timeframe, opens.tolist())
 
-    converted = Results(row, {"timeframe": timeframe}, CLOCK, RepeatedHours()).part(rates)
+    converted = Results(row, arguments, CLOCK, RepeatedHours()).part(rates)
 
     assert converted[["time", "time_close"]].tolist() == bars_one_by_one(series, opens.tolist())
 
@@ -423,14 +425,15 @@ def test_a_repeated_half_hour_is_warned_of_at_its_first_repeated_bar(caplog):
     caplog.set_level(logging.WARNING)
     opens = calendar.timegm((2026, 4, 5, 8, 0, 0)) + np.arange(60, dtype=np.int64) * 60
     first_repeated = next(value for value in opens.tolist() if LORD_HOWE.is_ambiguous(value))
-    row = calls.CALLS[Call.COPY_RATES_FROM]
+    row = calls.CALLS[Call.COPY_RATES_RANGE]
+    arguments = window_about(mirror.TIMEFRAME_M1, opens.tolist())
 
-    converted = Results(row, {"timeframe": mirror.TIMEFRAME_M1}, LORD_HOWE, RepeatedHours()).part(
+    converted = Results(row, arguments, LORD_HOWE, RepeatedHours()).part(
         rates_rows(*opens.tolist())
     )
 
     assert converted["time"].tolist() == [LORD_HOWE.to_utc(value) for value in opens.tolist()]
     assert [record.getMessage() for record in caplog.records] == [
-        f"copy_rates_from: time {first_repeated} is in the broker's repeated hour, read as its "
+        f"copy_rates_range: time {first_repeated} is in the broker's repeated hour, read as its "
         "first occurrence"
     ]

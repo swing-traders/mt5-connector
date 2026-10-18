@@ -443,7 +443,7 @@ async def test_a_request_that_never_reached_the_venue_is_rejected_unsent_at_once
     assert h.events[1].reason == f"not sent: {failure}"
     assert calls_after_order_send(h) == []
     assert len(h.venue.order_send.call_args_list) == 1
-    h.conn.get_account_info.assert_not_called()
+    h.venue.account_info.assert_not_called()
 
 
 def no_publisher() -> errors.NoPublisher:
@@ -567,6 +567,7 @@ async def test_a_verdict_taken_before_its_command_resumes_settles_it_once_it_doe
 
     h.venue.order_send.side_effect = sent_and_settled
     await submit(h, order)
+    await h.drained()
     assert h.names() == ["OrderSubmitted", "OrderAccepted", "AccountState"]
     assert h.events[1].venue_order_id == VenueOrderId("5001")
     await h.verdict(request_id=41, order=5001, deal=6001)

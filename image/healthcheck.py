@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 
 
 def main() -> int:
@@ -19,7 +20,7 @@ def main() -> int:
     except OSError as failure:
         print(f"{url}: {failure}")
         return 1
-    if status == 200:
+    if status == HTTPStatus.OK:
         return 0
     else:
         print(f"{url}: HTTP {status}")

@@ -50,10 +50,13 @@ def tick(msc=0):
     }
 
 
+def account(login):
+    return zeroed(calls.CALLS[Call.ACCOUNT_INFO].layout, login=login)
+
+
 def config(port):
     return MT5Config(
         account=12345678,
-        password="p",
         server="Broker-Demo",
         ws_url=f"ws://127.0.0.1:{port}",
         reconnect_initial_delay_s=0.05,
@@ -335,13 +338,13 @@ async def test_two_calls_answered_in_reverse_order_resolve_each_with_its_own_ans
     hub_session = session(hub, Owner())
     await hub_session.connect()
 
-    total = asyncio.create_task(hub_session.symbols_total())
+    account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
     first, second = await asked(hub, 2)
     await hub.answer(second, tick())
-    await hub.answer(first, 1_234)
+    await hub.answer(first, account(1_234))
 
-    assert (await asyncio.wait_for(total, 1)).result == 1_234
+    assert (await asyncio.wait_for(account_read, 1)).result.login == 1_234
     assert (await asyncio.wait_for(tick_read, 1)).result == calls.Tick(**tick())
     assert first.request_id != second.request_id
     await hub_session.disconnect()
@@ -402,16 +405,16 @@ async def test_deferring_asks_again_after_each_deferring_answer_until_it_is_answ
     hub_session = session(hub, Owner())
     await hub_session.connect()
 
-    read = asyncio.create_task(hub_session.deferring(Call.SYMBOLS_TOTAL))
+    read = asyncio.create_task(hub_session.deferring(Call.ACCOUNT_INFO))
     for count, kind in enumerate(
         (ErrorKind.NOT_READY, ErrorKind.NO_PUBLISHER, ErrorKind.SYNCING), start=1
     ):
         requests = await asked(hub, count)
         await hub.fail(requests[-1], binary.AnswerError(kind, "", 20))
     requests = await asked(hub, 4)
-    await hub.answer(requests[-1], 7)
+    await hub.answer(requests[-1], account(7))
 
-    assert (await asyncio.wait_for(read, 1)).result == 7
+    assert (await asyncio.wait_for(read, 1)).result.login == 7
     await hub_session.disconnect()
 
 
@@ -419,7 +422,7 @@ async def test_deferring_raises_an_answer_that_does_not_defer(hub):
     hub_session = session(hub, Owner())
     await hub_session.connect()
 
-    read = asyncio.create_task(hub_session.deferring(Call.SYMBOLS_TOTAL))
+    read = asyncio.create_task(hub_session.deferring(Call.ACCOUNT_INFO))
     (request,) = await asked(hub)
     await hub.fail(request, binary.AnswerError(ErrorKind.EA_GONE, "left"))
 
@@ -432,7 +435,7 @@ async def test_deferring_stops_when_its_caller_cancels(hub):
     hub_session = session(hub, Owner())
     await hub_session.connect()
 
-    read = asyncio.create_task(hub_session.deferring(Call.SYMBOLS_TOTAL))
+    read = asyncio.create_task(hub_session.deferring(Call.ACCOUNT_INFO))
     (request,) = await asked(hub)
     await hub.fail(request, binary.AnswerError(ErrorKind.NOT_READY, "", 60_000))
     await asyncio.sleep(0.05)
@@ -540,12 +543,12 @@ async def test_a_call_unanswered_past_the_sessions_deadline_raises_and_a_late_an
     loop = asyncio.get_running_loop()
 
     started = loop.time()
-    read = asyncio.create_task(hub_session.symbols_total())
+    read = asyncio.create_task(hub_session.account_info())
     (request,) = await asked(hub)
     with pytest.raises(ResponseLost):
         await asyncio.wait_for(read, 1)
     waited = loop.time() - started
-    await hub.answer(request, 1)
+    await hub.answer(request, account(1))
     await eventually(lambda: owner.log.warning.called)
 
     assert 0.15 <= waited < 0.3
@@ -562,7 +565,7 @@ async def test_a_busy_moves_the_sessions_deadline_to_its_bound(hub, monkeypatch)
     hub_session = session(hub, Owner())
     await hub_session.connect()
 
-    read = asyncio.create_task(hub_session.copy_ticks_from("EURUSD", 1, 1, 1))
+    read = asyncio.create_task(hub_session.copy_ticks_range("EURUSD", 1, 2, 1))
     (request,) = await asked(hub)
     await hub.push(binary.Busy(request.request_id, 1))
     await asyncio.sleep(0.5)
@@ -578,7 +581,7 @@ async def test_a_tick_call_waits_under_the_tick_bound_from_the_moment_it_is_sent
     loop = asyncio.get_running_loop()
 
     told = loop.time()
-    read = asyncio.create_task(hub_session.copy_ticks_from("EURUSD", 1, 1, 1))
+    read = asyncio.create_task(hub_session.copy_ticks_range("EURUSD", 1, 2, 1))
     (request,) = await asked(hub)
     deadline = hub_session._in_flight[request.request_id].timer.when()
     await hub.answer(request, np.zeros(0, dtype=_TICKS))
@@ -594,7 +597,7 @@ async def test_a_tick_reads_busy_holds_the_sessions_deadline_for_its_whole_bound
     await hub_session.connect()
     loop = asyncio.get_running_loop()
 
-    read = asyncio.create_task(hub_session.copy_ticks_from("EURUSD", 1, 1, 1))
+    read = asyncio.create_task(hub_session.copy_ticks_range("EURUSD", 1, 2, 1))
     (request,) = await asked(hub)
     told = loop.time()
     await hub.push(binary.Busy(request.request_id, calls.TICK_BUSY_S))
@@ -877,30 +880,23 @@ async def test_an_answer_of_one_record_in_two_parts_fails_its_call():
     hub_session = session(hub_double, Owner())
     await hub_session.connect()
 
-    total = asyncio.create_task(hub_session.symbols_total())
+    account_read = asyncio.create_task(hub_session.account_info())
     (request,) = await asked(hub_double)
-    await hub_double.answer(request, 1, last=False)
-    await hub_double.answer(request, 2, part=1)
+    await hub_double.answer(request, account(1), last=False)
+    await hub_double.answer(request, account(2), part=1)
 
-    with pytest.raises(ServerUnreachable, match="symbols_total: a integer answer in 2 parts"):
-        await asyncio.wait_for(total, 1)
+    with pytest.raises(ServerUnreachable, match="account_info: a struct answer in 2 parts"):
+        await asyncio.wait_for(account_read, 1)
     await hub_session.disconnect()
     server.close()
 
 
-@pytest.mark.parametrize("call", [Call.COPY_RATES_RANGE, Call.COPY_RATES_FROM])
-async def test_a_bar_read_of_a_timeframe_no_series_serves_is_refused_before_it_is_sent(hub, call):
+async def test_a_bar_read_of_a_timeframe_no_series_serves_is_refused_before_it_is_sent(hub):
     hub_session = session(hub, Owner())
     await hub_session.connect()
-    if call is Call.COPY_RATES_RANGE:
-        arguments = {"date_from": 1, "date_to": 2}
-    else:
-        arguments = {"date_from": 1, "count": 2}
 
     with pytest.raises(ValueError, match="timeframe 999 has no history series"):
-        await asyncio.wait_for(
-            hub_session.request(call, symbol="EURUSD", timeframe=999, **arguments), 1
-        )
+        await asyncio.wait_for(hub_session.copy_rates_range("EURUSD", 999, 1, 2), 1)
     await asyncio.sleep(0.05)
     assert hub.requests() == []
     await hub_session.disconnect()
@@ -915,7 +911,7 @@ async def test_an_answer_whose_payload_runs_short_fails_its_request_at_once_and_
     hub_session = session(hub, owner)
     await hub_session.connect()
     loop = asyncio.get_running_loop()
-    total = asyncio.create_task(hub_session.symbols_total())
+    account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
     first, second = await asked(hub, 2)
 
@@ -926,7 +922,7 @@ async def test_an_answer_whose_payload_runs_short_fails_its_request_at_once_and_
     )
 
     with pytest.raises(ProtocolError, match="answer frame: offset 20: part runs past the payload"):
-        await asyncio.wait_for(total, 1)
+        await asyncio.wait_for(account_read, 1)
     assert loop.time() - started < 0.5
     assert not tick_read.done()
     await hub.answer(second, tick())
@@ -944,13 +940,13 @@ async def test_a_frame_whose_header_does_not_decode_fails_every_request_in_fligh
     owner = Owner()
     hub_session = session(hub, owner)
     await hub_session.connect()
-    total = asyncio.create_task(hub_session.symbols_total())
+    account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
     await asked(hub, 2)
 
     await hub.connections[-1].send(raw)
 
-    for read in (total, tick_read):
+    for read in (account_read, tick_read):
         with pytest.raises(ProtocolError, match="offset 0: "):
             await asyncio.wait_for(read, 1)
     assert len(owner.log.error.call_args_list) == 1
@@ -961,14 +957,14 @@ async def test_an_undecodable_stream_frame_fails_nothing_and_the_session_answers
     owner = Owner()
     hub_session = session(hub, owner)
     await hub_session.connect()
-    total = asyncio.create_task(hub_session.symbols_total())
+    account_read = asyncio.create_task(hub_session.account_info())
     (request,) = await asked(hub)
 
     # A tick frame counting one tick and carrying none.
     await hub.connections[-1].send(raw_header(binary.FrameKind.TICK, b"\x01\x00X", count=1))
-    await hub.answer(request, 3)
+    await hub.answer(request, account(3))
 
-    assert (await asyncio.wait_for(total, 1)).result == 3
+    assert (await asyncio.wait_for(account_read, 1)).result.login == 3
     assert owner.frames == []
     assert owner.log.error.call_args.args[0].startswith("hub session: a frame it cannot decode")
     await hub_session.disconnect()

@@ -1,42 +1,23 @@
 """The MetaTrader5 package's call surface the repository uses, at one release: its functions, the
-structs and arrays they return with their epoch fields, and its constants."""
+structs and arrays they take and return with their epoch fields, and its constants."""
 
 from dataclasses import dataclass, field
 from enum import StrEnum
 
 
 class FunctionName(StrEnum):
-    INITIALIZE = "initialize"
-    SHUTDOWN = "shutdown"
-    LOGIN = "login"
-    VERSION = "version"
     TERMINAL_INFO = "terminal_info"
     ACCOUNT_INFO = "account_info"
-    COPY_TICKS_FROM = "copy_ticks_from"
     COPY_TICKS_RANGE = "copy_ticks_range"
-    COPY_RATES_FROM = "copy_rates_from"
-    COPY_RATES_FROM_POS = "copy_rates_from_pos"
     COPY_RATES_RANGE = "copy_rates_range"
-    POSITIONS_TOTAL = "positions_total"
     POSITIONS_GET = "positions_get"
-    ORDERS_TOTAL = "orders_total"
     ORDERS_GET = "orders_get"
-    HISTORY_ORDERS_TOTAL = "history_orders_total"
     HISTORY_ORDERS_GET = "history_orders_get"
-    HISTORY_DEALS_TOTAL = "history_deals_total"
     HISTORY_DEALS_GET = "history_deals_get"
-    ORDER_CHECK = "order_check"
     ORDER_SEND = "order_send"
-    ORDER_CALC_MARGIN = "order_calc_margin"
-    ORDER_CALC_PROFIT = "order_calc_profit"
     SYMBOL_INFO = "symbol_info"
     SYMBOL_INFO_TICK = "symbol_info_tick"
-    SYMBOLS_TOTAL = "symbols_total"
     SYMBOLS_GET = "symbols_get"
-    MARKET_BOOK_ADD = "market_book_add"
-    MARKET_BOOK_RELEASE = "market_book_release"
-    MARKET_BOOK_GET = "market_book_get"
-    LAST_ERROR = "last_error"
 
 
 class StructName(StrEnum):
@@ -45,12 +26,10 @@ class StructName(StrEnum):
     TRADE_DEAL = "TradeDeal"
     TRADE_REQUEST = "TradeRequest"
     ORDER_SEND_RESULT = "OrderSendResult"
-    ORDER_CHECK_RESULT = "OrderCheckResult"
     TICK = "Tick"
     TERMINAL_INFO = "TerminalInfo"
     SYMBOL_INFO = "SymbolInfo"
     ACCOUNT_INFO = "AccountInfo"
-    BOOK_INFO = "BookInfo"
 
 
 class ArrayName(StrEnum):
@@ -61,21 +40,14 @@ class ArrayName(StrEnum):
 class ParamKind(StrEnum):
     INT = "int"
     STR = "str"
-    FLOAT = "float"
-    BOOL = "bool"
     DATETIME = "datetime"
-    TIMEOUT_MS = "timeout_ms"
     REQUEST = "request"
 
 
 class ResultKind(StrEnum):
-    SCALAR = "scalar"
-    BOOL = "bool"
-    TUPLE = "tuple"
     STRUCT = "struct"
     STRUCTS = "structs"
     ARRAY = "array"
-    NONE = "none"
 
 
 class EpochUnit(StrEnum):
@@ -190,10 +162,6 @@ class Struct:
     # members.
     key: str | None = None
 
-    @property
-    def fields(self) -> tuple[str, ...]:
-        return tuple(member.name for member in self.members)
-
 
 @dataclass(frozen=True)
 class Array:
@@ -231,34 +199,6 @@ FUNCTIONS: dict[FunctionName, Function] = {
     function.name: function
     for function in (
         Function(
-            FunctionName.INITIALIZE,
-            (
-                Param("path", ParamKind.STR),
-                Param("login", ParamKind.INT),
-                Param("password", ParamKind.STR),
-                Param("server", ParamKind.STR),
-                Param("timeout", ParamKind.TIMEOUT_MS),
-                Param("portable", ParamKind.BOOL),
-            ),
-            ResultKind.BOOL,
-        ),
-        Function(
-            FunctionName.SHUTDOWN,
-            (),
-            ResultKind.NONE,
-        ),
-        Function(
-            FunctionName.LOGIN,
-            (
-                Param("login", ParamKind.INT, required=True),
-                Param("password", ParamKind.STR),
-                Param("server", ParamKind.STR),
-                Param("timeout", ParamKind.TIMEOUT_MS),
-            ),
-            ResultKind.BOOL,
-        ),
-        Function(FunctionName.VERSION, (), ResultKind.TUPLE),
-        Function(
             FunctionName.TERMINAL_INFO,
             (),
             ResultKind.STRUCT,
@@ -271,43 +211,10 @@ FUNCTIONS: dict[FunctionName, Function] = {
             struct=StructName.ACCOUNT_INFO,
         ),
         Function(
-            FunctionName.COPY_TICKS_FROM,
-            (
-                _SYMBOL,
-                _DATE_FROM,
-                Param("count", ParamKind.INT, required=True),
-                Param("flags", ParamKind.INT, required=True),
-            ),
-            ResultKind.ARRAY,
-            array=ArrayName.TICKS,
-        ),
-        Function(
             FunctionName.COPY_TICKS_RANGE,
             (_SYMBOL, _DATE_FROM, _DATE_TO, Param("flags", ParamKind.INT, required=True)),
             ResultKind.ARRAY,
             array=ArrayName.TICKS,
-        ),
-        Function(
-            FunctionName.COPY_RATES_FROM,
-            (
-                _SYMBOL,
-                Param("timeframe", ParamKind.INT, required=True),
-                _DATE_FROM,
-                Param("count", ParamKind.INT, required=True),
-            ),
-            ResultKind.ARRAY,
-            array=ArrayName.RATES,
-        ),
-        Function(
-            FunctionName.COPY_RATES_FROM_POS,
-            (
-                _SYMBOL,
-                Param("timeframe", ParamKind.INT, required=True),
-                Param("start_pos", ParamKind.INT, required=True),
-                Param("count", ParamKind.INT, required=True),
-            ),
-            ResultKind.ARRAY,
-            array=ArrayName.RATES,
         ),
         Function(
             FunctionName.COPY_RATES_RANGE,
@@ -315,24 +222,17 @@ FUNCTIONS: dict[FunctionName, Function] = {
             ResultKind.ARRAY,
             array=ArrayName.RATES,
         ),
-        Function(FunctionName.POSITIONS_TOTAL, (), ResultKind.SCALAR),
         Function(
             FunctionName.POSITIONS_GET,
             _OPEN_QUERY,
             ResultKind.STRUCTS,
             struct=StructName.TRADE_POSITION,
         ),
-        Function(FunctionName.ORDERS_TOTAL, (), ResultKind.SCALAR),
         Function(
             FunctionName.ORDERS_GET,
             _OPEN_QUERY,
             ResultKind.STRUCTS,
             struct=StructName.TRADE_ORDER,
-        ),
-        Function(
-            FunctionName.HISTORY_ORDERS_TOTAL,
-            (_DATE_FROM, _DATE_TO),
-            ResultKind.SCALAR,
         ),
         Function(
             FunctionName.HISTORY_ORDERS_GET,
@@ -342,11 +242,6 @@ FUNCTIONS: dict[FunctionName, Function] = {
             forms=_HISTORY_FORMS,
         ),
         Function(
-            FunctionName.HISTORY_DEALS_TOTAL,
-            (_DATE_FROM, _DATE_TO),
-            ResultKind.SCALAR,
-        ),
-        Function(
             FunctionName.HISTORY_DEALS_GET,
             _HISTORY_QUERY,
             ResultKind.STRUCTS,
@@ -354,37 +249,10 @@ FUNCTIONS: dict[FunctionName, Function] = {
             forms=_HISTORY_FORMS,
         ),
         Function(
-            FunctionName.ORDER_CHECK,
-            (_REQUEST,),
-            ResultKind.STRUCT,
-            struct=StructName.ORDER_CHECK_RESULT,
-        ),
-        Function(
             FunctionName.ORDER_SEND,
             (_REQUEST,),
             ResultKind.STRUCT,
             struct=StructName.ORDER_SEND_RESULT,
-        ),
-        Function(
-            FunctionName.ORDER_CALC_MARGIN,
-            (
-                Param("action", ParamKind.INT, required=True),
-                _SYMBOL,
-                Param("volume", ParamKind.FLOAT, required=True),
-                Param("price", ParamKind.FLOAT, required=True),
-            ),
-            ResultKind.SCALAR,
-        ),
-        Function(
-            FunctionName.ORDER_CALC_PROFIT,
-            (
-                Param("action", ParamKind.INT, required=True),
-                _SYMBOL,
-                Param("volume", ParamKind.FLOAT, required=True),
-                Param("price_open", ParamKind.FLOAT, required=True),
-                Param("price_close", ParamKind.FLOAT, required=True),
-            ),
-            ResultKind.SCALAR,
         ),
         Function(
             FunctionName.SYMBOL_INFO,
@@ -398,30 +266,12 @@ FUNCTIONS: dict[FunctionName, Function] = {
             ResultKind.STRUCT,
             struct=StructName.TICK,
         ),
-        Function(FunctionName.SYMBOLS_TOTAL, (), ResultKind.SCALAR),
         Function(
             FunctionName.SYMBOLS_GET,
             (Param("group", ParamKind.STR),),
             ResultKind.STRUCTS,
             struct=StructName.SYMBOL_INFO,
         ),
-        Function(
-            FunctionName.MARKET_BOOK_ADD,
-            (_SYMBOL,),
-            ResultKind.BOOL,
-        ),
-        Function(
-            FunctionName.MARKET_BOOK_RELEASE,
-            (_SYMBOL,),
-            ResultKind.BOOL,
-        ),
-        Function(
-            FunctionName.MARKET_BOOK_GET,
-            (_SYMBOL,),
-            ResultKind.STRUCTS,
-            struct=StructName.BOOK_INFO,
-        ),
-        Function(FunctionName.LAST_ERROR, (), ResultKind.TUPLE),
     )
 }
 
@@ -564,21 +414,6 @@ STRUCTS: dict[StructName, Struct] = {
                 Member("comment", MqlType.STRING, "comment"),
                 Member("request_id", MqlType.UINT, "request_id"),
                 Member("retcode_external", MqlType.INT, "retcode_external"),
-                Member("request", None),
-            ),
-            nested={"request": StructName.TRADE_REQUEST},
-        ),
-        Struct(
-            StructName.ORDER_CHECK_RESULT,
-            (
-                Member("retcode", None),
-                Member("balance", None),
-                Member("equity", None),
-                Member("profit", None),
-                Member("margin", None),
-                Member("margin_free", None),
-                Member("margin_level", None),
-                Member("comment", None),
                 Member("request", None),
             ),
             nested={"request": StructName.TRADE_REQUEST},
@@ -816,15 +651,6 @@ STRUCTS: dict[StructName, Struct] = {
                 Member("company", MqlType.STRING, "ACCOUNT_COMPANY"),
             ),
         ),
-        Struct(
-            StructName.BOOK_INFO,
-            (
-                Member("type", None),
-                Member("price", None),
-                Member("volume", None),
-                Member("volume_dbl", None),
-            ),
-        ),
     )
 }
 
@@ -856,7 +682,6 @@ TICKS = Array(
     ),
     epochs={"time": EpochUnit.SECONDS, "time_msc": EpochUnit.MILLISECONDS},
 )
-ARRAYS: dict[ArrayName, Array] = {array.name: array for array in (RATES, TICKS)}
 
 # ENUM_TIMEFRAMES
 TIMEFRAME_M1 = 1
@@ -1074,11 +899,6 @@ ACCOUNT_MARGIN_MODE_RETAIL_NETTING = 0
 ACCOUNT_MARGIN_MODE_EXCHANGE = 1
 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
 
-# ENUM_BOOK_TYPE
-BOOK_TYPE_SELL = 1
-BOOK_TYPE_BUY = 2
-BOOK_TYPE_SELL_MARKET = 3
-BOOK_TYPE_BUY_MARKET = 4
 
 # trade server return codes
 TRADE_RETCODE_REQUOTE = 10004
@@ -1122,23 +942,6 @@ TRADE_RETCODE_SHORT_ONLY = 10043
 TRADE_RETCODE_CLOSE_ONLY = 10044
 TRADE_RETCODE_FIFO_CLOSE = 10045
 
-# last_error() codes
-RES_S_OK = 1
-RES_E_FAIL = -1
-RES_E_INVALID_PARAMS = -2
-RES_E_NO_MEMORY = -3
-RES_E_NOT_FOUND = -4
-RES_E_INVALID_VERSION = -5
-RES_E_AUTH_FAILED = -6
-RES_E_UNSUPPORTED = -7
-RES_E_AUTO_TRADING_DISABLED = -8
-RES_E_INTERNAL_FAIL = -10000
-RES_E_INTERNAL_FAIL_SEND = -10001
-RES_E_INTERNAL_FAIL_RECEIVE = -10002
-RES_E_INTERNAL_FAIL_INIT = -10003
-RES_E_INTERNAL_FAIL_CONNECT = -10004
-RES_E_INTERNAL_FAIL_TIMEOUT = -10005
-
 
 CONSTANT_FAMILIES = (
     "TIMEFRAME_",
@@ -1151,9 +954,7 @@ CONSTANT_FAMILIES = (
     "SYMBOL_",
     "DAY_OF_WEEK_",
     "ACCOUNT_",
-    "BOOK_TYPE_",
     "TRADE_RETCODE_",
-    "RES_",
 )
 CONSTANTS: dict[str, int] = {
     name: value for name, value in globals().items() if name.startswith(CONSTANT_FAMILIES)

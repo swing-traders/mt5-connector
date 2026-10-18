@@ -1,6 +1,7 @@
-"""The hub and its EAs in a running image, through the client's hub session; runs only when
-MT5_LIVE_HUB_URL names the hub and MT5_LIVE_HUB_SYMBOL a symbol its account trades, weekends
-included."""
+"""The hub and its EAs in two running images, through the client's hub session; runs only when
+MT5_LIVE_HUB_SYMBOL names a symbol their account trades, weekends included. MT5_LIVE_HUB_URL names
+the hub of a terminal whose MaxBars is the ceiling, MT5_LIVE_CAPPED_HUB_URL one whose MaxBars is
+capped; the server README's live-tier playbook starts both."""
 
 import asyncio
 import logging
@@ -9,6 +10,7 @@ import time
 
 import numpy as np
 import pytest
+from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import InvalidWindow, NoPublisher
@@ -17,13 +19,11 @@ from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.history_wire import Series
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
-HUB_URL = os.environ.get("MT5_LIVE_HUB_URL")
+HUB_URL = os.environ.get("MT5_LIVE_HUB_URL", "ws://127.0.0.1:9000")
+CAPPED_HUB_URL = os.environ.get("MT5_LIVE_CAPPED_HUB_URL", "ws://127.0.0.1:9001")
 SYMBOL = os.environ.get("MT5_LIVE_HUB_SYMBOL")
 
-pytestmark = pytest.mark.skipif(
-    HUB_URL is None or SYMBOL is None,
-    reason="MT5_LIVE_HUB_URL and MT5_LIVE_HUB_SYMBOL are not both set",
-)
+pytestmark = pytest.mark.skipif(SYMBOL is None, reason="MT5_LIVE_HUB_SYMBOL is not set")
 
 Call = calls.Call
 # How long a call may stay deferred while the clock verifies or a chart opens.
@@ -119,18 +119,17 @@ def verdict_of(request_id: int):
     return matches
 
 
-def config() -> MT5Config:
+def config(url: str) -> MT5Config:
     # The session reads the hub's URL and its reconnect delays alone; the account is the image's.
     return MT5Config(
         account=1,
-        password="unused",
         server="unused",
-        ws_url=HUB_URL,
+        ws_url=url,
     )
 
 
-async def connected(owner: Owner) -> HubSession:
-    session = HubSession(config(), asyncio.get_running_loop(), owner.on_frame, None, Log())
+async def connected(owner: Owner, url: str = HUB_URL) -> HubSession:
+    session = HubSession(config(url), asyncio.get_running_loop(), owner.on_frame, None, Log())
     await session.connect()
     return session
 
@@ -203,7 +202,6 @@ async def test_every_spawner_read_answers_as_its_row_types_it(session):
 
     account = (await ask(hub_session, Call.ACCOUNT_INFO)).result
     terminal = (await ask(hub_session, Call.TERMINAL_INFO)).result
-    total = (await ask(hub_session, Call.SYMBOLS_TOTAL)).result
     symbols = (await ask(hub_session, Call.SYMBOLS_GET)).result
     positions = (await ask(hub_session, Call.POSITIONS_GET)).result
     orders = (await ask(hub_session, Call.ORDERS_GET)).result
@@ -215,7 +213,6 @@ async def test_every_spawner_read_answers_as_its_row_types_it(session):
     assert isinstance(account.trade_allowed, bool)
     assert is_struct(terminal, "TerminalInfo") and terminal.connected is True
     assert terminal.maxbars > 0
-    assert isinstance(total, int) and total > 0
     assert len(symbols) > 0 and all(is_struct(symbol, "SymbolListing") for symbol in symbols)
     listed = {symbol.name: symbol for symbol in symbols}
     assert type(symbols[0])._fields == binary.SYMBOL_LISTING.fields
@@ -361,24 +358,28 @@ async def test_a_window_starting_after_the_terminals_time_raises_invalid_window(
         )
 
 
-async def test_a_bar_window_one_period_over_the_span_cap_answers_every_bar_once(session):
-    hub_session, _ = session
-    maxbars = (await ask(hub_session, Call.TERMINAL_INFO)).result.maxbars
-    # Ending a whole hour back, so no bar of either read is still forming.
-    end = int(time.time()) // HOUR_S * HOUR_S - HOUR_S
-    over, under = end - (maxbars - 10) * MINUTE_S, end - (maxbars - 11) * MINUTE_S
-    if over < DAY_S:
-        pytest.skip(f"MaxBars {maxbars} spans an M1 window from before 1970-01-02")
-    # The bars the window holds, read in thirds, each well within the cap.
-    cuts = [over + (end - over) * third // 3 for third in range(4)]
-    thirds = []
-    for k in range(2):
-        thirds.append(await m1_bars(hub_session, cuts[k], cuts[k + 1] - 1))
-    thirds.append(await m1_bars(hub_session, cuts[2], end))
-    expected = np.concatenate(thirds)
+async def test_a_bar_window_one_period_over_the_span_cap_answers_every_bar_once():
+    try:
+        hub_session = await connected(Owner(), CAPPED_HUB_URL)
+    except WebSocketClientError as exc:
+        pytest.fail(f"no hub answers at {CAPPED_HUB_URL}: {exc}")
+    try:
+        maxbars = (await ask(hub_session, Call.TERMINAL_INFO)).result.maxbars
+        # Ending a whole hour back, so no bar of either read is still forming.
+        end = int(time.time()) // HOUR_S * HOUR_S - HOUR_S
+        over, under = end - (maxbars - 10) * MINUTE_S, end - (maxbars - 11) * MINUTE_S
+        # The bars the window holds, read in thirds, each well within the cap.
+        cuts = [over + (end - over) * third // 3 for third in range(4)]
+        thirds = []
+        for k in range(2):
+            thirds.append(await m1_bars(hub_session, cuts[k], cuts[k + 1] - 1))
+        thirds.append(await m1_bars(hub_session, cuts[2], end))
+        expected = np.concatenate(thirds)
 
-    over_cap = await m1_bars(hub_session, over, end)
-    at_cap = await m1_bars(hub_session, under, end)
+        over_cap = await m1_bars(hub_session, over, end)
+        at_cap = await m1_bars(hub_session, under, end)
+    finally:
+        await hub_session.disconnect()
 
     assert len(expected) > 0
     assert np.all(np.diff(expected["time"]) > 0)

@@ -1,5 +1,5 @@
 # The MT5 server: the terminal under Wine with the connector's EA compiled in, and the connector's
-# hub under the environment's Linux Python, headless.
+# hub under the image's Linux Python, headless.
 # Build context: the repository root. The Wine apt version is the one version held here; every
 # downloaded artifact is versioned by its row in image/artifacts.txt.
 ARG VERSION_WINE=11.19~trixie-1
@@ -108,20 +108,22 @@ RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
     && rm -rf "$WINEPREFIX/drive_c/users/mt5/AppData/Roaming/MetaQuotes/WebInstall" \
     && find "$WINEPREFIX/drive_c/Program Files/MetaTrader 5/Bases" -mindepth 1 -delete
 
-# The checkout's runtime environment, its client editable from the copy, is the base environment,
-# root-owned and read-only. Root's steps run in root's home, leaving nothing in the runtime user's.
+# The image's environment, Python and pip alone, is the base environment, root-owned and read-only.
+# Root's steps run in root's home, leaving nothing in the runtime user's.
 USER root
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
-COPY environment.yml VERSION /opt/mt5-connector/
-COPY packages/client /opt/mt5-connector/packages/client
-RUN export HOME=/root PIP_ROOT_USER_ACTION=ignore PIP_NO_CACHE_DIR=1 \
+COPY image/environment.yml /opt/mt5-connector/
+RUN export HOME=/root \
     && micromamba install --yes --name base --file /opt/mt5-connector/environment.yml \
     && micromamba clean --all --yes \
     && rm -rf "$MAMBA_ROOT_PREFIX/pkgs" \
     && chown -R root:root "$MAMBA_ROOT_PREFIX" \
     && chmod -R go-w "$MAMBA_ROOT_PREFIX"
 
-# The wheel of the checkout's server: the hub runs from it, and the EA builds from its MQL5 sources.
+# The wheel of the checkout's server, carrying a copy of the client's wire vocabulary its link
+# names: the hub runs from it, and the EA builds from its MQL5 sources.
+COPY VERSION /opt/mt5-connector/
+COPY packages/client/mt5connector/wire /opt/mt5-connector/packages/client/mt5connector/wire
 COPY packages/server /opt/mt5-connector/packages/server
 RUN export HOME=/root PIP_ROOT_USER_ACTION=ignore PIP_NO_CACHE_DIR=1 \
     && python -m pip wheel --no-deps --wheel-dir /opt/mt5-connector/dist \

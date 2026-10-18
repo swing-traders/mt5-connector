@@ -279,7 +279,7 @@ NT TradingNode ──> mt5connector.client (data + exec clients, provider, facto
 
 The adapter reaches the terminal through the hub alone, every call on a hub session of the connection or client it belongs to — the connection's (`MT5Connection.session`) or a client's own; no module holds a session or a last error. A config is refused when built without the hub's URL. Neither distribution imports anything of the other; `tests/test_distributions.py` pins both import chains.
 
-The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `environment.yml`, the hub and the EA from `packages/server`. The image's Windows Python runs the dialogs' driver, `image/terminal_gui.py`, on its standard library alone; nothing is installed into it. Every apt package the `Dockerfile` pins takes its version from an `ARG VERSION_<PACKAGE>` used at every pin, never a literal, and every file it downloads is versioned by its row in `image/artifacts.txt` alone — the URL carries the version, the SHA-256 pins the bytes.
+The server image (`Dockerfile`, its files in `image/`) is a release artifact like the wheels, built from the tagged checkout alone: the Linux Python from `image/environment.yml`, Python and pip alone, and the hub and the EA from `packages/server`'s wheel; nothing of the client or NautilusTrader enters it. The image's Windows Python runs the dialogs' driver, `image/terminal_gui.py`, on its standard library alone; nothing is installed into it. Every apt package the `Dockerfile` pins takes its version from an `ARG VERSION_<PACKAGE>` used at every pin, never a literal, and every file it downloads is versioned by its row in `image/artifacts.txt` alone — the URL carries the version, the SHA-256 pins the bytes.
 
 ---
 
@@ -293,7 +293,7 @@ The design documents itself in-repo: `packages/server/mt5connector/server/` modu
   - A repeated wall-clock hour reads as its first occurrence, and a skipped one at the offset before the change, since the broker's clock moves minutes after the zone's; each warns once per hour. The spawner's server-time sample, a live reading of the terminal's clock, reads a repeated hour as the occurrence nearer the hub's clock.
   - Of two bars of a series that convert to one true-UTC period, the hub pushes and answers the first and drops the other, with a warning once per hour; nothing is merged.
   - A history window about a clock change is read across every broker stamp that reads into it, at either occurrence of a repeated hour, and answered with those alone. A zero epoch stays zero.
-- **No authentication.** The hub trusts its network. The image publishes no host port, loopback included, so it is reachable on the container network alone; publishing one is a design change.
+- **No authentication.** The hub trusts its network. The image declares no host port, loopback included, and declaring one is a design change; a runtime may publish the hub's port on its own host.
 - **The image contract lives in the server's README.** A change to a setting, an entry point, the EA's inputs, what the terminal needs or how the image builds and boots updates its "What the image provides" section in the same change.
 
 ---
@@ -402,7 +402,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 - **Every test but the image tier and the live hub tier runs without a terminal.** Client tests (`tests/client/`) hand a client a double of its connection or of its hub session (`session_double.py`), or serve its sessions a hub double on a loopback port (`hub_double.py`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
 - **The image tier** (`tests/image/`) starts a built image on a made-up account and runs only when asked for, its GUI-driver and log-tail tests aside; the server README says how to run it.
-- **The live hub tier** (`tests/live/`) needs a running image's hub; it runs only when asked for, and `README.md` says how to run it.
+- **The live hub tier** (`tests/live/`) needs two running images' hubs on one account, one terminal's `MaxBars` capped; it runs only when asked for, and the server README's playbook says how to start both and run it.
 - **An `xfail` is `strict=True` and names the defect it pins.** An xfail that starts passing is a fix to record, never a marker to leave.
 
 ---

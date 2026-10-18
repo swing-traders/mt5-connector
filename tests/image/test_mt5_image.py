@@ -407,13 +407,13 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
 def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password() -> None:
     runtime = _runtime()
     name = f"mt5-image-boot-test-{os.getpid()}"
-    subprocess.run(
-        [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
         _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         output = _logs(runtime, name)
     finally:
@@ -425,6 +425,67 @@ def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password()
     assert "mt5: adding 127.0.0.1 to the WebRequest allowlist" in output
     assert "mt5: the WebRequest allowlist holds 127.0.0.1 alone" in output
     assert _ACCOUNT["MT5_PASSWORD"] not in output
+
+
+def _startup_ini(max_bars: str | None) -> str:
+    """The startup ini the entrypoint writes on the unknown account, `MT5_MAX_BARS` set to
+    `max_bars` unless it is None; the container is removed once the ini is read."""
+    runtime = _runtime()
+    name = f"mt5-image-ini-test-{os.getpid()}"
+    environment = {**os.environ, **_ACCOUNT}
+    settings = _account_env()
+    if max_bars is not None:
+        environment["MT5_MAX_BARS"] = max_bars
+        settings += ["-e", "MT5_MAX_BARS"]
+    try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *settings, _IMAGE],
+            env=environment,
+            check=True,
+            timeout=60,
+        )
+        fetching = "mt5: fetching the trade server's broker into the server list"
+        _await_log(runtime, name, fetching, count=1, seconds=120)
+        read = subprocess.run(
+            [runtime, "exec", name, "cat", "/tmp/mt5/setup.ini"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+    return read.stdout
+
+
+@_needs_image
+@pytest.mark.parametrize(
+    ("max_bars", "written"), [(None, "100000000"), ("100000", "100000")], ids=["unset", "set"]
+)
+def test_the_startup_ini_carries_max_bars_the_terminals_ceiling_unless_set(max_bars, written):
+    lines = _startup_ini(max_bars).splitlines()
+
+    assert [line for line in lines if line.startswith("MaxBars=")] == [f"MaxBars={written}"]
+
+
+@_needs_image
+@pytest.mark.parametrize("max_bars", ["0", "abc", ""], ids=["zero", "word", "empty"])
+def test_a_max_bars_that_is_no_positive_integer_fails_the_start_naming_it(max_bars) -> None:
+    runtime = _runtime()
+    name = f"mt5-image-max-bars-test-{os.getpid()}"
+    try:
+        result = subprocess.run(
+            [runtime, "run", "--rm", "--name", name, *_account_env(), "-e", "MT5_MAX_BARS", _IMAGE],
+            env={**os.environ, **_ACCOUNT, "MT5_MAX_BARS": max_bars},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+
+    assert result.returncode == 1
+    assert "mt5: MT5_MAX_BARS is not a positive integer" in result.stdout + result.stderr
 
 
 def _start_with(tmp_path, stub_at: str, stub: str, *, timeout: int) -> subprocess.CompletedProcess:
@@ -524,13 +585,13 @@ done
 def test_a_terminal_that_exits_during_the_boot_ends_the_container_with_its_status() -> None:
     runtime = _runtime()
     name = f"mt5-image-test-{os.getpid()}"
-    subprocess.run(
-        [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
         _await_log(runtime, name, "mt5: launching the terminal", count=1, seconds=120)
         subprocess.run([runtime, "exec", name, "sh", "-c", _KILL_TERMINAL], check=True, timeout=60)
         status = subprocess.run(
@@ -549,23 +610,23 @@ def test_a_stop_closes_the_terminal_and_ends_the_container_within_the_stop_timeo
     runtime = _runtime()
     name = f"mt5-image-stop-test-{os.getpid()}"
     stop_timeout = _STOP_TIMEOUT_SECONDS
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--stop-timeout",
-            str(stop_timeout),
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
+        subprocess.run(
+            [
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--stop-timeout",
+                str(stop_timeout),
+                *_account_env(),
+                _IMAGE,
+            ],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
         _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         started = time.monotonic()
         subprocess.run([runtime, "stop", name], capture_output=True, timeout=stop_timeout + 30)
@@ -630,27 +691,27 @@ def _booted(runtime: str, tmp_path, name: str):
     for script, text in (("read_allowlist.py", _READ_ALLOWLIST), ("absent.py", _ABSENT_CHECKBOX)):
         (scripts / script).write_text(text)
         (scripts / script).chmod(0o644)
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--stop-timeout",
-            str(_STOP_TIMEOUT_SECONDS),
-            "-v",
-            _BASES,
-            "-v",
-            f"{scripts}:{_SCRIPTS}:ro,z",
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
+        subprocess.run(
+            [
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--stop-timeout",
+                str(_STOP_TIMEOUT_SECONDS),
+                "-v",
+                _BASES,
+                "-v",
+                f"{scripts}:{_SCRIPTS}:ro,z",
+                *_account_env(),
+                _IMAGE,
+            ],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
         _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         yield name
     finally:
@@ -883,23 +944,23 @@ def _health(port: int) -> tuple[int, dict] | None:
 def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> None:
     runtime = _runtime()
     name = f"mt5-image-hub-test-{os.getpid()}"
-    subprocess.run(
-        [
-            runtime,
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--publish",
-            f"127.0.0.1::{_HUB_PORT}",
-            *_account_env(),
-            _IMAGE,
-        ],
-        env={**os.environ, **_ACCOUNT},
-        check=True,
-        timeout=60,
-    )
     try:
+        subprocess.run(
+            [
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--publish",
+                f"127.0.0.1::{_HUB_PORT}",
+                *_account_env(),
+                _IMAGE,
+            ],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
         hub = _published_port(runtime, name, _HUB_PORT)
         _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         deadline = time.monotonic() + 30

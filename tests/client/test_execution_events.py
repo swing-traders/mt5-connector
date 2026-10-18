@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 from exec_harness import ACCOUNT_ID, MAGIC, STRATEGY_ID, TRADER_ID, build, ours_deal, ours_order
+from hub_double import eventually
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.core.uuid import UUID4
@@ -19,8 +20,7 @@ from session_double import deal_added, order_left, request_done, transaction_fra
 from venue_doubles import account_info, trade_deal
 
 from mt5connector.client import errors, execution
-from mt5connector.client.connection import AccountSnapshot
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
 
@@ -238,7 +238,7 @@ async def test_two_deals_on_two_positions_fill_with_their_own_venue_position_ids
             fee=-0.1,
         ),
     )
-    h.client._account_turn()
+    await h.client._account_turn()
     assert h.names() == ["OrderFilled", "OrderFilled", "AccountState"]
     first, second = fills(h)
     assert (
@@ -643,7 +643,7 @@ async def test_a_pending_order_the_venue_ended_emits_its_end_once(exec_venue, st
 
     await h.delivered(order_left(TransactionType.ORDER_DELETE, ended))
     await h.delivered(order_left(TransactionType.HISTORY_ADD, ended))
-    h.client._account_turn()
+    await h.client._account_turn()
 
     assert h.names() == [event, "AccountState"]
     assert h.events[0].client_order_id == order.client_order_id
@@ -886,7 +886,7 @@ async def test_the_account_books_balance_and_credit_with_the_margin_locked(exec_
     h.place(h.limit(), ticket=9001)
     await h.connect()
     await h.deals_added(ours_deal(ticket=7001, order=9001))
-    h.client._account_turn()
+    await h.client._account_turn()
     assert h.names() == ["OrderFilled", "AccountState"]
     state = h.ledger[-1]
     assert state.account_id == ACCOUNT_ID
@@ -905,7 +905,7 @@ async def test_the_account_reports_its_margin_as_one_account_level_balance(exec_
     )
     await h.connect()
     h.client._account_owed = True
-    h.client._account_turn()
+    await h.client._account_turn()
     (margin,) = h.ledger[-1].margins
     assert margin.instrument_id is None
     assert (margin.initial, margin.maintenance) == (
@@ -918,11 +918,11 @@ async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec
     h = build(exec_venue)
     await h.connect_keeping_events()
     account = MarginAccount(h.ledger[-1])
-    h.conn.get_account_info.return_value = AccountSnapshot.from_mt5(
-        account_info(margin=200.0, margin_initial=40.0, margin_maintenance=150.0)
+    h.venue.account_info.return_value = account_info(
+        margin=200.0, margin_initial=40.0, margin_maintenance=150.0
     )
     h.client._account_owed = True
-    h.client._account_turn()
+    await h.client._account_turn()
     account.apply(h.ledger[-1])
     assert account.account_margins_init() == {USD: Money(Decimal("200.00"), USD)}
     assert account.account_margins_maint() == {USD: Money(Decimal("150.00"), USD)}
@@ -931,7 +931,7 @@ async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec
 async def test_a_turn_owing_no_report_and_before_the_refresh_period_reports_nothing(exec_venue):
     h = await connected(exec_venue)
 
-    h.client._account_turn()
+    await h.client._account_turn()
 
     assert h.names() == []
 
@@ -947,34 +947,93 @@ async def test_the_account_is_reported_on_the_configs_refresh_period(exec_venue)
     assert h.names() == ["AccountState"]
 
 
+async def test_an_account_turn_reads_the_account_on_its_session_while_the_loop_runs_on(exec_venue):
+    h = await connected(exec_venue, exec_poll_interval_ms=50)
+    exec_venue.account_info.return_value = account_info(balance=20_000.0, margin=0.0)
+    asked = asyncio.Event()
+    answered = asyncio.Event()
+    plain = h.push.request
+
+    async def held(call, **arguments):
+        if call is calls.Call.ACCOUNT_INFO:
+            asked.set()
+            await answered.wait()
+        return await plain(call, **arguments)
+
+    h.push.request = held
+    h.client._account_owed = True
+    account_loop = asyncio.get_running_loop().create_task(h.client._account_loop())
+    try:
+        await eventually(asked.is_set)
+        await asyncio.sleep(0.1)
+        assert h.names() == []
+        answered.set()
+        await eventually(lambda: h.names() == ["AccountState"])
+    finally:
+        account_loop.cancel()
+        await asyncio.gather(account_loop, return_exceptions=True)
+    (balance,) = h.ledger[-1].balances
+    assert balance.total == Money(Decimal("20000.00"), USD)
+
+
+async def test_a_report_an_event_owes_while_the_accounts_read_is_in_flight_stays_owed(exec_venue):
+    h = build(exec_venue)
+    h.place(h.limit(), ticket=9001)
+    await h.connect()
+    asked = asyncio.Event()
+    answered = asyncio.Event()
+    plain = h.push.request
+
+    async def first_held(call, **arguments):
+        if call is calls.Call.ACCOUNT_INFO and not asked.is_set():
+            asked.set()
+            await answered.wait()
+        return await plain(call, **arguments)
+
+    h.push.request = first_held
+    h.client._account_owed = True
+    turn = asyncio.get_running_loop().create_task(h.client._account_turn())
+    await eventually(asked.is_set)
+    await h.deals_added(ours_deal(ticket=7001, order=9001))
+    answered.set()
+    await asyncio.wait_for(turn, 1)
+    exec_venue.account_info.reset_mock()
+
+    await h.client._account_turn()
+
+    assert exec_venue.account_info.call_count == 1
+    assert h.names() == ["OrderFilled", "AccountState", "AccountState"]
+
+
 @pytest.mark.parametrize(
     "failure",
     [
+        errors.NotReady("account_info: the broker clock is not verified", 0, 5.0),
         errors.HubTimeout("account_info: the EA did not answer within its deadline", 0),
         errors.ServerUnreachable("account_info: unavailable"),
         errors.ResponseLost("account_info: unavailable"),
-        errors.MT5ConnectionError("MT5 not connected (state=DISCONNECTED)"),
     ],
+    ids=["not-ready", "timeout", "unreachable", "lost"],
 )
-async def test_an_account_report_the_server_does_not_answer_stays_owed_and_warns_once(
+async def test_an_account_report_the_hub_does_not_answer_stays_owed_and_warns_once(
     exec_venue, failure
 ):
     h = build(exec_venue)
     h.place(h.limit(), ticket=9001)
     await h.connect()
     await h.deals_added(ours_deal(ticket=7001, order=9001))
-    h.conn.get_account_info.side_effect = failure
+    exec_venue.account_info.side_effect = failure
     for _ in range(3):
-        h.client._account_turn()
+        await h.client._account_turn()
     assert h.names() == ["OrderFilled"]
-    assert h.conn.get_account_info.call_count == 3
+    assert exec_venue.account_info.call_count == 3
     assert len(h.logged(LogLevel.WARNING)) == 1
 
-    h.conn.get_account_info.side_effect = None
-    h.client._account_turn()
-    h.client._account_turn()
+    exec_venue.account_info.side_effect = None
+    await h.client._account_turn()
+    await h.client._account_turn()
     assert h.names() == ["OrderFilled", "AccountState"]
     assert len(h.logged(LogLevel.WARNING)) == 1
     assert [line for line in h.logged(LogLevel.INFO) if "answers again" in line] == [
-        "account report: the server answers again"
+        "account report: the hub answers again"
     ]

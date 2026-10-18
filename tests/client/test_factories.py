@@ -33,7 +33,6 @@ GBPUSD = InstrumentId.from_str("GBPUSD.MT5")
 def make_config(account=12345678, server="Exness-MT5Trial1", venue=MT5_VENUE):
     return MT5Config(
         account=account,
-        password="test_password",
         server=server,
         ws_url="ws://127.0.0.1:9000",
         venue=venue,

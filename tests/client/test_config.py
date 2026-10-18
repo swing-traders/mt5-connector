@@ -10,7 +10,7 @@ _WS_URL = "ws://192.168.1.10:9001"
 
 
 def _base(**kw):
-    return MT5Config(account=1, password="p", server="s", **kw)
+    return MT5Config(account=1, server="s", **kw)
 
 
 def _config(**kw):

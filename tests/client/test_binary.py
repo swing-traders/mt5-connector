@@ -273,9 +273,8 @@ def test_a_symbols_name_travels_as_the_key_ahead_of_its_typed_members():
 
     assert raw[:10] == struct.pack("<H", 8) + b"EURUSD.a"
     assert binary.read_record(binary.Reader(raw), layout) == values
-    assert layout.fields.index("name") == mirror.STRUCTS[
-        mirror.StructName.SYMBOL_INFO
-    ].fields.index("name")
+    members = mirror.STRUCTS[mirror.StructName.SYMBOL_INFO].members
+    assert layout.fields.index("name") == [member.name for member in members].index("name")
 
 
 def test_a_struct_packs_each_member_by_its_accessor_in_order():

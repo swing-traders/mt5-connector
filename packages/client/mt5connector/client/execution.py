@@ -84,7 +84,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.objects import AccountBalance, MarginBalance, Money, Price, Quantity
 
-from mt5connector.client.connection import MarginMode
+from mt5connector.client.connection import AccountSnapshot, MarginMode
 from mt5connector.client.currencies import register_venue_currency, venue_currency
 from mt5connector.client.errors import (
     EaError,
@@ -496,7 +496,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         await self._hub.connect()
         try:
             await self._take_in_venue()
-            self._refresh_account()
+            await self._refresh_account()
             self._account_unanswered = False
             await self._hub.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
         except BaseException:
@@ -574,16 +574,16 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     async def _account_loop(self) -> None:
         while True:
-            self._account_turn()
+            await self._account_turn()
             await asyncio.sleep(self._config.exec_poll_interval_s)
 
-    def _account_turn(self) -> None:
+    async def _account_turn(self) -> None:
         """Reports the account when an event owes a report or the refresh period is up. A report the
-        server does not answer stays owed and is logged once until one is answered, any other
-        failure with its stack."""
+        hub does not answer stays owed and is logged once until one is answered, any other failure
+        with its stack."""
         if self._account_owed or self._clock.timestamp_ns() >= self._account_due_ns:
             try:
-                self._refresh_account()
+                await self._refresh_account()
             except MT5ConnectionError as exc:
                 if not self._account_unanswered:
                     self._log.warning(f"account report: {exc}")
@@ -593,7 +593,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             else:
                 if self._account_unanswered:
                     self._account_unanswered = False
-                    self._log.info("account report: the server answers again")
+                    self._log.info("account report: the hub answers again")
 
     # ── The hub session ──────────────────────────────────────────────────────
 
@@ -834,28 +834,33 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             "ts_event": deal.time_msc * 1_000_000,
         }
 
-    def _refresh_account(self) -> None:
+    async def _refresh_account(self) -> None:
         """Reports the account: its balance and credit in total, its margin locked and the rest
         free, and one account-level margin — the margin the venue states as used as initial, the
         maintenance floor as maintenance; NT's portfolio adds the open positions' unrealised P&L. A
-        report that fails stays owed to the next account turn."""
-        self._account_owed = True
-        account = self._conn.get_account_info()
-        total = Money(account.balance + account.credit, self.base_currency)
-        locked = Money(account.margin, self.base_currency)
-        free = Money(total.as_decimal() - locked.as_decimal(), self.base_currency)
-        margin = MarginBalance(
-            initial=Money(account.margin, self.base_currency),
-            maintenance=Money(account.margin_maintenance, self.base_currency),
-            instrument_id=None,
-        )
-        self.generate_account_state(
-            balances=[AccountBalance(total, locked, free)],
-            margins=[margin],
-            reported=True,
-            ts_event=self._clock.timestamp_ns(),
-        )
+        report that fails stays owed to the next account turn, and so does one an event owes while
+        the read is in flight, since the answer may predate the event."""
         self._account_owed = False
+        try:
+            answered = await self._hub.request(calls.Call.ACCOUNT_INFO)
+            account = AccountSnapshot.from_mt5(answered.result)
+            total = Money(account.balance + account.credit, self.base_currency)
+            locked = Money(account.margin, self.base_currency)
+            free = Money(total.as_decimal() - locked.as_decimal(), self.base_currency)
+            margin = MarginBalance(
+                initial=Money(account.margin, self.base_currency),
+                maintenance=Money(account.margin_maintenance, self.base_currency),
+                instrument_id=None,
+            )
+            self.generate_account_state(
+                balances=[AccountBalance(total, locked, free)],
+                margins=[margin],
+                reported=True,
+                ts_event=self._clock.timestamp_ns(),
+            )
+        except BaseException:
+            self._account_owed = True
+            raise
         self._account_due_ns = (
             self._clock.timestamp_ns() + self._config.account_refresh_seconds * 1_000_000_000
         )
@@ -1089,7 +1094,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 self._modify_rejected(order, order.venue_order_id, f"not sent: {exc}")
             else:
                 self._exit_updated(order, exit_id.slot, command.quantity, level)
-                self._refresh_account()
+                await self._refresh_account()
         else:
             pending = self._started(
                 Command.AMEND, order, slot=exit_id.slot, quantity=command.quantity, level=level
@@ -1144,7 +1149,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             else:
                 self._finished(pending, SendOutcome.NOT_SENT)
                 self._cancel_closed(order, exit_id, deals)
-                self._refresh_account()
+                await self._refresh_account()
 
     def _cancel_closed(self, order: Order, exit_id: _ExitId, deals) -> None:
         """Answers the cancel of an exit whose position the venue no longer holds, from the
@@ -1301,7 +1306,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 await self._command(pending, request)
             else:
                 self._modify_rejected(order, _venue_order_id(ticket), refusal)
-                self._refresh_account()
+                await self._refresh_account()
 
     def _modify_rejected(
         self, order: Order, venue_order_id: VenueOrderId | None, reason: str
@@ -1369,7 +1374,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 await self._command(self._started(Command.REMOVE, order, ticket=ticket), request)
             else:
                 self._cancel_rejected(order, _venue_order_id(ticket), refusal)
-                self._refresh_account()
+                await self._refresh_account()
 
     def _cancel_rejected(
         self, order: Order, venue_order_id: VenueOrderId | None, reason: str
@@ -1426,7 +1431,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._sent_for_verdict(pending, sent.result.request_id)
         else:
             self._release_held()
-            self._answered_unsent(pending, sent)
+            await self._answered_unsent(pending, sent)
 
     def _sent_for_verdict(self, pending: _Pending, request_id: int) -> None:
         """Settles a command the terminal sent with the verdict held for it, else keeps it for its
@@ -1438,14 +1443,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         else:
             self._pending[request_id] = pending
 
-    def _answered_unsent(self, pending: _Pending, sent: _Sent) -> None:
+    async def _answered_unsent(self, pending: _Pending, sent: _Sent) -> None:
         """Emits what the terminal's answer proves of a request it did not send: a refusal or a
         request that never reached the venue rejects the command, and a lost answer emits nothing.
         """
         pending.outcome.set_result(sent.outcome)
         if sent.outcome == SendOutcome.REFUSED:
             self._rejected(pending, sent.reason)
-            self._refresh_account()
+            await self._refresh_account()
         elif sent.outcome == SendOutcome.NOT_SENT:
             self._rejected(pending, sent.reason)
         else:
@@ -1467,7 +1472,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             )
         else:
             self._rejected(pending, reason)
-            self._refresh_account()
+            self._handle(self._refresh_account())
 
     def _done(self, pending: _Pending, ticket: int) -> None:
         """Emits what a command the venue completed did; `ticket` is the order a placement
@@ -1523,7 +1528,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 VenueOrderId(str(pending.ticket)),
                 ts_event,
             )
-        self._refresh_account()
+        self._handle(self._refresh_account())
 
     def _accepted(self, order: Order, venue_order_id: VenueOrderId, ts_event: int) -> None:
         """Accepts an order the venue completed, unless NT holds it filled or ended already: its

@@ -48,7 +48,6 @@ EURUSD_ONLY = InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str
 def _config(venue: Venue = MT5_VENUE) -> MT5Config:
     return MT5Config(
         account=12345678,
-        password="p",
         server="Broker-Demo",
         ws_url="ws://127.0.0.1:9000",
         venue=venue,
@@ -95,6 +94,7 @@ def _client(
         "connected": True,
         "trade_allowed": terminal_trade_allowed,
     }
+    served.account_info.return_value = raw_account
     clock = LiveClock()
     with patch.object(execution, "HubSession", partial(ExecSession, served)):
         client = MT5LiveExecutionClient(
@@ -112,8 +112,9 @@ def _client(
 
 @pytest.fixture
 def venue():
-    """The venue behind the client's hub session: no order, position or deal."""
+    """The venue behind the client's hub session: the account, and no order, position or deal."""
     package = MagicMock()
+    package.account_info.return_value = account_info()
     package.orders_get.return_value = ()
     package.positions_get.return_value = ()
     package.history_deals_get.return_value = ()
@@ -332,11 +333,11 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
     Portfolio(msgbus, cache, clock)
     states = []
     msgbus.subscribe(topic="events.account.*", handler=states.append)
+    account = account_info(login=7654321, currency="EUR")
     conn = MagicMock(spec=MT5Connection)
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(
-        account_info(login=7654321, currency="EUR")
-    )
+    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account)
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    venue.account_info.return_value = account
     with patch.object(execution, "HubSession", partial(ExecSession, venue)):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),

@@ -127,7 +127,6 @@ async def connected():
         connection = MT5Connection(
             MT5Config(
                 account=terminal.login,
-                password="p",
                 server=terminal.server,
                 ws_url=f"ws://127.0.0.1:{terminal.hub.port}",
                 venue=Venue(terminal.server),

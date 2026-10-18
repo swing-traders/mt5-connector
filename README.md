@@ -15,7 +15,7 @@ This is the swing-traders organisation's hard fork of [aulekator/mt5-connector](
 
 ## What this is
 
-`mt5-connector` is a **data and execution adapter** that connects [NautilusTrader](https://nautilustrader.io) to any MetaTrader 5 broker. Write your strategy once in Python, then run it as a backtest against historical MT5 data  or flip a switch and run it live.
+`mt5-connector` is a **data and execution adapter** that connects [NautilusTrader](https://nautilustrader.io) to any MetaTrader 5 broker. Write your strategy once in Python, then run it as a backtest against historical MT5 data or live against your broker account.
 
 ```
 MT5 server ←→ mt5-connector-client ←→ NautilusTrader
@@ -71,6 +71,7 @@ The repository ships two distributions, versioned together: one release builds b
   - [Broker compatibility](#broker-compatibility)
   - [Troubleshooting](#troubleshooting)
   - [Safety notes](#safety-notes)
+  - [Contributing](#contributing)
   - [License](#license)
 
 ---
@@ -115,7 +116,7 @@ just test
 
 ## Quick start
 
-**1. Run an MT5 server.** The adapter talks to the MT5 terminal through `mt5-connector-server`, which the image each release publishes runs beside the terminal — [its README](packages/server/mt5connector/server/README.md) states what the terminal and the server need, and how to run the image. The server must be up, and the terminal's AutoTrading on, before you run any script; without AutoTrading every order is rejected.
+**1. Run an MT5 server.** The adapter talks to the MT5 terminal through `mt5-connector-server`, which the image each release publishes runs beside the terminal — [its README](packages/server/mt5connector/server/README.md) states what the terminal and the server need, and how to run the image. The server must be up before you run any script.
 
 **2. Test the connection:**
 
@@ -123,10 +124,7 @@ just test
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import MT5Connection
 
-config = MT5Config(
-    account=12345678, password="your_password", server="YourBroker-Demo",
-    ws_url="ws://127.0.0.1:9000",
-)
+config = MT5Config(account=12345678, server="YourBroker-Demo", ws_url="ws://127.0.0.1:9000")
 with MT5Connection(config) as conn:
     print(conn.get_account_info())
 ```
@@ -135,13 +133,13 @@ with MT5Connection(config) as conn:
 
 ## Configuration
 
-The adapter's own configuration goes through `MT5Config`; its required fields are your account credentials and the URL of the MT5 server's WebSocket hub (`ws_url`), supplied by the application that embeds the client. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
+The adapter's own configuration goes through `MT5Config`; its required fields are your account's login and broker server, which identify it, and the URL of the MT5 server's WebSocket hub (`ws_url`), supplied by the application that embeds the client. No configuration names the symbols a deployment is for: the server serves every symbol the account has, and each client loads the instruments NT's `instrument_provider` config names on it (see [Running in a node](#running-in-a-node)). A config is refused when it is built:
 
 - without a `ws_url`, or with one that is not a `ws` or `wss` URL naming a host;
 - with that URL malformed, or naming a port outside 1–65535;
 - with a `venue` that is not a NautilusTrader `Venue`, or whose name is neither `MT5` nor `MT5_` followed by 1 to 8 capital letters or digits — NautilusTrader reads an account id's issuer as the text before its first hyphen, so a venue cannot carry one.
 
-Its repr and string name none of the credentials: the login, the password and the broker server's name.
+Its repr and string name neither the login nor the broker server's name.
 
 The broker behind an account is the venue: a consumer running several brokers in one process gives each its own venue, and every instrument id, client id and account id carries it. Every connection owns its hub session; nothing is shared across connections but the process. `venue` defaults to `Venue("MT5")`; an account at another broker beside it takes, say, `Venue("MT5_ALPHA")`, its instruments `XAUUSD.MT5_ALPHA` and its clients registered under `MT5_ALPHA`.
 
@@ -150,7 +148,6 @@ from mt5connector.client.config import MT5Config
 
 config = MT5Config(
     account    = 12345678,            # MT5 account number
-    password   = "your_password",
     server     = "Exness-MT5Trial9",  # broker server name
     ws_url     = "ws://127.0.0.1:9000",  # the MT5 server's WebSocket hub
 )
@@ -162,7 +159,6 @@ config = MT5Config(
 config = MT5Config(
     # Required
     account  = 12345678,
-    password = "your_password",
     server   = "Exness-MT5Trial9",
     ws_url   = "ws://127.0.0.1:9000",
 
@@ -186,17 +182,16 @@ config = MT5Config(
 )
 ```
 
-**Loading from the environment** (never hardcode credentials):
+**Loading from the environment:**
 
 ```python
 import os
 from mt5connector.client.config import MT5Config
 
 config = MT5Config(
-    account  = int(os.environ["MT5_ACCOUNT"]),
-    password = os.environ["MT5_PASSWORD"],
-    server   = os.environ["MT5_SERVER"],
-    ws_url   = os.environ["MT5_WS_URL"],
+    account = int(os.environ["MT5_ACCOUNT"]),
+    server  = os.environ["MT5_SERVER"],
+    ws_url  = os.environ["MT5_WS_URL"],
 )
 ```
 
@@ -256,11 +251,7 @@ from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from datetime import datetime, timezone
 
-config = MT5Config(
-    account=12345678, password="your_password",
-    server="Exness-MT5Trial9",
-    ws_url="ws://127.0.0.1:9000",
-)
+config = MT5Config(account=12345678, server="Exness-MT5Trial9", ws_url="ws://127.0.0.1:9000")
 
 conn     = MT5Connection(config)
 conn.connect()
@@ -320,10 +311,9 @@ from mt5connector.client.factories import (
 )
 
 mt5_config = MT5Config(
-    account  = int(os.environ["MT5_ACCOUNT"]),
-    password = os.environ["MT5_PASSWORD"],
-    server   = os.environ["MT5_SERVER"],
-    ws_url   = os.environ["MT5_WS_URL"],
+    account = int(os.environ["MT5_ACCOUNT"]),
+    server  = os.environ["MT5_SERVER"],
+    ws_url  = os.environ["MT5_WS_URL"],
 )
 
 traded   = frozenset({InstrumentId.from_str("EURUSDm.MT5")})
@@ -383,7 +373,7 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
   - Each symbol's publisher publishes that symbol's transactions, so they are pushed while its chart is open: while a consumer subscribes to the symbol or the account holds open positions or pending orders on it, and for `MT5_CHART_IDLE_SECONDS` after the server last read it. The client names the symbol on every request it sends, cancels and modifies included, so a request's transaction travels through its symbol's EA.
 - The execution client polls nothing for events: what the hub session misses — a disconnection, a ticket it could not resolve, a symbol whose chart is closed — NautilusTrader's own reconciliation heals, through its in-flight check and, once a node sets `open_check_interval_secs` and `position_check_interval_secs`, its open-order and position checks. Its one loop reports the account.
 - The account state carries the login's margin as one account-level margin balance in the account currency: the margin the venue states as used as initial, and the maintenance floor as maintenance.
-- There is no authentication: the server trusts its network. Its image publishes no host port, loopback included, so the hub is reachable on the container network alone.
+- There is no authentication: the server trusts its network. Its image declares no host port, loopback included; a runtime may publish the hub's port on its own host.
 
 `mt5connector.client.history` reads history as coroutines on the hub session each is handed as its first argument, every epoch true-UTC seconds:
 
@@ -409,30 +399,24 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 just test
 ```
 
-All tests but the image tier's mock the MT5 terminal — no live connection required to run tests.
+All tests but the image tier's and the live hub tier's mock the MT5 terminal — no live connection required to run them.
 
 ```
 tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the history client and the downloader
 tests/server/              — the WS hub: its streams, requests, clock gate, epoch conversion and settings, the EA's half of the protocol, and the MQL5 generator
 tests/image/               — the server image, started on a made-up account; its GUI driver and log tail
-tests/live/                — the hub and its EAs in a running image, through the client's hub session
+tests/live/                — the hub and its EAs in two running images, through the client's hub session
 tests/test_distributions.py — the two distributions' shared version and the import boundary between them
 ```
 
 The image tier runs against a built image when `MT5_IMAGE_TEST` names it, as the server README's [image tests](packages/server/mt5connector/server/README.md#the-image-tests) state; CI builds the image and runs it on every pull request.
 
-The live hub tier, `tests/live/`, runs from any host when `MT5_LIVE_HUB_URL` names a running image's hub (`ws://host:port`) and `MT5_LIVE_HUB_SYMBOL` a symbol its account trades, weekends included. Every case leaves the account flat:
+The live hub tier, `tests/live/`, runs against two running images' hubs on one account when `MT5_LIVE_HUB_SYMBOL` names a symbol that account trades, weekends included; the server README's [live hub tier](packages/server/mt5connector/server/README.md#the-live-hub-tier) playbook starts both and runs it. Every case leaves the account flat:
 
 - every read the spawner and a publisher serve, and a deal read by its ticket;
 - the symbol's ticks and M1 bars;
 - a pending order whose expiration has passed, which the venue refuses, and a command for a symbol no publisher serves;
-- its history: a cold M1 window and the floor it measures, a window before that floor, one starting after the terminal's time, a window one period over the span cap where the terminal's `MaxBars` leaves one, a day of ticks, and a week of ticks, timing a publisher read every second while it downloads.
-
-Run it with:
-
-```bash
-MT5_LIVE_HUB_URL=ws://<host>:9000 MT5_LIVE_HUB_SYMBOL=<symbol> pytest tests/live -q
-```
+- its history: a cold M1 window and the floor it measures, a window before that floor, one starting after the terminal's time, a window one period over the span cap on the terminal whose `MaxBars` is capped, a day of ticks, and a week of ticks, timing a publisher read every second while it downloads.
 
 ---
 
@@ -442,7 +426,7 @@ MT5_LIVE_HUB_URL=ws://<host>:9000 MT5_LIVE_HUB_SYMBOL=<symbol> pytest tests/live
 mt5-connector/
 ├── VERSION                       # the one version both distributions carry
 ├── Dockerfile                    # the server image
-├── image/                        # the image's boot scripts, GUI driver, log tail, startup ini, template and pins
+├── image/                        # the image's boot scripts, GUI driver, log tail, startup ini, template, Linux Python and pins
 ├── packages/
 │   ├── client/                   # mt5-connector-client
 │   │   ├── pyproject.toml
@@ -476,13 +460,21 @@ mt5-connector/
 │           └── server/
 │               ├── README.md        # the hub protocol and what its image provides
 │               ├── ws_server.py     # the hub (mt5-connector-hub)
+│               ├── settings.py      # the hub's settings, read from the environment
 │               ├── hub_requests.py  # the hub's pending requests and their deadlines
 │               ├── hub_gate.py      # the hub's clock gate
 │               ├── hub_health.py    # the hub's /health
 │               ├── hub_utc.py       # the hub's conversion of every epoch to and from true UTC
+│               ├── eras.py          # arrays of broker epochs in true UTC, the clock asked once per broker hour
+│               ├── windows.py       # a true-UTC window's broker bounds and the seconds that read into it
+│               ├── repeated_hours.py # the once-per-hour warnings of repeated and skipped hours and dropped bars
+│               ├── encoding.py      # a bar's close in true UTC
 │               ├── floors.py        # the history floors measured per series
+│               ├── commissions.py   # the commission schedules the EAs relay, per symbol
+│               ├── sessions.py      # the trading sessions the EAs relay, per symbol
+│               ├── mql5gen.py       # writes the EA's half of the hub protocol from the inventory
 │               ├── wire -> ../../../client/mt5connector/wire
-│               └── mql5/            # the EA, its startup script and their includes
+│               └── mql5/            # the EA, its indicator, its startup script and their includes
 └── tests/                        # full test suite (no live MT5 required; the image tier runs the image)
 ```
 
@@ -510,18 +502,6 @@ Find your exact server name in MT5 → File → Open Account → search your bro
 
 The hub has not verified the broker clock: the terminal is still booting, or it never logged in — a wrong account number, password or server name in the container's environment. Check the container's log and the hub's `/health` (see [its README](packages/server/mt5connector/server/README.md#boot)), then connect again; a longer `timeout_s` waits out a boot still in progress.
 
-**An order rejected with `TRADE_RETCODE_CLIENT_DISABLES_AT: AutoTrading disabled by client`**
-
-AutoTrading is disabled in the server's MT5 terminal. Click the **AutoTrading** button in the toolbar — it should turn green. This must be enabled for any automated order to be sent.
-
-**`Factory was not of type LiveExecClientFactory`**
-
-You are using an old version of `factories.py` where `MT5LiveExecClientFactory` did not inherit from `LiveExecClientFactory`. Update to the latest version.
-
-**Strategy not placing trades after 30+ minutes**
-
-Check that the bar type string in your strategy config exactly matches the bar type you subscribed to in `on_start`. A mismatch means `on_bar` is never called. Also verify AutoTrading is enabled in the server's MT5 terminal.
-
 ---
 
 ## Safety notes
@@ -529,7 +509,7 @@ Check that the bar type string in your strategy config exactly matches the bar t
 - Always use a **demo account** until you have verified your strategy behaves correctly.
 - Every order the adapter sends carries a magic derived from the node's trader id (the first 8 bytes of its SHA-256, masked to 63 bits). The execution client tracks only the orders, positions and deals carrying its own magic, the stop-loss and take-profit deals of the positions it holds exits for, and the stop-outs of the positions it opened, so manual trading on the same account, or a node with another trader id, is left alone.
 - The adapter runs on hedging accounts only: it declares NT's `HEDGING` position model and refuses to connect to an account whose margin mode is netting or exchange, or to a read-only (investor) session.
-- The execution account id is `MT5-<hash>-<magic>`: the first 8 hex digits of the SHA-256 of the login's decimal string, the login read from the account at connect, and the node's magic. Two trader ids on one login book under two ids that share the hash, and the login appears in neither. The login, the password and the broker server's name appear in no log, repr, string or exception message the client composes.
+- The execution account id is `MT5-<hash>-<magic>`: the first 8 hex digits of the SHA-256 of the login's decimal string, the login read from the account at connect, and the node's magic. Two trader ids on one login book under two ids that share the hash, and the login appears in neither. The login and the broker server's name appear in no log, repr, string or exception message the client composes.
 - An order's comment at the venue is the first 29 hex digits of its client order id's SHA-256. Venue tickets map to NT orders through NT's own order records, and through that digest for an order whose submit got no answer; a deal or order neither explains is logged and left to NT's reconciliation.
 - Order lists, post-only and trailing orders, and times in force other than GTC and GTD are rejected before anything is sent.
 - A reduce-only order is an exit of the position its submit names (NT's position id, the venue's position identifier), translated into what the venue holds for one, which is one stop loss and one take profit per position:
@@ -548,12 +528,12 @@ Check that the bar type string in your strategy config exactly matches the bar t
 
 ---
 
-
+## Contributing
 
 Pull requests are welcome. Run the test suite before submitting:
 
 ```bash
-pytest tests/ -v
+just test
 ```
 
 New features should include tests. The test suite mocks the MT5 terminal so no live account is needed to contribute.

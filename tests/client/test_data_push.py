@@ -100,7 +100,6 @@ class Client:
         provider.load_ids_async = AsyncMock()
         config = MT5Config(
             account=12345678,
-            password="p",
             server="Broker-Demo",
             ws_url="ws://127.0.0.1:9000",
         )

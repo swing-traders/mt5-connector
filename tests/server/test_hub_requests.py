@@ -232,7 +232,12 @@ async def test_a_tick_history_read_with_no_history_ea_asks_the_spawner_for_its_h
         consumer = await Consumer.connect(port)
 
         await consumer.ask(
-            1, Call.COPY_TICKS_FROM, symbol="EURUSD", date_from=UTC_EPOCH, count=10, flags=1
+            1,
+            Call.COPY_TICKS_RANGE,
+            symbol="EURUSD",
+            date_from=UTC_EPOCH,
+            date_to=UTC_EPOCH + 60,
+            flags=1,
         )
         refused = await consumer.received()
 
@@ -301,7 +306,6 @@ async def test_two_requests_an_ea_answers_in_reverse_order_resolve_each_with_its
         session = HubSession(
             MT5Config(
                 account=12345678,
-                password="p",
                 server="Broker-Demo",
                 ws_url=f"ws://127.0.0.1:{port}",
             ),
@@ -746,15 +750,15 @@ async def test_a_history_reads_floor_reaches_the_ranges_with_the_terminals_maxba
         consumer = await Consumer.connect(port)
         await consumer.ask(
             1,
-            Call.COPY_RATES_FROM,
+            Call.COPY_RATES_RANGE,
             symbol="EURUSD",
             timeframe=mirror.TIMEFRAME_H1,
             date_from=UTC_EPOCH,
-            count=1,
+            date_to=UTC_EPOCH + 3_600,
         )
         request = await eurusd.request()
         await eurusd.send(
-            answer(request.request_id, Call.COPY_RATES_FROM, [], stub_floor(BROKER_EPOCH))
+            answer(request.request_id, Call.COPY_RATES_RANGE, [], stub_floor(BROKER_EPOCH))
         )
         await consumer.received()
         before = int(time.time())
@@ -1046,11 +1050,11 @@ async def test_a_bar_read_of_a_timeframe_no_series_serves_is_refused():
 
     await consumer.ask(
         1,
-        Call.COPY_RATES_FROM,
+        Call.COPY_RATES_RANGE,
         symbol="EURUSD",
         timeframe=mirror.TIMEFRAME_MN1,
         date_from=UTC_EPOCH,
-        count=1,
+        date_to=UTC_EPOCH + 3_600,
     )
 
     assert await consumer.received() == binary.Refusal(

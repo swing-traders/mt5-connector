@@ -230,19 +230,13 @@ class Results:
             converted = conversion.rows(mirror.TICKS.epochs, kept, where)
         elif self._row.shape is calls.Shape.RATES:
             converted = self._bars(self._in_window(value, value["time"]), conversion, where)
-        elif self._row.shape is calls.Shape.TRANSACTIONS:
-            converted = [_transaction(conversion, transaction, where) for transaction in value]
         else:
-            converted = value
+            converted = [_transaction(conversion, transaction, where) for transaction in value]
         return converted
 
     def _in_window(self, rows: np.ndarray, seconds: np.ndarray) -> np.ndarray:
-        """The rows whose broker second reads into a range read's window; every row of any other
-        read."""
-        if self._window is None:
-            return rows
-        else:
-            return rows[reading_into(self._clock, seconds, *self._window)]
+        """The rows whose broker second reads into the read's window."""
+        return rows[reading_into(self._clock, seconds, *self._window)]
 
     def _bars(self, rates: np.ndarray, conversion: Conversion, where: str) -> np.ndarray:
         """The bars with their opens and closes in true UTC, of two opening at one true-UTC second

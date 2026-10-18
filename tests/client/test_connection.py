@@ -156,7 +156,6 @@ class TestSuccessfulConnect:
         conn = await connect(
             MT5Config(
                 account=12345678,
-                password="test_password",
                 server="Broker-Demo",
                 ws_url=ready.ws_url,
             )
@@ -533,13 +532,11 @@ class TestAccountSnapshot:
 
 SERVER = "Zq7Broker-Live42"
 LOGIN = 918273645
-PASSWORD = "pw-Zq7-secret"
 
 
 def secret_config(ws_url: str) -> MT5Config:
     return MT5Config(
         account=LOGIN,
-        password=PASSWORD,
         server=SERVER,
         ws_url=ws_url,
         reconnect_initial_delay_s=0.01,
@@ -548,12 +545,12 @@ def secret_config(ws_url: str) -> MT5Config:
 
 
 def assert_names_no_credential(text: str) -> None:
-    for credential in (SERVER, str(LOGIN), PASSWORD):
+    for credential in (SERVER, str(LOGIN)):
         assert credential not in text
 
 
 class TestCredentials:
-    """The broker server, the login and the password reach no log, repr, string or exception."""
+    """The broker server and the login reach no log, repr, string or exception."""
 
     @pytest.fixture
     def secret(self, hub, ready):

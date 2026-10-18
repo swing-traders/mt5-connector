@@ -116,7 +116,6 @@ class RecordedExecClient(MT5LiveExecutionClient):
 def config(**fields) -> MT5Config:
     return MT5Config(
         account=12345678,
-        password="p",
         server="Broker-Demo",
         **{"ws_url": "ws://127.0.0.1:9000", **fields},
     )
@@ -254,8 +253,8 @@ def gtd(day: str = "2026-10-04T00:00:00Z") -> dict:
 
 def build(venue, *, instruments=None, account=None, cache=None, **settings) -> Harness:
     """A client of the trader TRADER_ID whose hub session `venue` answers, with EURUSD loaded unless
-    `instruments` names others, its connection reporting `account`, over `cache` when one is given:
-    a restart's client over what NT kept."""
+    `instruments` names others, its connection and its session reporting `account`, over `cache`
+    when one is given: a restart's client over what NT kept."""
     clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
     ledger = []
@@ -268,6 +267,7 @@ def build(venue, *, instruments=None, account=None, cache=None, **settings) -> H
     conn = MagicMock(spec=MT5Connection)
     conn.get_account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
     conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    venue.account_info.return_value = account or account_info()
 
     provider = MagicMock(spec=MT5InstrumentProvider)
     provider.initialize = AsyncMock()

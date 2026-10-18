@@ -18,20 +18,14 @@ SPAWNER_CALLS = {
     Call.ACCOUNT_INFO,
     Call.TERMINAL_INFO,
     Call.SYMBOLS_GET,
-    Call.SYMBOLS_TOTAL,
     Call.POSITIONS_GET,
     Call.ORDERS_GET,
     Call.HISTORY_ORDERS_GET,
     Call.HISTORY_DEALS_GET,
 }
-HISTORY_CALLS = {
-    Call.COPY_RATES_RANGE,
-    Call.COPY_RATES_FROM,
-    Call.COPY_TICKS_RANGE,
-    Call.COPY_TICKS_FROM,
-}
+HISTORY_CALLS = {Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE}
 # The tick history, which the history EA reads in its own thread.
-TICK_CALLS = {Call.COPY_TICKS_RANGE, Call.COPY_TICKS_FROM}
+TICK_CALLS = {Call.COPY_TICKS_RANGE}
 PUBLISHER_CALLS = {
     Call.SYMBOL_INFO,
     Call.SYMBOL_INFO_TICK,
@@ -64,12 +58,11 @@ def ticks(*milliseconds):
 # ── The registry ──────────────────────────────────────────────────────────────
 
 
-def test_the_registry_serves_the_nineteen_calls():
+def test_the_registry_serves_the_sixteen_calls():
     assert {call.name.lower() for call in calls.CALLS} == {
         "account_info",
         "terminal_info",
         "symbols_get",
-        "symbols_total",
         "symbol_info",
         "symbol_info_tick",
         "positions_get",
@@ -78,9 +71,7 @@ def test_the_registry_serves_the_nineteen_calls():
         "history_deals_get",
         "order_send",
         "copy_rates_range",
-        "copy_rates_from",
         "copy_ticks_range",
-        "copy_ticks_from",
         "ranges",
         "outcomes",
         "commission_schedule",
@@ -129,11 +120,11 @@ def test_a_command_waits_under_the_command_deadline_a_copy_under_its_historys_th
             ],
         ),
         (
-            Call.COPY_TICKS_FROM,
+            Call.COPY_TICKS_RANGE,
             [
                 ("symbol", ArgType.STRING, True),
                 ("date_from", ArgType.EPOCH, True),
-                ("count", ArgType.INTEGER, True),
+                ("date_to", ArgType.EPOCH, True),
                 ("flags", ArgType.INTEGER, True),
             ],
         ),
@@ -178,8 +169,7 @@ def test_a_calls_arguments_travel_by_their_wire_types(call, arguments):
         (Call.OUTCOMES, calls.Shape.TRANSACTIONS, None),
         (Call.SYMBOL_INFO_TICK, calls.Shape.TICK, None),
         (Call.COPY_TICKS_RANGE, calls.Shape.TICKS, None),
-        (Call.COPY_RATES_FROM, calls.Shape.RATES, None),
-        (Call.SYMBOLS_TOTAL, calls.Shape.INTEGER, None),
+        (Call.COPY_RATES_RANGE, calls.Shape.RATES, None),
         (Call.RANGES, calls.Shape.RANGES, None),
         (Call.COMMISSION_SCHEDULE, calls.Shape.SCHEDULE, None),
         (Call.TRADING_SESSIONS, calls.Shape.SESSIONS, None),
@@ -190,22 +180,6 @@ def test_a_calls_answer_has_the_shape_of_its_result(call, shape, layout):
     row = calls.CALLS[call]
 
     assert (row.shape, None if row.layout is None else row.layout.name) == (shape, layout)
-
-
-@pytest.mark.parametrize(
-    ("function", "kind"),
-    [
-        (mirror.FunctionName.MARKET_BOOK_ADD, "bool"),
-        (mirror.FunctionName.VERSION, "tuple"),
-        (mirror.FunctionName.SHUTDOWN, "none"),
-    ],
-    ids=lambda value: value if isinstance(value, str) else "",
-)
-def test_a_package_function_of_a_result_kind_the_registry_serves_no_shape_for_is_refused(
-    function, kind
-):
-    with pytest.raises(ValueError, match=f"{function}: .*{kind}"):
-        calls._package(Call.ACCOUNT_INFO, function, ChartRole.SPAWNER, calls.Wait.READ)
 
 
 def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_its_request():
@@ -255,8 +229,8 @@ def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_it
     [
         (Call.SYMBOL_INFO, {"symbol": "EURUSD.a"}, "EURUSD.a"),
         (
-            Call.COPY_TICKS_FROM,
-            {"symbol": "XAUUSD", "date_from": 1, "count": 1, "flags": 1},
+            Call.COPY_TICKS_RANGE,
+            {"symbol": "XAUUSD", "date_from": 1, "date_to": 2, "flags": 1},
             "XAUUSD",
         ),
         (Call.ORDER_SEND, {"request": calls.trade_request({"symbol": "US500#"})}, "US500#"),
@@ -327,7 +301,7 @@ def test_arguments_a_call_does_not_take_are_refused_before_they_are_sent(call, a
 
 
 def test_arguments_out_of_their_calls_order_are_refused_on_arrival():
-    row = calls.CALLS[Call.COPY_TICKS_FROM]
+    row = calls.CALLS[Call.COPY_TICKS_RANGE]
     writer = Writer()
     writer.u8(1)
     writer.i64(1)
@@ -335,7 +309,7 @@ def test_arguments_out_of_their_calls_order_are_refused_on_arrival():
     writer.string("EURUSD")
 
     with pytest.raises(CodecError, match="index 0 is out of order"):
-        calls.decode_arguments(row, binary.Request(1, Call.COPY_TICKS_FROM, 2, writer.payload()))
+        calls.decode_arguments(row, binary.Request(1, Call.COPY_TICKS_RANGE, 2, writer.payload()))
 
 
 def test_a_trade_request_is_whole_with_every_member_not_given_zero():
@@ -475,7 +449,6 @@ def test_bars_reach_a_consumer_with_their_close():
 @pytest.mark.parametrize(
     ("call", "value"),
     [
-        (Call.SYMBOLS_TOTAL, 1_234),
         (
             Call.RANGES,
             calls.Ranges(
@@ -493,7 +466,7 @@ def test_bars_reach_a_consumer_with_their_close():
             {"quote": [[] for _ in range(7)], "trade": [[[0, 0]]] * 7, "last_error": 0},
         ),
     ],
-    ids=["integer", "ranges", "no-floors", "schedule", "sessions"],
+    ids=["ranges", "no-floors", "schedule", "sessions"],
 )
 def test_a_single_record_result_round_trips(call, value):
     row = calls.CALLS[call]
@@ -502,17 +475,18 @@ def test_a_single_record_result_round_trips(call, value):
 
 
 def test_a_single_record_result_in_two_parts_is_refused():
-    row = calls.CALLS[Call.SYMBOLS_TOTAL]
+    row = calls.CALLS[Call.ACCOUNT_INFO]
+    account = zeroed(row.layout)
 
-    with pytest.raises(CodecError, match="symbols_total: a integer answer in 2 parts"):
-        calls.joined(row, [1, 2])
+    with pytest.raises(CodecError, match="account_info: a struct answer in 2 parts"):
+        calls.joined(row, [account, account])
 
 
 def test_a_struct_result_of_two_records_is_refused():
-    row = calls.CALLS[Call.SYMBOLS_TOTAL]
-    count, body = calls.write_result(row, 1)
+    row = calls.CALLS[Call.ACCOUNT_INFO]
+    count, body = calls.write_result(row, zeroed(row.layout))
 
-    with pytest.raises(CodecError, match="symbols_total: 2 records where a integer is one"):
+    with pytest.raises(CodecError, match="account_info: 2 records where a struct is one"):
         calls.read_hub_result(row, binary.Answer(1, 0, True, 0, 2, body + body))
 
 
@@ -568,10 +542,8 @@ def test_a_history_answer_with_two_floors_is_refused():
 
 
 def test_an_eas_single_record_result_in_a_part_before_its_last_is_refused():
-    row = calls.CALLS[Call.SYMBOLS_TOTAL]
-    count, body = calls.write_result(row, 1)
+    row = calls.CALLS[Call.ACCOUNT_INFO]
+    count, body = calls.write_result(row, zeroed(row.layout))
 
-    with pytest.raises(
-        CodecError, match="symbols_total: a integer answer in a part before its last"
-    ):
+    with pytest.raises(CodecError, match="account_info: a struct answer in a part before its last"):
         calls.read_ea_result(row, binary.Answer(1, 0, False, 0, count, body))

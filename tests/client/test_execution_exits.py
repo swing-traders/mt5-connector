@@ -296,7 +296,7 @@ async def turn(h, deals=None):
     else:
         held = h.venue.history_deals_get.return_value
     await h.deals_added(*held)
-    h.client._account_turn()
+    await h.client._account_turn()
 
 
 def fills(h) -> list:

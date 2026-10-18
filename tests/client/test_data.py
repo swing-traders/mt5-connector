@@ -96,7 +96,6 @@ def make_config(ws_url="ws://127.0.0.1:9000", venue=MT5_VENUE):
 
     return MT5Config(
         account=12345678,
-        password="test",
         server="Exness-MT5Trial1",
         ws_url=ws_url,
         venue=venue,

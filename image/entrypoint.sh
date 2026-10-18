@@ -9,6 +9,8 @@ readonly baked_dir=/opt/mt5-baked
 readonly runtime_dir=/tmp/mt5
 readonly startup_ini="$runtime_dir/setup.ini"
 readonly search_ini="$runtime_dir/search.ini"
+# Unset, the terminal's ceiling: it clamps a larger MaxBars to it. Set empty, it is refused.
+readonly max_bars="${MT5_MAX_BARS-100000000}"
 readonly window_wait_seconds=120
 # A stop's bounds together — a call in flight, the terminal's close, the log tail's, the hub's, the
 # display's and the kill — stay under the stop timeout the server README asks the container to be
@@ -88,6 +90,9 @@ require_settings() {
             fail "$name is not set"
         fi
     done
+    if [[ ! "$max_bars" =~ ^[1-9][0-9]*$ ]]; then
+        fail "MT5_MAX_BARS is not a positive integer"
+    fi
 }
 
 # The display is up once its socket is: a start removes whatever socket and lock a killed X server
@@ -157,8 +162,9 @@ acquire_server_list() {
     close_terminal
 }
 
-# The baked ini plus the account's credentials and the spawner's symbol, taken from the environment
-# and written where only this user reads them; the search session's copy runs no startup script.
+# The baked ini plus the account's credentials, MaxBars and the spawner's symbol, taken from the
+# environment and written where only this user reads them; the search session's copy runs no startup
+# script.
 write_inis() {
     mkdir -p -m 0700 "$runtime_dir"
     (
@@ -169,7 +175,7 @@ write_inis() {
 }
 
 write_ini() {
-    awk -v session="$1" '
+    awk -v session="$1" -v max_bars="$max_bars" '
         /^\[/ { skipping = (session == "search" && $0 == "[StartUp]") }
         skipping { next }
         { print $0 "\r" }
@@ -178,6 +184,7 @@ write_ini() {
             print "Password=\"" ENVIRON["MT5_PASSWORD"] "\"\r"
             print "Server=" ENVIRON["MT5_SERVER"] "\r"
         }
+        $0 == "[Charts]" { print "MaxBars=" max_bars "\r" }
         $0 == "[StartUp]" { print "Symbol=" ENVIRON["MT5_SPAWNER_SYMBOL"] "\r" }
     ' /opt/mt5/setup.ini
 }

@@ -747,10 +747,6 @@ void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer 
         else
             answer.FailRead("the terminal", failures);
         break;
-    case HUB_CALL_SYMBOLS_TOTAL:
-        answer.rows.I64(SymbolsTotal(false));
-        answer.Record();
-        break;
     case HUB_CALL_SYMBOLS_GET:
         AnswerSymbols(arguments, answer);
         break;
@@ -896,8 +892,7 @@ void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
     else if (!arguments.Read(call, count, reader))
         SendError(requestId, HUB_ERROR_EA_ERROR, "arguments out of the call's layout",
                   ERR_INVALID_PARAMETER);
-    else if (call == HUB_CALL_COPY_RATES_RANGE || call == HUB_CALL_COPY_RATES_FROM
-             || call == HUB_CALL_COPY_TICKS_RANGE || call == HUB_CALL_COPY_TICKS_FROM)
+    else if (call == HUB_CALL_COPY_RATES_RANGE || call == HUB_CALL_COPY_TICKS_RANGE)
         StartHistory(requestId, call, arguments);
     else
         Serve(requestId, call, arguments);
@@ -991,7 +986,7 @@ public:
     // A bar read's timeframe and its series' period.
     int timeframe;
     int period;
-    // A range read's bounds in broker seconds, or a count read's start and count.
+    // The window's bounds in broker seconds.
     long from;
     long to;
     uint flags;
@@ -1071,7 +1066,7 @@ public:
 
 bool IsBars(const HistoryRequest *r)
 {
-    return r.call == HUB_CALL_COPY_RATES_RANGE || r.call == HUB_CALL_COPY_RATES_FROM;
+    return r.call == HUB_CALL_COPY_RATES_RANGE;
 }
 
 int RowCount(const HistoryRequest *r)
@@ -1093,11 +1088,7 @@ string SeriesName(const HistoryRequest *r)
 
 string Described(const HistoryRequest *r)
 {
-    if (r.call == HUB_CALL_COPY_RATES_FROM || r.call == HUB_CALL_COPY_TICKS_FROM)
-        return StringFormat("%s %s %I64d from broker %I64d", r.symbol, SeriesName(r), r.to,
-                            r.from);
-    else
-        return StringFormat("%s %s broker %I64d..%I64d", r.symbol, SeriesName(r), r.from, r.to);
+    return StringFormat("%s %s broker %I64d..%I64d", r.symbol, SeriesName(r), r.from, r.to);
 }
 
 // ── Floors ───────────────────────────────────────────────────────────────────────────────────────
@@ -1953,31 +1944,6 @@ void RunTicks(HistoryRequest *r, HistoryRun &run)
     }
 }
 
-// ── The count reads, answered as the terminal reads them ─────────────────────────────────────────
-
-void RunCountRead(HistoryRequest *r, HistoryRun &run)
-{
-    if (IsBars(r))
-    {
-        HistoryWindow window;
-        SetWindow(window, HUB_EVENT_ASK_RATES_FROM, r.timeframe, r.from, r.to);
-        if (Need(r, run, window))
-        {
-            ResetLastError();
-            const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)r.timeframe, (datetime)r.from,
-                                         (int)r.to, r.rates);
-            run.lastError = GetLastError();
-            if (copied < 0)
-                run.Stop(RUN_FAILED, StringFormat("%s: the read failed", Described(r)),
-                         run.lastError);
-        }
-    }
-    else
-    {
-        SettleTicks(r, run, TICK_READ_FROM, r.from * 1000, r.to, r.flags, r.ticks);
-    }
-}
-
 // ── A request's stages and answer ────────────────────────────────────────────────────────────────
 
 int HistoryIndex(const HistoryRequest *r)
@@ -2052,15 +2018,14 @@ void AskIndicator(HistoryRequest *r, const HistoryWindow &windows[])
     }
 }
 
-// The floor fact a range read's last part carries: the series' floor as the store holds it when the
-// hub has not heard it, whichever request measured it; none for a count read.
+// The floor fact a read's last part carries: the series' floor as the store holds it when the hub
+// has not heard it, whichever request measured it.
 int FloorFact(const HistoryRequest *r, uchar &fact[])
 {
     const int index = FloorIndex(SeriesOf(r));
-    const bool range = r.call == HUB_CALL_COPY_RATES_RANGE || r.call == HUB_CALL_COPY_TICKS_RANGE;
     BinaryWriter writer;
     int carried = -1;
-    if (range && index >= 0 && g_floors[index].held && !g_floors[index].published)
+    if (index >= 0 && g_floors[index].held && !g_floors[index].published)
     {
         writer.U8(1);
         writer.I64(g_floors[index].value);
@@ -2143,9 +2108,6 @@ void Evaluate(HistoryRequest *r)
     case HUB_CALL_COPY_TICKS_RANGE:
         RunTicks(r, run);
         break;
-    default:
-        RunCountRead(r, run);
-        break;
     }
     if (run.state != RUN_SYNCING)
         CommitFloors(run);
@@ -2182,26 +2144,13 @@ void StartHistory(const ulong requestId, const ENUM_HUB_CALL call, RequestArgume
         r.from = arguments.Integer(HUB_ARG_COPY_RATES_RANGE_DATE_FROM);
         r.to = arguments.Integer(HUB_ARG_COPY_RATES_RANGE_DATE_TO);
         break;
-    case HUB_CALL_COPY_RATES_FROM:
-        r.symbol = arguments.String(HUB_ARG_COPY_RATES_FROM_SYMBOL);
-        r.timeframe = (int)arguments.Integer(HUB_ARG_COPY_RATES_FROM_TIMEFRAME);
-        r.from = arguments.Integer(HUB_ARG_COPY_RATES_FROM_DATE_FROM);
-        r.to = arguments.Integer(HUB_ARG_COPY_RATES_FROM_COUNT);
-        break;
     case HUB_CALL_COPY_TICKS_RANGE:
         r.symbol = arguments.String(HUB_ARG_COPY_TICKS_RANGE_SYMBOL);
         r.from = arguments.Integer(HUB_ARG_COPY_TICKS_RANGE_DATE_FROM);
         r.to = arguments.Integer(HUB_ARG_COPY_TICKS_RANGE_DATE_TO);
         r.flags = (uint)arguments.Integer(HUB_ARG_COPY_TICKS_RANGE_FLAGS);
         break;
-    case HUB_CALL_COPY_TICKS_FROM:
-        r.symbol = arguments.String(HUB_ARG_COPY_TICKS_FROM_SYMBOL);
-        r.from = arguments.Integer(HUB_ARG_COPY_TICKS_FROM_DATE_FROM);
-        r.to = arguments.Integer(HUB_ARG_COPY_TICKS_FROM_COUNT);
-        r.flags = (uint)arguments.Integer(HUB_ARG_COPY_TICKS_FROM_FLAGS);
-        break;
     }
-    const bool range = call == HUB_CALL_COPY_RATES_RANGE || call == HUB_CALL_COPY_TICKS_RANGE;
     const long now = (long)TimeTradeServer();
     string series = "";
     if (r.symbol != _Symbol)
@@ -2218,18 +2167,12 @@ void StartHistory(const ulong requestId, const ENUM_HUB_CALL call, RequestArgume
                   ERR_INVALID_PARAMETER);
         delete r;
     }
-    else if (!range && (r.to < 0 || r.to > INT_MAX))
-    {
-        SendError(requestId, HUB_ERROR_EA_ERROR, StringFormat("count %I64d is out of range", r.to),
-                  ERR_INVALID_PARAMETER);
-        delete r;
-    }
-    else if (range && r.from > r.to)
+    else if (r.from > r.to)
     {
         SendError(requestId, HUB_ERROR_INVALID_WINDOW, "the window starts after it ends", 0);
         delete r;
     }
-    else if (range && r.from > now)
+    else if (r.from > now)
     {
         SendError(requestId, HUB_ERROR_INVALID_WINDOW,
                   StringFormat("the window starts at broker %I64d, after the terminal's time %I64d",

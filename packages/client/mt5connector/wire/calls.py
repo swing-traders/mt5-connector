@@ -44,7 +44,6 @@ class Call(IntEnum):
     ACCOUNT_INFO = 1
     TERMINAL_INFO = 2
     SYMBOLS_GET = 3
-    SYMBOLS_TOTAL = 4
     SYMBOL_INFO = 6
     SYMBOL_INFO_TICK = 7
     POSITIONS_GET = 8
@@ -53,9 +52,7 @@ class Call(IntEnum):
     HISTORY_DEALS_GET = 11
     ORDER_SEND = 12
     COPY_RATES_RANGE = 13
-    COPY_RATES_FROM = 14
     COPY_TICKS_RANGE = 15
-    COPY_TICKS_FROM = 16
     RANGES = 17
     OUTCOMES = 18
     COMMISSION_SCHEDULE = 19
@@ -86,7 +83,6 @@ class Shape(StrEnum):
     TICKS = "ticks"
     # MqlRates from the EA; to a consumer each bar with its close.
     RATES = "rates"
-    INTEGER = "integer"
     RANGES = "ranges"
     SCHEDULE = "schedule"
     SESSIONS = "sessions"
@@ -190,12 +186,8 @@ def _package(call: Call, name: mirror.FunctionName, role: ChartRole, wait: Wait)
         struct_layout = binary.layout(mirror.STRUCTS[function.struct])
     elif function.array is mirror.ArrayName.TICKS:
         shape = Shape.TICKS
-    elif function.array is mirror.ArrayName.RATES:
-        shape = Shape.RATES
-    elif function.result is mirror.ResultKind.SCALAR:
-        shape = Shape.INTEGER
     else:
-        raise ValueError(f"{name}: the call registry has no shape for a {function.result} result")
+        shape = Shape.RATES
     return Row(call, arguments, shape, role, wait, struct_layout, function.forms)
 
 
@@ -207,9 +199,6 @@ CALLS: dict[Call, Row] = {
             Call.TERMINAL_INFO, mirror.FunctionName.TERMINAL_INFO, ChartRole.SPAWNER, Wait.READ
         ),
         _package(Call.SYMBOLS_GET, mirror.FunctionName.SYMBOLS_GET, ChartRole.SPAWNER, Wait.READ),
-        _package(
-            Call.SYMBOLS_TOTAL, mirror.FunctionName.SYMBOLS_TOTAL, ChartRole.SPAWNER, Wait.READ
-        ),
         _package(Call.SYMBOL_INFO, mirror.FunctionName.SYMBOL_INFO, ChartRole.PUBLISHER, Wait.READ),
         _package(
             Call.SYMBOL_INFO_TICK,
@@ -243,20 +232,8 @@ CALLS: dict[Call, Row] = {
             Wait.HISTORY,
         ),
         _package(
-            Call.COPY_RATES_FROM,
-            mirror.FunctionName.COPY_RATES_FROM,
-            ChartRole.PUBLISHER,
-            Wait.HISTORY,
-        ),
-        _package(
             Call.COPY_TICKS_RANGE,
             mirror.FunctionName.COPY_TICKS_RANGE,
-            ChartRole.HISTORY,
-            Wait.TICKS,
-        ),
-        _package(
-            Call.COPY_TICKS_FROM,
-            mirror.FunctionName.COPY_TICKS_FROM,
             ChartRole.HISTORY,
             Wait.TICKS,
         ),
@@ -456,9 +433,6 @@ def write_result(row: Row, value: object) -> tuple[int, bytes]:
     elif row.shape is Shape.RATES:
         count = len(value)
         writer.raw(np.ascontiguousarray(value, dtype=_BARS).tobytes())
-    elif row.shape is Shape.INTEGER:
-        count = 1
-        writer.i64(value)
     elif row.shape is Shape.RANGES:
         count = len(value.series)
         writer.i64(value.maxbars)
@@ -521,9 +495,6 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
         return _rows(reader, count, _RATES)
     elif row.shape is Shape.RATES:
         return _rows(reader, count, _BARS)
-    elif row.shape is Shape.INTEGER:
-        _one(row, count)
-        return reader.i64("result")
     elif row.shape is Shape.RANGES:
         maxbars = reader.i64("maxbars")
         series = {}
