@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from hub_double import eventually
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
@@ -19,10 +20,10 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from session_double import SessionDouble
-from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info
+from venue_doubles import SymbolVenue, serve, symbol_info
 
 from mt5connector.client import data
-from mt5connector.client.connection import AccountSnapshot, MT5Connection
+from mt5connector.client.connection import MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient, _epoch_s
 from mt5connector.client.errors import (
@@ -30,11 +31,12 @@ from mt5connector.client.errors import (
     MT5ConfigError,
     MT5ConnectionError,
     MT5InstrumentError,
+    NotReady,
     ProtocolError,
     ResponseLost,
 )
 from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.wire import mirror
+from mt5connector.wire import calls, mirror
 from mt5connector.wire.history_wire import Series
 from mt5connector.wire.push_wire import Stream, Subscription
 
@@ -129,7 +131,6 @@ def make_provider(instrument=None):
     provider._failed_symbols = []
 
     provider.get_instrument = MagicMock(return_value=inst)
-    provider.load_symbol = MagicMock(return_value=inst)
     provider.list_all = MagicMock(return_value=[inst])
     provider.load_ids_async = AsyncMock()
     provider.load_all_async = AsyncMock()
@@ -663,7 +664,8 @@ class TestRequestInstruments:
 
         [response] = responses
         assert isinstance(response, DataResponse)
-        assert (response.correlation_id, response.data) == (request.id, [provider.load_symbol()])
+        assert (response.correlation_id, response.data) == (request.id, [provider.get_instrument()])
+        provider.load_ids_async.assert_awaited_once_with([request.instrument_id])
 
     @pytest.mark.asyncio
     async def test_an_instruments_request_reaches_the_data_engine_as_its_response(self):
@@ -773,9 +775,7 @@ def served_client(symbols: SymbolVenue, provider_config: InstrumentProviderConfi
     """A data client over a real provider whose config is `provider_config`, its connection's hub
     session reads `symbols`, what it hands NT as data recorded."""
     conn = MagicMock(spec=MT5Connection)
-    conn.session = symbols
-    conn.run = run_apart
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
+    serve(conn, symbols)
     provider = MT5InstrumentProvider(
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
     )
@@ -861,6 +861,48 @@ class TestInstrumentsNtNames:
         assert [instrument.id for instrument in response.data] == [GBPUSD]
         assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
         await client._disconnect()
+
+    @pytest.mark.asyncio
+    async def test_an_instrument_request_the_hub_defers_leaves_the_clients_loop_running(
+        self, terminal
+    ):
+        terminal.refusals[(calls.Call.SYMBOL_INFO, "GBPUSD")] = [
+            NotReady("symbol_info: the broker clock is not verified", 0, 0.25)
+        ]
+        client, provider = served_client(
+            terminal, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        )
+        responses = responses_of(client)
+        order = []
+        asyncio.get_running_loop().call_later(0.025, order.append, "callback")
+
+        await client._request_instrument(instrument_request("GBPUSD"))
+        order.append("answered")
+
+        assert order == ["callback", "answered"]
+        [response] = responses
+        assert [instrument.id for instrument in response.data] == [GBPUSD]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_an_instrument_request_the_hub_defers_ends_its_reads(self, terminal):
+        terminal.refusals[(calls.Call.SYMBOL_INFO, "GBPUSD")] = [
+            NotReady("symbol_info: the broker clock is not verified", 0, 0.25)
+        ]
+        client, provider = served_client(
+            terminal, InstrumentProviderConfig(load_ids=frozenset({EURUSD}))
+        )
+        responses = responses_of(client)
+        request = asyncio.create_task(client._request_instrument(instrument_request("GBPUSD")))
+        await eventually(lambda: calls.Call.SYMBOL_INFO in terminal.asked_of("GBPUSD"))
+
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await asyncio.sleep(0.5)
+
+        assert terminal.asked_of("GBPUSD") == [calls.Call.SYMBOL_INFO]
+        assert responses == []
+        assert loaded_ids(provider) == []
 
 
 # ═════════════════════════════════════════════════════════════════════════════

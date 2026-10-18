@@ -121,12 +121,19 @@ just test
 **2. Test the connection:**
 
 ```python
+import asyncio
+
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import MT5Connection
 
-config = MT5Config(account=12345678, server="YourBroker-Demo", ws_url="ws://127.0.0.1:9000")
-with MT5Connection(config) as conn:
-    print(conn.get_account_info())
+
+async def main() -> None:
+    config = MT5Config(account=12345678, server="YourBroker-Demo", ws_url="ws://127.0.0.1:9000")
+    async with MT5Connection(config) as conn:
+        print(await conn.account_info())
+
+
+asyncio.run(main())
 ```
 
 ---
@@ -227,13 +234,15 @@ The instrument provider loads a symbol by this exact name — one a client's `in
 The provider also answers what a consumer discovers its settlement currencies by:
 
 - `quoted_pairs() -> dict[tuple[str, str], str]` — the venue symbol quoting each `(base, profit)` currency pair the venue's FOREX symbols cover, as the last load found it: a symbol the run loads, else one fully tradable, else the first whose quote is not the all-zero struct, each rung in alphabetical order.
-- `account_currency() -> str` — the account's currency code, as the account reports it at the call.
+- `async account_currency() -> str` — the account's currency code, as the account reports it at the call.
+
+Its loads — NautilusTrader's `load_all_async` and `load_ids_async`, and `load_symbol(symbol)`, which answers the symbol's instrument — are coroutines on the loop the connection was connected on: that loop runs on while the hub defers a read, and cancelling a load ends its reads and adds nothing. `load_all_async` lists the terminal's symbols once, for its symbols and its conversion pairs alike.
 
 ---
 
 ## Downloading history
 
-`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the hub's [history calls](packages/server/mt5connector/server/README.md#history) on its connection's hub session.
+`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the hub's [history calls](packages/server/mt5connector/server/README.md#history) on its connection's hub session; `download_ticks`, `download_bars` and `download_all` are coroutines.
 
 The downloader walks back from `end`, one request per window, until `start` or the floor the hub's `ranges` holds for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
 
@@ -243,36 +252,43 @@ The downloader walks back from `end`, one request per window, until `start` or t
 A window the hub answers with an error, or whose answer is lost, is recorded among the result's errors and the walk goes on, and so is a `ranges` read the hub answers with an error; any other error reading it raises.
 
 ```python
+import asyncio
+from datetime import datetime, timezone
+
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import MT5Connection
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.client.downloader import MT5DataDownloader
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from datetime import datetime, timezone
 
-config = MT5Config(account=12345678, server="Exness-MT5Trial9", ws_url="ws://127.0.0.1:9000")
 
-conn     = MT5Connection(config)
-conn.connect()
+async def main() -> None:
+    config = MT5Config(account=12345678, server="Exness-MT5Trial9", ws_url="ws://127.0.0.1:9000")
 
-provider = MT5InstrumentProvider(conn, venue=config.venue, clock=LiveClock())
-catalog  = ParquetDataCatalog("./catalog")
+    conn     = MT5Connection(config)
+    await conn.connect()
 
-# Write the instrument definition first (required by the backtest engine)
-instrument = provider.load_symbol("EURUSDm")
-catalog.write_data([instrument])
+    provider = MT5InstrumentProvider(conn, venue=config.venue, clock=LiveClock())
+    catalog  = ParquetDataCatalog("./catalog")
 
-# Download bars
-downloader = MT5DataDownloader(conn, provider, catalog)
-result = downloader.download_bars(
-    symbol    = "EURUSDm",
-    start     = datetime(2024, 1,  1, tzinfo=timezone.utc),
-    end       = datetime(2024, 12, 31, tzinfo=timezone.utc),
-    timeframe = 16385,  # MT5 timeframe constant: 16385 = H1
-)
-print(result)
-conn.disconnect()
+    # Write the instrument definition first (required by the backtest engine)
+    instrument = await provider.load_symbol("EURUSDm")
+    catalog.write_data([instrument])
+
+    # Download bars
+    downloader = MT5DataDownloader(conn, provider, catalog)
+    result = await downloader.download_bars(
+        symbol    = "EURUSDm",
+        start     = datetime(2024, 1,  1, tzinfo=timezone.utc),
+        end       = datetime(2024, 12, 31, tzinfo=timezone.utc),
+        timeframe = 16385,  # MT5 timeframe constant: 16385 = H1
+    )
+    print(result)
+    await conn.disconnect()
+
+
+asyncio.run(main())
 ```
 
 **MT5 timeframe constants:**
@@ -298,6 +314,7 @@ The data and execution clients run in NautilusTrader's `TradingNode`, and the no
 - A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — reading each opens its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
 - A symbol no config names is loaded when it is requested (`request_instrument`): the server serves any symbol the account has, so another deployment's instruments need no change to it.
 - The factories, registered before `node.build()` under the config's venue, build the clients on one connection per account and server, and one instrument provider per connection, venue and `instrument_provider` config.
+- The factories connect the account's connection on the node's loop at `node.build()`, before the loop runs; a build inside a running loop raises asyncio's `RuntimeError`.
 
 ```python
 import os
@@ -357,11 +374,11 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 ```
 
 - `MT5Config` requires the hub's `ws_url`, a `ws` or `wss` URL naming a host; a port it names must lie in 1–65535 — see `packages/client/mt5connector/client/config.py`.
-- Each `MT5Connection` owns a hub session of its own, on an event loop it runs on its own thread while connected.
-  - `connect()` starts the thread, connects the session and confirms the terminal's login by reading `account_info`, asked again after each deferring answer's delay. The terminal logs in at the container's boot and the hub answers `not_ready` until it has verified the broker clock, so `timeout_s` bounds that wait: past it, `connect()` raises `MT5ConnectionError` naming the last deferral, such as `not_ready`. A hub it cannot reach raises `MT5ConnectionError` naming the hub's URL, and an account read answered with any other error raises that error. A failed connect leaves the connection disconnected with no thread running.
-  - `get_account_info()` and `get_terminal_info()` read through the session and raise the hub's error for a read it fails. `disconnect()` disconnects the session and stops the thread.
-  - `run(coroutine)` runs a coroutine on the session's loop and blocks for its result, raising what it raised, and `session` is the session such a coroutine is handed; both raise `RuntimeError` on a connection not connected.
-  - A connect on a connection already connected or connecting, and a disconnect on one not connected, raise `MT5ConnectionError` naming its state; used as a context manager, a connection connects on entry and disconnects on exit. A lost hub leaves the connection connected: NautilusTrader's client reconnects its session, as it does a client's.
+- Each `MT5Connection` owns a hub session of its own, on the event loop it was connected on; its lifecycle and its reads are coroutines on that loop.
+  - `connect()` connects the session and confirms the terminal's login by reading `account_info`, asked again after each deferring answer's delay. The terminal logs in at the container's boot and the hub answers `not_ready` until it has verified the broker clock, so `timeout_s` bounds that wait: past it, `connect()` raises `MT5ConnectionError` naming the last deferral, such as `not_ready`. A hub it cannot reach raises `MT5ConnectionError` naming the hub's URL, and an account read answered with any other error raises that error. A failed connect leaves the connection disconnected and its session closed.
+  - `account_info()` and `terminal_info()` read through the session and raise the hub's error for a read it fails. `disconnect()` disconnects the session: a read in flight raises `ResponseLost`, and one waiting out a deferral's delay raises `RuntimeError` when it next asks.
+  - `session` is the session a caller's own reads ride on that loop, the history reads below among them; it raises `RuntimeError` on a connection not connected.
+  - A connect on a connection not disconnected — connected, connecting or disconnecting — and a disconnect on one not connected raise `RuntimeError` naming its state; used as an async context manager, a connection connects on entry and disconnects on exit. A lost hub leaves the connection connected: NautilusTrader's client reconnects its session, as it does a client's.
 - Each client holds a hub session, `mt5connector.client.hub.HubSession`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the session says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
 - A session also asks the hub's calls: `request(call, **arguments)`, or the method named after each call with its arguments, answers `Answered(result, last_error)` once every part of the answer arrived — a struct as its record type, rows as numpy arrays, transactions as `TradeTransaction` frames.
   - It raises the `HubAnswerError` of the answer's error kind. `Syncing`, `NotReady` and `NoPublisher` carry `retry_after_s`, and `deferring(call, **arguments)` asks again after each such delay until it is answered otherwise or its caller cancels.
@@ -380,7 +397,7 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 - `bars(session, symbol, series, first_open_s, last_open_s)` answers the bars of a `Series` opened in that window as a numpy array of `MqlRates`' fields and each bar's `time_close`; `ticks(session, symbol, start_s, end_s, flags=TickFlags.INFO)` the ticks of those seconds as the package's array; and `ranges(session, symbol)` the hub's `Ranges`: the terminal's `maxbars` and each series' `SeriesRange` floor.
 - Each reads through the session's `deferring`: a `syncing`, `not_ready` or `no_publisher` answer is asked again after its delay, with no deadline of its own, until the hub answers otherwise or the caller cancels. Any other error is the hub's `HubAnswerError` raised — `InvalidWindow` for a window starting after the terminal's time — and an answer lost to the session's deadline or a reconnect raises `ResponseLost`.
 - `opens_closing(series, first_close, last_close)` gives the opens a window of closes is read by, and `closing(rows, first_close, last_close)` keeps the bars closing in it.
-- A synchronous caller runs one on its connection: `conn.run(history.bars(conn.session, "EURUSDm", Series.H1, first_open_s, last_open_s))`.
+- A caller awaits one on its connection's session, on the loop the connection was connected on: `await history.bars(conn.session, "EURUSDm", Series.H1, first_open_s, last_open_s)`.
 
 ---
 

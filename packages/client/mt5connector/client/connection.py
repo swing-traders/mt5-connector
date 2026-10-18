@@ -1,20 +1,18 @@
 """The adapter's connection to the MT5 terminal behind the hub, and the account as the terminal
 reports it.
 
-State: where the connection is in its lifecycle, and while connected, its hub session and the event
-loop the session runs on, on the connection's own thread. A connection not connected runs no thread.
-A lost hub leaves the connection connected: NT's client reconnects its session."""
+State: where the connection is in its lifecycle, and while connected, its hub session, which lives
+on the loop the connection was connected on. A lost hub leaves the connection connected: NT's client
+reconnects its session."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
-from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum, StrEnum, auto
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING
 
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
@@ -27,8 +25,6 @@ if TYPE_CHECKING:
     from mt5connector.client.config import MT5Config
 
 logger = logging.getLogger(__name__)
-
-_T = TypeVar("_T")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,9 +39,6 @@ class ConnectionState(Enum):
     CONNECTING = auto()  # the hub session connecting and the login being confirmed
     CONNECTED = auto()  # fully ready to use
     SHUTTING_DOWN = auto()  # the hub session disconnecting
-
-
-_CONNECTED_OR_CONNECTING = frozenset({ConnectionState.CONNECTING, ConnectionState.CONNECTED})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,42 +140,40 @@ class MT5Connection:
     def __init__(self, config: MT5Config) -> None:
         self._config = config
         self._state = ConnectionState.DISCONNECTED
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
         self._session: HubSession | None = None
 
     # ── Core lifecycle ────────────────────────────────────────────────────────
 
-    def connect(self) -> None:
-        """Connects the hub session on the connection's own thread and confirms the terminal's login
-        by reading its account. Raises MT5ConnectionError naming the state on a connection already
-        connected or connecting, for a hub it cannot reach and for one not ready within the config's
+    async def connect(self) -> None:
+        """Connects a hub session on the running loop and confirms the terminal's login by reading
+        its account. Raises RuntimeError naming the state on a connection not disconnected,
+        MT5ConnectionError for a hub it cannot reach and for one not ready within the config's
         timeout, and the hub's error for an account read it fails."""
-        if self._state in _CONNECTED_OR_CONNECTING:
-            raise MT5ConnectionError(
-                f"MT5 already connected or connecting (state={self._state.name})"
-            )
+        if self._state != ConnectionState.DISCONNECTED:
+            raise RuntimeError(f"MT5 not disconnected (state={self._state.name})")
         self._state = ConnectionState.CONNECTING
+        session = HubSession(
+            self._config, asyncio.get_running_loop(), _unsubscribed, None, _SessionLog()
+        )
         try:
-            self._open()
+            snapshot = await self._logged_in(session)
         except BaseException:
             self._state = ConnectionState.DISCONNECTED
             raise
+        self._session = session
         self._state = ConnectionState.CONNECTED
+        logger.info(f"MT5Connection: connected — {snapshot}")
 
-    def disconnect(self) -> None:
-        """Disconnects the hub session and stops the connection's thread, the latter even when the
-        former raises; raises MT5ConnectionError naming the state on a connection not connected."""
+    async def disconnect(self) -> None:
+        """Disconnects the hub session, leaving the connection disconnected even when that raises;
+        raises RuntimeError naming the state on a connection not connected."""
         if self._state != ConnectionState.CONNECTED:
-            raise MT5ConnectionError(f"MT5 not connected (state={self._state.name})")
+            raise RuntimeError(f"MT5 not connected (state={self._state.name})")
         logger.info("MT5Connection: shutting down")
         self._state = ConnectionState.SHUTTING_DOWN
         try:
-            asyncio.run_coroutine_threadsafe(self._session.disconnect(), self._loop).result()
+            await self._session.disconnect()
         finally:
-            _stop(self._loop, self._thread)
-            self._loop = None
-            self._thread = None
             self._session = None
             self._state = ConnectionState.DISCONNECTED
         logger.info("MT5Connection: disconnected")
@@ -196,34 +187,25 @@ class MT5Connection:
 
     @property
     def session(self) -> HubSession:
-        """The hub session, for a coroutine `run` is handed; raises RuntimeError when not
-        connected."""
+        """The hub session; raises RuntimeError when not connected."""
         if self._state != ConnectionState.CONNECTED:
             raise RuntimeError(f"MT5 not connected (state={self._state.name})")
         return self._session
 
-    def run(self, coroutine: Coroutine[Any, Any, _T]) -> _T:
-        """Runs a coroutine on the session's loop and blocks for its result, raising what it raised;
-        raises RuntimeError when not connected."""
-        if self._state != ConnectionState.CONNECTED:
-            coroutine.close()
-            raise RuntimeError(f"MT5 not connected (state={self._state.name})")
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
-
     # ── Data accessors ────────────────────────────────────────────────────────
 
-    def get_account_info(self) -> AccountSnapshot:
+    async def account_info(self) -> AccountSnapshot:
         """The account as the terminal reports it now; raises MT5ConnectionError when not connected,
         and the hub's error when the read fails."""
         self.ensure_connected()
-        return AccountSnapshot.from_mt5(self.run(self._session.account_info()).result)
+        return AccountSnapshot.from_mt5((await self._session.account_info()).result)
 
-    def get_terminal_info(self) -> dict:
+    async def terminal_info(self) -> dict:
         """The hub's MT5 terminal as `terminal_info()` reports it, its trading permission and
         connection included; raises MT5ConnectionError when not connected, and the hub's error when
         the read fails."""
         self.ensure_connected()
-        info = self.run(self._session.terminal_info()).result
+        info = (await self._session.terminal_info()).result
         return {
             "name": info.name,
             "path": info.path,
@@ -235,23 +217,6 @@ class MT5Connection:
         }
 
     # ── Private ───────────────────────────────────────────────────────────────
-
-    def _open(self) -> None:
-        """Starts a loop on a thread of the connection's, connects a hub session on it and confirms
-        the login; a failure stops the thread."""
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever, name="MT5Connection", daemon=True)
-        thread.start()
-        session = HubSession(self._config, loop, _unsubscribed, None, _SessionLog())
-        try:
-            snapshot = asyncio.run_coroutine_threadsafe(self._logged_in(session), loop).result()
-        except BaseException:
-            _stop(loop, thread)
-            raise
-        self._loop = loop
-        self._thread = thread
-        self._session = session
-        logger.info(f"MT5Connection: connected — {snapshot}")
 
     async def _logged_in(self, session: HubSession) -> AccountSnapshot:
         """The terminal's account, read once the session connects; the session is disconnected
@@ -296,12 +261,12 @@ class MT5Connection:
 
     # ── Context manager ───────────────────────────────────────────────────────
 
-    def __enter__(self) -> MT5Connection:
-        self.connect()
+    async def __aenter__(self) -> MT5Connection:
+        await self.connect()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        self.disconnect()
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        await self.disconnect()
         return False  # never suppress exceptions
 
     def __repr__(self) -> str:
@@ -316,12 +281,6 @@ def _deferral(deferred: Deferred) -> ErrorKind:
         return ErrorKind.SYNCING
     else:
         return ErrorKind.NO_PUBLISHER
-
-
-def _stop(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join()
-    loop.close()
 
 
 def _unsubscribed(frame: object) -> None:

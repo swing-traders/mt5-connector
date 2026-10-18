@@ -1,6 +1,7 @@
 """NT's live data and execution client factories for MT5 — sharing one connection per account and
-server, and one instrument provider per connection, venue and instrument-provider config, for the
-process's life — and the node config that wires a venue's clients."""
+server, connected on the loop NT hands them, and one instrument provider per connection, venue and
+instrument-provider config, for the process's life — and the node config that wires a venue's
+clients."""
 
 from __future__ import annotations
 
@@ -44,14 +45,15 @@ _provider_registry: dict[
 _mt5_config_registry: dict[str, MT5Config] = {}
 
 
-def _ensure_connection(config: MT5Config) -> MT5Connection:
-    """The connection of the config's account and server, created and connected on first use."""
+def _ensure_connection(config: MT5Config, loop: asyncio.AbstractEventLoop) -> MT5Connection:
+    """The connection of the config's account and server, created on first use and connected by
+    running `loop` until the connect completes."""
     registry_key = (config.account, config.server)
 
     if registry_key not in _connection_registry:
         logger.info("MT5 factories: creating the account's connection")
         conn = MT5Connection(config)
-        conn.connect()
+        loop.run_until_complete(conn.connect())
         _connection_registry[registry_key] = conn
         logger.info(f"MT5 factories: connection established — {conn}")
 
@@ -104,7 +106,7 @@ class MT5LiveDataClientFactory(LiveDataClientFactory):
         )
         if mt5_config is None:
             raise RuntimeError(f"MT5LiveDataClientFactory: no MT5Config for {name}")
-        conn = _ensure_connection(mt5_config)
+        conn = _ensure_connection(mt5_config, loop)
 
         return MT5DataClient(
             loop=loop,
@@ -147,11 +149,13 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
         )
         if mt5_config is None:
             raise RuntimeError(f"MT5LiveExecClientFactory: no MT5Config for {name}")
-        conn = _ensure_connection(mt5_config)
+        conn = _ensure_connection(mt5_config, loop)
+        account = loop.run_until_complete(conn.account_info())
 
         return MT5LiveExecutionClient(
             loop=loop,
             connection=conn,
+            account=account,
             msgbus=msgbus,
             cache=cache,
             clock=clock,

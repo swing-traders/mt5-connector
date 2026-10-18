@@ -31,7 +31,7 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from session_double import ExecSession
-from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info, trade_position
+from venue_doubles import SymbolVenue, account_info, serve, symbol_info, trade_position
 
 from mt5connector.client import connection, execution
 from mt5connector.client.config import MT5Config
@@ -89,8 +89,8 @@ def _client(
     except RuntimeError:
         loop = asyncio.new_event_loop()
     conn = MagicMock(spec=MT5Connection)
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(raw_account)
-    conn.get_terminal_info.return_value = {
+    conn.account_info.return_value = AccountSnapshot.from_mt5(raw_account)
+    conn.terminal_info.return_value = {
         "connected": True,
         "trade_allowed": terminal_trade_allowed,
     }
@@ -100,6 +100,7 @@ def _client(
         client = MT5LiveExecutionClient(
             loop=loop,
             connection=conn,
+            account=AccountSnapshot.from_mt5(raw_account),
             msgbus=MessageBus(trader_id=TraderId(trader_id), clock=clock),
             cache=TestComponentStubs.cache(),
             clock=clock,
@@ -212,9 +213,9 @@ async def test_the_terminal_info_exposes_trading_permission_and_connection(confi
     hub.answers[calls.Call.ACCOUNT_INFO] = [account_info()._asdict()]
     hub.answers[calls.Call.TERMINAL_INFO] = [zeroed(terminal, trade_allowed=True, connected=True)]
     conn = MT5Connection(replace(config, ws_url=f"ws://127.0.0.1:{hub.port}"))
-    await asyncio.to_thread(conn.connect)
-    info = await asyncio.to_thread(conn.get_terminal_info)
-    await asyncio.to_thread(conn.disconnect)
+    await conn.connect()
+    info = await conn.terminal_info()
+    await conn.disconnect()
     assert info["trade_allowed"] is True
     assert info["connected"] is True
 
@@ -335,13 +336,14 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
     msgbus.subscribe(topic="events.account.*", handler=states.append)
     account = account_info(login=7654321, currency="EUR")
     conn = MagicMock(spec=MT5Connection)
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account)
-    conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    conn.account_info.return_value = AccountSnapshot.from_mt5(account)
+    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
     venue.account_info.return_value = account
     with patch.object(execution, "HubSession", partial(ExecSession, venue)):
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
+            account=AccountSnapshot.from_mt5(account),
             msgbus=msgbus,
             cache=cache,
             clock=clock,
@@ -381,10 +383,10 @@ async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(v
     await _stop_account_loop(client)
 
 
-def _serve_symbols(conn, symbols: SymbolVenue) -> None:
-    """Hands the connection's hub session reads to `symbols`."""
-    conn.session = symbols
-    conn.run = run_apart
+def _serve_symbols(conn, symbols: SymbolVenue, account) -> None:
+    """Hands the connection's hub session reads to `symbols`, its account `account`."""
+    symbols.account = account
+    serve(conn, symbols)
 
 
 @pytest.fixture
@@ -400,8 +402,9 @@ async def test_sequential_accounts_use_their_own_digits_in_money_and_instruments
 ):
     seen = []
     for digits in (8, 2):
-        client = _client(venue, account_info(currency="UST", currency_digits=digits))
-        _serve_symbols(client._conn, settlement_symbols)
+        account = account_info(currency="UST", currency_digits=digits)
+        client = _client(venue, account)
+        _serve_symbols(client._conn, settlement_symbols, account)
         client._provider = MT5InstrumentProvider(
             connection=client._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
         )
@@ -435,8 +438,9 @@ async def test_an_earlier_account_does_not_define_a_later_accounts_settlement(
         await _stop_account_loop(first)
 
     settlement_symbols.add(symbol_info(currency_profit=code))
-    later = _client(venue, account_info(currency="USD"))
-    _serve_symbols(later._conn, settlement_symbols)
+    account = account_info(currency="USD")
+    later = _client(venue, account)
+    _serve_symbols(later._conn, settlement_symbols, account)
     later._provider = MT5InstrumentProvider(
         connection=later._conn, venue=MT5_VENUE, clock=LiveClock(), config=EURUSD_ONLY
     )
@@ -518,9 +522,9 @@ def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProvi
     """A client over a real provider whose config is `provider_config`, its hub session answered by
     `venue` and its connection's session's reads by `symbols`."""
     conn = MagicMock(spec=MT5Connection)
-    _serve_symbols(conn, symbols)
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info())
-    conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    _serve_symbols(conn, symbols, account_info())
+    conn.account_info.return_value = AccountSnapshot.from_mt5(account_info())
+    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
     provider = MT5InstrumentProvider(
         connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
@@ -529,6 +533,7 @@ def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProvi
         client = MT5LiveExecutionClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
+            account=AccountSnapshot.from_mt5(account_info()),
             msgbus=MessageBus(trader_id=TraderId("TESTER-001"), clock=clock),
             cache=TestComponentStubs.cache(),
             clock=clock,

@@ -423,13 +423,13 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self,
         loop: asyncio.AbstractEventLoop,
         connection: MT5Connection,
+        account: AccountSnapshot,
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
         instrument_provider: MT5InstrumentProvider,
         config: MT5Config,
     ) -> None:
-        account = connection.get_account_info()
         super().__init__(
             loop=loop,
             client_id=ClientId(config.venue.value),
@@ -475,8 +475,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if self._account_task is not None:
             raise RuntimeError("execution client: already connected")
         self._conn.ensure_connected()
-        account = self._conn.get_account_info()
-        terminal = self._conn.get_terminal_info()
+        account = await self._conn.account_info()
+        terminal = await self._conn.terminal_info()
         if account.margin_mode != MarginMode.RETAIL_HEDGING:
             raise MT5ConfigError(
                 f"the client declares {self.oms_type.name}, the account's margin mode is "

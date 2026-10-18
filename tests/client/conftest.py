@@ -1,6 +1,8 @@
 """Shared fixtures: a valid MT5Config, the venue behind the execution client's hub session, and a
-hub double on a free loopback port."""
+hub double on a free loopback port, on the test's loop or on a thread of its own."""
 
+import asyncio
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -65,3 +67,37 @@ async def hub():
     double.port = server.sockets[0].getsockname()[1]
     yield double
     server.close()
+
+
+@pytest.fixture
+def pinging_hub():
+    """A hub double on a loop of its own thread, for a test whose own loop is not running: it pings
+    every connection every 0.1 s and drops one whose pong is 0.3 s late."""
+    double = HubDouble()
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    async def start() -> None:
+        double.server = await serve(
+            double.handler, "127.0.0.1", 0, ping_interval=0.1, ping_timeout=0.3
+        )
+        double.port = double.server.sockets[0].getsockname()[1]
+        started.set()
+
+    def serving() -> None:
+        loop.run_until_complete(start())
+        loop.run_forever()
+
+    thread = threading.Thread(target=serving, daemon=True)
+    thread.start()
+    started.wait()
+    yield double
+
+    async def stop() -> None:
+        double.server.close()
+        await double.server.wait_closed()
+
+    asyncio.run_coroutine_threadsafe(stop(), loop).result()
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join()
+    loop.close()

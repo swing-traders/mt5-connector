@@ -1,6 +1,5 @@
-"""The hub's history reads on a session: the rows of a bar or tick window, true UTC and asked again
-while the hub defers them, the floors it holds for a symbol, and the bars a window of closes keeps.
-A read the hub answers otherwise raises its error."""
+"""The hub's history reads on a session, asked again while the hub defers them, and the bars a
+window of closes keeps."""
 
 from __future__ import annotations
 

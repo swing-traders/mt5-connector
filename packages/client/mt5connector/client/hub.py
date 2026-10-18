@@ -152,7 +152,8 @@ class HubSession:
 
     async def connect(self) -> None:
         """Connects to the hub, says hello, subscribes everything wanted and asks the outcomes of
-        the commands still outstanding; NT's client reconnects with backoff from then on. Raises
+        the commands still outstanding; NT's client reconnects with backoff from then on, and a
+        connect that fails or is cancelled once its socket is open disconnects it. Raises
         RuntimeError on a connected session."""
         if self._ws is not None:
             raise RuntimeError("hub session: already connected")
@@ -170,7 +171,11 @@ class HubSession:
             self._on_message,
             post_reconnection=self._on_reconnected_off_loop,
         )
-        await self._send_wanted()
+        try:
+            await self._send_wanted()
+        except BaseException:
+            await self.disconnect()
+            raise
         self._track(self._loop.create_task(self._ask_outstanding()))
 
     async def disconnect(self) -> None:

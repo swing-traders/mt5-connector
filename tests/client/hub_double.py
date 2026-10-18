@@ -23,10 +23,8 @@ def zeroed(layout: binary.Layout, **values) -> dict:
 
 
 class HubDouble:
-    """A hub that records what each connection sends, acknowledges every op, and sends what a test
-    hands it to the latest connection. A request of a call in `answers` is answered at once with
-    the call's next answer — an AnswerError fails it — and the last answer stands for every later
-    request."""
+    """A hub for a client's sessions to connect to, recording what each connection sends and
+    answering what a test hands it."""
 
     def __init__(self):
         self.received: list[list] = []
@@ -52,6 +50,8 @@ class HubDouble:
             pass
 
     async def _answered(self, ws, request: binary.Request) -> None:
+        """Answers a request with its call's next answer, an AnswerError failing it; the last answer
+        stands for every later request."""
         queued = self.answers[calls.Call(request.call)]
         if len(queued) > 1:
             answer = queued.pop(0)

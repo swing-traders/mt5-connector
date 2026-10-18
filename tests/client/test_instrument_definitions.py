@@ -1,10 +1,13 @@
 """The instrument provider against a hub session double: what it loads and how it builds each
 definition, its currencies, the conversion pairs it finds, and the taker fees it derives."""
 
+import asyncio
+import threading
 from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
+from hub_double import eventually
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
@@ -12,14 +15,14 @@ from nautilus_trader.model.identifiers import Venue as NtVenue
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from venue_doubles import (
-    UNKNOWN_SYMBOL,
     SymbolVenue,
     account_info,
     relayed_sessions,
-    run_apart,
+    serve,
     symbol_info,
 )
 
+from mt5connector.client.commissions import parse_schedule
 from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.errors import (
@@ -29,24 +32,25 @@ from mt5connector.client.errors import (
     MT5InstrumentError,
     MT5SymbolNotFoundError,
     NoPublisher,
+    NotReady,
     Syncing,
 )
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import calls, mirror
+from mt5connector.wire.push_wire import (
+    CommissionChargeMode,
+    CommissionDirectionMode,
+    CommissionEntryMode,
+    CommissionMode,
+    CommissionProfitMode,
+    CommissionRangeMode,
+    CommissionVolumeType,
+    MqlError,
+)
 
 Call = calls.Call
 
 NOW_NS = 1_760_000_000_000_000_000
-
-# The names EnumToString gives the commission enumerations' members, as the EA relays them.
-MONEY_DEPOSIT = "SYMBOL_COMMISSION_MONEY_DEPOSIT"
-MONEY_SPECIFIED = "SYMBOL_COMMISSION_MONEY_SPECIFIED"
-PERCENT = "SYMBOL_COMMISSION_PERCENT"
-POINTS = "SYMBOL_COMMISSION_PIPS"
-PERCENT_PROFIT = "SYMBOL_COMMISSION_PERCENT_PROFIT"
-ENTRY_INOUT = "SYMBOL_COMMISSION_ENTRY_INOUT"
-ENTRY_IN = "SYMBOL_COMMISSION_ENTRY_IN"
-ENTRY_OUT = "SYMBOL_COMMISSION_ENTRY_OUT"
 
 TRADED_MODES = {
     mirror.SYMBOL_CALC_MODE_FOREX: CurrencyPair,
@@ -62,23 +66,24 @@ REFUSED_MODES = [
 ]
 
 
-def schedule(value, currency, mode=MONEY_DEPOSIT, entry=ENTRY_INOUT):
-    """One relayed SymbolInfoCommissions answer: one rule with one volume tier."""
+def schedule(value, currency, mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT):
+    """One relayed SymbolInfoCommissions answer, as the session reads it: one rule with one volume
+    tier."""
     return {
         "ret": 1,
         "last_error": 0,
         "rules": [
             {
                 "currency": currency,
-                "mode_range": "SYMBOL_COMMISSION_RANGE_VOLUME",
-                "mode_charge": "SYMBOL_COMMISSION_CHARGE_INSTANT",
+                "mode_range": CommissionRangeMode.VOLUME,
+                "mode_charge": CommissionChargeMode.INSTANT,
                 "mode_entry": entry,
-                "mode_direction": "SYMBOL_COMMISSION_DIRECTION_BOTH",
-                "mode_profit": "SYMBOL_COMMISSION_PROFIT_ALL",
+                "mode_direction": CommissionDirectionMode.BOTH,
+                "mode_profit": CommissionProfitMode.ALL,
                 "tiers": [
                     {
                         "mode": mode,
-                        "volume_type": "SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
+                        "volume_type": CommissionVolumeType.VOLUME,
                         "value": value,
                         "min_value": 0.0,
                         "max_value": 0.0,
@@ -99,10 +104,10 @@ def venue():
 
 def connection_of(venue: SymbolVenue, **account) -> MT5Connection:
     """A connected connection whose hub session is `venue`, its account under `account`."""
+    venue.account = account_info(**account)
     conn = MagicMock(spec=MT5Connection)
-    conn.session = venue
-    conn.run = run_apart
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account_info(**account))
+    serve(conn, venue)
+    conn.account_info.return_value = AccountSnapshot.from_mt5(venue.account)
     return conn
 
 
@@ -366,6 +371,20 @@ async def test_initializing_with_load_all_loads_every_symbol_the_terminal_serves
         assert Call.SYMBOL_INFO in venue.asked_of(symbol)
 
 
+async def test_loading_every_symbol_lists_the_terminals_symbols_once_for_the_load_and_its_pairs(
+    venue,
+):
+    three_symbols(venue)
+    provider = provider_of(venue, InstrumentProviderConfig(load_all=True))
+    await provider.load_all_async()
+    assert [call for call, _ in venue.asked].count(Call.SYMBOLS_GET) == 1
+    assert provider.quoted_pairs() == {
+        ("EUR", "USD"): "EURUSDm",
+        ("GBP", "USD"): "GBPUSDm",
+        ("USD", "JPY"): "USDJPYm",
+    }
+
+
 @pytest.mark.parametrize(
     "config",
     [InstrumentProviderConfig(), InstrumentProviderConfig(load_ids=frozenset())],
@@ -552,9 +571,9 @@ async def test_only_forex_symbols_quote_a_pair(venue):
     assert set(provider.quoted_pairs()) == {("EUR", "USD")}
 
 
-def test_the_account_currency_is_the_accounts(venue):
+async def test_the_account_currency_is_the_accounts(venue):
     provider = provider_for(venue, "EURUSD", currency="UST")
-    assert provider.account_currency() == "UST"
+    assert await provider.account_currency() == "UST"
 
 
 # ── Fees ─────────────────────────────────────────────────────────────────────
@@ -570,7 +589,9 @@ async def test_a_deposit_currency_rule_charged_on_both_legs_is_a_whole_fee_per_f
         symbol_info(name="EURUSD.a", trade_contract_size=100000.0),
         bid=1.08490,
         ask=1.08510,
-        schedule=schedule(3.5, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+        schedule=schedule(
+            3.5, "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
@@ -596,7 +617,9 @@ async def test_an_entry_only_rule_in_the_deposit_currency_is_halved_and_converte
         symbol_info(name="EURUSD+", trade_contract_size=100000.0),
         bid=1.08500,
         ask=1.08500,
-        schedule=schedule(6.0, "UST", mode=MONEY_DEPOSIT, entry=ENTRY_IN),
+        schedule=schedule(
+            6.0, "UST", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.IN
+        ),
     )
     provider = provider_for(venue, "EURUSD+", currency="UST", currency_digits=2)
     await provider.initialize()
@@ -622,7 +645,9 @@ async def test_a_per_share_rule_in_a_named_currency_is_divided_by_the_price(venu
         ),
         bid=230.0,
         ask=230.0,
-        schedule=schedule(0.02, "USD", mode=MONEY_SPECIFIED, entry=ENTRY_IN),
+        schedule=schedule(
+            0.02, "USD", mode=CommissionMode.MONEY_SPECIFIED, entry=CommissionEntryMode.IN
+        ),
     )
     provider = provider_for(venue, "AAPL")
     await provider.initialize()
@@ -648,7 +673,9 @@ async def test_a_rule_in_a_currency_the_venue_quotes_inversely_is_converted_thro
         ),
         bid=20000.0,
         ask=20000.0,
-        schedule=schedule(5.0, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+        schedule=schedule(
+            5.0, "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
     )
     provider = provider_for(venue, "DE40")
     await provider.initialize()
@@ -673,7 +700,9 @@ async def test_a_conversion_symbol_whose_quote_the_hub_fails_fails_the_load_with
         ),
         bid=20000.0,
         ask=20000.0,
-        schedule=schedule(5.0, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+        schedule=schedule(
+            5.0, "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
     )
     failure = EaError("symbol_info_tick: the publisher chart of EURUSD failed to open", 4105)
     venue.refusals[(Call.SYMBOL_INFO_TICK, "EURUSD")] = [failure]
@@ -689,7 +718,9 @@ async def test_a_rule_in_a_currency_the_venue_cannot_convert_fails_the_load_nami
         symbol_info(name="EURUSD.a"),
         bid=1.085,
         ask=1.085,
-        schedule=schedule(3.5, "GBP", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+        schedule=schedule(
+            3.5, "GBP", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
     )
     provider = provider_for(venue, "EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a") as refused:
@@ -702,7 +733,7 @@ async def test_a_percent_rule_charged_on_both_legs_is_its_percentage_of_the_noti
         symbol_info(name="EURUSD.a"),
         bid=1.08490,
         ask=1.08510,
-        schedule=schedule(0.002, "", mode=PERCENT, entry=ENTRY_INOUT),
+        schedule=schedule(0.002, "", mode=CommissionMode.PERCENT, entry=CommissionEntryMode.INOUT),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
@@ -716,7 +747,7 @@ async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
         symbol_info(name="EURUSD.a"),
         bid=1.085,
         ask=1.085,
-        schedule=schedule(0.004, "", mode=PERCENT, entry=ENTRY_IN),
+        schedule=schedule(0.004, "", mode=CommissionMode.PERCENT, entry=CommissionEntryMode.IN),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
@@ -730,7 +761,7 @@ async def test_a_points_rule_is_its_points_in_price_over_the_price(venue):
         symbol_info(name="EURUSD.a", point=0.00001),
         bid=1.08490,
         ask=1.08510,
-        schedule=schedule(30.0, "", mode=POINTS, entry=ENTRY_INOUT),
+        schedule=schedule(30.0, "", mode=CommissionMode.PIPS, entry=CommissionEntryMode.INOUT),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
@@ -745,7 +776,7 @@ async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
         symbol_info(name="EURUSD.a", point=0.00001),
         bid=1.085,
         ask=1.085,
-        schedule=schedule(30.0, "", mode=POINTS, entry=ENTRY_IN),
+        schedule=schedule(30.0, "", mode=CommissionMode.PIPS, entry=CommissionEntryMode.IN),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
@@ -756,8 +787,8 @@ async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
 @pytest.mark.parametrize(
     ("mode", "entry", "named"),
     [
-        (PERCENT_PROFIT, ENTRY_INOUT, PERCENT_PROFIT),
-        (MONEY_DEPOSIT, ENTRY_OUT, ENTRY_OUT),
+        (CommissionMode.PERCENT_PROFIT, CommissionEntryMode.INOUT, CommissionMode.PERCENT_PROFIT),
+        (CommissionMode.MONEY_DEPOSIT, CommissionEntryMode.OUT, CommissionEntryMode.OUT),
     ],
     ids=["mode-without-derivation", "exit-only"],
 )
@@ -781,7 +812,9 @@ async def test_a_non_finite_commission_value_fails_the_load_naming_the_symbol(ve
         symbol_info(name="EURUSD.a"),
         bid=1.085,
         ask=1.085,
-        schedule=schedule(float("nan"), "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+        schedule=schedule(
+            float("nan"), "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
     )
     provider = provider_for(venue, "EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a"):
@@ -802,7 +835,9 @@ async def test_a_non_finite_quote_fails_the_load_naming_the_symbol(venue):
         symbol_info(name="EURUSD.a"),
         bid=float("nan"),
         ask=1.085,
-        schedule=schedule(3.5, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT),
+        schedule=schedule(
+            3.5, "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
     )
     provider = provider_for(venue, "EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a"):
@@ -814,7 +849,9 @@ async def test_a_reload_recomputes_the_fee_from_the_current_schedule(venue):
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
     assert provider.get_instrument("EURUSD.a").taker_fee == Decimal(0)
-    venue.schedules["EURUSD.a"] = schedule(3.5, "USD", mode=MONEY_DEPOSIT, entry=ENTRY_INOUT)
+    venue.schedules["EURUSD.a"] = schedule(
+        3.5, "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+    )
     await provider.initialize(reload=True)
     fee = provider.get_instrument("EURUSD.a").taker_fee
     assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000323")
@@ -832,88 +869,138 @@ async def test_every_load_refuses_a_lost_connection(venue):
     with pytest.raises(MT5ConnectionError):
         await provider.load_ids_async([InstrumentId.from_str("EURUSD.MT5")])
     with pytest.raises(MT5ConnectionError):
-        provider.load_symbol("EURUSD")
+        await provider.load_symbol("EURUSD")
 
 
-def test_loading_one_symbol_answers_and_holds_its_instrument(venue):
+async def test_loading_one_symbol_answers_and_holds_its_instrument(venue):
     venue.add(symbol_info(name="EURUSDm"))
     provider = provider_for(venue)
-    instrument = provider.load_symbol("EURUSDm")
+    instrument = await provider.load_symbol("EURUSDm")
     assert instrument.id.value == "EURUSDm.MT5"
     assert provider.get_instrument("EURUSDm") is instrument
     assert provider.get_instrument("EURUSDM") is None
 
 
-def test_a_definition_the_hub_fails_as_an_unknown_symbol_is_not_found(venue):
+async def test_a_definition_the_hub_fails_as_an_unknown_symbol_is_not_found(venue):
     venue.refusals[(Call.SYMBOL_INFO, "NOSUCH")] = [
-        EaError("symbol_info: SymbolExist found no such symbol", UNKNOWN_SYMBOL)
+        EaError(
+            "symbol_info: SymbolExist found no such symbol", MqlError.MARKET_UNKNOWN_SYMBOL.value
+        )
     ]
     provider = provider_for(venue)
     with pytest.raises(MT5SymbolNotFoundError) as refused:
-        provider.load_symbol("NOSUCH")
+        await provider.load_symbol("NOSUCH")
     assert refused.value.symbol == "NOSUCH"
     assert str(refused.value) == "symbol 'NOSUCH' not found"
 
 
-def test_a_definition_the_hub_fails_with_another_error_raises_that_error(venue):
+async def test_a_definition_the_hub_fails_with_another_error_raises_that_error(venue):
     failure = EaError("symbol_info: SymbolInfoString failed", 4756)
     venue.refusals[(Call.SYMBOL_INFO, "NOSUCH")] = [failure]
     provider = provider_for(venue)
     with pytest.raises(EaError) as refused:
-        provider.load_symbol("NOSUCH")
+        await provider.load_symbol("NOSUCH")
     assert refused.value is failure
 
 
-def test_a_definition_deferred_while_its_chart_opens_is_asked_again_and_loads(venue):
+async def test_a_definition_deferred_while_its_chart_opens_is_asked_again_and_loads(venue):
     venue.add(symbol_info(name="EURUSD"))
     venue.refusals[(Call.SYMBOL_INFO, "EURUSD")] = [
         NoPublisher("symbol_info: no publisher EA for EURUSD; chart requested", 0, 0.05)
     ]
     provider = provider_for(venue)
-    instrument = provider.load_symbol("EURUSD")
+    instrument = await provider.load_symbol("EURUSD")
     assert instrument.id.value == "EURUSD.MT5"
     assert venue.asked_of("EURUSD").count(Call.SYMBOL_INFO) == 2
 
 
-def test_a_schedule_deferred_until_it_is_relayed_is_asked_again_and_loads(venue):
+async def test_a_schedule_deferred_until_it_is_relayed_is_asked_again_and_loads(venue):
     venue.add(symbol_info(name="EURUSD"))
     venue.refusals[(Call.COMMISSION_SCHEDULE, "EURUSD")] = [
         Syncing("commission_schedule: no commission_schedule relayed for EURUSD", 0, 0.05)
     ]
     provider = provider_for(venue)
-    instrument = provider.load_symbol("EURUSD")
+    instrument = await provider.load_symbol("EURUSD")
     assert instrument.taker_fee == Decimal(0)
     assert venue.asked_of("EURUSD").count(Call.COMMISSION_SCHEDULE) == 2
 
 
-def test_a_failed_load_adds_none_of_its_symbols(venue):
+async def test_a_load_the_hub_defers_leaves_its_callers_loop_running_and_adds_on_it(venue):
+    venue.add(symbol_info(name="EURUSD"))
+    venue.refusals[(Call.SYMBOL_INFO, "EURUSD")] = [
+        NotReady("symbol_info: the broker clock is not verified", 0, 0.25)
+    ]
+    provider = provider_for(venue)
+    added_on = []
+
+    def add(instrument):
+        added_on.append(threading.current_thread())
+        MT5InstrumentProvider.add(provider, instrument)
+
+    provider.add = add
+    order = []
+    asyncio.get_running_loop().call_later(0.025, order.append, "callback")
+
+    await provider.load_ids_async([InstrumentId.from_str("EURUSD.MT5")])
+    order.append("loaded")
+
+    assert order == ["callback", "loaded"]
+    assert added_on == [threading.current_thread()]
+
+
+async def test_cancelling_a_load_the_hub_defers_ends_its_reads_and_adds_nothing(venue):
+    venue.add(symbol_info(name="EURUSD"))
+    venue.refusals[(Call.SYMBOL_INFO, "EURUSD")] = [
+        NotReady("symbol_info: the broker clock is not verified", 0, 0.25)
+    ]
+    provider = provider_for(venue)
+    load = asyncio.create_task(provider.load_ids_async([InstrumentId.from_str("EURUSD.MT5")]))
+    await eventually(lambda: Call.SYMBOL_INFO in venue.asked_of("EURUSD"))
+
+    load.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await load
+    await asyncio.sleep(0.5)
+
+    assert venue.asked_of("EURUSD") == [Call.SYMBOL_INFO]
+    assert provider.list_all() == []
+
+
+async def test_a_relayed_schedule_reaches_the_provider_with_its_selectors_members(venue):
+    venue.add(symbol_info(name="EURUSD"), schedule=schedule(3.5, "USD"))
+    relayed = await venue.request(Call.COMMISSION_SCHEDULE, symbol="EURUSD")
+    rule = parse_schedule(relayed.result)
+    assert (type(rule.entry), type(rule.mode)) == (CommissionEntryMode, CommissionMode)
+
+
+async def test_a_failed_load_adds_none_of_its_symbols(venue):
     venue.add(symbol_info(name="EURUSD"))
     venue.add(symbol_info(name="ODDPAIR", currency_profit="XYZ"))
     provider = provider_for(venue)
     with pytest.raises(MT5InstrumentError):
-        provider._load(["EURUSD", "ODDPAIR"])
+        await provider._load(["EURUSD", "ODDPAIR"])
     assert provider.list_all() == []
 
 
-def test_loads_accumulate_and_a_reload_replaces_the_instrument(venue):
+async def test_loads_accumulate_and_a_reload_replaces_the_instrument(venue):
     venue.add(symbol_info(name="EURUSD"))
     venue.add(symbol_info(name="GBPUSD", currency_base="GBP"))
     provider = provider_for(venue)
-    provider.load_symbol("EURUSD")
-    provider.load_symbol("GBPUSD")
-    provider.load_symbol("EURUSD")
+    await provider.load_symbol("EURUSD")
+    await provider.load_symbol("GBPUSD")
+    await provider.load_symbol("EURUSD")
     assert sorted(instrument.id.value for instrument in provider.list_all()) == [
         "EURUSD.MT5",
         "GBPUSD.MT5",
     ]
 
 
-def test_a_listing_the_hub_fails_fails_the_load_with_its_error(venue):
+async def test_a_listing_the_hub_fails_fails_the_load_with_its_error(venue):
     venue.add(symbol_info(name="EURUSD"))
     failure = EaError("symbols_get: SymbolName failed", 4756)
     venue.refusals[(Call.SYMBOLS_GET, None)] = [failure]
     provider = provider_for(venue)
     with pytest.raises(EaError) as refused:
-        provider.load_symbol("EURUSD")
+        await provider.load_symbol("EURUSD")
     assert refused.value is failure
     assert provider.list_all() == []

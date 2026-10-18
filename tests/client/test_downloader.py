@@ -1,11 +1,10 @@
 """MT5DataDownloader: its backward walks over the hub's bar windows and UTC days, its instrument
 loading, and download_all."""
 
-import asyncio
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum, auto
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
@@ -161,9 +160,8 @@ def from_str_sym(s):
 
 
 def make_conn(connected=True):
-    """A connection whose bridge runs each coroutine it is handed to its end."""
+    """A connection, connected unless `connected` is False."""
     conn = MagicMock()
-    conn.run = asyncio.run
     if connected:
         conn.ensure_connected = MagicMock()
     else:
@@ -175,7 +173,7 @@ def make_provider(instrument=None):
     provider = MagicMock()
     eurusd = instrument or make_eurusd_instrument()
     provider.get_instrument.return_value = eurusd
-    provider.load_symbol.return_value = eurusd
+    provider.load_symbol = AsyncMock(return_value=eurusd)
     return provider
 
 
@@ -298,24 +296,24 @@ BAR_WINDOWS = [
 
 class TestDownloadBarsWalk:
 
-    def test_walks_back_to_the_advertised_floor_and_records_it(self, downloader, catalog):
+    async def test_walks_back_to_the_advertised_floor_and_records_it(self, downloader, catalog):
         floor = LAST_OPEN - 2 * SPAN - 50 * HOUR
         server = Server(*[Answer.ROWS] * 3, floors={Series.H1: floor})
         with serving(server):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert server.asked == [("EURUSD", Series.H1, lo, hi) for lo, hi in BAR_WINDOWS]
         assert (result.chunks_processed, result.total_written) == (3, 6)
         assert catalog.write_data.call_count == 3
         assert (result.success, result.floor) == (True, datetime.fromtimestamp(floor, UTC))
 
-    def test_an_empty_window_reads_the_floor_again_and_the_walk_stops_at_it(
+    async def test_an_empty_window_reads_the_floor_again_and_the_walk_stops_at_it(
         self, downloader, catalog
     ):
         floor = LAST_OPEN - SPAN
         server = Server(Answer.ROWS, Answer.EMPTY, floors={Series.H1: floor}, measured_after=1)
         with serving(server):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert server.asked == [("EURUSD", Series.H1, lo, hi) for lo, hi in BAR_WINDOWS[:2]]
         # Before the walk, after the empty window, and once the walk ends.
@@ -323,32 +321,32 @@ class TestDownloadBarsWalk:
         assert (result.chunks_empty, result.total_written) == (1, 2)
         assert result.floor == datetime.fromtimestamp(floor, UTC)
 
-    def test_a_floor_measured_while_the_last_window_was_answered_is_recorded(
+    async def test_a_floor_measured_while_the_last_window_was_answered_is_recorded(
         self, downloader, catalog
     ):
         floor = int(dt(2024, 12, 28).timestamp())
         server = Server(Answer.ROWS, floors={Series.H1: floor}, measured_after=1)
         with serving(server):
-            result = downloader.download_bars("EURUSD", dt(2024, 12, 27), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 12, 27), dt(2024, 12, 31))
 
         assert len(server.asked) == 1
         assert result.floor == datetime.fromtimestamp(floor, UTC)
 
-    def test_an_empty_window_after_the_floor_does_not_end_the_walk(self, downloader, catalog):
+    async def test_an_empty_window_after_the_floor_does_not_end_the_walk(self, downloader, catalog):
         server = Server(
             Answer.ROWS, Answer.EMPTY, Answer.ROWS, floors={Series.H1: LAST_OPEN - 50 * SPAN}
         )
         with serving(server):
-            result = downloader.download_bars("EURUSD", dt(2024, 12, 19), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 12, 19), dt(2024, 12, 31))
 
         assert len(server.asked) == 3
         assert server.ranges_read == 3
         assert (result.chunks_empty, result.total_written, result.floor) == (1, 4, None)
 
-    def test_writes_bars_stamped_at_their_close(self, downloader, catalog):
+    async def test_writes_bars_stamped_at_their_close(self, downloader, catalog):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
         with serving(server):
-            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         written = catalog.write_data.call_args_list[0][0][0]
         assert all(isinstance(bar, Bar) for bar in written)
@@ -358,7 +356,7 @@ class TestDownloadBarsWalk:
             end * 1_000_000_000,
         ]
 
-    def test_writes_the_bars_whose_real_closes_the_range_names_across_a_clock_change(
+    async def test_writes_the_bars_whose_real_closes_the_range_names_across_a_clock_change(
         self, downloader, catalog
     ):
         # The week opened 2025-11-01T21:00Z runs 169 hours, to the next one's open.
@@ -378,19 +376,19 @@ class TestDownloadBarsWalk:
             patch("mt5connector.client.history.bars", side_effect=bars),
             patch("mt5connector.client.history.ranges", return_value=ranges),
         ):
-            downloader.download_bars(
+            await downloader.download_bars(
                 "EURUSD", dt(2025, 11, 8, 21, 30), dt(2025, 11, 15, 23), mirror.TIMEFRAME_W1
             )
 
         written = [bar for call in catalog.write_data.call_args_list for bar in call[0][0]]
         assert [bar.ts_event // 1_000_000_000 for bar in written] == [weeks[0][1], weeks[1][1]]
 
-    def test_a_failed_window_is_an_error_and_the_walk_goes_on(self, downloader, catalog):
+    async def test_a_failed_window_is_an_error_and_the_walk_goes_on(self, downloader, catalog):
         server = Server(
             Answer.FAILED, Answer.ROWS, floors={Series.H1: LAST_OPEN - SPAN - 50 * HOUR}
         )
         with serving(server):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert len(server.asked) == 2
         assert result.errors == [
@@ -407,18 +405,20 @@ class TestDownloadBarsWalk:
         ],
         ids=["unreachable", "lost"],
     )
-    def test_a_window_the_server_does_not_answer_is_an_error_and_the_walk_goes_on(
+    async def test_a_window_the_server_does_not_answer_is_an_error_and_the_walk_goes_on(
         self, downloader, failure
     ):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN - SPAN - 50 * HOUR})
         failures = [failure, rate_rows(LAST_OPEN - SPAN - HOUR)]
         with serving(server), patch("mt5connector.client.history.bars", side_effect=failures):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert (result.chunks_processed, result.total_written) == (2, 1)
         assert str(failure) in result.errors[0]
 
-    def test_a_window_failing_any_other_way_raises_and_ends_the_walk(self, downloader, catalog):
+    async def test_a_window_failing_any_other_way_raises_and_ends_the_walk(
+        self, downloader, catalog
+    ):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN - SPAN - 50 * HOUR})
         with (
             serving(server),
@@ -427,54 +427,60 @@ class TestDownloadBarsWalk:
             ) as bars,
         ):
             with pytest.raises(RuntimeError, match="a defect"):
-                downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+                await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert bars.call_count == 1
         catalog.write_data.assert_not_called()
 
     @pytest.mark.parametrize("failure", RANGES_FAILURES, ids=lambda failure: type(failure).__name__)
-    def test_failed_ranges_are_an_error_and_nothing_is_walked(self, downloader, failure):
+    async def test_failed_ranges_are_an_error_and_nothing_is_walked(self, downloader, failure):
         with (
             patch("mt5connector.client.history.ranges", side_effect=failure),
             patch("mt5connector.client.history.bars") as bars,
         ):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         bars.assert_not_called()
         assert result.errors == [f"Ranges failed: {failure}"]
 
     @pytest.mark.parametrize("failure", RANGES_FAILURES, ids=lambda failure: type(failure).__name__)
-    def test_a_floor_read_again_that_fails_is_an_error_and_the_floor_read_before_stands(
+    async def test_a_floor_read_again_that_fails_is_an_error_and_the_floor_read_before_stands(
         self, downloader, failure
     ):
         floor = LAST_OPEN - SPAN - 50 * HOUR
         server = Server(Answer.ROWS, Answer.ROWS, floors={Series.H1: floor})
         ranges = [server.ranges(None, "EURUSD"), failure]
         with serving(server), patch("mt5connector.client.history.ranges", side_effect=ranges):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert len(server.asked) == 2
         assert result.errors == [f"Ranges failed: {failure}"]
         assert result.floor == datetime.fromtimestamp(floor, UTC)
 
-    def test_the_default_timeframe_is_h1_and_an_explicit_one_is_used(self, downloader):
+    async def test_the_default_timeframe_is_h1_and_an_explicit_one_is_used(self, downloader):
         floors = {Series.H1: int(dt(2024, 12, 29).timestamp()), Series.D1: 0}
         server = Server(Answer.ROWS, Answer.ROWS, floors=floors)
         with serving(server):
-            downloader.download_bars("EURUSD", dt(2024, 12, 1), dt(2024, 12, 31))
-            downloader.download_bars("EURUSD", dt(2024, 12, 1), dt(2024, 12, 31), timeframe=16408)
+            await downloader.download_bars("EURUSD", dt(2024, 12, 1), dt(2024, 12, 31))
+            await downloader.download_bars(
+                "EURUSD", dt(2024, 12, 1), dt(2024, 12, 31), timeframe=16408
+            )
 
         assert [asked[1] for asked in server.asked] == [Series.H1, Series.D1]
 
-    def test_a_month_timeframe_has_no_history(self, downloader):
+    async def test_a_month_timeframe_has_no_history(self, downloader):
         with pytest.raises(ValueError, match="49153"):
-            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=49153)
+            await downloader.download_bars(
+                "EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=49153
+            )
 
-    def test_a_timeframe_of_zero_is_refused_not_defaulted(self, downloader):
+    async def test_a_timeframe_of_zero_is_refused_not_defaulted(self, downloader):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
         with serving(server):
             with pytest.raises(ValueError, match="^timeframe 0 has no history series$"):
-                downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=0)
+                await downloader.download_bars(
+                    "EURUSD", dt(2024, 1, 1), dt(2024, 12, 31), timeframe=0
+                )
         assert server.asked == []
 
     @pytest.mark.parametrize(
@@ -482,23 +488,23 @@ class TestDownloadBarsWalk:
         [({"chart_mode": "BID"}, "BID"), ({"chart_mode": "LAST"}, "LAST"), ({}, "LAST")],
         ids=["bid-chart", "last-chart", "no-chart-mode"],
     )
-    def test_bars_are_typed_by_the_price_the_venue_charts_them_on(
+    async def test_bars_are_typed_by_the_price_the_venue_charts_them_on(
         self, conn, catalog, info, price_type
     ):
         downloader = MT5DataDownloader(conn, make_provider(make_eurusd_instrument(info)), catalog)
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
         with serving(server):
-            downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         written = catalog.write_data.call_args_list[0][0][0]
         assert {str(bar.bar_type) for bar in written} == {
             f"EURUSD.MT5-1-HOUR-{price_type}-EXTERNAL"
         }
 
-    def test_data_type_is_bars(self, downloader):
+    async def test_data_type_is_bars(self, downloader):
         server = Server(Answer.ROWS, floors={Series.H1: LAST_OPEN})
         with serving(server):
-            result = downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
+            result = await downloader.download_bars("EURUSD", dt(2024, 1, 1), dt(2024, 12, 31))
 
         assert result.data_type == "bars"
 
@@ -510,11 +516,11 @@ class TestDownloadBarsWalk:
 
 class TestDownloadTicksWalk:
 
-    def test_walks_back_day_by_day_to_the_advertised_floor(self, downloader, catalog):
+    async def test_walks_back_day_by_day_to_the_advertised_floor(self, downloader, catalog):
         floor = int(dt(2024, 1, 8, 12).timestamp())
         server = Server(*[Answer.ROWS] * 3, floors={Series.TICKS: floor})
         with serving(server):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 10, 12))
+            result = await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 10, 12))
 
         end = int(dt(2024, 1, 10, 12).timestamp())
         midnight = int(dt(2024, 1, 10).timestamp())
@@ -528,18 +534,22 @@ class TestDownloadTicksWalk:
         written = catalog.write_data.call_args_list[0][0][0]
         assert all(isinstance(tick, QuoteTick) for tick in written)
 
-    def test_both_sizes_of_a_tick_are_the_instruments_largest_order(self, downloader, catalog):
+    async def test_both_sizes_of_a_tick_are_the_instruments_largest_order(
+        self, downloader, catalog
+    ):
         server = Server(Answer.ROWS, floors={Series.TICKS: int(dt(2024, 1, 8).timestamp())})
         with serving(server):
-            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+            await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         [tick] = catalog.write_data.call_args_list[0][0][0]
         assert (tick.bid_size, tick.ask_size) == (Quantity(1000, 2), Quantity(1000, 2))
 
-    def test_walks_no_further_back_than_start(self, downloader):
+    async def test_walks_no_further_back_than_start(self, downloader):
         server = Server(Answer.ROWS, Answer.ROWS)
         with serving(server):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 9, 6), dt(2024, 1, 10, 12))
+            result = await downloader.download_ticks(
+                "EURUSD", dt(2024, 1, 9, 6), dt(2024, 1, 10, 12)
+            )
 
         assert server.asked[-1] == (
             "EURUSD",
@@ -548,40 +558,44 @@ class TestDownloadTicksWalk:
         )
         assert (result.chunks_processed, result.floor) == (2, None)
 
-    def test_a_floor_measured_while_the_last_day_was_answered_is_recorded(
+    async def test_a_floor_measured_while_the_last_day_was_answered_is_recorded(
         self, downloader, catalog
     ):
         floor = int(dt(2024, 1, 9, 12).timestamp())
         server = Server(Answer.ROWS, Answer.ROWS, floors={Series.TICKS: floor}, measured_after=1)
         with serving(server):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 9, 6), dt(2024, 1, 10, 12))
+            result = await downloader.download_ticks(
+                "EURUSD", dt(2024, 1, 9, 6), dt(2024, 1, 10, 12)
+            )
 
         assert len(server.asked) == 2
         assert result.floor == datetime.fromtimestamp(floor, UTC)
 
     @pytest.mark.parametrize("failure", RANGES_FAILURES, ids=lambda failure: type(failure).__name__)
-    def test_failed_ranges_are_an_error_and_no_day_is_walked(self, downloader, failure):
+    async def test_failed_ranges_are_an_error_and_no_day_is_walked(self, downloader, failure):
         with (
             patch("mt5connector.client.history.ranges", side_effect=failure),
             patch("mt5connector.client.history.ticks") as ticks,
         ):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 10))
+            result = await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 10))
 
         ticks.assert_not_called()
         assert result.errors == [f"Ranges failed: {failure}"]
 
-    def test_a_day_answered_without_ticks_is_empty_and_writes_nothing(self, downloader, catalog):
+    async def test_a_day_answered_without_ticks_is_empty_and_writes_nothing(
+        self, downloader, catalog
+    ):
         server = Server(Answer.EMPTY)
         with serving(server):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 10), dt(2024, 1, 10, 12))
+            result = await downloader.download_ticks("EURUSD", dt(2024, 1, 10), dt(2024, 1, 10, 12))
 
         assert (result.chunks_empty, result.total_written) == (1, 0)
         catalog.write_data.assert_not_called()
 
-    def test_data_type_is_ticks(self, downloader):
+    async def test_data_type_is_ticks(self, downloader):
         server = Server(Answer.ROWS, floors={Series.TICKS: int(dt(2024, 1, 8).timestamp())})
         with serving(server):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+            result = await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.data_type == "ticks"
 
@@ -593,68 +607,72 @@ class TestDownloadTicksWalk:
 
 class TestInstruments:
 
-    def test_a_symbol_not_found_is_an_error_and_nothing_is_asked(self, conn, catalog):
+    async def test_a_symbol_not_found_is_an_error_and_nothing_is_asked(self, conn, catalog):
         provider = MagicMock()
         provider.get_instrument.return_value = None
-        provider.load_symbol.side_effect = MT5SymbolNotFoundError("FAKESYM")
+        provider.load_symbol = AsyncMock(side_effect=MT5SymbolNotFoundError("FAKESYM"))
         downloader = MT5DataDownloader(conn, provider, catalog)
 
         with (
             patch("mt5connector.client.history.ticks") as ticks,
             patch("mt5connector.client.history.bars") as bars,
         ):
-            ticks_result = downloader.download_ticks("FAKESYM", dt(2024, 1, 1), dt(2024, 1, 8))
-            bars_result = downloader.download_bars("FAKESYM", dt(2024, 1, 1), dt(2024, 1, 8))
+            ticks_result = await downloader.download_ticks(
+                "FAKESYM", dt(2024, 1, 1), dt(2024, 1, 8)
+            )
+            bars_result = await downloader.download_bars("FAKESYM", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert "FAKESYM" in ticks_result.errors[0] and "FAKESYM" in bars_result.errors[0]
         assert (ticks_result.total_written, bars_result.total_written) == (0, 0)
         ticks.assert_not_called()
         bars.assert_not_called()
 
-    def test_a_definition_the_venue_refuses_is_that_symbols_error(self, conn, catalog):
+    async def test_a_definition_the_venue_refuses_is_that_symbols_error(self, conn, catalog):
         provider = MagicMock()
         provider.get_instrument.return_value = None
-        provider.load_symbol.side_effect = MT5InstrumentError("DE40: trade_calc_mode FUTURES")
+        provider.load_symbol = AsyncMock(
+            side_effect=MT5InstrumentError("DE40: trade_calc_mode FUTURES")
+        )
         downloader = MT5DataDownloader(conn, provider, catalog)
 
         with patch("mt5connector.client.history.bars") as bars:
-            result = downloader.download_bars("DE40", dt(2024, 1, 1), dt(2024, 1, 8))
+            result = await downloader.download_bars("DE40", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert len(result.errors) == 1 and "DE40: trade_calc_mode FUTURES" in result.errors[0]
         bars.assert_not_called()
 
-    def test_a_load_the_server_does_not_answer_is_raised_not_recorded(self, conn, catalog):
+    async def test_a_load_the_server_does_not_answer_is_raised_not_recorded(self, conn, catalog):
         provider = MagicMock()
         provider.get_instrument.return_value = None
-        provider.load_symbol.side_effect = ServerUnreachable("symbol_info: refused")
+        provider.load_symbol = AsyncMock(side_effect=ServerUnreachable("symbol_info: refused"))
         downloader = MT5DataDownloader(conn, provider, catalog)
 
         with pytest.raises(ServerUnreachable, match="symbol_info"):
-            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+            await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
-    def test_raises_when_not_connected(self, catalog, provider):
+    async def test_raises_when_not_connected(self, catalog, provider):
         downloader = MT5DataDownloader(make_conn(connected=False), provider, catalog)
 
         with pytest.raises(MT5ConnectionError):
-            downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+            await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
-    def test_auto_loads_instrument_if_not_pre_loaded(self, conn, catalog):
+    async def test_auto_loads_instrument_if_not_pre_loaded(self, conn, catalog):
         provider = MagicMock()
         provider.get_instrument.return_value = None
-        provider.load_symbol.return_value = make_eurusd_instrument()
+        provider.load_symbol = AsyncMock(return_value=make_eurusd_instrument())
         downloader = MT5DataDownloader(conn, provider, catalog)
         server = Server(Answer.ROWS, floors={Series.TICKS: int(dt(2024, 1, 8).timestamp())})
 
         with serving(server):
-            result = downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
+            result = await downloader.download_ticks("EURUSD", dt(2024, 1, 1), dt(2024, 1, 8))
 
         provider.load_symbol.assert_called_once_with("EURUSD")
         assert result.total_written == 1
 
-    def test_symbol_whitespace_stripped_and_casing_preserved(self, downloader):
+    async def test_symbol_whitespace_stripped_and_casing_preserved(self, downloader):
         server = Server(Answer.ROWS, floors={Series.TICKS: int(dt(2024, 1, 8).timestamp())})
         with serving(server):
-            result = downloader.download_ticks("  EURUSDm  ", dt(2024, 1, 1), dt(2024, 1, 8))
+            result = await downloader.download_ticks("  EURUSDm  ", dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert result.symbol == "EURUSDm"
         assert server.asked[0][0] == "EURUSDm"
@@ -675,10 +693,10 @@ ONE_WINDOW_FLOORS = {
 
 class TestDownloadAll:
 
-    def test_every_symbol_gets_its_ticks_then_each_timeframe(self, downloader):
+    async def test_every_symbol_gets_its_ticks_then_each_timeframe(self, downloader):
         server = Server(*[Answer.ROWS] * 6, floors=ONE_WINDOW_FLOORS)
         with serving(server):
-            results = downloader.download_all(
+            results = await downloader.download_all(
                 ["EURUSD", "XAUUSD"], dt(2024, 1, 1), dt(2024, 1, 8), timeframes=[16385, 16408]
             )
 
@@ -687,34 +705,36 @@ class TestDownloadAll:
             "XAUUSD": ["ticks", "bars", "bars"],
         }
 
-    def test_default_timeframes_are_h1_and_d1(self, downloader):
+    async def test_default_timeframes_are_h1_and_d1(self, downloader):
         server = Server(*[Answer.ROWS] * 3, floors=ONE_WINDOW_FLOORS)
         with serving(server):
-            downloader.download_all(["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8))
+            await downloader.download_all(["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8))
 
         assert [asked[1] for asked in server.asked[1:]] == [Series.H1, Series.D1]
 
-    def test_no_timeframes_downloads_no_bars(self, downloader):
+    async def test_no_timeframes_downloads_no_bars(self, downloader):
         server = Server(Answer.ROWS, floors=ONE_WINDOW_FLOORS)
         with serving(server):
-            results = downloader.download_all(
+            results = await downloader.download_all(
                 ["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8), timeframes=[]
             )
 
         assert [r.data_type for r in results["EURUSD"]] == ["ticks"]
 
-    def test_skip_ticks_when_include_ticks_false(self, downloader):
+    async def test_skip_ticks_when_include_ticks_false(self, downloader):
         server = Server(Answer.ROWS, floors=ONE_WINDOW_FLOORS)
         with serving(server), patch("mt5connector.client.history.ticks") as ticks:
-            downloader.download_all(
+            await downloader.download_all(
                 ["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8), include_ticks=False, timeframes=[16385]
             )
 
         ticks.assert_not_called()
 
-    def test_skip_bars_when_include_bars_false(self, downloader):
+    async def test_skip_bars_when_include_bars_false(self, downloader):
         server = Server(Answer.ROWS, floors=ONE_WINDOW_FLOORS)
         with serving(server), patch("mt5connector.client.history.bars") as bars:
-            downloader.download_all(["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8), include_bars=False)
+            await downloader.download_all(
+                ["EURUSD"], dt(2024, 1, 1), dt(2024, 1, 8), include_bars=False
+            )
 
         bars.assert_not_called()

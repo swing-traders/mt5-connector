@@ -330,7 +330,8 @@ class MT5DataClient(LiveMarketDataClient):
         pass
 
     async def _request_instrument(self, request: RequestInstrument) -> None:
-        instrument = self._provider.load_symbol(request.instrument_id.symbol.value)
+        await self._provider.load_ids_async([request.instrument_id])
+        instrument = self._instrument(request.instrument_id.symbol.value)
         _register_settlement([instrument])
         self._handle_instrument(instrument, request.id, request.start, request.end, request.params)
 

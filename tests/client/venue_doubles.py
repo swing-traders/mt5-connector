@@ -3,18 +3,14 @@ immediate answer as the hub session hands them back, every field the hub carries
 trading sessions a publisher relays, and a hub session serving an instrument provider's reads, for
 tests that feed the client a venue."""
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 from mt5connector.client.errors import EaError
 from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls, mirror
+from mt5connector.wire.push_wire import MqlError
 
 Call = calls.Call
-# MQL5's ERR_MARKET_UNKNOWN_SYMBOL, which the hub's answer carries for a symbol the broker does not
-# list.
-UNKNOWN_SYMBOL = 4301
 
 _ACCOUNT_STRINGS = frozenset({"name", "server", "currency", "company"})
 _SYMBOL_STRINGS = frozenset(
@@ -207,23 +203,15 @@ def listing(info):
     return struct(**{field: getattr(info, field) for field in struct._fields})
 
 
-def run_apart(coroutine):
-    """Runs a coroutine to its end on a loop of its own thread, as a connection runs its session's
-    coroutines on its own."""
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coroutine).result()
-
-
 class SymbolVenue:
-    """The hub session of an instrument provider's connection: the terminal's listing, each listed
-    symbol's definition and quote and the commission schedule and trading sessions relayed for it,
-    each request asked by its call and symbol, in order. A symbol it does not list fails as the hub
-    fails one the broker does not list; a refusal queued for a call and symbol is raised in turn
-    before it answers."""
+    """The hub session of an instrument provider's connection, answering the reads a provider asks
+    from the account, symbols and refusals a test hands it."""
 
+    account_info = HubSession.account_info
     deferring = HubSession.deferring
 
     def __init__(self) -> None:
+        self.account = account_info()
         self.definitions = {}
         self.ticks = {}
         self.schedules = {}
@@ -250,13 +238,15 @@ class SymbolVenue:
         refusals = self.refusals.get((call, symbol), [])
         if refusals:
             raise refusals.pop(0)
+        elif call is Call.ACCOUNT_INFO:
+            return Answered(self.account, 0)
         elif call is Call.SYMBOLS_GET:
             return Answered(tuple(listing(info) for info in self.definitions.values()), 0)
         elif symbol not in self.definitions:
             raise EaError(
                 f"{call.name.lower()}: the publisher chart of {symbol} failed to open: "
-                f"MQL5 error {UNKNOWN_SYMBOL}",
-                UNKNOWN_SYMBOL,
+                f"MQL5 error {MqlError.MARKET_UNKNOWN_SYMBOL.value}",
+                MqlError.MARKET_UNKNOWN_SYMBOL.value,
             )
         elif call is Call.SYMBOL_INFO:
             return Answered(self.definitions[symbol], 0)
@@ -268,3 +258,8 @@ class SymbolVenue:
             return Answered(self.sessions.get(symbol, relayed_sessions()), 0)
         else:
             raise ValueError(f"{call.name.lower()}: not a call an instrument provider asks")
+
+
+def serve(conn: MagicMock, venue: SymbolVenue) -> None:
+    """Hands a connection double's hub session to `venue`."""
+    conn.session = venue

@@ -1,8 +1,6 @@
-"""Two connections in one process, each on its own hub: every read a connection makes — an account,
-an instrument or a history read — reaches its own, whichever connected last. Each blocking call runs
-off the loop the hub doubles serve on."""
+"""Two connections in one process, each on its own hub double: every read a connection makes reaches
+its own hub, whichever connected last."""
 
-import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -132,14 +130,14 @@ async def connected():
                 venue=Venue(terminal.server),
             )
         )
-        await asyncio.to_thread(connection.connect)
+        await connection.connect()
         connections.append(connection)
         return connection
 
     yield connect
     for connection in connections:
         if connection._state is ConnectionState.CONNECTED:
-            await asyncio.to_thread(connection.disconnect)
+            await connection.disconnect()
 
 
 def provider_of(connection: MT5Connection, venue: str) -> MT5InstrumentProvider:
@@ -162,7 +160,7 @@ async def test_an_account_read_after_another_connection_connects_reaches_its_own
     await connected(beta)
     forget(alpha, beta)
 
-    account = await asyncio.to_thread(first.get_account_info)
+    account = await first.account_info()
 
     assert account.login == 1001
     assert alpha.calls() == [Call.ACCOUNT_INFO]
@@ -177,7 +175,7 @@ async def test_a_failed_read_reports_its_own_hubs_error(alpha, beta, connected):
     ]
 
     with pytest.raises(EaError, match="^account_info: the spawner of alpha failed it$"):
-        await asyncio.to_thread(first.get_account_info)
+        await first.account_info()
 
 
 async def test_an_instrument_load_after_another_connection_connects_reaches_its_own_hub(
@@ -187,7 +185,7 @@ async def test_an_instrument_load_after_another_connection_connects_reaches_its_
     await connected(beta)
     forget(alpha, beta)
 
-    instrument = await asyncio.to_thread(provider_of(first, "MT5_ALPHA").load_symbol, "EURUSD")
+    instrument = await provider_of(first, "MT5_ALPHA").load_symbol("EURUSD")
 
     assert instrument.id.value == "EURUSD.MT5_ALPHA"
     assert set(alpha.calls()) == {
@@ -204,7 +202,7 @@ async def test_an_instrument_load_after_another_connection_connects_reaches_its_
 async def test_a_loaded_instrument_carries_the_fee_and_sessions_its_hub_relays(alpha, connected):
     first = await connected(alpha)
 
-    instrument = await asyncio.to_thread(provider_of(first, "MT5_ALPHA").load_symbol, "EURUSD")
+    instrument = await provider_of(first, "MT5_ALPHA").load_symbol("EURUSD")
 
     value, contract_size, mid = Decimal("3.5"), Decimal(100000), Decimal("1.0851")
     assert abs(instrument.taker_fee - value / (contract_size * mid)) < Decimal("1e-18")
@@ -222,8 +220,7 @@ async def test_history_reads_after_another_connection_connects_reach_their_own_h
         first, provider_of(first, "MT5_ALPHA"), ParquetDataCatalog(str(tmp_path))
     )
 
-    results = await asyncio.to_thread(
-        downloader.download_all,
+    results = await downloader.download_all(
         ["EURUSD"],
         datetime(2025, 7, 14, tzinfo=UTC),
         datetime(2025, 7, 15, tzinfo=UTC),
@@ -244,8 +241,7 @@ async def test_a_history_failure_is_recorded_with_its_own_hubs_error(
         first, provider_of(first, "MT5_ALPHA"), ParquetDataCatalog(str(tmp_path))
     )
 
-    result = await asyncio.to_thread(
-        downloader.download_bars,
+    result = await downloader.download_bars(
         "EURUSD",
         datetime(2025, 7, 14, tzinfo=UTC),
         datetime(2025, 7, 15, tzinfo=UTC),
@@ -259,10 +255,10 @@ async def test_disconnecting_another_connection_leaves_this_ones_session_open_on
 ):
     first = await connected(alpha)
     second = await connected(beta)
-    await asyncio.to_thread(second.disconnect)
+    await second.disconnect()
     forget(alpha, beta)
 
-    account = await asyncio.to_thread(first.get_account_info)
+    account = await first.account_info()
 
     assert account.login == 1001
     assert len(alpha.hub.connections) == 1

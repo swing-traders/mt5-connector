@@ -153,7 +153,7 @@ class Harness:
         await self.connect_keeping_events()
         self.ledger.clear()
         self.venue.reset_mock()
-        self.conn.get_account_info.reset_mock()
+        self.conn.account_info.reset_mock()
 
     async def connect_keeping_events(self) -> None:
         """Connects the client and stops its account loop, keeping what connecting emitted."""
@@ -265,8 +265,8 @@ def build(venue, *, instruments=None, account=None, cache=None, **settings) -> H
     loaded = {item.raw_symbol.value: item for item in (instruments or [instrument()])}
 
     conn = MagicMock(spec=MT5Connection)
-    conn.get_account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
-    conn.get_terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    conn.account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
+    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
     venue.account_info.return_value = account or account_info()
 
     provider = MagicMock(spec=MT5InstrumentProvider)
@@ -278,6 +278,7 @@ def build(venue, *, instruments=None, account=None, cache=None, **settings) -> H
         client = RecordedExecClient(
             loop=asyncio.get_running_loop(),
             connection=conn,
+            account=AccountSnapshot.from_mt5(account or account_info()),
             msgbus=msgbus,
             cache=cache,
             clock=clock,

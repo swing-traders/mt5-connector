@@ -2,16 +2,18 @@
 and the node config that wires them."""
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from dataclasses import replace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.objects import Currency
-from venue_doubles import SymbolVenue, account_info, run_apart, symbol_info
+from venue_doubles import SymbolVenue, account_info, serve, symbol_info
+from websockets.asyncio.server import serve as serve_websocket
 
 from mt5connector.client.config import MT5Config
-from mt5connector.client.connection import AccountSnapshot
+from mt5connector.client.connection import AccountSnapshot, MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
 from mt5connector.client.execution import MT5LiveExecutionClient
@@ -25,7 +27,9 @@ from mt5connector.client.factories import (
     _provider_registry,
     build_mt5_node_config,
 )
+from mt5connector.wire import calls
 
+Call = calls.Call
 EURUSD = InstrumentId.from_str("EURUSD.MT5")
 GBPUSD = InstrumentId.from_str("GBPUSD.MT5")
 
@@ -87,16 +91,30 @@ def clean_registry():
     _mt5_config_registry.clear()
 
 
+def connection_double() -> MagicMock:
+    """A connection whose connect completes at once and whose account is in EUR."""
+    conn = MagicMock()
+    conn.connect = AsyncMock()
+    conn.disconnect = AsyncMock()
+    conn.ensure_connected = MagicMock()
+    conn.account_info = AsyncMock(
+        return_value=AccountSnapshot.from_mt5(account_info(currency="EUR"))
+    )
+    return conn
+
+
+@pytest.fixture
+def loop():
+    """A loop not running, as NT hands its factories one at build."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
 @pytest.fixture
 def mock_mt5_conn():
     with patch("mt5connector.client.factories.MT5Connection") as MockConn:
-        instance = MagicMock()
-        instance.connect = MagicMock()
-        instance.disconnect = MagicMock()
-        instance.ensure_connected = MagicMock()
-        instance.get_account_info.return_value = AccountSnapshot.from_mt5(
-            account_info(currency="EUR")
-        )
+        instance = connection_double()
         MockConn.return_value = instance
         yield MockConn, instance
 
@@ -118,63 +136,65 @@ def mock_provider():
 
 
 class TestEnsureConnection:
-    def test_creates_connection_on_first_call(self, mock_mt5_conn):
+    def test_creates_connection_on_first_call(self, mock_mt5_conn, loop):
         MockConn, _ = mock_mt5_conn
         config = make_config()
-        _ensure_connection(config)
+        _ensure_connection(config, loop)
         MockConn.assert_called_once_with(config)
 
-    def test_calls_connect_on_first_call(self, mock_mt5_conn):
+    def test_calls_connect_on_first_call(self, mock_mt5_conn, loop):
         _, conn_inst = mock_mt5_conn
-        _ensure_connection(make_config())
-        conn_inst.connect.assert_called_once()
+        _ensure_connection(make_config(), loop)
+        conn_inst.connect.assert_awaited_once()
 
-    def test_reuses_connection_on_second_call(self, mock_mt5_conn):
+    def test_reuses_connection_on_second_call(self, mock_mt5_conn, loop):
         config = make_config()
-        assert _ensure_connection(config) is _ensure_connection(config)
+        assert _ensure_connection(config, loop) is _ensure_connection(config, loop)
 
-    def test_connect_called_only_once_for_same_config(self, mock_mt5_conn):
+    def test_connect_called_only_once_for_same_config(self, mock_mt5_conn, loop):
         _, conn_inst = mock_mt5_conn
         config = make_config()
-        _ensure_connection(config)
-        _ensure_connection(config)
-        conn_inst.connect.assert_called_once()
+        _ensure_connection(config, loop)
+        _ensure_connection(config, loop)
+        conn_inst.connect.assert_awaited_once()
 
-    def test_returns_the_connection(self, mock_mt5_conn):
+    def test_returns_the_connection(self, mock_mt5_conn, loop):
         _, conn_inst = mock_mt5_conn
-        assert _ensure_connection(make_config()) is conn_inst
+        assert _ensure_connection(make_config(), loop) is conn_inst
 
 
 class TestConnectionRegistryIsolation:
-    def test_different_accounts_get_separate_connections(self, mock_mt5_conn):
+    def test_different_accounts_get_separate_connections(self, mock_mt5_conn, loop):
         MockConn, _ = mock_mt5_conn
-        _ensure_connection(make_config(account=11111111))
-        _ensure_connection(make_config(account=22222222))
+        _ensure_connection(make_config(account=11111111), loop)
+        _ensure_connection(make_config(account=22222222), loop)
         assert MockConn.call_count == 2
 
-    def test_different_servers_get_separate_connections(self, mock_mt5_conn):
+    def test_different_servers_get_separate_connections(self, mock_mt5_conn, loop):
         MockConn, _ = mock_mt5_conn
-        _ensure_connection(make_config(server="BrokerA-Demo"))
-        _ensure_connection(make_config(server="BrokerB-Demo"))
+        _ensure_connection(make_config(server="BrokerA-Demo"), loop)
+        _ensure_connection(make_config(server="BrokerB-Demo"), loop)
         assert MockConn.call_count == 2
 
-    def test_same_account_different_server_is_separate(self, mock_mt5_conn):
+    def test_same_account_different_server_is_separate(self, mock_mt5_conn, loop):
         MockConn, _ = mock_mt5_conn
-        _ensure_connection(make_config(account=12345678, server="ServerA"))
-        _ensure_connection(make_config(account=12345678, server="ServerB"))
+        _ensure_connection(make_config(account=12345678, server="ServerA"), loop)
+        _ensure_connection(make_config(account=12345678, server="ServerB"), loop)
         assert MockConn.call_count == 2
 
-    def test_registry_grows_with_each_new_config(self, mock_mt5_conn):
-        _ensure_connection(make_config(account=10000001))
-        _ensure_connection(make_config(account=10000002))
-        _ensure_connection(make_config(account=10000003))
+    def test_registry_grows_with_each_new_config(self, mock_mt5_conn, loop):
+        _ensure_connection(make_config(account=10000001), loop)
+        _ensure_connection(make_config(account=10000002), loop)
+        _ensure_connection(make_config(account=10000003), loop)
         assert len(_connection_registry) == 3
 
-    def test_two_accounts_get_two_connections_keyed_by_account_and_server(self, mock_mt5_conn):
+    def test_two_accounts_get_two_connections_keyed_by_account_and_server(
+        self, mock_mt5_conn, loop
+    ):
         MockConn, _ = mock_mt5_conn
-        MockConn.side_effect = lambda config: MagicMock()
-        first = _ensure_connection(make_config(account=1001, server="MT5_ALPHA"))
-        second = _ensure_connection(make_config(account=1002, server="MT5_BETA"))
+        MockConn.side_effect = lambda config: connection_double()
+        first = _ensure_connection(make_config(account=1001, server="MT5_ALPHA"), loop)
+        second = _ensure_connection(make_config(account=1002, server="MT5_BETA"), loop)
         assert first is not second
         assert _connection_registry == {(1001, "MT5_ALPHA"): first, (1002, "MT5_BETA"): second}
 
@@ -301,6 +321,52 @@ class TestFactoriesShareConnection:
         assert MockConn.call_count == 1
 
 
+class TestFactoriesOnNtsLoop:
+    def test_the_factories_connect_one_real_connection_on_the_loop_they_are_handed(
+        self, pinging_hub, loop
+    ):
+        pinging_hub.answers[Call.ACCOUNT_INFO] = [account_info(currency="EUR")._asdict()]
+        config = replace(make_config(), ws_url=f"ws://127.0.0.1:{pinging_hub.port}")
+        msgbus, cache, clock = make_nt_components()
+        msgbus2, cache2, clock2 = make_nt_components()
+
+        data_client = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
+        exec_client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus2, cache2, clock2
+        )
+
+        assert isinstance(exec_client._conn, MT5Connection)
+        assert data_client._conn is exec_client._conn
+        assert len(pinging_hub.connections) == 1
+        assert exec_client.base_currency == Currency.from_str("EUR")
+        loop.run_until_complete(exec_client._conn.disconnect())
+
+    async def test_a_create_on_a_running_loop_raises_asyncios_refusal_and_registers_nothing(
+        self,
+    ):
+        # Nothing listens on the port, so a connect that ran would fail rather than reach a hub.
+        server = await serve_websocket(lambda ws: None, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        server.close()
+        await server.wait_closed()
+        config = replace(make_config(), ws_url=f"ws://127.0.0.1:{port}")
+        msgbus, cache, clock = make_nt_components()
+
+        with pytest.raises(RuntimeError, match="^This event loop is already running$"):
+            MT5LiveExecClientFactory.create(
+                asyncio.get_running_loop(),
+                "MT5",
+                make_live_exec_config(config),
+                msgbus,
+                cache,
+                clock,
+            )
+
+        assert _connection_registry == {}
+
+
 class TestBuildMt5NodeConfig:
 
     def test_returns_trading_node_config(self):
@@ -373,8 +439,8 @@ def terminal(mock_mt5_conn):
     symbols = SymbolVenue()
     symbols.add(symbol_info(name="EURUSD"))
     symbols.add(symbol_info(name="GBPUSD", currency_base="GBP"))
-    conn.session = symbols
-    conn.run = run_apart
+    symbols.account = account_info(currency="EUR")
+    serve(conn, symbols)
     return symbols
 
 
@@ -396,15 +462,14 @@ class TestInstrumentProviders:
             load_ids=frozenset({EURUSD})
         )
 
-    async def test_each_client_of_a_node_loads_what_its_config_names_on_one_connection(
-        self, mock_mt5_conn, terminal
+    def test_each_client_of_a_node_loads_what_its_config_names_on_one_connection(
+        self, mock_mt5_conn, terminal, loop
     ):
         node = build_mt5_node_config(
             make_config(),
             data_instruments=frozenset({EURUSD, GBPUSD}),
             exec_instruments=frozenset({EURUSD}),
         )
-        loop = asyncio.get_running_loop()
         msgbus, cache, clock = make_nt_components()
         msgbus2, cache2, clock2 = make_nt_components()
         data_client = MT5LiveDataClientFactory.create(
@@ -414,8 +479,8 @@ class TestInstrumentProviders:
             loop, "MT5", node.exec_clients["MT5"], msgbus2, cache2, clock2
         )
 
-        await data_client._provider.initialize()
-        await exec_client._provider.initialize()
+        loop.run_until_complete(data_client._provider.initialize())
+        loop.run_until_complete(exec_client._provider.initialize())
 
         assert loaded_ids(data_client._provider) == {EURUSD, GBPUSD}
         assert loaded_ids(exec_client._provider) == {EURUSD}
@@ -520,11 +585,10 @@ class TestNamedVenues:
         assert ftmo is not icm
         assert ftmo is _ensure_provider(conn_inst, ALPHA, load, clock)
 
-    async def test_two_venues_on_one_login_load_their_instruments_each_at_its_own_venue(
-        self, mock_mt5_conn, terminal
+    def test_two_venues_on_one_login_load_their_instruments_each_at_its_own_venue(
+        self, mock_mt5_conn, terminal, loop
     ):
         MockConn, _ = mock_mt5_conn
-        loop = asyncio.get_running_loop()
         loaded_by_venue = {}
         for venue in (ALPHA, BETA):
             node = build_mt5_node_config(
@@ -536,7 +600,7 @@ class TestNamedVenues:
             data_client = MT5LiveDataClientFactory.create(
                 loop, venue.value, node.data_clients[venue.value], msgbus, cache, clock
             )
-            await data_client._provider.initialize()
+            loop.run_until_complete(data_client._provider.initialize())
             loaded_by_venue[venue.value] = loaded_ids(data_client._provider)
             assert data_client._provider.get_instrument("EURUSD").id.venue == venue
 
