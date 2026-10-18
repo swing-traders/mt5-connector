@@ -150,12 +150,11 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
         if mt5_config is None:
             raise RuntimeError(f"MT5LiveExecClientFactory: no MT5Config for {name}")
         conn = _ensure_connection(mt5_config, loop)
-        account = loop.run_until_complete(conn.account_info())
 
         return MT5LiveExecutionClient(
             loop=loop,
             connection=conn,
-            account=account,
+            account=conn.account,
             msgbus=msgbus,
             cache=cache,
             clock=clock,
