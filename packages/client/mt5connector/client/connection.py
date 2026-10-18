@@ -2,8 +2,8 @@
 reports it.
 
 State: where the connection is in its lifecycle, and while connected, its hub session, which lives
-on the loop the connection was connected on. A lost hub leaves the connection connected: NT's client
-reconnects its session."""
+on the loop the connection was connected on, and the account as its login reported it. A lost hub
+leaves the connection connected: NT's client reconnects its session."""
 
 from __future__ import annotations
 
@@ -141,6 +141,7 @@ class MT5Connection:
         self._config = config
         self._state = ConnectionState.DISCONNECTED
         self._session: HubSession | None = None
+        self._login_account: AccountSnapshot | None = None
 
     # ── Core lifecycle ────────────────────────────────────────────────────────
 
@@ -156,13 +157,14 @@ class MT5Connection:
             self._config, asyncio.get_running_loop(), _unsubscribed, None, _SessionLog()
         )
         try:
-            snapshot = await self._logged_in(session)
+            account = await self._logged_in(session)
         except BaseException:
             self._state = ConnectionState.DISCONNECTED
             raise
         self._session = session
+        self._login_account = account
         self._state = ConnectionState.CONNECTED
-        logger.info(f"MT5Connection: connected — {snapshot}")
+        logger.info(f"MT5Connection: connected — {account}")
 
     async def disconnect(self) -> None:
         """Disconnects the hub session, leaving the connection disconnected even when that raises;
@@ -175,6 +177,7 @@ class MT5Connection:
             await self._session.disconnect()
         finally:
             self._session = None
+            self._login_account = None
             self._state = ConnectionState.DISCONNECTED
         logger.info("MT5Connection: disconnected")
 
@@ -193,6 +196,14 @@ class MT5Connection:
         return self._session
 
     # ── Data accessors ────────────────────────────────────────────────────────
+
+    @property
+    def account(self) -> AccountSnapshot:
+        """The account as the login reported it at connect; raises RuntimeError when not
+        connected."""
+        if self._state != ConnectionState.CONNECTED:
+            raise RuntimeError(f"MT5 not connected (state={self._state.name})")
+        return self._login_account
 
     async def account_info(self) -> AccountSnapshot:
         """The account as the terminal reports it now; raises MT5ConnectionError when not connected,

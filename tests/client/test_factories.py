@@ -97,9 +97,8 @@ def connection_double() -> MagicMock:
     conn.connect = AsyncMock()
     conn.disconnect = AsyncMock()
     conn.ensure_connected = MagicMock()
-    conn.account_info = AsyncMock(
-        return_value=AccountSnapshot.from_mt5(account_info(currency="EUR"))
-    )
+    conn.account = AccountSnapshot.from_mt5(account_info(currency="EUR"))
+    conn.account_info = AsyncMock(return_value=conn.account)
     return conn
 
 
@@ -344,6 +343,43 @@ class TestFactoriesOnNtsLoop:
         assert data_client._conn is exec_client._conn
         assert len(pinging_hub.connections) == 1
         assert exec_client.base_currency == Currency.from_str("EUR")
+        loop.run_until_complete(exec_client._conn.disconnect())
+
+    def test_the_exec_factory_reads_no_account_beyond_the_one_the_connect_reads(
+        self, pinging_hub, loop
+    ):
+        pinging_hub.answers[Call.ACCOUNT_INFO] = [account_info(currency="EUR")._asdict()]
+        config = replace(make_config(), ws_url=f"ws://127.0.0.1:{pinging_hub.port}")
+        msgbus, cache, clock = make_nt_components()
+
+        exec_client = MT5LiveExecClientFactory.create(
+            loop, "MT5", make_live_exec_config(config), msgbus, cache, clock
+        )
+
+        assert len(pinging_hub.asked(Call.ACCOUNT_INFO)) == 1
+        loop.run_until_complete(exec_client._conn.disconnect())
+
+    def test_a_create_on_a_running_loop_already_holding_the_accounts_connection_succeeds(
+        self, pinging_hub, loop
+    ):
+        pinging_hub.answers[Call.ACCOUNT_INFO] = [account_info(currency="EUR")._asdict()]
+        config = replace(make_config(), ws_url=f"ws://127.0.0.1:{pinging_hub.port}")
+        msgbus, cache, clock = make_nt_components()
+        msgbus2, cache2, clock2 = make_nt_components()
+        data_client = MT5LiveDataClientFactory.create(
+            loop, "MT5", make_live_data_config(config), msgbus, cache, clock
+        )
+
+        async def main() -> MT5LiveExecutionClient:
+            return MT5LiveExecClientFactory.create(
+                loop, "MT5", make_live_exec_config(config), msgbus2, cache2, clock2
+            )
+
+        exec_client = loop.run_until_complete(main())
+
+        assert exec_client._conn is data_client._conn
+        assert exec_client.base_currency == Currency.from_str("EUR")
+        assert len(pinging_hub.connections) == 1
         loop.run_until_complete(exec_client._conn.disconnect())
 
     def test_a_config_on_another_loop_gets_a_connection_of_its_own_connected_on_that_loop(

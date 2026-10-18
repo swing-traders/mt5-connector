@@ -387,6 +387,29 @@ class TestAccountInfo:
         assert "500" in s
 
 
+class TestAccount:
+
+    async def test_the_account_is_the_one_the_login_reported_at_connect(self, hub, connect):
+        hub.answers[Call.ACCOUNT_INFO] = [account_info(currency="EUR", login=87654321)._asdict()]
+        conn = await connect()
+
+        assert (conn.account.currency, conn.account.login) == ("EUR", 87654321)
+        assert len(hub.asked(Call.ACCOUNT_INFO)) == 1
+
+    def test_the_account_of_a_connection_never_connected_is_refused(self, config):
+        conn = MT5Connection(config)
+
+        with pytest.raises(RuntimeError, match=r"^MT5 not connected \(state=DISCONNECTED\)$"):
+            conn.account  # noqa: B018
+
+    async def test_the_account_of_a_connection_disconnected_is_refused(self, connect):
+        conn = await connect()
+        await conn.disconnect()
+
+        with pytest.raises(RuntimeError, match=r"^MT5 not connected \(state=DISCONNECTED\)$"):
+            conn.account  # noqa: B018
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 8. terminal_info()
 # ═════════════════════════════════════════════════════════════════════════════
