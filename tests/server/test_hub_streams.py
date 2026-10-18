@@ -27,6 +27,7 @@ from mt5connector.server.wire.push_wire import (
 from mt5connector.server.ws_server import Hub
 
 IDLE_S = 900
+CLOSE_BOUND_S = 30
 PUBLISHER = ChartRole.PUBLISHER
 SPAWNER = ChartRole.SPAWNER
 
@@ -564,6 +565,188 @@ async def test_a_chart_the_spawner_keeps_open_is_closed_only_after_a_further_idl
     assert sent_to_ea(spawner) == [close, close]
     assert sent_to_ea(usdjpy) == [binary.Wanted("USDJPY", False, ())]
     await _closed(tasks, spawner, usdjpy)
+
+
+async def test_after_a_chart_kept_the_next_close_is_sent_a_full_idle_period_later(clock, caplog):
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings(chart_idle_seconds=10))
+    spawner, usdjpy = Peer(), Peer()
+    tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+    clock[0] = 1_010.0
+    hub.close_idle_charts()
+    spawner.put_ea(binary.ChartKept(PUBLISHER, "USDJPY", 1, 0))
+    await settle()
+
+    clock[0] = 1_019.0
+    hub.close_idle_charts()
+    await settle()
+    kept = sent_to_ea(spawner)
+    clock[0] = 1_020.0
+    hub.close_idle_charts()
+    await settle()
+
+    close = binary.CloseChart(PUBLISHER, "USDJPY")
+    assert kept == [close]
+    assert sent_to_ea(spawner) == [close, close]
+    assert warnings(caplog) == []
+    await _closed(tasks, spawner, usdjpy)
+
+
+async def test_a_publisher_saying_hello_while_its_close_is_pending_is_not_revived(clock, caplog):
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings())
+    spawner, usdjpy, again = Peer(), Peer(), Peer()
+    tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+    clock[0] = 1_000.0 + IDLE_S
+    hub.close_idle_charts()
+    await settle()
+
+    await usdjpy.close()
+    await settle()
+    tasks.append(asyncio.create_task(hub.handler(again)))
+    again.put_ea(binary.EaHello(PUBLISHER, "USDJPY"))
+    await settle()
+    await again.close()
+    await settle()
+    clock[0] = 1_000.0 + IDLE_S + CLOSE_BOUND_S
+    hub.close_idle_charts()
+    await settle()
+
+    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    assert sent_to_ea(again) == [binary.Wanted("USDJPY", False, ())]
+    assert warnings(caplog) == []
+    await _closed(tasks, spawner)
+
+
+async def test_a_hello_once_its_chart_has_closed_starts_its_idle_period(clock):
+    hub = Hub(CLOCK, settings())
+    spawner, usdjpy, reopened = Peer(), Peer(), Peer()
+    tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+    clock[0] = 1_000.0 + IDLE_S
+    hub.close_idle_charts()
+    await usdjpy.close()
+    await settle()
+    clock[0] = 1_000.0 + IDLE_S + CLOSE_BOUND_S
+    hub.close_idle_charts()
+
+    hello = clock[0] + 1
+    clock[0] = hello
+    tasks.append(asyncio.create_task(hub.handler(reopened)))
+    reopened.put_ea(binary.EaHello(PUBLISHER, "USDJPY"))
+    await settle()
+    clock[0] = hello + IDLE_S - 1
+    hub.close_idle_charts()
+    await settle()
+    early = sent_to_ea(spawner)
+    clock[0] = hello + IDLE_S
+    hub.close_idle_charts()
+    await settle()
+
+    close = binary.CloseChart(PUBLISHER, "USDJPY")
+    assert early == [close]
+    assert sent_to_ea(spawner) == [close, close]
+    await _closed(tasks, spawner, reopened)
+
+
+async def test_a_close_neither_ended_nor_kept_within_its_bound_is_sent_again_once_per_bound(
+    clock, caplog
+):
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings())
+    spawner, usdjpy = Peer(), Peer()
+    tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+    sent = 1_000.0 + IDLE_S
+    clock[0] = sent
+    hub.close_idle_charts()
+
+    clock[0] = sent + CLOSE_BOUND_S - 1
+    hub.close_idle_charts()
+    await settle()
+    within = sent_to_ea(spawner)
+    clock[0] = sent + CLOSE_BOUND_S
+    hub.close_idle_charts()
+    clock[0] = sent + 2 * CLOSE_BOUND_S - 1
+    hub.close_idle_charts()
+    await settle()
+    once = sent_to_ea(spawner)
+    clock[0] = sent + 2 * CLOSE_BOUND_S
+    hub.close_idle_charts()
+    await settle()
+
+    close = binary.CloseChart(PUBLISHER, "USDJPY")
+    assert within == [close]
+    assert once == [close, close]
+    assert sent_to_ea(spawner) == [close, close, close]
+    resent = warnings(caplog)
+    assert len(resent) == 2
+    assert all("publisher" in warning and "USDJPY" in warning for warning in resent)
+    await _closed(tasks, spawner, usdjpy)
+
+
+async def test_a_pending_close_of_a_chart_in_use_again_ends_at_its_bound_unsent(clock, caplog):
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings())
+    spawner, usdjpy = Peer(), Peer()
+    tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+    sent = 1_000.0 + IDLE_S
+    clock[0] = sent
+    hub.close_idle_charts()
+
+    clock[0] = sent + 10
+    used = hub.use_chart((PUBLISHER, "USDJPY"))
+    clock[0] = sent + CLOSE_BOUND_S
+    hub.close_idle_charts()
+    clock[0] = sent + 10 + IDLE_S - 1
+    hub.close_idle_charts()
+    await settle()
+    in_use = sent_to_ea(spawner)
+    clock[0] = sent + 10 + IDLE_S
+    hub.close_idle_charts()
+    await settle()
+
+    close = binary.CloseChart(PUBLISHER, "USDJPY")
+    assert used == ChartState.PUBLISHED
+    assert in_use == [close]
+    assert sent_to_ea(spawner) == [close, close]
+    assert warnings(caplog) == []
+    await _closed(tasks, spawner, usdjpy)
+
+
+async def test_a_close_that_overflows_the_spawners_queue_leaves_no_close_pending(clock):
+    hub = Hub(CLOCK, settings(ea_queue_bound=1))
+    stuck, gbpusd, usdjpy, xauusd = Peer(stuck=True), Peer(), Peer(), Peer()
+    tasks = await _spawning(
+        hub,
+        (stuck, SPAWNER, "EURUSD"),
+        (gbpusd, PUBLISHER, "GBPUSD"),
+        (usdjpy, PUBLISHER, "USDJPY"),
+        (xauusd, PUBLISHER, "XAUUSD"),
+    )
+    clock[0] = 1_000.0 + IDLE_S
+    hub.close_idle_charts()
+    await settle()
+
+    hello = 1_000.0 + IDLE_S + CLOSE_BOUND_S
+    clock[0] = hello
+    await xauusd.close()
+    await settle()
+    again, spawner = Peer(), Peer()
+    tasks += await _spawning(hub, (again, PUBLISHER, "XAUUSD"), (spawner, SPAWNER, "EURUSD"))
+    clock[0] = hello + 1
+    hub.use_chart((PUBLISHER, "GBPUSD"))
+    hub.use_chart((PUBLISHER, "USDJPY"))
+    clock[0] = hello + IDLE_S - 1
+    hub.close_idle_charts()
+    await settle()
+    early = sent_to_ea(spawner)
+    clock[0] = hello + IDLE_S
+    hub.close_idle_charts()
+    await settle()
+
+    assert stuck.closed == (ws_server.OVERFLOW, "queue overflow")
+    assert early == []
+    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "XAUUSD")]
+    await _closed(tasks, spawner, gbpusd, usdjpy, again)
 
 
 # ── The broker's repeated and skipped hours ───────────────────────────────────

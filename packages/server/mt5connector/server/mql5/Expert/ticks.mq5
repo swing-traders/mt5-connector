@@ -26,6 +26,9 @@ input int HubPingTimeoutSec = 50;
 // How often the spawner tries again to take a symbol whose chart it closed out of Market Watch
 // while open positions or pending orders hold it.
 #define HELD_DESELECT_SECONDS 900
+// How long a chart the spawner closed may stay listed before the frames of its symbol are served
+// again.
+#define CHART_CLOSE_GONE_SECONDS 10
 // The REQUEST transactions a publisher keeps for the outcomes call, the latest first.
 #define OUTCOME_RING 1000
 #define DAY_SECONDS 86400
@@ -80,6 +83,21 @@ datetime g_barOpens[];
 long g_openedCharts[];
 ENUM_CHART_ROLE g_openedRoles[];
 string g_openedSymbols[];
+
+// The open_chart and close_chart frames the spawner has not served, in arrival order. It serves one
+// per timer pass: the terminal tears a chart down, and loads a template's EA, after the call
+// returns.
+ENUM_HUB_FRAME g_chartFrameKinds[];
+ENUM_CHART_ROLE g_chartFrameRoles[];
+string g_chartFrameSymbols[];
+
+// The charts the spawner closed that the terminal may still list, each with its symbol and when it
+// was closed, by GetTickCount64. A synchronous chart call on a chart being torn down blocks the
+// EA's thread, so no chart of the list is searched for its comment, and no frame of its symbol is
+// served while it is listed.
+long g_closingCharts[];
+string g_closingSymbols[];
+ulong g_closingSince[];
 
 // The symbols whose charts the spawner closed that are still in Market Watch, each with when to try
 // the deselect again, by GetTickCount64, and whether positions or orders were found holding it.
@@ -2468,13 +2486,15 @@ void CountHoldings(const string symbol, int &positions, int &orders)
             orders++;
 }
 
-// The chart of the symbol whose comment marks the role, its EA running or gone; -1 when none.
+// The chart of the symbol whose comment marks the role, its EA running or gone, other than one the
+// spawner closed; -1 when none.
 long MarkedChart(const ENUM_CHART_ROLE role, const string symbol)
 {
     long chart = ChartFirst();
     while (chart != -1)
     {
-        if (ChartSymbol(chart) == symbol && ChartGetString(chart, CHART_COMMENT) == Marker(role))
+        if (!IsClosing(chart) && ChartSymbol(chart) == symbol
+            && ChartGetString(chart, CHART_COMMENT) == Marker(role))
             return chart;
         chart = ChartNext(chart);
     }
@@ -2544,6 +2564,73 @@ void ForgetClosedCharts()
             ArrayRemove(g_openedCharts, i, 1);
             ArrayRemove(g_openedRoles, i, 1);
             ArrayRemove(g_openedSymbols, i, 1);
+        }
+    }
+}
+
+void RememberClosing(const long chart, const string symbol)
+{
+    const int n = ArraySize(g_closingCharts);
+    ArrayResize(g_closingCharts, n + 1);
+    ArrayResize(g_closingSymbols, n + 1);
+    ArrayResize(g_closingSince, n + 1);
+    g_closingCharts[n] = chart;
+    g_closingSymbols[n] = symbol;
+    g_closingSince[n] = GetTickCount64();
+}
+
+bool IsClosing(const long chart)
+{
+    for (int i = 0; i < ArraySize(g_closingCharts); i++)
+        if (g_closingCharts[i] == chart)
+            return true;
+    return false;
+}
+
+// Whether a chart of the symbol the spawner closed may still be listed.
+bool HasClosingChart(const string symbol)
+{
+    for (int i = 0; i < ArraySize(g_closingSymbols); i++)
+        if (g_closingSymbols[i] == symbol)
+            return true;
+    return false;
+}
+
+bool Listed(const long chart)
+{
+    long listed = ChartFirst();
+    while (listed != -1)
+    {
+        if (listed == chart)
+            return true;
+        listed = ChartNext(listed);
+    }
+    return false;
+}
+
+void ForgetClosing(const int index)
+{
+    ArrayRemove(g_closingCharts, index, 1);
+    ArrayRemove(g_closingSymbols, index, 1);
+    ArrayRemove(g_closingSince, index, 1);
+}
+
+// Forget each chart the spawner closed once the terminal no longer lists it, or, still listed,
+// CHART_CLOSE_GONE_SECONDS after its close
+void ForgetGoneClosing()
+{
+    const ulong now = GetTickCount64();
+    for (int i = ArraySize(g_closingCharts) - 1; i >= 0; i--)
+    {
+        if (!Listed(g_closingCharts[i]))
+        {
+            ForgetClosing(i);
+        }
+        else if (now - g_closingSince[i] >= (ulong)CHART_CLOSE_GONE_SECONDS * 1000)
+        {
+            PrintFormat("ticks: chart %I64d of '%s' is still listed %d s after its close",
+                        g_closingCharts[i], g_closingSymbols[i], CHART_CLOSE_GONE_SECONDS);
+            ForgetClosing(i);
         }
     }
 }
@@ -2698,7 +2785,11 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             {
                 failing = "ChartApplyTemplate";
                 error = GetLastError();
-                ChartClose(chart);
+                if (ChartClose(chart))
+                    RememberClosing(chart, symbol);
+                else
+                    PrintFormat("ticks: ChartClose of the %s chart of '%s' failed: %d",
+                                ChartRoleName(role), symbol, GetLastError());
             }
             else
             {
@@ -2753,6 +2844,7 @@ void CloseChart(const ENUM_CHART_ROLE role, const string symbol)
     else
     {
         ForgetOpened(chart);
+        RememberClosing(chart, symbol);
         PrintFormat("ticks: closed the %s chart of '%s'", ChartRoleName(role), symbol);
         Deselect(symbol, chart);
     }
@@ -2815,7 +2907,7 @@ void OnWanted(const uint count, BinaryReader &reader)
         ApplyWanted(ticks == 1, timeframes);
 }
 
-// An open_chart or close_chart frame, which the hub sends the spawner.
+// An open_chart or close_chart frame, which the hub sends the spawner, queued to be served.
 void OnChartFrame(const ENUM_HUB_FRAME kind, BinaryReader &reader)
 {
     const string roleName = reader.String();
@@ -2828,10 +2920,41 @@ void OnChartFrame(const ENUM_HUB_FRAME kind, BinaryReader &reader)
     else if (role == ROLE_SPAWNER)
         PrintFormat("ticks: a chart frame for the spawner's chart of '%s', which the startup "
                     "script alone opens", symbol);
-    else if (kind == HUB_FRAME_OPEN_CHART)
-        OpenChart(role, symbol);
     else
-        CloseChart(role, symbol);
+        QueueChartFrame(kind, role, symbol);
+}
+
+void QueueChartFrame(const ENUM_HUB_FRAME kind, const ENUM_CHART_ROLE role, const string symbol)
+{
+    const int n = ArraySize(g_chartFrameKinds);
+    ArrayResize(g_chartFrameKinds, n + 1);
+    ArrayResize(g_chartFrameRoles, n + 1);
+    ArrayResize(g_chartFrameSymbols, n + 1);
+    g_chartFrameKinds[n] = kind;
+    g_chartFrameRoles[n] = role;
+    g_chartFrameSymbols[n] = symbol;
+}
+
+// Serve the oldest chart frame while the hub takes this EA's frames, so its answer reaches the
+// hub, unless a chart of its symbol the spawner closed is still listed; then it waits, and every
+// frame behind it
+void ServeChartFrame()
+{
+    ForgetGoneClosing();
+    if (wss.isConnected() && !g_refused && ArraySize(g_chartFrameKinds) > 0
+        && !HasClosingChart(g_chartFrameSymbols[0]))
+    {
+        const ENUM_HUB_FRAME kind = g_chartFrameKinds[0];
+        const ENUM_CHART_ROLE role = g_chartFrameRoles[0];
+        const string symbol = g_chartFrameSymbols[0];
+        ArrayRemove(g_chartFrameKinds, 0, 1);
+        ArrayRemove(g_chartFrameRoles, 0, 1);
+        ArrayRemove(g_chartFrameSymbols, 0, 1);
+        if (kind == HUB_FRAME_OPEN_CHART)
+            OpenChart(role, symbol);
+        else
+            CloseChart(role, symbol);
+    }
 }
 
 void OnDuplicateFrame(BinaryReader &reader)
@@ -3094,6 +3217,8 @@ void OnTimer()
     if (g_closing)
         return;
     ReadHub();
+    if (!g_closing)
+        ServeChartFrame();
     RetryDeselects();
     // TimeLocal, not TimeCurrent: the time of the last quote stands still while the market is
     // closed.

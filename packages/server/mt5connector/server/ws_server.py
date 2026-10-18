@@ -6,10 +6,11 @@ symbol — and each one's queue of frames not yet sent; the EA serving each role
 wanted frame last told each publisher; the spawner; the chart requests held for a role and symbol no
 EA serves, and those the spawner was sent; the MQL5 error the spawner met on each chart it failed to
 open, standing until that chart opens or its EA says hello; when each chart was last in use, and
-those the spawner was told to close; the true-UTC open of the last bar fanned out of each series;
-the latest commission schedule and trading sessions relayed for each symbol; the floors learned from
-history answers; the pending requests and the clock gate. Nothing is persisted, and nothing is
-replayed to a consumer that reconnects."""
+when the spawner was last told to close each chart whose close is pending, which outlives the
+chart's EA; the true-UTC open of the last bar fanned out of each series; the latest commission
+schedule and trading sessions relayed for each symbol; the floors learned from history answers; the
+pending requests and the clock gate. Nothing is persisted, and nothing is replayed to a consumer
+that reconnects."""
 
 import asyncio
 import dataclasses
@@ -66,6 +67,7 @@ from mt5connector.server.wire.push_wire import (
 
 OVERFLOW = 4008
 _IDLE_SWEEP_S = 5
+_CLOSE_BOUND_S = 30
 _HOUR_S = 3_600
 _TERMINAL_INFO = calls.CALLS[calls.Call.TERMINAL_INFO]
 _RANGES = calls.CALLS[calls.Call.RANGES]
@@ -128,7 +130,7 @@ class Hub:
         self._sent: set[ChartKey] = set()
         self._failed: dict[ChartKey, int] = {}
         self._used: dict[ChartKey, float] = {}
-        self._close_sent: set[ChartKey] = set()
+        self._close_sent: dict[ChartKey, float] = {}
         self._bar_opens: dict[Subscription, int] = {}
         self._commissions = CommissionStore()
         self._sessions = SessionStore()
@@ -187,25 +189,40 @@ class Hub:
             return ChartState.REQUESTED
 
     def close_idle_charts(self) -> None:
-        """Tells the spawner to close each chart out of use for the idle period, once per spawner
-        connection; the spawner's own chart never closes."""
-        if self._spawner is not None:
-            now = time.monotonic()
-            for key in sorted(self._served, key=str):
-                chart_role, symbol = key
-                if (
-                    chart_role is not ChartRole.SPAWNER
-                    and key not in self._close_sent
-                    and not self._in_use(key, now)
-                ):
-                    self._close_sent.add(key)
-                    logger.info(
-                        "the %s chart of %s out of use for %d s: closing it",
+        """Tells the spawner to close each chart out of use for the idle period, and settles each
+        close pending for the bound: sent again while an EA serves the chart out of use, else ended.
+        The spawner's own chart never closes."""
+        now = time.monotonic()
+        # The spawner is read per key: a close that overflows its queue drops it mid-sweep.
+        for key, sent in list(self._close_sent.items()):
+            if self._spawner is not None and now - sent >= _CLOSE_BOUND_S:
+                if key not in self._served or self._in_use(key, now):
+                    del self._close_sent[key]
+                else:
+                    chart_role, symbol = key
+                    logger.warning(
+                        "the %s chart of %s neither closed nor was kept within %d s: closing it "
+                        "again",
                         chart_role,
                         symbol,
-                        self._settings.chart_idle_seconds,
+                        _CLOSE_BOUND_S,
                     )
-                    self._to_ea(self._spawner, binary.CloseChart(chart_role, symbol))
+                    self._close_chart(key, now)
+        for key in sorted(self._served, key=str):
+            chart_role, symbol = key
+            if (
+                self._spawner is not None
+                and chart_role is not ChartRole.SPAWNER
+                and key not in self._close_sent
+                and not self._in_use(key, now)
+            ):
+                logger.info(
+                    "the %s chart of %s out of use for %d s: closing it",
+                    chart_role,
+                    symbol,
+                    self._settings.chart_idle_seconds,
+                )
+                self._close_chart(key, now)
 
     # ── Frames ────────────────────────────────────────────────────────────────
 
@@ -263,10 +280,13 @@ class Hub:
                 for key in sorted(self._requested):
                     self._request_chart(key)
             else:
-                self._used[ea.key] = time.monotonic()
                 self._requested.discard(ea.key)
                 self._sent.discard(ea.key)
                 self._failed.pop(ea.key, None)
+                # The terminal drops a closing chart's EA's socket before it unloads the EA, which
+                # says hello again in between: that hello is no use.
+                if ea.key not in self._close_sent:
+                    self._used[ea.key] = time.monotonic()
             if ea.chart_role is ChartRole.PUBLISHER:
                 self._told[ea.symbol] = self._wanted(ea.symbol)
                 self._to_ea(ws, self._told[ea.symbol])
@@ -452,7 +472,12 @@ class Hub:
                 frame.orders,
             )
             self._used[key] = time.monotonic()
-            self._close_sent.discard(key)
+            self._close_sent.pop(key, None)
+
+    def _close_chart(self, key: ChartKey, now: float) -> None:
+        # Recorded first: a send that overflows the spawner's queue drops it, clearing every close.
+        self._close_sent[key] = now
+        self._to_ea(self._spawner, binary.CloseChart(*key))
 
     def _request_chart(self, key: ChartKey) -> None:
         """Holds a chart request until its EA says hello, sending it to the spawner once per spawner
@@ -800,8 +825,8 @@ class Hub:
     def _drop(self, ws) -> None:
         """Forgets a connection. A consumer's subscriptions leave the wanted frames with it and its
         pending requests are answered to no one; an EA that served its role and symbol leaves them
-        unserved, each of its pending requests answered ea_gone, and a chart still in use is
-        requested again."""
+        unserved, each of its pending requests answered ea_gone, a close pending on its chart still
+        pending, and a chart still in use is requested again."""
         consumer = self._consumers.pop(ws, None)
         ea = self._eas.pop(ws, None)
         if consumer is not None:
@@ -831,7 +856,6 @@ class Hub:
                     self._sent.clear()
                     self._close_sent.clear()
                 else:
-                    self._close_sent.discard(ea.key)
                     if ea.chart_role is ChartRole.PUBLISHER:
                         del self._told[ea.symbol]
                     if self._in_use(ea.key, time.monotonic()):
