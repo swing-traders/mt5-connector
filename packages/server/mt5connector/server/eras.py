@@ -1,6 +1,5 @@
-"""Arrays of broker epochs read on the broker's clock, BrokerClock asked once per broker hour they
-span: each second's true UTC at its first and its last occurrence, exactly as BrokerClock reads it
-alone, and whether its hour is one the clock repeats or skips.
+"""Arrays of broker epochs read on the broker's clock exactly as BrokerClock reads each second
+alone, BrokerClock asked once per broker hour they span.
 
 State: each broker hour an Eras met, with its offsets from true UTC at either occurrence and whether
 the clock repeats or skips it — or nothing, for an hour whose readings change within it, whose

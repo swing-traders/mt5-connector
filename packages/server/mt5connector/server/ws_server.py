@@ -1,7 +1,5 @@
-"""The hub, the one endpoint the EAs and the consumers connect to: each publisher's frames fanned
-out to their subscribers in true UTC, the relays the EAs send kept, every request a consumer asks
-routed to the EA of its call's role or answered by the hub, the clock gate, /health, and the charts
-the spawner opens and closes for the roles and symbols in use.
+"""The hub, the one endpoint the EAs and the consumers connect to: it fans the EAs' frames out in
+true UTC, routes or answers every request, and has the spawner open and close the charts in use.
 
 State: the connections that said hello — each consumer's subscriptions, each EA's chart role and
 symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
@@ -40,7 +38,14 @@ from mt5connector.server.floors import FloorStore
 from mt5connector.server.hub_gate import ClockGate
 from mt5connector.server.hub_health import health
 from mt5connector.server.hub_requests import Pending, Requests
-from mt5connector.server.hub_utc import Conversion, Results, broker_arguments, published
+from mt5connector.server.hub_utc import (
+    WINDOWS,
+    Conversion,
+    Results,
+    broker_arguments,
+    published,
+    window_refusal,
+)
 from mt5connector.server.repeated_hours import RepeatedHours
 from mt5connector.server.sessions import SessionStore, sessions_refusal, trading_sessions
 from mt5connector.server.settings import HubSettings, read_hub_settings
@@ -481,8 +486,8 @@ class Hub:
 
     def _request(self, ws, frame: binary.Request) -> None:
         """Routes a consumer's request: answered at once while the gate is shut, at the pending
-        bound, and with no EA to serve it; answered by the hub for a call it serves; else sent to
-        the EA of its call's role and symbol."""
+        bound, for an invalid window and with no EA to serve it; answered by the hub for a call it
+        serves; else sent to the EA of its call's role and symbol."""
         try:
             call = calls.Call(frame.call)
         except ValueError:
@@ -503,9 +508,23 @@ class Hub:
             self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._sessions)
         elif call is calls.Call.RANGES:
             self._send(ws, frame.request_id, row, _TERMINAL_INFO, {}, arguments["symbol"])
+        elif call in WINDOWS:
+            self._window_read(ws, frame.request_id, row, arguments)
         else:
             symbol = calls.routed_symbol(row, arguments)
             self._send(ws, frame.request_id, row, row, arguments, symbol)
+
+    def _window_read(
+        self, ws, client_id: int, row: calls.Row, arguments: dict[str, object]
+    ) -> None:
+        """Sends a range read to its EA, or answers it invalid_window when its true-UTC window
+        starts after it ends or after the terminal's time."""
+        refusal = window_refusal(arguments, self._gate.terminal_time())
+        if refusal is None:
+            symbol = calls.routed_symbol(row, arguments)
+            self._send(ws, client_id, row, row, arguments, symbol)
+        else:
+            self._error(ws, client_id, 0, ErrorKind.INVALID_WINDOW, refusal)
 
     def _send(
         self,

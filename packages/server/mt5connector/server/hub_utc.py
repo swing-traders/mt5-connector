@@ -1,8 +1,5 @@
-"""Every epoch a hub frame carries converted at the era of the timestamp itself: a request's
-arguments from true UTC to the broker's clock on their way to the EA, and what an EA sends — a
-published tick, bar or transaction, an answer's results — from the broker's clock to true UTC. A
-zero epoch stays zero both ways. A range read asks the broker bounds its window reads across, and
-keeps the records that read into it at either occurrence of a repeated hour.
+"""Every epoch a hub frame carries converted between true UTC and the broker's clock at the era of
+the timestamp itself; a range read's window judged in true UTC and read across its broker bounds.
 
 State: a Conversion's verdict on each broker hour it met, whether the clock repeats or skips it, for
 one frame or answer part; and a request's Results, for the life of its answer, the true-UTC window
@@ -10,6 +7,7 @@ it keeps records of and the true-UTC open of the last bar it passed on, so a bar
 period in a later part is dropped."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -29,7 +27,7 @@ from mt5connector.server.wire.push_wire import (
 
 _HOUR_S = 3_600
 # The reads of a true-UTC window, which their EA reads across its broker window.
-_WINDOWS = frozenset({calls.Call.COPY_RATES_RANGE, calls.Call.COPY_TICKS_RANGE})
+WINDOWS = frozenset({calls.Call.COPY_RATES_RANGE, calls.Call.COPY_TICKS_RANGE})
 _BARS = np.dtype(list(BARS.dtype))
 
 
@@ -109,9 +107,8 @@ class Conversion:
 
 @dataclass(frozen=True)
 class Published:
-    """A frame an EA published, as its consumers receive it: the subscription it reaches and the
-    symbol it is of — a tick's or a bar's, a request transaction's request's, any other
-    transaction's own, empty for one that names none."""
+    """A frame an EA published, as its consumers receive it, with the subscription and the symbol it
+    reaches them by."""
 
     subscription: Subscription
     symbol: str
@@ -164,14 +161,32 @@ def _transaction(
     )
 
 
+def window_refusal(arguments: dict[str, object], terminal_time: int) -> str | None:
+    """Why a range read's true-UTC window is invalid at the terminal's true-UTC time, or None when
+    it is valid."""
+    if arguments["date_from"] > arguments["date_to"]:
+        return "the window starts after it ends"
+    elif arguments["date_from"] > terminal_time:
+        return (
+            f"the window starts at {_iso(arguments['date_from'])}, after the terminal's time "
+            f"{_iso(terminal_time)}"
+        )
+    else:
+        return None
+
+
+def _iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
+
+
 def broker_arguments(
     row: calls.Row, arguments: dict[str, object], clock: BrokerClock
 ) -> dict[str, object]:
     """A request's arguments as its EA reads them: each epoch on the broker's clock, a trade
     request's included, and a range read's window as the broker bounds it reads across."""
     converted = dict(arguments)
-    if row.call in _WINDOWS:
-        lo, hi = broker_window(clock, arguments["date_from"], arguments["date_to"]).fetch
+    if row.call in WINDOWS:
+        lo, hi = broker_window(clock, arguments["date_from"], arguments["date_to"])
         # A zero bound is no time and stays zero.
         if arguments["date_from"] != 0:
             converted["date_from"] = lo
@@ -209,7 +224,7 @@ class Results:
         if row.shape is calls.Shape.RATES:
             self.series = bar_series(arguments["timeframe"])
         self._window: tuple[int, int] | None = None
-        if row.call in _WINDOWS:
+        if row.call in WINDOWS:
             self._window = (arguments["date_from"], arguments["date_to"])
         self._last_open: int | None = None
 

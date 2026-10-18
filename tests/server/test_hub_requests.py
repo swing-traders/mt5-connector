@@ -5,8 +5,11 @@ import asyncio
 import calendar
 import logging
 import time
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import hub_doubles
 import pytest
 from ea_wire import FakeEa, answer, arguments_of, decode_to_ea, stub_floor, zeroed
 from hub_doubles import (
@@ -25,7 +28,7 @@ from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.hub import HubSession
-from mt5connector.server import ws_server
+from mt5connector.server import hub_gate, ws_server
 from mt5connector.server.wire import binary, calls, mirror
 from mt5connector.server.wire.binary import ErrorKind
 from mt5connector.server.wire.history_wire import Series
@@ -1117,8 +1120,8 @@ async def test_while_the_gate_is_shut_a_request_at_the_pending_bound_is_answered
     server.close()
 
 
-# New York's 01:00–02:00 on 2026-11-01 happens twice; the broker's clock shows 08:00–09:00 twice.
-AUTUMN = calendar.timegm((2026, 11, 1, 0, 0, 0))
+# New York's 01:00–02:00 on 2025-11-02 happens twice; the broker's clock shows 08:00–09:00 twice.
+AUTUMN = calendar.timegm((2025, 11, 2, 0, 0, 0))
 # The broker's clock skips 09:00–10:00 on 2026-03-08, though the terminal stamps records in it.
 SPRING = calendar.timegm((2026, 3, 8, 0, 0, 0))
 
@@ -1185,6 +1188,96 @@ async def test_a_window_about_the_skipped_hour_holds_the_records_stamped_in_it()
     assert arguments["date_from"] <= SPRING + 9 * HOUR
     assert arguments["date_to"] >= SPRING + 10 * HOUR + 10 * 60
     assert ticks["time"].tolist() == [start + 5 * 60, start + 5 * 60]
+    server.close()
+
+
+@pytest.fixture
+def terminal_at(monkeypatch):
+    """Sets the true-UTC instant the hub's clock and the spawner's samples read."""
+
+    def at(utc_epoch: int) -> None:
+        wall = SimpleNamespace(time=lambda: float(utc_epoch), monotonic=time.monotonic)
+        monkeypatch.setattr(hub_gate, "time", wall)
+        monkeypatch.setattr(hub_doubles, "time", wall)
+
+    return at
+
+
+def _iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
+
+
+# On 2026-03-08 at 07:30Z the terminal reads broker 10:30; a window about the change is read from
+# the broker bounds of the offset before it, so its broker start is not after the terminal's time.
+@pytest.mark.parametrize("call", [Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE])
+@pytest.mark.parametrize(
+    ("terminal", "date_from", "date_to", "message"),
+    [
+        (
+            SPRING + 7 * HOUR + 30 * 60,
+            SPRING + 8 * HOUR,
+            SPRING + 8 * HOUR + 60,
+            f"the window starts at {_iso(SPRING + 8 * HOUR)}, after the terminal's time "
+            f"{_iso(SPRING + 7 * HOUR + 30 * 60)}",
+        ),
+        (
+            SPRING + 9 * HOUR + 30 * 60,
+            SPRING + 8 * HOUR + 60,
+            SPRING + 8 * HOUR,
+            "the window starts after it ends",
+        ),
+    ],
+    ids=["future", "reversed"],
+)
+async def test_a_window_invalid_in_true_utc_about_a_clock_change_is_refused_by_the_hub(
+    terminal_at, call, terminal, date_from, date_to, message
+):
+    terminal_at(terminal)
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        ea = await FakeEa.connect(port, calls.CALLS[call].role, "EURUSD")
+        consumer = await Consumer.connect(port)
+        if call is Call.COPY_RATES_RANGE:
+            await consumer.ask(
+                1,
+                call,
+                symbol="EURUSD",
+                timeframe=mirror.TIMEFRAME_M1,
+                date_from=date_from,
+                date_to=date_to,
+            )
+        else:
+            await consumer.ask(
+                1, call, symbol="EURUSD", date_from=date_from, date_to=date_to, flags=1
+            )
+        reply = await consumer.received()
+
+        assert (reply.request_id, error_of(reply)) == (1, (ErrorKind.INVALID_WINDOW, None))
+        assert reply.error.message == message
+        with pytest.raises(asyncio.TimeoutError):
+            await ea.request(timeout=0.3)
+        await consumer.close()
+        await ea.close()
+        await spawner.close()
+    server.close()
+
+
+async def test_a_window_before_the_terminals_time_on_a_constant_offset_day_reaches_its_ea(
+    terminal_at,
+):
+    # On 2026-03-10 the broker's clock runs three hours ahead of true UTC all day.
+    day = SPRING + 2 * 86_400
+    terminal_at(day + 7 * HOUR + 30 * 60)
+    hub, server, port = await run_hub()
+
+    arguments, _ = await _window_read(
+        port, Call.COPY_TICKS_RANGE, day + 7 * HOUR, day + 7 * HOUR + 60, []
+    )
+
+    assert (arguments["date_from"], arguments["date_to"]) == (
+        day + 10 * HOUR,
+        day + 10 * HOUR + 60,
+    )
     server.close()
 
 

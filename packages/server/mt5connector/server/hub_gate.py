@@ -1,7 +1,5 @@
-"""The hub's clock gate: the broker clock verified against the trade-server time the spawner relays
-— a sample fresh for its max-age, from a terminal connected without a break for that long, measured
-within the tolerance — and re-verified on its interval. A missed bootstrap window or a sample the
-broker clock contradicts never ends the process: the gate stays shut until a sample verifies it.
+"""The hub's clock gate: the broker clock verified against the trade-server time the spawner
+relays, and re-verified on its interval.
 
 State: the latest sample, the monotonic time it arrived and when its unbroken connected run began;
 the sample last measured; the latest verification, held while the latest sample is verifiable and
@@ -91,6 +89,13 @@ class ClockGate:
         else:
             return time.monotonic() - self._latest.arrived
 
+    def terminal_time(self) -> int:
+        """The terminal's trade-server time now in true UTC: the latest sample's, advanced by the
+        sample's age."""
+        now = time.time()
+        trade_server = self._clock.to_utc_near(self._latest.sample.trade_server, int(now))
+        return trade_server + int(time.monotonic() - self._latest.arrived)
+
     def is_fresh(self) -> bool:
         """Whether the latest sample says the terminal is connected and arrived within its
         max-age."""
@@ -176,6 +181,8 @@ class ClockGate:
             )
 
     def _bootstrap_ends(self) -> None:
+        """Logs a bootstrap window that passed unverified as critical; the gate stays shut and the
+        process serves on."""
         if self.verification is None and not self.bootstrap_missed:
             self.bootstrap_missed = True
             if self._is_fresh(time.monotonic()):

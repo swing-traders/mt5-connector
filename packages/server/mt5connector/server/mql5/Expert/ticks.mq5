@@ -1041,12 +1041,11 @@ public:
     // The request's series, and its floor as the store holds it with this run's writes.
     int series;
     Floor floor;
-    bool wrote;
     int writtenSeries[];
     long writtenValues[];
     ENUM_FLOOR_ORIGIN writtenOrigins[];
 
-    HistoryRun() : state(RUN_GOING), why(""), error(0), lastError(0), series(0), wrote(false)
+    HistoryRun() : state(RUN_GOING), why(""), error(0), lastError(0), series(0)
     {
         ZeroMemory(floor);
     }
@@ -1152,7 +1151,6 @@ void WriteFloor(HistoryRun &run, const int series, const long value,
     run.writtenSeries[n] = series;
     run.writtenValues[n] = value;
     run.writtenOrigins[n] = origin;
-    run.wrote = true;
 }
 
 // The run's measurements into the store, each by the store's rule.

@@ -112,7 +112,7 @@ Every request is answered once, by a result or an error, and nothing comes after
 | `syncing` | EA, hub | yes | a history window the terminal's answers do not prove yet; or a commission schedule or trading sessions not yet relayed |
 | `not_ready` | hub | yes | the broker clock is not verified |
 | `no_publisher` | hub | yes | no EA serves the call's role and symbol: its chart is requested from the spawner — once per spawner connection — and the request answered at once |
-| `invalid_window` | EA | no | a history window starting after the terminal's time |
+| `invalid_window` | hub, EA | no | a history window starting after it ends or after the terminal's time: the hub judges the true-UTC window asked, the EA the broker bounds it is sent |
 | `overflow` | hub | no | the consumer has `MT5_HUB_PENDING_BOUND` requests pending, or the EA's outbound queue is full |
 | `ea_gone` | hub | no | the EA left — a close, or its pong overdue — with the request pending |
 | `timeout` | hub | no | the EA answered nothing by the call's deadline; logged as an error, and a later answer dropped with a warning |
@@ -138,6 +138,7 @@ Every request is answered once, by a result or an error, and nothing comes after
 The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. A history read is answered only once the terminal's answers prove it, so a consumer never receives emptiness it cannot trust: a window nothing proves yet is `syncing`, and the consumer's retry reads it again.
 
 - A bar read names its timeframe from `M1` to `W1`: a month has no fixed period, so `MN1` is refused.
+- A window that starts after it ends, or after the terminal's time — the spawner's latest server-time sample, advanced by its age — is answered `invalid_window` by the hub, judged in true UTC before the window is widened to its broker bounds.
 - A window about a clock change is read in the broker window holding every stamp that reads into it — a skipped hour's stamps read at the offset before the change, a repeated hour's at either pass — and answered with those stamps alone.
 - Every bar an answer carries and the hub pushes carries its close, `time_close`, in true UTC: a frame on the broker day's grid, H2 to W1, closes at the next grid open on the broker's clock, an hour more or less than its period across a clock change; a finer one a period of real time after its open. Of two bars of a series that open at one true-UTC second — about a spring change, one stamped in the hour the broker's clock skips and the one after it — the first is answered and pushed, and the other dropped with one warning per such hour.
 - The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in spans within that, `maxbars` read from the terminal.
