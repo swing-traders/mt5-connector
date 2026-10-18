@@ -22,6 +22,8 @@ class SessionDouble:
         self.connected = True
 
     async def disconnect(self):
+        if not self.connected:
+            raise RuntimeError("hub session: not connected")
         self.connected = False
 
     async def subscribe(self, subscription):
@@ -60,11 +62,6 @@ class ExecSession(SessionDouble):
         if self.connected:
             raise RuntimeError("hub session: already connected")
         self.connected = True
-
-    async def disconnect(self):
-        if not self.connected:
-            raise RuntimeError("hub session: not connected")
-        self.connected = False
 
     async def request(self, call: calls.Call, **arguments) -> Answered:
         """A call's answer on a later turn of the loop, once the registry's codec takes its

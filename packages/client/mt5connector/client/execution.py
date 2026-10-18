@@ -449,6 +449,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._magic = magic_for(self.trader_id)
         self._hub = HubSession(config, loop, self._on_push_frame, None, self._log)
         self._account_task: asyncio.Task | None = None
+        # The task NT runs `_connect` as, while it runs, for a disconnect to end.
+        self._connecting: asyncio.Task | None = None
         self._client_order_ids: dict[int, ClientOrderId] = {}
         self._tickets: dict[ClientOrderId, int] = {}
         self._seen_deals: set[int] = set()
@@ -474,56 +476,72 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         client."""
         if self._account_task is not None:
             raise RuntimeError("execution client: already connected")
-        self._conn.ensure_connected()
-        account = await self._conn.account_info()
-        terminal = await self._conn.terminal_info()
-        if account.margin_mode != MarginMode.RETAIL_HEDGING:
-            raise MT5ConfigError(
-                f"the client declares {self.oms_type.name}, the account's margin mode is "
-                f"{account.margin_mode}"
-            )
-        elif terminal["trade_allowed"] and not account.trade_allowed:
-            raise MT5ConfigError("read-only (investor) session: the account does not allow trading")
-
-        self._set_account_id(_account_id_of(self._config.venue, account.login, self._magic))
-        await self._provider.initialize()
-        # Money mints at its currency's registered precision, which NT may hold at a guess.
-        register_venue_currency(self.base_currency)
-        for instrument in self._provider.list_all():
-            register_venue_currency(instrument.quote_currency)
-
-        self._index_nt_orders()
-        await self._hub.connect()
+        self._connecting = asyncio.current_task()
         try:
-            await self._take_in_venue()
-            await self._refresh_account()
-            self._account_unanswered = False
-            await self._hub.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
-        except BaseException:
-            await self._hub.disconnect()
-            raise
-        self._account_task = self._loop.create_task(
-            self._account_loop(),
-            name="MT5LiveExecutionClient._account_loop",
-        )
-        self._log.info(f"connected, the hub session at {self._config.ws_display_url}")
+            self._conn.ensure_connected()
+            account = await self._conn.account_info()
+            terminal = await self._conn.terminal_info()
+            if account.margin_mode != MarginMode.RETAIL_HEDGING:
+                raise MT5ConfigError(
+                    f"the client declares {self.oms_type.name}, the account's margin mode is "
+                    f"{account.margin_mode}"
+                )
+            elif terminal["trade_allowed"] and not account.trade_allowed:
+                raise MT5ConfigError(
+                    "read-only (investor) session: the account does not allow trading"
+                )
+
+            self._set_account_id(_account_id_of(self._config.venue, account.login, self._magic))
+            await self._provider.initialize()
+            # Money mints at its currency's registered precision, which NT may hold at a guess.
+            register_venue_currency(self.base_currency)
+            for instrument in self._provider.list_all():
+                register_venue_currency(instrument.quote_currency)
+
+            self._index_nt_orders()
+            await self._hub.connect()
+            try:
+                await self._take_in_venue()
+                await self._refresh_account()
+                self._account_unanswered = False
+                await self._hub.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+            except BaseException:
+                await self._hub.disconnect()
+                raise
+            self._account_task = self._loop.create_task(
+                self._account_loop(),
+                name="MT5LiveExecutionClient._account_loop",
+            )
+            self._log.info(f"connected, the hub session at {self._config.ws_display_url}")
+        finally:
+            self._connecting = None
 
     async def _disconnect(self) -> None:
-        """Stops the account loop, the handling of every pushed transaction and the hub session, and
-        drops the client's view of the venue; the commands the terminal sent stay, for the verdicts
-        the session asks at its next connect. Raises RuntimeError on a client never connected."""
-        if self._account_task is None:
+        """Ends a connect still under way, or stops the account loop; then stops the handling of
+        every pushed transaction and the hub session, and drops the client's view of the venue; the
+        commands the terminal sent stay, for the verdicts the session asks at its next connect.
+        Raises RuntimeError on a client never connected."""
+        if self._connecting is not None:
+            self._connecting.cancel()
+            try:
+                await self._connecting
+            except asyncio.CancelledError:
+                pass
+        elif self._account_task is not None:
+            self._account_task.cancel()
+            try:
+                await self._account_task
+            except asyncio.CancelledError:
+                pass
+            self._account_task = None
+        else:
             raise RuntimeError("execution client: not connected")
-        self._account_task.cancel()
-        try:
-            await self._account_task
-        except asyncio.CancelledError:
-            pass
-        self._account_task = None
         for task in self._handlers:
             task.cancel()
         await self._hub.unsubscribe(Subscription(Stream.TRADE_TRANSACTIONS))
-        await self._hub.disconnect()
+        # A connect ended under way has disconnected the session it opened.
+        if self._hub.connected:
+            await self._hub.disconnect()
         self._held.clear()
         self._client_order_ids.clear()
         self._tickets.clear()

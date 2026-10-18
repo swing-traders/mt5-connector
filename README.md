@@ -313,7 +313,7 @@ The data and execution clients run in NautilusTrader's `TradingNode`, and the no
 - `build_mt5_node_config` makes both clients the node's default route and gives each its `InstrumentProviderConfig(load_ids=...)`: the data client the instruments the node reads, those it trades and those it follows; the execution client those it trades.
 - A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — reading each opens its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
 - A symbol no config names is loaded when it is requested (`request_instrument`): the server serves any symbol the account has, so another deployment's instruments need no change to it.
-- The factories, registered before `node.build()` under the config's venue, build the clients on one connection per account and server, and one instrument provider per connection, venue and `instrument_provider` config.
+- The factories, registered before `node.build()` under the config's venue, build the clients on one connection per account, server and loop, and one instrument provider per connection, venue and `instrument_provider` config.
 - The factories connect the account's connection on the node's loop at `node.build()`, before the loop runs; a build inside a running loop raises asyncio's `RuntimeError`.
 
 ```python

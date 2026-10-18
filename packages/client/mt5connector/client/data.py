@@ -96,29 +96,44 @@ class MT5DataClient(LiveMarketDataClient):
         self._next_closes: dict[BarType, int] = {}
         self._recoveries: dict[BarType, _Recovery] = {}
         self._read_backs: set[asyncio.Task] = set()
+        # The task NT runs `_connect` as, while it runs, for a disconnect to end.
+        self._connecting: asyncio.Task | None = None
 
     async def _connect(self) -> None:
         """Loads what the instrument provider's config names, hands NT every instrument the provider
         holds and connects the hub session; raises MT5ConfigError for a config that names nothing to
         load."""
-        self._conn.ensure_connected()
-        await self._provider.initialize()
-        instruments = self._provider.list_all()
-        _register_settlement(instruments)
-        for instrument in instruments:
-            self._handle_data(instrument)
-            self._log.info(f"MT5DataClient: loaded instrument {instrument.raw_symbol}")
-        await self._hub.connect()
-        self._log.info(
-            f"MT5DataClient: connected, the hub session at {self._config.ws_display_url}"
-        )
+        self._connecting = asyncio.current_task()
+        try:
+            self._conn.ensure_connected()
+            await self._provider.initialize()
+            instruments = self._provider.list_all()
+            _register_settlement(instruments)
+            for instrument in instruments:
+                self._handle_data(instrument)
+                self._log.info(f"MT5DataClient: loaded instrument {instrument.raw_symbol}")
+            await self._hub.connect()
+            self._log.info(
+                f"MT5DataClient: connected, the hub session at {self._config.ws_display_url}"
+            )
+        finally:
+            self._connecting = None
 
     async def _disconnect(self) -> None:
-        """Disconnects the hub session; what NT subscribes stays wanted for the next connect."""
+        """Ends a connect still under way, which connects the hub session last, else disconnects the
+        hub session; what NT subscribes stays wanted for the next connect. Raises RuntimeError on a
+        client never connected."""
         for task in self._read_backs:
             task.cancel()
         self._recoveries.clear()
-        await self._hub.disconnect()
+        if self._connecting is not None:
+            self._connecting.cancel()
+            try:
+                await self._connecting
+            except asyncio.CancelledError:
+                pass
+        else:
+            await self._hub.disconnect()
         self._log.info("MT5DataClient: disconnected")
 
     # ── Quotes and marks ──────────────────────────────────────────────────────

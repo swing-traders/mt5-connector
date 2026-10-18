@@ -1,7 +1,7 @@
-"""NT's live data and execution client factories for MT5 — sharing one connection per account and
-server, connected on the loop NT hands them, and one instrument provider per connection, venue and
-instrument-provider config, for the process's life — and the node config that wires a venue's
-clients."""
+"""NT's live data and execution client factories for MT5 — sharing one connection per account,
+server and the loop NT hands them, connected on that loop, and one instrument provider per
+connection, venue and instrument-provider config, for the process's life — and the node config that
+wires a venue's clients."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # SHARED CONNECTIONS AND INSTRUMENT PROVIDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_connection_registry: dict[tuple[int, str], MT5Connection] = {}
+_connection_registry: dict[tuple[int, str, asyncio.AbstractEventLoop], MT5Connection] = {}
 
 _provider_registry: dict[
     tuple[MT5Connection, Venue, InstrumentProviderConfig], MT5InstrumentProvider
@@ -46,9 +46,9 @@ _mt5_config_registry: dict[str, MT5Config] = {}
 
 
 def _ensure_connection(config: MT5Config, loop: asyncio.AbstractEventLoop) -> MT5Connection:
-    """The connection of the config's account and server, created on first use and connected by
-    running `loop` until the connect completes."""
-    registry_key = (config.account, config.server)
+    """The connection of the config's account and server on `loop`, created on first use and
+    connected by running `loop` until the connect completes."""
+    registry_key = (config.account, config.server, loop)
 
     if registry_key not in _connection_registry:
         logger.info("MT5 factories: creating the account's connection")

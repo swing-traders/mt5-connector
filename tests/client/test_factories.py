@@ -188,7 +188,7 @@ class TestConnectionRegistryIsolation:
         _ensure_connection(make_config(account=10000003), loop)
         assert len(_connection_registry) == 3
 
-    def test_two_accounts_get_two_connections_keyed_by_account_and_server(
+    def test_two_accounts_get_two_connections_keyed_by_account_server_and_loop(
         self, mock_mt5_conn, loop
     ):
         MockConn, _ = mock_mt5_conn
@@ -196,7 +196,10 @@ class TestConnectionRegistryIsolation:
         first = _ensure_connection(make_config(account=1001, server="MT5_ALPHA"), loop)
         second = _ensure_connection(make_config(account=1002, server="MT5_BETA"), loop)
         assert first is not second
-        assert _connection_registry == {(1001, "MT5_ALPHA"): first, (1002, "MT5_BETA"): second}
+        assert _connection_registry == {
+            (1001, "MT5_ALPHA", loop): first,
+            (1002, "MT5_BETA", loop): second,
+        }
 
 
 class TestDataClientFactory:
@@ -342,6 +345,25 @@ class TestFactoriesOnNtsLoop:
         assert len(pinging_hub.connections) == 1
         assert exec_client.base_currency == Currency.from_str("EUR")
         loop.run_until_complete(exec_client._conn.disconnect())
+
+    def test_a_config_on_another_loop_gets_a_connection_of_its_own_connected_on_that_loop(
+        self, pinging_hub, loop
+    ):
+        pinging_hub.answers[Call.ACCOUNT_INFO] = [account_info(currency="EUR")._asdict()]
+        config = replace(make_config(), ws_url=f"ws://127.0.0.1:{pinging_hub.port}")
+        other_loop = asyncio.new_event_loop()
+        try:
+            first = _ensure_connection(config, loop)
+            second = _ensure_connection(config, other_loop)
+            account = other_loop.run_until_complete(second.account_info())
+
+            assert account.currency == "EUR"
+            assert second is not first
+            assert len(pinging_hub.connections) == 2
+            other_loop.run_until_complete(second.disconnect())
+        finally:
+            other_loop.close()
+        loop.run_until_complete(first.disconnect())
 
     async def test_a_create_on_a_running_loop_raises_asyncios_refusal_and_registers_nothing(
         self,

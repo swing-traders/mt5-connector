@@ -1,7 +1,5 @@
-"""The terminal's account, symbol, tick, order, deal and position structs and a trade request's
-immediate answer as the hub session hands them back, every field the hub carries present, the
-trading sessions a publisher relays, and a hub session serving an instrument provider's reads, for
-tests that feed the client a venue."""
+"""The venue's structs and relayed answers as the hub session hands them back, and a hub session
+serving an instrument provider's reads, for the client's tests to feed it a venue."""
 
 from unittest.mock import MagicMock
 

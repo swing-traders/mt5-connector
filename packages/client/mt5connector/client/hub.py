@@ -150,6 +150,12 @@ class HubSession:
         self._greeted: int | None = None
         self._tasks: set[asyncio.Task] = set()
 
+    @property
+    def connected(self) -> bool:
+        """Whether the session is connected, from its connect until its disconnect, reconnects
+        included."""
+        return self._ws is not None
+
     async def connect(self) -> None:
         """Connects to the hub, says hello, subscribes everything wanted and asks the outcomes of
         the commands still outstanding; NT's client reconnects with backoff from then on, and a
