@@ -1,6 +1,5 @@
 """The hub's streams, charts and relays: each publisher's frames fanned out to their subscribers in
-true UTC, the wanted frames, the spawner's charts, the server-time relay, and the frames the hub
-refuses."""
+true UTC, and the frames the hub refuses."""
 
 import asyncio
 import calendar

@@ -1,5 +1,4 @@
-"""The EA's half of the hub protocol, which only MQL5 speaks in production: the frames an EA sends
-encoded, the frames the hub sends it decoded, and an EA's answer results; and a fake EA on a real
+"""The EA's half of the hub protocol, which only MQL5 speaks in production, and a fake EA on a real
 websockets connection."""
 
 import asyncio

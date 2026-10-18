@@ -1,6 +1,5 @@
-"""The hub's clock gate under the HTTP server's sample rules: fresh for the max-age, from a terminal
-connected without a break for that long, within the tolerance; a missed bootstrap or a contradicting
-sample shuts it and never ends the process."""
+"""The hub's clock gate: a sample fresh for the max-age, from a terminal connected without a break
+that long, within the tolerance, opens it; a missed bootstrap or contradicting sample shuts it."""
 
 import asyncio
 import logging

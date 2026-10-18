@@ -131,15 +131,15 @@ async def eventually(predicate, timeout=2.0):
 
 
 class Peer:
-    """A connection double for the hub's handler: what is put on `incoming` reaches the hub as
-    frames, a send records the frame, and while `stuck` no send of the hub's ever completes; its
-    pings are answered unless `deaf`."""
+    """A connection double for the hub's handler."""
 
     def __init__(self, stuck=False, deaf=False):
         self.incoming = asyncio.Queue()
         self.sent = []
         self.closed = None
+        # No send of the hub's ever completes.
         self.stuck = stuck
+        # Its pings are never answered.
         self.deaf = deaf
         self.remote_address = ("127.0.0.1", 0)
 

@@ -30,10 +30,6 @@ class FloorStore:
         self._floors: dict[tuple[str, Series], Floor] = {}
         self._lock = threading.Lock()
 
-    def read(self, symbol: str, series: Series) -> Floor | None:
-        with self._lock:
-            return self._floors.get((symbol, series))
-
     def of_symbol(self, symbol: str) -> dict[Series, Floor]:
         with self._lock:
             return {
