@@ -11,21 +11,18 @@ import numpy as np
 
 from . import binary, mirror
 from .binary import CodecError, Reader, Writer
-from .history_wire import BARS, FloorOrigin, Series
+from .history_wire import BARS, TICK_TIMEFRAME, Series, bar_series
 from .push_wire import ChartRole
 
 # The deadlines a request waits under, which bind the hub and the session alike: a read's answer, a
-# command's answer that it was sent, a bar history read's without a busy, and the margin past a
-# busy's bound.
+# command's answer that it was sent, and the margin past a busy's bound.
 READ_DEADLINE_S = 5.0
 COMMAND_DEADLINE_S = 1.0
-HISTORY_DEADLINE_S = 45.0
 BUSY_MARGIN_S = 10.0
-# A tick read's deadline from the moment it is sent, and the bound of the busy the history EA renews
-# while the read is in flight: the EA repeats the terminal's call until its answer settles, one call
-# can wait past the history deadline, and a read queued behind another's call hears no busy until
-# that call returns.
-TICK_BUSY_S = 900
+# A history request's deadline from the moment it is sent, and the bound of the busy its history EA
+# renews while it is pending: the EA serves one request at a time, each blocking in the terminal's
+# calls, and a request queued behind another's call hears no busy until that call returns.
+HISTORY_BUSY_S = 900
 # How long a deferred request waits before it is asked again, by default.
 RETRY_AFTER_S = 5.0
 # The most result bytes an EA's answer part carries, which keeps its frame within the hub's 1 MiB
@@ -92,8 +89,6 @@ class Shape(StrEnum):
 
 # The shapes of a result of rows, which alone travels in parts.
 _ROWS = frozenset({Shape.STRUCTS, Shape.TICKS, Shape.RATES, Shape.TRANSACTIONS})
-# The shapes of a history read's result, whose last part carries the floor fact.
-_HISTORY = frozenset({Shape.TICKS, Shape.RATES})
 
 
 class Wait(StrEnum):
@@ -102,7 +97,6 @@ class Wait(StrEnum):
     READ = "read"
     COMMAND = "command"
     HISTORY = "history"
-    TICKS = "ticks"
 
 
 @dataclass(frozen=True)
@@ -145,12 +139,12 @@ class Ranges:
 
 
 @dataclass(frozen=True)
-class FloorFact:
-    """A floor an EA measured on a history read, on the broker's clock — seconds for bars,
-    milliseconds for ticks — and what set it."""
+class MeasuredFloors:
+    """The terminal's MaxBars and each floor a history EA measured for a symbol, in broker seconds:
+    a ranges answer as the EA sends it."""
 
-    floor: int
-    origin: FloorOrigin
+    maxbars: int
+    floors: dict[Series, int]
 
 
 _ARG_TYPES = {
@@ -228,17 +222,17 @@ CALLS: dict[Call, Row] = {
         _package(
             Call.COPY_RATES_RANGE,
             mirror.FunctionName.COPY_RATES_RANGE,
-            ChartRole.PUBLISHER,
+            ChartRole.HISTORY,
             Wait.HISTORY,
         ),
         _package(
             Call.COPY_TICKS_RANGE,
             mirror.FunctionName.COPY_TICKS_RANGE,
             ChartRole.HISTORY,
-            Wait.TICKS,
+            Wait.HISTORY,
         ),
-        # The hub answers it from the floors it holds and the MaxBars of a terminal_info it asks.
-        Row(Call.RANGES, (_SYMBOL,), Shape.RANGES, None, Wait.READ),
+        # The history EA answers its symbol's floors, which the hub keeps and stamps.
+        Row(Call.RANGES, (_SYMBOL,), Shape.RANGES, ChartRole.HISTORY, Wait.HISTORY),
         # A publisher answers each request id its outcome log holds with its REQUEST transaction.
         Row(
             Call.OUTCOMES,
@@ -385,24 +379,15 @@ def _read_argument(reader: Reader, argument: Argument) -> object:
 # ── Results ───────────────────────────────────────────────────────────────────
 
 
-def read_ea_result(row: Row, answer: binary.Answer) -> tuple[object, FloorFact | None]:
-    """The results of an EA's answer part, on the broker's clock, and the floor fact the last part
-    of a history read carries; raises CodecError for a part out of the row's layout, a part before
-    the last of a result that is one record among them."""
+def read_ea_result(row: Row, answer: binary.Answer) -> object:
+    """The results of an EA's answer part, on the broker's clock; raises CodecError for a part out
+    of the row's layout, a part before the last of a result that is one record among them."""
     if not answer.last and row.shape not in _ROWS:
         raise CodecError(f"{row.call.name.lower()}: a {row.shape} answer in a part before its last")
     reader = Reader(answer.result)
     value = _read_value(row, reader, answer.count, binary.Sender.EA)
-    fact = None
-    if row.shape in _HISTORY and answer.last:
-        at = reader.offset
-        facts = reader.u8("floors")
-        if facts == 1:
-            fact = FloorFact(reader.i64("floor"), reader.member(FloorOrigin, "origin"))
-        elif facts != 0:
-            raise CodecError(f"result offset {at}: {facts} floors on one answer")
     reader.done()
-    return value, fact
+    return value
 
 
 def read_hub_result(row: Row, answer: binary.Answer) -> object:
@@ -495,6 +480,8 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
         return _rows(reader, count, _RATES)
     elif row.shape is Shape.RATES:
         return _rows(reader, count, _BARS)
+    elif row.shape is Shape.RANGES and sender is binary.Sender.EA:
+        return _measured_floors(reader, count)
     elif row.shape is Shape.RANGES:
         maxbars = reader.i64("maxbars")
         series = {}
@@ -512,6 +499,26 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
     else:
         _one(row, count)
         return binary.read_sessions(reader)
+
+
+def _measured_floors(reader: Reader, count: int) -> MeasuredFloors:
+    """An EA's ranges answer: the MaxBars, then each floor by the timeframe of its series."""
+    maxbars = reader.i64("maxbars")
+    floors: dict[Series, int] = {}
+    for _ in range(count):
+        at = reader.offset
+        timeframe = reader.i32("timeframe")
+        if timeframe == TICK_TIMEFRAME:
+            series = Series.TICKS
+        else:
+            try:
+                series = bar_series(timeframe)
+            except ValueError as unserved:
+                raise CodecError(f"result offset {at}: {unserved}") from None
+        if series in floors:
+            raise CodecError(f"result offset {at}: timeframe {timeframe} is repeated")
+        floors[series] = reader.i64("floor")
+    return MeasuredFloors(maxbars, floors)
 
 
 def _rows(reader: Reader, count: int, dtype: np.dtype) -> np.ndarray:

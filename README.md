@@ -433,7 +433,9 @@ The live hub tier, `tests/live/`, runs against two running images' hubs on one a
 - every read the spawner and a publisher serve, and a deal read by its ticket;
 - the symbol's ticks and M1 bars;
 - a pending order whose expiration has passed, which the venue refuses, and a command for a symbol no publisher serves;
-- its history: a cold M1 window and the floor it measures, a window before that floor, one starting after the terminal's time, a window one period over the span cap on the terminal whose `MaxBars` is capped, a day of ticks, and a week of ticks, timing a publisher read every second while it downloads.
+- its history: the floors `ranges` reports against a bar read from 1970 and the first real tick, windows before the M1 floor and in the daily lead-in, one starting after the terminal's time, a cold M1 window, a day of ticks from the ticks' floor and a month back, and a week of ticks, timing a publisher read every second while it downloads;
+- the era spread rule: a day's tickless minutes from the spread floor on synthesised from their M1 bars with each bar's own spread, and none synthesised before it;
+- on the terminal whose `MaxBars` is capped, the one window over the span cap a capped frame allows, whole and as thirds, and a wide read beginning at the M1 floor `ranges` reports or one period after it.
 
 ---
 
@@ -467,7 +469,7 @@ mt5-connector/
 │   │       └── wire/
 │   │           ├── mirror.py        # the inventory of the pinned MetaTrader5 package
 │   │           ├── broker_clock.py  # broker wall-clock time ↔ true UTC
-│   │           ├── history_wire.py  # the history protocol's series, bar rows and floor origins
+│   │           ├── history_wire.py  # the history protocol's series, bar rows and tick selections
 │   │           ├── push_wire.py     # the hub protocol's roles, streams and MQL5 names
 │   │           ├── binary.py        # the hub protocol's binary frames
 │   │           └── calls.py         # the hub's call registry and its arguments' and results' codecs
@@ -486,12 +488,12 @@ mt5-connector/
 │               ├── windows.py       # a true-UTC window's broker bounds and the seconds that read into it
 │               ├── repeated_hours.py # the once-per-hour warnings of repeated and skipped hours and dropped bars
 │               ├── encoding.py      # a bar's close in true UTC
-│               ├── floors.py        # the history floors measured per series
+│               ├── floors.py        # the floors the history EAs measured, per series
 │               ├── commissions.py   # the commission schedules the EAs relay, per symbol
 │               ├── sessions.py      # the trading sessions the EAs relay, per symbol
 │               ├── mql5gen.py       # writes the EA's half of the hub protocol from the inventory
 │               ├── wire -> ../../../client/mt5connector/wire
-│               └── mql5/            # the EA, its indicator, its startup script and their includes
+│               └── mql5/            # the EA, its startup script and their includes
 └── tests/                        # full test suite (no live MT5 required; the image tier runs the image)
 ```
 

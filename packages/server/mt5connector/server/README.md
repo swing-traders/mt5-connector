@@ -1,6 +1,6 @@
 # mt5-connector-server
 
-The terminal side of mt5-connector: the hub that carries the terminal's ticks, closed bars and trade transactions and answers the calls the EAs serve, every epoch in true UTC, and the source of the EA, its history indicator and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
+The terminal side of mt5-connector: the hub that carries the terminal's ticks, closed bars and trade transactions and answers the calls the EAs serve, every epoch in true UTC, and the source of the EA and the startup script that run inside the terminal. `mt5-connector-client`, the NautilusTrader adapter, talks to it.
 
 Releases are wheels on the fork's package index, versioned together with the client's; `<version>` is a release's version, the `VERSION` file's value at its tag, the latest listed on the [releases page](https://github.com/swing-traders/mt5-connector/releases):
 
@@ -11,7 +11,7 @@ python -m pip install --extra-index-url https://swing-traders.github.io/mt5-conn
 | Part | What it is |
 |---|---|
 | `mt5connector.server.ws_server` | the hub, started as `mt5-connector-hub` |
-| `mt5connector/server/mql5/` | the EA (`Expert/ticks.mq5`), its history indicator (`Indicators/hub_history.mq5`), its startup script (`Scripts/ticks_setup.mq5`) and the MQL5 libraries they include (`Include/`) |
+| `mt5connector/server/mql5/` | the EA (`Expert/ticks.mq5`), its startup script (`Scripts/ticks_setup.mq5`) and the MQL5 libraries they include (`Include/`) |
 | `mt5connector.server.wire` | the wire vocabulary, copied from the client's `mt5connector.wire` when the wheel is built |
 
 ---
@@ -23,8 +23,8 @@ The hub (`mt5connector.server.ws_server`, port `MT5_HUB_PORT`) is the one endpoi
 | Role | What its EA serves |
 |---|---|
 | `spawner` | the account: its reads (account, open positions and orders, deal and order history, the symbol list, terminal facts), the charts the hub requests, the server-time relay and the transactions that name no symbol |
-| `publisher` | one symbol: its ticks, closed bars and transactions, its reads and bar history, its trade commands and their outcomes, and its commission schedule and trading sessions |
-| `history` | one symbol's tick history |
+| `publisher` | one symbol: its ticks, closed bars and transactions, its reads, its trade commands and their outcomes, and its commission schedule and trading sessions |
+| `history` | one symbol's history: its floors, bars and ticks |
 
 - The hub addresses an EA by its role and symbol, the spawner by its role alone. The first EA to say hello for a role and symbol serves it; the hub answers a later one `duplicate`, closes it, and logs a warning. A refused duplicate's frames are dropped silently.
 - The hub keeps no event store and replays nothing: a consumer that reconnects subscribes again and receives what is published from then on.
@@ -90,18 +90,18 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 | `history_orders_get` | 10 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeOrder` rows | read |
 | `history_deals_get` | 11 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeDeal` rows | read |
 | `order_send` | 12 | publisher of the request's `symbol` | `request` | `MqlTradeResult` | command |
-| `copy_rates_range` | 13 | publisher | `symbol`, `timeframe`, `date_from`, `date_to` | bars | history |
-| `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags` | `MqlTick` rows | ticks |
-| `ranges` | 17 | the hub | `symbol` | the terminal's `maxbars` (int64), then each floor held: `series`, `floor`, `measured_at`, `generation` (int64) | read |
+| `copy_rates_range` | 13 | history | `symbol`, `timeframe`, `date_from`, `date_to` | bars | history |
+| `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags` | `MqlTick` rows | history |
+| `ranges` | 17 | history | `symbol` | the terminal's `maxbars` (int64), then each floor held: `series`, `floor`, `measured_at`, `generation` (int64) | history |
 | `outcomes` | 18 | publisher | `symbol`, `request_ids` | per request id its outcome log holds, the `MqlTradeTransaction`, `MqlTradeRequest` and `MqlTradeResult` of its `REQUEST` transaction, back to back | read |
 | `commission_schedule` | 19 | the hub | `symbol` | the schedule, laid out as a `commissions` frame's after its symbol | read |
 | `trading_sessions` | 20 | the hub | `symbol` | the sessions, laid out as a `sessions` frame's after its symbol | read |
 
 - Arguments travel by the inventory's parameter kinds: integers as int64, strings as `str`, a time as int64 epoch seconds, `request` as an `MqlTradeRequest` record, `request_ids` as a u32 count and each id as a u32. A required argument missing, an argument out of the call's order or of the wrong type, or a history query in none of its call forms is a frame the hub cannot handle; a session refuses it before sending. A bar read of a timeframe no series serves is refused too.
 - `last_error` is the MQL5 `GetLastError()` the EA read after the call, folded into every answer; the hub's own answers carry 0, but for a chart the spawner failed to open, which carry the error its `chart_failed` named.
-- A result of rows travels in parts, numbered from 0, the last flagged; an EA's part carries at most 1,000,000 result bytes, which keeps its frame within the hub's 1 MiB message limit; an EA's last part of a history read carries a floor fact after its rows — a u8 count, 0 or 1, and for 1 the floor (int64 on the broker's clock, seconds for bars and milliseconds for ticks) and what set it, `stub` or `coarse`. The hub keeps that floor for `ranges` and passes the rows on without it.
+- A result of rows travels in parts, numbered from 0, the last flagged; an EA's part carries at most 1,000,000 result bytes, which keeps its frame within the hub's 1 MiB message limit. A history EA answers `ranges` in one part: the terminal's `maxbars` (int64), then, for each series it holds a floor of, the series' timeframe (int32; 0, `TICK_TIMEFRAME`, for the ticks) and its floor (int64, broker seconds). An answer naming a timeframe no series serves, or one twice, is a frame the hub cannot handle.
 - `order_send` is served through `OrderSendAsync`: its answer, the `MqlTradeResult` with its `request_id` and retcode 10008, means sent; the venue's verdict arrives as the `REQUEST` transaction carrying the same `request_id`. A publisher keeps the last 1,000 `REQUEST` transactions of its symbol, and `outcomes` answers those of the request ids it is asked; an id it no longer holds is absent from the answer.
-- `ranges` answers the floors the hub holds for the symbol, in true UTC, beside the `maxbars` of a `terminal_info` the hub asks the spawner for it; `commission_schedule` and `trading_sessions` answer the latest relay of the symbol's publisher.
+- `ranges` answers, in true UTC, beside the terminal's `maxbars`, every floor the hub holds for the symbol: each floor of the history EA's latest `ranges` answer, kept with the time the hub learned it and a generation that steps whenever its value changes or it returns after an answer that omitted it. A series with no rows is in none. `commission_schedule` and `trading_sessions` answer the latest relay of the symbol's publisher.
 
 ### Every request ends
 
@@ -109,7 +109,7 @@ Every request is answered once, by a result or an error, and nothing comes after
 
 | Error | Answered by | `retry_after_ms` | When |
 |---|---|---|---|
-| `syncing` | EA, hub | yes | a history window the terminal's answers do not prove yet; or a commission schedule or trading sessions not yet relayed |
+| `syncing` | EA, hub | yes | a history request its history EA has not settled within the history bound — the symbol's measurement, or a read the terminal is still loading; or a commission schedule or trading sessions not yet relayed |
 | `not_ready` | hub | yes | the broker clock is not verified |
 | `no_publisher` | hub | yes | no EA serves the call's role and symbol: its chart is requested from the spawner — once per spawner connection — and the request answered at once |
 | `invalid_window` | hub, EA | no | a history window starting after it ends or after the terminal's time: the hub judges the true-UTC window asked, the EA the broker bounds it is sent |
@@ -125,8 +125,7 @@ Every request is answered once, by a result or an error, and nothing comes after
   |---|---|---|
   | `read`, 5 s | `READ_DEADLINE_S` | every read |
   | `command`, 1 s | `COMMAND_DEADLINE_S` | a command's sent answer |
-  | `history`, 45 s | `HISTORY_DEADLINE_S` | a bar history read |
-  | `ticks`, 900 s | `TICK_BUSY_S` | a tick read, so that one queued at a history EA blocked in another's call outlasts that call until its own `busy` arrives |
+  | `history`, 900 s | `HISTORY_BUSY_S` | every history request — `ranges` and both reads — so that one queued at a history EA blocked in another's call outlasts that call until its own `busy` arrives |
 
 - A `busy` moves the request's deadline to its bound plus 10 s (`BUSY_MARGIN_S`) from its arrival, holds off the EA's keepalive as long, and is passed on to the consumer.
 - The session waits each request 5 s past the hub's deadline, so the hub's `timeout` reaches it first.
@@ -135,19 +134,20 @@ Every request is answered once, by a result or an error, and nothing comes after
 
 ### History
 
-The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. A history read is answered only once the terminal's answers prove it, so a consumer never receives emptiness it cannot trust: a window nothing proves yet is `syncing`, and the consumer's retry reads it again.
+The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. So the history EA brings the terminal to its symbol's full picture before it answers anything: an empty stretch it then answers is a hole in the venue's history, and a request the terminal has not settled within the history bound is `syncing`, asked again by the consumer.
 
+- **The full picture first.** The first history request a history EA serves — `ranges`, a bar read or a tick read — brings the terminal to its symbol's full picture before anything is answered: the bar store downloaded to the server's first date, every bar series' floor measured, the whole tick history synced, and the first real tick and the spread floor read. On a fresh volume that request waits for the bar store and the whole tick history, minutes for a CFD and possibly hours for a symbol with a long tick history, answered `syncing` at each bound and asked again while the measurement goes on.
+- **One measurement per series.** A bar series' floor is the first of its first two rows one period apart, whatever rows lie before them; a daily or weekly series' floor is its first row. A series holding no such pair is empty history: answered with no rows, without a read, and in no `ranges`. A floor stands for the history EA's life, but a capped series' — one holding more bars than the terminal's `MaxBars`, whose oldest bars the terminal trims as new ones form — is measured at every request, and may answer from one period after its floor when a minute turns between the two.
+- **A stalled store**, one whose first date stands still across three deep reads short of the server's first date, is measured from where it stopped; the history chart's next life measures it again.
+- **The quote floor**, the tick series' floor `ranges` reports, is the earlier of the first real tick and the spread floor: the first M1 bar from the M1 floor on that records a spread.
+- **The era spread rule.** Each minute of a tick read from the spread floor on that holds no real tick of any kind, and whose M1 bar the terminal holds, is answered with four ticks synthesised from that bar by the kline-quote rule ([The EA](#the-ea)), with the bar's own spread, zero included; a minute before the spread floor holds no synthesised tick. Real ticks are answered as the venue has them.
+- **Every history read is served on the history chart** by blocking reads, one request at a time, busy to the hub between calls under one bound. A bar read settles when two identical calls agree, a tick read when a call answers without a loading error; a read not settled within the bound answers `syncing` and is asked again.
 - A bar read names its timeframe from `M1` to `W1`: a month has no fixed period, so `MN1` is refused.
 - A window that starts after it ends, or after the terminal's time — the spawner's latest server-time sample, advanced by its age — is answered `invalid_window` by the hub, judged in true UTC before the window is widened to its broker bounds.
 - A window about a clock change is read in the broker window holding every stamp that reads into it — a skipped hour's stamps read at the offset before the change, a repeated hour's at either pass — and answered with those stamps alone.
 - Every bar an answer carries and the hub pushes carries its close, `time_close`, in true UTC: a frame on the broker day's grid, H2 to W1, closes at the next grid open on the broker's clock, an hour more or less than its period across a clock change; a finer one a period of real time after its open. Of two bars of a series that open at one true-UTC second — about a spring change, one stamped in the hour the broker's clock skips and the one after it — the first is answered and pushed, and the other dropped with one warning per such hour.
 - The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in spans within that, `maxbars` read from the terminal.
-- A read the terminal answers with rows and a success error is proven: the rows are the answer. A read that answers no rows is proven empty by one of these facts, each read from the terminal, and is `syncing` without one:
-  - **Before the floor**: the window lies wholly before the series' floor.
-  - **The live edge**: the window lies after the second of the symbol's last quote; a window holding that second is not, since the quote is itself a record.
-  - **Bracketed**: the terminal has a row before the window and a record after it. An empty span of a long bar window between spans that answered rows is bracketed by them.
-- Every bar must lie on its timeframe's grid, or the read fails naming the row. In an answer that begins at the series' floor, a leading run of an intraday series spaced a whole number of days apart, ahead of its first two rows one period apart, is not that timeframe's data: it is dropped and the floor moves past it. Ticks must not go back in time.
-- A series' floor is set by the stub — the one bar the terminal answers for a window before any plausible history; for ticks, the first tick from then — or by a coarse prefix at the series' start, at the first row past it. A stub never moves a floor the coarse prefix set back.
+- Every bar must lie on its timeframe's grid, or the read fails naming the row; ticks must not go back in time.
 
 ### Clock and true UTC
 
@@ -170,36 +170,40 @@ The terminal answers a history request with whatever it has synced, substitutes 
 
 ### The EA
 
-The EA, `ticks.mq5`, is one program in three roles, the `Role` its chart's template sets, and every frame it sends and reads is binary. A publisher syncs its bars through the indicator `hub_history.mq5`, which it attaches to its own chart at init and takes off at deinit; a publisher that cannot attach it fails its init. A history EA reads its ticks itself.
+The EA, `ticks.mq5`, is one program in three roles, the `Role` its chart's template sets, and every frame it sends and reads is binary. A history EA reads its symbol's history itself, in its own thread.
 
-- Its half of the protocol is `Include/hub_wire.mqh`, which the image's build writes from the installed wheel's wire inventory with `python -m mt5connector.server.mql5gen <path>`: the header's constants, the frame, error and call codes, the chart roles, the calls each role serves with their arguments, the chart events between a publisher and its indicator, the history's deadline, a tick read's busy bound, the retry delay, span margin, bar series and floor origins, and a writer of every struct an EA sends — and a reader of the trade request — each member read by the MQL5 property `mirror.py` names for it, in the inventory's order.
+- Its half of the protocol is `Include/hub_wire.mqh`, which the image's build writes from the installed wheel's wire inventory with `python -m mt5connector.server.mql5gen <path>`: the header's constants, the frame, error and call codes, the chart roles, the calls each role serves with their arguments, the history's busy bound, the retry delay, the span margin, the bar series with the table of their timeframes and the timeframe the ticks' floor travels under, and a writer of every struct an EA sends — and a reader of the trade request — each member read by the MQL5 property `mirror.py` names for it, in the inventory's order.
 - A writer reads each property by the overload that answers whether the read succeeded; `AccountInfo*` and `TerminalInfo*` have none, so the error a read of theirs leaves decides. A read that fails writes nothing and the writer reads on, collecting every property that failed, the first `HUB_PROPERTY_FAILURES_MAX` (128) by name, and then fails.
 - `Include/hub_codec.mqh` packs and reads the fields: little-endian numbers, a `str` as its u16 byte count and UTF-8 bytes, `MqlTick` and `MqlRates` by `StructToCharArray`, whose 60-byte packing the EA checks at start, failing its init otherwise.
 
 What it does inside the terminal:
 
 - **Every EA** says hello with its role and symbol, and marks its chart with its role in the chart's comment, `ticks publisher` for a publisher. It reads the hub on its timer, every `PollMilliseconds`, and on every tick, so the vendored library answers the hub's pings and acknowledges a close. While disconnected it reconnects every `ReconnectIntervalSec` on `TimeLocal()`, and a publisher publishes no ticks or bars until the reconnected hub wants them again.
-- **Requests** are answered once each, under their correlation id: a result's records in parts as [Calls](#calls) lays them out, each part carrying the `GetLastError()` the call left; or `ea_error` with the error the call met. Every call but a history read waits on nothing beyond a local read and is answered at once, in the order the requests arrive; a history read is answered once its windows are synced, as below.
+- **Requests** are answered once each, under their correlation id: a result's records in parts as [Calls](#calls) lays them out, each part carrying the `GetLastError()` the call left; or `ea_error` with the error the call met. Every call but a history request waits on nothing beyond a local read and is answered at once, in the order the requests arrive; a history request is answered once the symbol is measured and its reads settle, as below.
   - A call its role does not serve, and a `group` filter, are answered `ea_error` with `ERR_FUNCTION_NOT_ALLOWED` (4014); arguments out of the call's layout with `ERR_INVALID_PARAMETER` (4003).
   - A property of a record that cannot be read fails the call: `ea_error` naming the record — the symbol, or the position, order or deal by its ticket — and every property of it that failed, each with its MQL5 error, the first one's error the answer's `last_error`. `symbols_get` fails whole on one symbol whose definition it cannot read.
   - The spawner serves `account_info`, `terminal_info` and `symbols_get`, the definition of every symbol the terminal knows, in Market Watch or not; `positions_get` and `orders_get` by `symbol`, by `ticket`, by both, or every one with neither; and `history_orders_get` and `history_deals_get` by `ticket`, else by `position`, else by window. A `ticket` names the order or the deal itself; one the history does not hold answers no record, the selection's error its `last_error`.
-  - A publisher serves `symbol_info`, `symbol_info_tick`, `order_send`, `outcomes` and the bar history read of its own symbol; a history EA the tick history read of its own, and nothing else. A `symbol_info` of a symbol `SymbolExist` denies is answered `ea_error` with `ERR_MARKET_UNKNOWN_SYMBOL` (4301).
-- **History.** Bars are synced by the indicator, whose reads never wait, and ticks by the history EA's own reads, which do; no read in a publisher waits on a download:
-  - The publisher asks the indicator by chart event, `push_wire.HistoryEvent`, its `lparam` the request id and its `sparam` the window of rates on the broker's clock, `"timeframe,from,to"` or `"timeframe,from,count"`. It sends `busy` for `HISTORY_DEADLINE_S` (45 s) with each stage of asks.
-  - The indicator reads each window at once — a read in an indicator answers what the terminal holds and starts the download it lacks — and again on every calculation and every second, until it answers rows, none with no error, or an error other than a loading one (4401, 4403); it then signals the window ready, its `dparam` the rows and its `sparam` `"<error>,<time>"`, the time its first row's in broker seconds, or 0 for none. A window still loading 45 s after its ask is signalled with 4403 and forgotten, and so is every window of a request the publisher has given up on. A window of ticks is not the indicator's: in an indicator one without ticks never settles.
-  - Once every window of a stage is ready the publisher runs the rules over them, asking a next stage when a rule needs a window not yet synced. It reads a window's rows itself, but takes a floor stub and a probe's one row from the indicator's ready: its own read of a window wholly before a series answers -1 with 4401 even once the indicator's read answers it. Each of those is asked as a stage of its own, since a ready names no window. A ready carrying an error, or a stage not ready 45 s after its ask, answers `syncing` with a 5 s retry, and the client's retry finds more synced.
-  - A history EA reads ticks in its own thread, and a tick read waits: one call to the terminal can take about 90 s, and the EA makes it again, at most once a second, while it answers a loading error (4401, 4403), until it answers ticks or none with no error, or another error. Between calls it reads the hub once, so the hub's pings are answered and new requests are taken; the EA is single-threaded, so while a call waits nothing else of it runs.
-  - A tick request waits under `TICK_BUSY_S` (900 s) from the moment it is sent, hears `busy` for that bound on its arrival at the EA, before anything waits, and again every 300 s while it is in flight, the hub's keepalive and deadlines following that bound. The requests run from the EA's timer, oldest first, one at a time. A request makes no call once 900 s have passed since its arrival, and answers `syncing` then, whatever a call that returned past that bound read.
-  - `copy_rates_range` and `copy_ticks_range` follow the rules of [History](#history) over the broker bounds the hub sends: a window that starts after it ends, or after `TimeTradeServer()`, is `invalid_window`; the bars' floor stub is read from 1970-01-02 on the broker's clock, the bar before a gap as the one bar `CopyRates` reads from its start, the tick after it as the one tick `CopyTicks` reads from its last second, and the ticks before it in its broker day, then its broker week. A window nothing proves is `syncing`.
-  - A tick window is read first and answered when it holds ticks. An empty one is proven by the live edge, the tick after it and the ticks before it; only when no tick precedes it is the ticks' floor measured — the first tick of every kind `CopyTicks` answers from 1970-01-02 — and the window is empty when it lies wholly before that floor. The ticks' floor stands once measured, and a window wholly before it is answered empty without a read.
-  - The rows go out in parts, more than one part's worth a part per timer pass behind a `busy`; the last part carries the floor fact: the series' floor when the hub has not heard it on this connection, whichever request measured it, or none. A bar series' floor is used for 900 s, then measured again.
+  - A publisher serves `symbol_info`, `symbol_info_tick`, `order_send` and `outcomes` of its own symbol; a history EA `ranges`, `copy_rates_range` and `copy_ticks_range` of its own, and nothing else. A `symbol_info` of a symbol `SymbolExist` denies is answered `ea_error` with `ERR_MARKET_UNKNOWN_SYMBOL` (4301).
+- **History.** A history EA serves its symbol's history in its own thread, and its reads wait; no read of a publisher's waits on a download:
+  - The requests run from the EA's timer, oldest first, one at a time, an earlier one's answer sent before the next runs. Each hears `busy` for `HISTORY_BUSY_S` (900 s) on its arrival, before anything waits, and again every 300 s while it is pending, the hub's keepalive and deadlines following that bound. A request makes no call once 900 s have passed since its run began, and answers `syncing` then, whatever a call that returned past that bound read.
+  - A read is one call to the terminal, made again at most once a second while it answers loading — −1 with no error, or error 4401 or 4403; 0 rows with no error is a settled empty window, a hole. A tick call can wait 45 s. A bar read's answer stands once the identical call, made at once, answers the same rows; an answer with another error is `ea_error` for bars and `syncing` for ticks. After every call the EA reads the hub, so its pings are answered and new requests are queued; the EA is single-threaded, so while a call waits nothing else of it runs. A read stops on the chart closing, the program stopping or the hub connection lost.
+  - **The measurement.** One blocking read of 1970-01-02 on the broker's clock, never judged, starts the bar store's backfill, and the EA waits a second at a time until `SERIES_TERMINAL_FIRSTDATE` reaches `SERIES_SERVER_FIRSTDATE`; a first date standing still 30 turns is read deep again, and three deep reads without a movement settle the store where it stopped. Each bar series is then built — a frame not yet built is asked by a read before any history and polled — and walked forward from its first available row, a day of bars by position per read, each read anchored by time with `iBarShift`, to its first two rows one period apart. A capped series' first available row is the bar at position `maxbars − 1`. Then one `CopyTicks` of one tick from the first millisecond syncs the whole tick history and answers the first tick, and the same walk over M1 from its floor finds the first bar recording a spread, the forming bar untested.
+  - `copy_rates_range` and `copy_ticks_range` follow the rules of [History](#history) over the broker bounds the hub sends: a window that starts after it ends, or after `TimeTradeServer()`, is `invalid_window`; a window wholly before its series' floor, or of an empty series, is answered with no rows without a read; any other is read from the floor on, a bar window in spans within the cap.
+  - A tick window's whole minutes are read first. Each minute from the spread floor on that holds no real tick of any kind — judged by a read of every kind where the request selects fewer — and whose M1 bar the terminal holds is answered from that bar, read with `CopyRates` in spans within the cap, as four ticks merged in time order with the real ones — the kline-quote rule:
+    - stamped at the bar's open, a third of the minute in, two thirds in and at the minute's last millisecond;
+    - the bid the bar's open, low, high and close, or open, high, low and close for a bar closing below its open;
+    - the ask the bid plus the bar's own `spread` in points, a point 10^-`SYMBOL_DIGITS`, zero included;
+    - `flags` bid and ask, and no volume.
+  - A bar opened after the symbol's last quote as the window's reads begin may be forming, its ticks not yet read, and yields no tick; a read of trade ticks alone, `COPY_TICKS_TRADE`, is answered no synthesised tick.
+  - `ranges` answers the terminal's `maxbars` and every floor the EA holds of a series with rows.
+  - The rows go out in parts, more than one part's worth a part per timer pass.
 - **Commands.** A publisher sends an `order_send`'s `MqlTradeRequest` as it came through `OrderSendAsync` and answers the `MqlTradeResult` at once: retcode 10008 and a `request_id` mean sent, and a request the terminal refuses itself answers with the retcode, comment and error that say why. The venue's verdict is the `REQUEST` transaction carrying that `request_id`, which the publisher publishes and keeps in its outcome log of the last 1,000, connected or not.
 - **Transactions.** A publisher publishes one `trade_transaction` frame per `OnTradeTransaction` call whose symbol is its own, in the order the calls arrive, whatever the magic; the spawner each one that names no symbol, such as a pending order's delete or modify sent without one. Every EA receives the account's whole transaction stream, so the filter publishes each transaction once; a transaction of a symbol no chart publishes, naming one, reaches the hub zero times.
 - **Ticks and bars.** While the hub wants a publisher's ticks it publishes them from its tick database — `COPY_TICKS_INFO`, the ticks that change the bid or the ask — from the moment they are wanted, read at every tick and again on its timer, since the terminal queues no tick event while one is queued or handled; each read's new ticks travel in one `tick` frame. It publishes the bar that closed for each wanted timeframe, found on its timer and its ticks when the forming bar's open moves.
 - **Relays.** Every `RelaySeconds` the spawner sends `server_time`, and a publisher its symbol's commission schedule and trading sessions.
 - **Duplicates.** On `duplicate` an EA closes its own chart, which unloads it. The spawner instead keeps its chart and says hello again on each reconnect, since the EA served may be its own terminal's earlier connection, which the hub drops at most 50 s after its last pong while its writes to it drain; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
 - **Charts.** The spawner, the publisher of its own symbol and that symbol's history EA are separate charts. The spawner serves `open_chart` and `close_chart` one per timer pass, in the order they arrive, and every other frame as it arrives; a queued frame waits while the spawner is disconnected or refused, and is answered on the connection the hub takes. A frame of a symbol whose chart the spawner closed waits, with every frame behind it, until the terminal no longer lists that chart, or 10 s after the close, logged. The spawner, on `open_chart` for a role and symbol, answers `chart_opened` when a chart of the symbol marked with the role runs the EA, or when a chart it opened for them is still loading its EA — a template's EA loads only once the chart has processed the template. A marked chart whose EA is gone takes its role's template again — `ChartTemplate` for a publisher, `HistoryTemplate` for a history EA. Otherwise it selects the symbol and opens an M1 chart of it with that template. A failure is answered `chart_failed` with the failing call's error — `SymbolSelect`, `ChartOpen` or `ChartApplyTemplate`, which its log names — and a symbol `SymbolExist` denies with `ERR_MARKET_UNKNOWN_SYMBOL` (4301).
-- The spawner, on `close_chart`, first counts the account's open positions and pending orders on the symbol: while it holds any, the chart stays and the spawner answers `chart_kept`. Otherwise it closes the chart of the role and symbol — the one it opened, or one its comment marks — then takes the symbol out of Market Watch once no other chart of it is open, and all the same when it finds no such chart. The terminal refuses that while a chart of the symbol is open or it has open positions, so a refused deselect is tried again on each timer tick until it succeeds or a chart of the symbol opens again, and only every 15 minutes, logged once, while positions or orders hold the symbol.
+- The spawner, on `close_chart`, first counts the account's open positions and pending orders on the symbol: while it holds any, a publisher's chart stays and the spawner answers `chart_kept`; a history chart closes whatever the symbol holds. Otherwise it closes the chart of the role and symbol — the one it opened, or one its comment marks — then takes the symbol out of Market Watch once no other chart of it is open, and all the same when it finds no such chart. The terminal refuses that while a chart of the symbol is open or it has open positions, so a refused deselect is tried again on each timer tick until it succeeds or a chart of the symbol opens again, and only every 15 minutes, logged once, while positions or orders hold the symbol.
 
 ---
 
@@ -328,18 +332,17 @@ The terminal must know the trade server `MT5_SERVER` names — its `Config\serve
 
 #### The EA and the startup script
 
-The wheel carries their source, and the EA's indicator's; `python -c "import mt5connector.server, pathlib; print(pathlib.Path(mt5connector.server.__file__).parent / 'mql5')"` prints where it is installed. Each file goes into the terminal's `MQL5\` tree:
+The wheel carries their source; `python -c "import mt5connector.server, pathlib; print(pathlib.Path(mt5connector.server.__file__).parent / 'mql5')"` prints where it is installed. Each file goes into the terminal's `MQL5\` tree:
 
 | In the wheel's `mql5/` | In `MQL5\` |
 |---|---|
 | `Expert/ticks.mq5` | `Experts\ticks.mq5` |
-| `Indicators/hub_history.mq5` | `Indicators\hub_history.mq5` |
 | `Scripts/ticks_setup.mq5` | `Scripts\ticks_setup.mq5` |
 | `Include/hub_codec.mqh` | `Include\hub_codec.mqh` |
 | `Include/MQL5Book/` | `Include\MQL5Book\` |
 | — | `Include\hub_wire.mqh`, which `python -m mt5connector.server.mql5gen <path>` writes from the wire inventory |
 
-The three sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `Experts\ticks.ex5`, `Indicators\hub_history.ex5` and `Scripts\ticks_setup.ex5`. Under Wine, MetaEditor has these quirks:
+The two sources are compiled by `MetaEditor64.exe`, beside `terminal64.exe`, into `Experts\ticks.ex5` and `Scripts\ticks_setup.ex5`. Under Wine, MetaEditor has these quirks:
 
 - Its name is `MetaEditor64.exe`, capital M and E, on a volume that is case-sensitive.
 - It honours only the last `/compile:` argument of an invocation: each source is compiled by its own.
@@ -354,7 +357,7 @@ On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on 
 - A chart the spawner opens on demand that does not open — a symbol the venue does not list, or one beyond `CHARTS_MAX` — is reported by the spawner, and a request that needs it is answered `ea_error` naming the reason, until a chart of it opens or its EA says hello.
 - The spawner refused as a duplicate keeps its chart and says hello again every `ReconnectIntervalSec`; still refused `HubPingTimeoutSec` after its first refusal, it closes its chart like any other duplicate.
 - A chart closes once its symbol has been out of use for `MT5_CHART_IDLE_SECONDS`: the spawner closes it and takes the symbol out of Market Watch, where the terminal would keep processing its ticks.
-- A symbol with open positions or pending orders never closes idle: the spawner keeps its chart and the hub counts it in use for another `MT5_CHART_IDLE_SECONDS`.
+- A symbol with open positions or pending orders never has its publisher's chart closed idle: the spawner keeps it and the hub counts it in use for another `MT5_CHART_IDLE_SECONDS`. Its history chart closes all the same.
 - A deselect the terminal refuses after the close is tried again on the spawner's timer until it succeeds or the chart reopens, less often while positions or orders hold the symbol.
 
 #### The chart template
@@ -591,8 +594,8 @@ Its tests of the driver's menu and tab lookups, of the log tail — following th
 | Variable | What it names | Default |
 |---|---|---|
 | `MT5_LIVE_HUB_SYMBOL` | the symbol every case reads and trades | — |
-| `MT5_LIVE_HUB_URL` | the hub of container 1, its `MaxBars` the ceiling, which every case but the span cap's reads | `ws://127.0.0.1:9000` |
-| `MT5_LIVE_CAPPED_HUB_URL` | the hub of container 2, its `MaxBars` capped, which the span-cap case reads; a case that finds no hub there fails naming it | `ws://127.0.0.1:9001` |
+| `MT5_LIVE_HUB_URL` | the hub of container 1, its `MaxBars` the ceiling, which every case but the capped ones reads | `ws://127.0.0.1:9000` |
+| `MT5_LIVE_CAPPED_HUB_URL` | the hub of container 2, its `MaxBars` capped, which the span-cap case and the capped floor's case read; a case that finds no hub there fails naming it | `ws://127.0.0.1:9001` |
 
 Nothing starts a container for it, and no CI runs it. By hand, from the repository root:
 
@@ -615,6 +618,8 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
      until curl -fsS "http://127.0.0.1:$port/health" >/dev/null; do sleep 10; done
    done
    ```
+
+   A symbol's first history request on a fresh volume waits for its bar store and its whole tick history, possibly hours, while each case waits at most two history bounds per read: the tier runs on volumes that have synced `MT5_LIVE_HUB_SYMBOL` before, which a `ranges` of it on each hub, asked again until it answers, does.
 
 4. Run the tier:
 

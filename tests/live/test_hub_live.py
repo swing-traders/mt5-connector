@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import UTC, datetime
 
 import numpy as np
 import pytest
@@ -16,7 +17,7 @@ from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import InvalidWindow, NoPublisher
 from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls, mirror
-from mt5connector.wire.history_wire import Series
+from mt5connector.wire.history_wire import BAR_TIMEFRAME, Series
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
 HUB_URL = os.environ.get("MT5_LIVE_HUB_URL", "ws://127.0.0.1:9000")
@@ -28,13 +29,18 @@ pytestmark = pytest.mark.skipif(SYMBOL is None, reason="MT5_LIVE_HUB_SYMBOL is n
 Call = calls.Call
 # How long a call may stay deferred while the clock verifies or a chart opens.
 ANSWERED_S = 120
-# How long a history read may stay deferred while its window syncs: a tick read's busy bound.
-SYNCED_S = calls.TICK_BUSY_S
+# How long a history request may stay deferred while its history EA measures the symbol and reads:
+# two history bounds.
+SYNCED_S = 2 * calls.HISTORY_BUSY_S
 # The magic every order of this tier carries, by which a resting one is found and removed.
 MAGIC = 7_114_001
 DAY_S = 86_400
 HOUR_S = 3_600
 MINUTE_S = 60
+# The offsets in a minute, in milliseconds, of the four ticks the kline-quote rule makes of its bar.
+KLINE_OFFSETS_MS = (0, 20_000, 40_000, 59_999)
+# How far before a read began a bar must have opened to be the same in every read of it.
+STABLE_S = 15 * MINUTE_S
 # The account history a deal read by its ticket is picked from.
 HISTORY_DAYS = 90
 # The longest a publisher's read may take while its symbol's ticks download.
@@ -151,6 +157,100 @@ async def m1_bars(session: HubSession, start: int, end: int) -> np.ndarray:
         session, Call.COPY_RATES_RANGE, symbol=SYMBOL, timeframe=mirror.TIMEFRAME_M1, **window
     )
     return answered.result
+
+
+async def info_ticks(session: HubSession, start: int, end: int) -> np.ndarray:
+    """The symbol's quote ticks in seconds [start, end], asked again while the window syncs."""
+    window = {"date_from": start, "date_to": end, "flags": mirror.COPY_TICKS_INFO}
+    answered = await synced(session, Call.COPY_TICKS_RANGE, symbol=SYMBOL, **window)
+    return answered.result
+
+
+async def ranges(session: HubSession) -> calls.Ranges:
+    """The symbol's ranges, asked again while its history EA measures it."""
+    return (await synced(session, Call.RANGES, symbol=SYMBOL)).result
+
+
+def kline_quotes(bar, digits: int) -> list[tuple]:
+    """The four ticks the kline-quote rule makes of a bar, inside its minute: the bid its open, low,
+    high and close, or open, high, low and close for a bar closing below its open, the ask the bid
+    plus the bar's own spread in points, zero included, and no volume."""
+    if bar["close"] < bar["open"]:
+        bids = (bar["open"], bar["high"], bar["low"], bar["close"])
+    else:
+        bids = (bar["open"], bar["low"], bar["high"], bar["close"])
+    opened = int(bar["time"]) * 1000
+    flags = mirror.TICK_FLAG_BID | mirror.TICK_FLAG_ASK
+    quotes = []
+    for offset, bid in zip(KLINE_OFFSETS_MS, bids, strict=True):
+        ask = round(float(bid) + int(bar["spread"]) * 10.0**-digits, digits)
+        stamp = opened + offset
+        quotes.append((stamp // 1000, float(bid), ask, 0.0, 0, stamp, flags, 0.0))
+    return quotes
+
+
+def minute_quotes(ticks: np.ndarray, opened: int, digits: int) -> list[tuple]:
+    """The ticks of the minute opened at `opened`, true-UTC seconds, their asks at the digits."""
+    minute = ticks[
+        (ticks["time_msc"] >= opened * 1000) & (ticks["time_msc"] < opened * 1000 + 60_000)
+    ]
+    return [
+        (
+            int(tick["time"]),
+            float(tick["bid"]),
+            round(float(tick["ask"]), digits),
+            float(tick["last"]),
+            int(tick["volume"]),
+            int(tick["time_msc"]),
+            int(tick["flags"]),
+            float(tick["volume_real"]),
+        )
+        for tick in minute
+    ]
+
+
+async def spread_day(session: HubSession, m1_floor: int) -> int | None:
+    """The first UTC day from the M1 floor's on whose M1 bars one records a spread, found by
+    bisection, the predicate monotone from the first such bar on; None when today holds none."""
+
+    async def recorded(day: int) -> bool:
+        bars = await m1_bars(session, day, day + DAY_S - 1)
+        return bool(np.any(bars["spread"] > 0))
+
+    lo = m1_floor - m1_floor % DAY_S
+    hi = int(time.time()) // DAY_S * DAY_S
+    if not await recorded(hi):
+        return None
+    elif await recorded(lo):
+        return lo
+    while hi - lo > DAY_S:
+        middle = lo + (hi - lo) // DAY_S // 2 * DAY_S
+        if await recorded(middle):
+            hi = middle
+        else:
+            lo = middle
+    return hi
+
+
+async def symbol_digits(session: HubSession) -> int:
+    return (await ask(session, Call.SYMBOL_INFO, symbol=SYMBOL)).result.digits
+
+
+def minute_times(ticks: np.ndarray, bar) -> list[int]:
+    """The time_msc of each tick of the bar's minute."""
+    opened = int(bar["time"]) * 1000
+    return [int(stamp) for stamp in ticks["time_msc"] if opened <= stamp < opened + 60_000]
+
+
+def at_the_rules_offsets(ticks: np.ndarray, bar) -> bool:
+    """Whether the bar's minute holds exactly four ticks at the kline-quote rule's offsets, whatever
+    their prices: the synthesis's signature, which no venue tick history carries."""
+    opened = int(bar["time"]) * 1000
+    return [stamp - opened for stamp in minute_times(ticks, bar)] == list(KLINE_OFFSETS_MS)
+
+
+def _iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="minutes")
 
 
 def is_struct(value, layout: str) -> bool:
@@ -321,26 +421,63 @@ async def test_a_cold_m1_window_a_week_back_answers_its_bars_and_the_m1_floor(se
     end = start + DAY_S
 
     bars = await m1_bars(hub_session, start, end)
-    ranges = (await ask(hub_session, Call.RANGES, symbol=SYMBOL)).result
+    held = await ranges(hub_session)
 
     assert len(bars) > 0
     assert np.all(bars["time"] % MINUTE_S == 0)
     assert np.all((bars["time"] >= start) & (bars["time"] <= end))
-    assert Series.M1 in ranges.series
+    assert Series.M1 in held.series
 
 
-async def test_a_window_before_the_m1_floor_answers_empty_and_writes_no_floor(session):
+async def test_the_ranges_report_every_series_the_m1_floor_a_read_from_1970_begins_at(session):
     hub_session, _ = session
-    now = int(time.time())
-    # The read the floor is measured on, should the EA's not be fresh.
-    await m1_bars(hub_session, now - HOUR_S, now)
-    floor = (await ask(hub_session, Call.RANGES, symbol=SYMBOL)).result.series[Series.M1]
 
-    bars = await m1_bars(hub_session, floor.floor - 2 * DAY_S, floor.floor - DAY_S)
-    ranges = (await ask(hub_session, Call.RANGES, symbol=SYMBOL)).result
+    held = await ranges(hub_session)
+    m1 = held.series[Series.M1].floor
+    ticks = held.series[Series.TICKS].floor
+    bars = await m1_bars(hub_session, DAY_S, m1 + DAY_S)
+    logger.info("%s: the M1 floor %s, the ticks floor %s", SYMBOL, _iso(m1), _iso(ticks))
+
+    assert set(held.series) == set(BAR_TIMEFRAME) | {Series.TICKS}
+    assert int(bars["time"][0]) == m1
+    assert int(bars["time"][1] - bars["time"][0]) == MINUTE_S
+    assert ticks >= m1
+
+
+async def test_a_bar_window_ending_a_period_before_the_m1_floor_answers_empty_at_once(session):
+    hub_session, _ = session
+    m1 = (await ranges(hub_session)).series[Series.M1].floor
+
+    asked = time.monotonic()
+    bars = await m1_bars(hub_session, m1 - DAY_S, m1 - MINUTE_S)
+    took = time.monotonic() - asked
 
     assert len(bars) == 0
-    assert ranges.series[Series.M1] == floor
+    assert took < 1.0
+
+
+async def test_a_day_of_m1_bars_in_the_daily_lead_in_answers_empty(session):
+    hub_session, _ = session
+    held = await ranges(hub_session)
+    d1, m1 = held.series[Series.D1].floor, held.series[Series.M1].floor
+    if d1 + DAY_S > m1:
+        pytest.skip(
+            f"{SYMBOL}: the D1 floor {_iso(d1)} leaves no day before the M1 floor {_iso(m1)}"
+        )
+
+    bars = await m1_bars(hub_session, d1, d1 + DAY_S - 1)
+
+    assert len(bars) == 0
+
+
+async def test_a_day_of_ticks_from_the_ticks_floor_begins_in_that_floors_minute(session):
+    hub_session, _ = session
+    floor = (await ranges(hub_session)).series[Series.TICKS].floor
+
+    ticks = await info_ticks(hub_session, floor, floor + DAY_S - 1)
+
+    assert len(ticks) > 0
+    assert int(ticks["time_msc"][0]) // 60_000 == floor // MINUTE_S
 
 
 async def test_a_window_starting_after_the_terminals_time_raises_invalid_window(session):
@@ -358,33 +495,54 @@ async def test_a_window_starting_after_the_terminals_time_raises_invalid_window(
         )
 
 
-async def test_a_bar_window_one_period_over_the_span_cap_answers_every_bar_once():
+async def capped() -> HubSession:
     try:
-        hub_session = await connected(Owner(), CAPPED_HUB_URL)
+        return await connected(Owner(), CAPPED_HUB_URL)
     except WebSocketClientError as exc:
         pytest.fail(f"no hub answers at {CAPPED_HUB_URL}: {exc}")
+
+
+async def test_the_one_window_over_the_span_cap_a_capped_frame_allows_answers_whole_as_in_thirds():
+    hub_session = await capped()
     try:
         maxbars = (await ask(hub_session, Call.TERMINAL_INFO)).result.maxbars
-        # Ending a whole hour back, so no bar of either read is still forming.
-        end = int(time.time()) // HOUR_S * HOUR_S - HOUR_S
-        over, under = end - (maxbars - 10) * MINUTE_S, end - (maxbars - 11) * MINUTE_S
-        # The bars the window holds, read in thirds, each well within the cap.
-        cuts = [over + (end - over) * third // 3 for third in range(4)]
+        floor = (await ranges(hub_session)).series[Series.M1].floor
+        # Read clamped to the floor, a gapless capped frame's one window over the span cap runs from
+        # the floor to the present.
+        began = int(time.time())
+        whole = await m1_bars(hub_session, floor, began)
+        cuts = [floor + (began - floor) * third // 3 for third in range(4)]
         thirds = []
         for k in range(2):
             thirds.append(await m1_bars(hub_session, cuts[k], cuts[k + 1] - 1))
-        thirds.append(await m1_bars(hub_session, cuts[2], end))
-        expected = np.concatenate(thirds)
-
-        over_cap = await m1_bars(hub_session, over, end)
-        at_cap = await m1_bars(hub_session, under, end)
+        thirds.append(await m1_bars(hub_session, cuts[2], began))
+        joined = np.concatenate(thirds)
     finally:
         await hub_session.disconnect()
 
-    assert len(expected) > 0
-    assert np.all(np.diff(expected["time"]) > 0)
-    assert np.array_equal(over_cap, expected)
-    assert np.array_equal(at_cap, expected[expected["time"] >= under])
+    # The forming bar, bars arriving between reads, and the floor sliding a bar a minute between
+    # them fall outside the comparison.
+    first = max(int(whole["time"][0]), int(joined["time"][0]))
+
+    def stable(rows: np.ndarray) -> np.ndarray:
+        return rows[(rows["time"] >= first) & (rows["time"] < began - STABLE_S)]
+
+    assert len(whole) >= maxbars - 11
+    assert np.all(np.diff(whole["time"]) > 0)
+    assert np.all(np.diff(joined["time"]) > 0)
+    assert len(stable(whole)) > 0
+    assert np.array_equal(stable(whole), stable(joined))
+
+
+async def test_a_wide_m1_read_on_the_capped_terminal_begins_at_the_m1_floor_ranges_reports():
+    hub_session = await capped()
+    try:
+        floor = (await ranges(hub_session)).series[Series.M1].floor
+        bars = await m1_bars(hub_session, floor - DAY_S, floor + DAY_S)
+    finally:
+        await hub_session.disconnect()
+
+    assert int(bars["time"][0]) in (floor, floor + MINUTE_S)
 
 
 async def test_a_tick_window_one_day_wide_a_month_back_answers_its_ticks_in_time_order(session):
@@ -443,6 +601,48 @@ async def test_a_week_of_ticks_answers_within_five_minutes_while_the_publishers_
     )
     assert isinstance(answered, Answered)
     assert max(durations) <= TICK_READ_S
+
+
+async def test_a_tickless_minute_from_the_spread_floor_on_holds_its_bars_kline_quotes(session):
+    hub_session, _ = session
+    m1 = (await ranges(hub_session)).series[Series.M1].floor
+    digits = await symbol_digits(hub_session)
+    day = await spread_day(hub_session, m1)
+    if day is None:
+        pytest.skip(f"{SYMBOL}: no M1 bar from the M1 floor to today records a spread")
+
+    ticks = await info_ticks(hub_session, day, day + DAY_S - 1)
+    bars = await m1_bars(hub_session, day, day + DAY_S - 1)
+    synthesised = next((bar for bar in bars if at_the_rules_offsets(ticks, bar)), None)
+    if synthesised is None:
+        pytest.skip(f"{SYMBOL}: no minute of {_iso(day)} holds four quotes at the rule's offsets")
+
+    assert minute_quotes(ticks, int(synthesised["time"]), digits) == kline_quotes(
+        synthesised, digits
+    )
+
+
+async def test_no_tickless_minute_before_the_spread_floor_holds_a_synthesised_quote(session):
+    hub_session, _ = session
+    held = await ranges(hub_session)
+    m1, floor = held.series[Series.M1].floor, held.series[Series.TICKS].floor
+    day = await spread_day(hub_session, m1)
+    if day is None:
+        pytest.skip(f"{SYMBOL}: no M1 bar from the M1 floor to today records a spread")
+    day_bars = await m1_bars(hub_session, day, day + DAY_S - 1)
+    spread_floor = int(day_bars["time"][day_bars["spread"] > 0][0])
+    if spread_floor == m1 or spread_floor <= floor:
+        pytest.skip(
+            f"{SYMBOL}: the spread floor {_iso(spread_floor)} lies at the M1 floor {_iso(m1)} or "
+            f"not after the ticks floor {_iso(floor)}"
+        )
+    end = min(floor + DAY_S - 1, spread_floor - 1)
+
+    ticks = await info_ticks(hub_session, floor, end)
+    bars = await m1_bars(hub_session, floor - floor % MINUTE_S, end)
+
+    assert len(bars) > 0
+    assert [_iso(int(bar["time"])) for bar in bars if at_the_rules_offsets(ticks, bar)] == []
 
 
 async def test_a_command_for_a_symbol_no_publisher_serves_answers_once_its_chart_opened(session):

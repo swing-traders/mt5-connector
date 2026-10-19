@@ -10,8 +10,8 @@ import pytest
 
 from mt5connector.server import mql5gen
 from mt5connector.server.wire import binary, calls, mirror
-from mt5connector.server.wire.history_wire import BAR_PERIOD_S, BAR_TIMEFRAME, FloorOrigin
-from mt5connector.server.wire.push_wire import ChartRole, HistoryEvent
+from mt5connector.server.wire.history_wire import BAR_PERIOD_S, BAR_TIMEFRAME
+from mt5connector.server.wire.push_wire import ChartRole
 
 Call = calls.Call
 
@@ -284,30 +284,41 @@ def test_the_protocols_codes_are_the_wire_packages(text):
     assert values["HUB_ROLE_EA"] == '"ea"'
 
 
-def test_the_history_constants_are_the_protocols(text):
-    values = defines(text)
+def test_the_history_constants_are_the_protocols():
+    values = defines(mql5gen._constants())
 
-    assert values["HUB_HISTORY_DEADLINE_S"] == "45"
-    assert values["HUB_TICK_BUSY_S"] == "900"
+    assert set(values) == {
+        "HUB_VERSION",
+        "HUB_HEADER_SIZE",
+        "HUB_FLAG_OK",
+        "HUB_FLAG_LAST",
+        "HUB_TICK_SIZE",
+        "HUB_RATES_SIZE",
+        "HUB_PART_BYTES",
+        "HUB_ROLE_EA",
+        "HUB_HISTORY_BUSY_S",
+        "HUB_RETRY_AFTER_MS",
+        "HUB_SPAN_MARGIN",
+        "HUB_TICK_SERIES",
+        "HUB_TICK_TIMEFRAME",
+        "HUB_PROPERTY_FAILURES_MAX",
+    }
+    assert values["HUB_HISTORY_BUSY_S"] == "900"
     assert values["HUB_RETRY_AFTER_MS"] == "5000"
     assert values["HUB_SPAN_MARGIN"] == "11"
     assert values["HUB_TICK_SERIES"] == '"ticks"'
+    assert values["HUB_TICK_TIMEFRAME"] == "0"
     assert values["HUB_PROPERTY_FAILURES_MAX"] == "128"
-    assert values["HUB_HISTORY_INDICATOR"] == '"hub_history"'
 
 
-def test_the_history_indicators_events_are_push_wires(text):
-    assert enum(text, "ENUM_HUB_EVENT") == {
-        f"HUB_EVENT_{event.name}": event.value for event in HistoryEvent
+def test_the_generated_enums_are_the_protocols_closed_sets(text):
+    assert set(re.findall(r"^enum (\w+)$", text, re.MULTILINE)) == {
+        "ENUM_HUB_FRAME",
+        "ENUM_HUB_ERROR",
+        "ENUM_HUB_CALL",
+        "ENUM_CHART_ROLE",
+        "ENUM_HUB_ARGUMENT",
     }
-    assert {event.name for event in HistoryEvent} == {
-        "ASK_RATES",
-        "ASK_RATES_FROM",
-        "RATES_READY",
-        "FORGET",
-    }
-    # The terminal delivers a custom event as CHARTEVENT_CUSTOM plus an id it takes as a ushort.
-    assert all(0 <= event.value <= 0xFFFF for event in HistoryEvent)
 
 
 def test_each_bar_series_is_read_by_its_timeframe_with_its_name_and_period(text):
@@ -322,13 +333,10 @@ def test_each_bar_series_is_read_by_its_timeframe_with_its_name_and_period(text)
     assert len(cases) == len(BAR_TIMEFRAME)
 
 
-def test_the_floor_origins_travel_by_their_names(text):
-    named = dict(re.findall(r'case (FLOOR_ORIGIN_\w+):\s+name = "(\w+)";', text))
+def test_the_series_table_lists_every_bar_series_timeframe_in_order(text):
+    table = re.search(r"^const int HUB_SERIES\[\] = \{([^}]*)\};$", text, re.MULTILINE)
 
-    assert enum(text, "ENUM_FLOOR_ORIGIN") == {
-        f"FLOOR_ORIGIN_{origin.name}": index for index, origin in enumerate(FloorOrigin)
-    }
-    assert named == {f"FLOOR_ORIGIN_{origin.name}": origin.value for origin in FloorOrigin}
+    assert [int(value) for value in table.group(1).split(",")] == list(BAR_TIMEFRAME.values())
 
 
 def test_the_error_kinds_an_ea_defers_carry_their_retry_delay(text):
@@ -368,6 +376,8 @@ def test_each_role_serves_the_calls_the_registry_gives_it(text):
         f"ROLE_{role.name}": {row.call.name for row in calls.CALLS.values() if row.role is role}
         for role in ChartRole
     }
+    assert serves["ROLE_HISTORY"] == {"COPY_RATES_RANGE", "COPY_TICKS_RANGE", "RANGES"}
+    assert serves["ROLE_PUBLISHER"] == {"SYMBOL_INFO", "SYMBOL_INFO_TICK", "ORDER_SEND", "OUTCOMES"}
 
 
 def test_each_served_calls_arguments_are_read_by_their_registry_index_and_type(text):

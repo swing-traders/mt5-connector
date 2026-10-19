@@ -29,7 +29,7 @@ from mt5connector.client.errors import (
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import ErrorKind, Sender
-from mt5connector.wire.history_wire import Series
+from mt5connector.wire.history_wire import BARS, Series
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
 Call = calls.Call
@@ -559,7 +559,7 @@ async def test_a_call_unanswered_past_the_sessions_deadline_raises_and_a_late_an
 
 
 async def test_a_busy_moves_the_sessions_deadline_to_its_bound(hub, monkeypatch):
-    monkeypatch.setattr(hub_module, "_DEADLINES", {calls.Wait.TICKS: 0.1})
+    monkeypatch.setattr(hub_module, "_DEADLINES", {calls.Wait.HISTORY: 0.1})
     monkeypatch.setattr(hub_module, "SESSION_MARGIN_S", 0.05)
     monkeypatch.setattr(calls, "BUSY_MARGIN_S", 0.1)
     hub_session = session(hub, Owner())
@@ -575,24 +575,35 @@ async def test_a_busy_moves_the_sessions_deadline_to_its_bound(hub, monkeypatch)
     await hub_session.disconnect()
 
 
-async def test_a_tick_call_waits_under_the_tick_bound_from_the_moment_it_is_sent(hub):
+@pytest.mark.parametrize("call", [Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE, Call.RANGES])
+async def test_a_history_call_waits_under_the_history_bound_from_the_moment_it_is_sent(hub, call):
     hub_session = session(hub, Owner())
     await hub_session.connect()
     loop = asyncio.get_running_loop()
 
     told = loop.time()
-    read = asyncio.create_task(hub_session.copy_ticks_range("EURUSD", 1, 2, 1))
+    if call is Call.COPY_RATES_RANGE:
+        reading = asyncio.create_task(
+            hub_session.copy_rates_range("EURUSD", mirror.TIMEFRAME_M1, 1, 2)
+        )
+        empty = np.zeros(0, dtype=list(BARS.dtype))
+    elif call is Call.COPY_TICKS_RANGE:
+        reading = asyncio.create_task(hub_session.copy_ticks_range("EURUSD", 1, 2, 1))
+        empty = np.zeros(0, dtype=_TICKS)
+    else:
+        reading = asyncio.create_task(hub_session.ranges("EURUSD"))
+        empty = calls.Ranges(1, {})
     (request,) = await asked(hub)
     deadline = hub_session._in_flight[request.request_id].timer.when()
-    await hub.answer(request, np.zeros(0, dtype=_TICKS))
-    bound = calls.TICK_BUSY_S + hub_module.SESSION_MARGIN_S
+    await hub.answer(request, empty)
+    bound = 900 + hub_module.SESSION_MARGIN_S
 
-    assert len((await asyncio.wait_for(read, 1)).result) == 0
+    await asyncio.wait_for(reading, 1)
     assert bound <= deadline - told < bound + 1
     await hub_session.disconnect()
 
 
-async def test_a_tick_reads_busy_holds_the_sessions_deadline_for_its_whole_bound(hub):
+async def test_a_history_reads_busy_holds_the_sessions_deadline_for_its_whole_bound(hub):
     hub_session = session(hub, Owner())
     await hub_session.connect()
     loop = asyncio.get_running_loop()
@@ -600,11 +611,11 @@ async def test_a_tick_reads_busy_holds_the_sessions_deadline_for_its_whole_bound
     read = asyncio.create_task(hub_session.copy_ticks_range("EURUSD", 1, 2, 1))
     (request,) = await asked(hub)
     told = loop.time()
-    await hub.push(binary.Busy(request.request_id, calls.TICK_BUSY_S))
+    await hub.push(binary.Busy(request.request_id, calls.HISTORY_BUSY_S))
     await asyncio.sleep(0.1)
     deadline = hub_session._in_flight[request.request_id].timer.when()
     await hub.answer(request, np.zeros(0, dtype=_TICKS))
-    bound = calls.TICK_BUSY_S + calls.BUSY_MARGIN_S + hub_module.SESSION_MARGIN_S
+    bound = calls.HISTORY_BUSY_S + calls.BUSY_MARGIN_S + hub_module.SESSION_MARGIN_S
 
     assert len((await asyncio.wait_for(read, 1)).result) == 0
     assert bound <= deadline - told < bound + 1
