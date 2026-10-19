@@ -47,6 +47,9 @@ HISTORY_DAYS = 90
 TICK_READ_S = 1.0
 # The sessions that command at once.
 SENDERS = 10
+# The symbols tried for one no publisher serves: a rerun inside the hub's idle period finds the
+# charts the last run opened still serving.
+UNSERVED_CANDIDATES = 5
 _SETTLED = frozenset(
     {mirror.TRADE_RETCODE_PLACED, mirror.TRADE_RETCODE_DONE, mirror.TRADE_RETCODE_DONE_PARTIAL}
 )
@@ -271,6 +274,23 @@ def refused_order(info, price: float) -> dict:
         "type_filling": mirror.ORDER_FILLING_RETURN,
         "magic": MAGIC,
     }
+
+
+async def deferred_command(
+    session: HubSession, candidates: list
+) -> tuple[dict, NoPublisher] | None:
+    """The first candidate's refused order whose command no publisher serves yet, with its
+    deferral; None when a publisher already serves each."""
+    for symbol in candidates:
+        order = refused_order(symbol, symbol.point)
+        try:
+            with pytest.raises(NoPublisher) as deferred:
+                await session.order_send(order)
+        except pytest.fail.Exception:
+            logger.info("%s: a publisher already serves it", symbol.name)
+        else:
+            return order, deferred.value
+    return None
 
 
 async def assert_flat(session: HubSession) -> None:
@@ -668,22 +688,26 @@ async def test_a_tickless_minute_from_the_spread_floor_on_holds_its_bars_kline_q
 async def test_a_command_for_a_symbol_no_publisher_serves_answers_once_its_chart_opened(session):
     hub_session, _ = session
     symbols = (await ask(hub_session, Call.SYMBOLS_GET)).result
-    other = next(
+    candidates = [
         symbol
         for symbol in symbols
         if symbol.name != SYMBOL
         and symbol.trade_mode == mirror.SYMBOL_TRADE_MODE_FULL
         and symbol.volume_min > 0
-    )
-    order = refused_order(other, other.point)
+    ][:UNSERVED_CANDIDATES]
     try:
-        with pytest.raises(NoPublisher) as deferred:
-            await hub_session.order_send(order)
-        await asyncio.sleep(deferred.value.retry_after_s)
-        answered = await ask(hub_session, Call.ORDER_SEND, request=order)
+        first = await deferred_command(hub_session, candidates)
+        if first is not None:
+            order, deferred = first
+            await asyncio.sleep(deferred.retry_after_s)
+            answered = await ask(hub_session, Call.ORDER_SEND, request=order)
 
-        assert is_struct(answered.result, "MqlTradeResult")
-        assert answered.result.retcode > 0
+            assert is_struct(answered.result, "MqlTradeResult")
+            assert answered.result.retcode > 0
+        else:
+            pytest.skip(
+                f"a publisher already serves each of {[symbol.name for symbol in candidates]}"
+            )
     finally:
         await assert_flat(hub_session)
 
