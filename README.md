@@ -433,9 +433,9 @@ The live hub tier, `tests/live/`, runs against two running images' hubs on one a
 - every read the spawner and a publisher serve, and a deal read by its ticket;
 - the symbol's ticks and M1 bars;
 - a pending order whose expiration has passed, which the venue refuses, and a command for a symbol no publisher serves;
-- its history: the floors `ranges` reports against a bar read from 1970 and the first real tick, windows before the M1 floor and in the daily lead-in, one starting after the terminal's time, a cold M1 window, a day of ticks from the ticks' floor and a month back, and a week of ticks, timing a publisher read every second while it downloads;
+- its history: the floors `ranges` reports against a bar read from 1970 and the first real tick, windows before the M1 floor, before the ticks' floor and in the daily lead-in, one starting after the terminal's time, a cold M1 window, a day of ticks from the ticks' floor and a month back, and a week of ticks, timing a publisher read every second while it downloads;
 - the era spread rule: a day's tickless minutes from the spread floor on synthesised from their M1 bars with each bar's own spread;
-- on the terminal whose `MaxBars` is capped, the one window over the span cap a capped frame allows, whole and as thirds, and a wide read beginning at the M1 floor `ranges` reports or one period after it.
+- on the terminal whose `MaxBars` is capped, the one window over the span cap a capped frame allows, whole and as thirds, a wide read beginning at the M1 floor `ranges` reports or one period after it, and a day of ticks between the ticks' floor and the M1 floor, settled with no minute synthesised.
 
 ---
 

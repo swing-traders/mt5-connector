@@ -480,6 +480,18 @@ async def test_a_day_of_ticks_from_the_ticks_floor_begins_in_that_floors_minute(
     assert int(ticks["time_msc"][0]) // 60_000 == floor // MINUTE_S
 
 
+async def test_a_day_of_ticks_ending_before_the_ticks_floor_answers_no_row_at_once(session):
+    hub_session, _ = session
+    floor = (await ranges(hub_session)).series[Series.TICKS].floor
+
+    asked = time.monotonic()
+    ticks = await info_ticks(hub_session, floor - DAY_S, floor - MINUTE_S)
+    took = time.monotonic() - asked
+
+    assert len(ticks) == 0
+    assert took < 1.0
+
+
 async def test_a_window_starting_after_the_terminals_time_raises_invalid_window(session):
     hub_session, _ = session
     now = int(time.time())
@@ -543,6 +555,37 @@ async def test_a_wide_m1_read_on_the_capped_terminal_begins_at_the_m1_floor_rang
         await hub_session.disconnect()
 
     assert int(bars["time"][0]) in (floor, floor + MINUTE_S)
+
+
+async def test_a_day_of_ticks_between_the_capped_terminals_floors_holds_no_synthesised_minute():
+    hub_session = await capped()
+    try:
+        held = (await ranges(hub_session)).series
+        ticks_floor, m1 = held[Series.TICKS].floor, held[Series.M1].floor
+        if m1 < ticks_floor + 2 * DAY_S:
+            pytest.skip(
+                f"{SYMBOL}: the M1 floor {_iso(m1)} is not two days after the ticks floor "
+                f"{_iso(ticks_floor)}"
+            )
+        asked = time.monotonic()
+        ticks = await info_ticks(hub_session, ticks_floor + DAY_S, ticks_floor + 2 * DAY_S - 1)
+        took = time.monotonic() - asked
+    finally:
+        await hub_session.disconnect()
+
+    minutes = ticks["time_msc"] // 60_000
+    opened, counts = np.unique(minutes, return_counts=True)
+    synthesised = [
+        minute
+        for minute in opened[counts == len(KLINE_OFFSETS_MS)]
+        if list(ticks["time_msc"][minutes == minute] - minute * 60_000) == list(KLINE_OFFSETS_MS)
+    ]
+
+    logger.info(
+        "%s: %d ticks in the day after the ticks floor on the capped terminal", SYMBOL, len(ticks)
+    )
+    assert synthesised == []
+    assert took < 60.0
 
 
 async def test_a_tick_window_one_day_wide_a_month_back_answers_its_ticks_in_time_order(session):

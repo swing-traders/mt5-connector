@@ -2177,12 +2177,12 @@ void SynthesiseBars(const HistoryRequest *r, HistoryRun &run, const long from, c
             AppendBarTicks(bars[i], bars[i].spread * point, (int)digits, rows);
 }
 
-// The ticks synthesised for the window's tickless minutes from the spread floor on: none before it,
-// where no spread was recorded, and none for a minute whose bar the terminal no longer holds.
+// The ticks synthesised for the window's tickless minutes from the spread floor on, and from the M1
+// floor on where a capped frame has trimmed older bars; none where no bar records a spread.
 void Synthesise(const HistoryRequest *r, HistoryRun &run, const long lo, const long hi,
                 const MqlTick &real[], MqlTick &rows[])
 {
-    if (g_spreadHeld && hi >= g_spreadFloor)
+    if (g_spreadHeld)
     {
         const long m1lo = Latest(lo, Latest(g_floors[FloorIndex((int)PERIOD_M1)].value,
                                             g_spreadFloor));
