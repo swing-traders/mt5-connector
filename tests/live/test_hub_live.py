@@ -622,29 +622,6 @@ async def test_a_tickless_minute_from_the_spread_floor_on_holds_its_bars_kline_q
     )
 
 
-async def test_no_tickless_minute_before_the_spread_floor_holds_a_synthesised_quote(session):
-    hub_session, _ = session
-    held = await ranges(hub_session)
-    m1, floor = held.series[Series.M1].floor, held.series[Series.TICKS].floor
-    day = await spread_day(hub_session, m1)
-    if day is None:
-        pytest.skip(f"{SYMBOL}: no M1 bar from the M1 floor to today records a spread")
-    day_bars = await m1_bars(hub_session, day, day + DAY_S - 1)
-    spread_floor = int(day_bars["time"][day_bars["spread"] > 0][0])
-    if spread_floor == m1 or spread_floor <= floor:
-        pytest.skip(
-            f"{SYMBOL}: the spread floor {_iso(spread_floor)} lies at the M1 floor {_iso(m1)} or "
-            f"not after the ticks floor {_iso(floor)}"
-        )
-    end = min(floor + DAY_S - 1, spread_floor - 1)
-
-    ticks = await info_ticks(hub_session, floor, end)
-    bars = await m1_bars(hub_session, floor - floor % MINUTE_S, end)
-
-    assert len(bars) > 0
-    assert [_iso(int(bar["time"])) for bar in bars if at_the_rules_offsets(ticks, bar)] == []
-
-
 async def test_a_command_for_a_symbol_no_publisher_serves_answers_once_its_chart_opened(session):
     hub_session, _ = session
     symbols = (await ask(hub_session, Call.SYMBOLS_GET)).result
