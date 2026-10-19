@@ -1,7 +1,7 @@
 #!/bin/sh
-# Places the connector's EA, its history indicator and the startup script in the terminal, compiled
-# with the EA's half of the hub protocol generated from the installed server, and writes the three
-# chart templates that attach the EA in its roles. Runs once, at image build, under Xvfb.
+# Places the connector's EA and the startup script in the terminal, compiled with the EA's half of
+# the hub protocol generated from the installed server, and writes the three chart templates that
+# attach the EA in its roles. Runs once, at image build, under Xvfb.
 set -eu
 
 terminal_dir="$WINEPREFIX/drive_c/Program Files/MetaTrader 5"
@@ -12,21 +12,19 @@ stage="$WINEPREFIX/drive_c/mt5build"
 
 rm -rf "$stage"
 mkdir "$stage"
-cp "$sources/Expert/ticks.mq5" "$sources/Scripts/ticks_setup.mq5" \
-    "$sources/Indicators/hub_history.mq5" "$stage/"
+cp "$sources/Expert/ticks.mq5" "$sources/Scripts/ticks_setup.mq5" "$stage/"
 cp -R "$sources/Include" "$stage/"
 python -m mt5connector.server.mql5gen "$stage/Include/hub_wire.mqh"
 echo "generated $stage/Include/hub_wire.mqh"
 
 cp "$sources/Expert/ticks.mq5" "$mql5/Experts/"
 cp "$sources/Scripts/ticks_setup.mq5" "$mql5/Scripts/"
-cp "$sources/Indicators/hub_history.mq5" "$mql5/Indicators/"
 cp "$stage/Include/hub_codec.mqh" "$stage/Include/hub_wire.mqh" "$mql5/Include/"
 cp -R "$stage/Include/MQL5Book" "$mql5/Include/"
 
 # MetaEditor honours only the last /compile: of an invocation, and its exit status is not the
 # compile's result: the .ex5 and the log's `Result:` line are.
-for source in ticks ticks_setup hub_history; do
+for source in ticks ticks_setup; do
     wine "$terminal_dir/MetaEditor64.exe" "/compile:C:\\mt5build\\$source.mq5" \
         "/log:C:\\mt5build\\$source.log" || :
     wineserver -w
@@ -41,7 +39,6 @@ for source in ticks ticks_setup hub_history; do
 done
 cp "$stage/ticks.ex5" "$mql5/Experts/"
 cp "$stage/ticks_setup.ex5" "$mql5/Scripts/"
-cp "$stage/hub_history.ex5" "$mql5/Indicators/"
 rm -rf "$stage"
 
 # An enum input travels as its value, which the generated ENUM_CHART_ROLE assigns.

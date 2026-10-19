@@ -1,5 +1,5 @@
 """The history protocol's vocabulary, shared by the hub and its client: the series and their
-periods, a bar's row, the tick selections and what sets a floor."""
+periods, a bar's row and the tick selections."""
 
 from enum import StrEnum
 
@@ -41,14 +41,6 @@ class TickFlags(StrEnum):
     ALL = "ALL"
     INFO = "INFO"
     TRADE = "TRADE"
-
-
-class FloorOrigin(StrEnum):
-    """What set a floor: the stub, the one row the terminal answers for a window before any
-    plausible history, or the first authentic row past a coarse prefix at the series' start."""
-
-    STUB = "stub"
-    COARSE = "coarse"
 
 
 # Each bar series' period and the package's timeframe for it. MN1 has no fixed period, so no series
@@ -97,6 +89,8 @@ BAR_TIMEFRAME: dict[Series, int] = {
     Series.D1: mirror.TIMEFRAME_D1,
     Series.W1: mirror.TIMEFRAME_W1,
 }
+# The timeframe an EA's ranges answer names the ticks' floor by: no package timeframe is 0.
+TICK_TIMEFRAME = 0
 
 
 # A bar as the bars route answers it and the hub pushes it: the package's MqlRates fields, its open

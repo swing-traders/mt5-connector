@@ -5,8 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mt5connector.server.wire import binary, calls, history_wire, mirror
-from mt5connector.server.wire.history_wire import BAR_PERIOD_S, BAR_TIMEFRAME, FloorOrigin, Series
-from mt5connector.server.wire.push_wire import HISTORY_INDICATOR, ChartRole, HistoryEvent, Role
+from mt5connector.server.wire.history_wire import (
+    BAR_PERIOD_S,
+    BAR_TIMEFRAME,
+    TICK_TIMEFRAME,
+    Series,
+)
+from mt5connector.server.wire.push_wire import ChartRole, Role
 
 _FAMILY = {
     mirror.Accessor.INTEGER: "Integer",
@@ -185,15 +190,6 @@ def render() -> str:
             [(f"HUB_ERROR_{kind.name}", kind.value) for kind in sorted(binary.EA_ERRORS)],
         ),
         _enum("ENUM_HUB_CALL", [(f"HUB_CALL_{call.name}", call.value) for call in calls.Call]),
-        "// The chart events between a publisher and its history indicator.\n"
-        + _enum(
-            "ENUM_HUB_EVENT", [(f"HUB_EVENT_{event.name}", event.value) for event in HistoryEvent]
-        ),
-        "// What set a floor.\n"
-        + _enum(
-            "ENUM_FLOOR_ORIGIN",
-            [(f"FLOOR_ORIGIN_{origin.name}", index) for index, origin in enumerate(FloorOrigin)],
-        ),
         "// The role an EA's chart template sets.\n"
         + _enum(
             "ENUM_CHART_ROLE",
@@ -212,7 +208,6 @@ def render() -> str:
         _argument_type(),
         _defers(),
         _series(),
-        _floor_origin_name(),
         _PROPERTY_FAILURE,
         *(_writer(writer) for writer in _WRITERS),
         _request_reader(),
@@ -246,13 +241,12 @@ def _constants() -> str:
         ("HUB_RATES_SIZE", str(binary.RATES.size)),
         ("HUB_PART_BYTES", str(calls.PART_BYTES)),
         ("HUB_ROLE_EA", f'"{Role.EA.value}"'),
-        ("HUB_HISTORY_DEADLINE_S", str(int(calls.HISTORY_DEADLINE_S))),
-        ("HUB_TICK_BUSY_S", str(calls.TICK_BUSY_S)),
+        ("HUB_HISTORY_BUSY_S", str(calls.HISTORY_BUSY_S)),
         ("HUB_RETRY_AFTER_MS", str(int(calls.RETRY_AFTER_S * 1000))),
         ("HUB_SPAN_MARGIN", str(history_wire.SPAN_MARGIN)),
         ("HUB_TICK_SERIES", f'"{Series.TICKS.value}"'),
+        ("HUB_TICK_TIMEFRAME", str(TICK_TIMEFRAME)),
         ("HUB_PROPERTY_FAILURES_MAX", str(_PROPERTY_FAILURES_MAX)),
-        ("HUB_HISTORY_INDICATOR", f'"{HISTORY_INDICATOR}"'),
     ]
     return "\n".join(f"#define {name} {value}" for name, value in values)
 
@@ -363,7 +357,10 @@ def _series() -> str:
         "        break;"
         for series, timeframe in BAR_TIMEFRAME.items()
     )
+    table = ", ".join(str(timeframe) for timeframe in BAR_TIMEFRAME.values())
     return (
+        "// Every bar series' timeframe, finest first.\n"
+        f"const int HUB_SERIES[] = {{{table}}};\n\n"
         "// The bar series a timeframe is read as, by its name, and its period in seconds; false\n"
         "// for a timeframe no series serves.\n"
         "bool HubSeries(const int timeframe, string &name, int &period)\n{\n"
@@ -371,20 +368,6 @@ def _series() -> str:
         f"    switch (timeframe)\n    {{\n{cases}\n"
         "    default:\n        served = false;\n        break;\n    }\n"
         "    return served;\n}"
-    )
-
-
-def _floor_origin_name() -> str:
-    cases = "\n".join(
-        f'    case FLOOR_ORIGIN_{origin.name}:\n        name = "{origin.value}";\n        break;'
-        for origin in FloorOrigin
-    )
-    return (
-        "// A floor origin's name on the wire.\n"
-        "string FloorOriginName(const ENUM_FLOOR_ORIGIN origin)\n{\n"
-        '    string name = "";\n'
-        f"    switch (origin)\n    {{\n{cases}\n    }}\n"
-        "    return name;\n}"
     )
 
 

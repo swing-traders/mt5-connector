@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import hub_doubles
 import pytest
-from ea_wire import FakeEa, answer, arguments_of, decode_to_ea, stub_floor, zeroed
+from ea_wire import FakeEa, answer, arguments_of, decode_to_ea, zeroed
 from hub_doubles import (
     MAX_AGE_S,
     Consumer,
@@ -31,7 +31,7 @@ from mt5connector.client.hub import HubSession
 from mt5connector.server import hub_gate, ws_server
 from mt5connector.server.wire import binary, calls, mirror
 from mt5connector.server.wire.binary import ErrorKind
-from mt5connector.server.wire.history_wire import Series
+from mt5connector.server.wire.history_wire import TICK_TIMEFRAME, Series
 from mt5connector.server.wire.push_wire import ChartRole, TransactionType
 
 Call = calls.Call
@@ -39,6 +39,16 @@ Call = calls.Call
 SUMMER_UTC = calendar.timegm((2025, 7, 15, 10, 0, 0))
 SUMMER_BROKER = calendar.timegm((2025, 7, 15, 13, 0, 0))
 HOUR = 3_600
+# The arguments beside the symbol a history read of each call carries here.
+HISTORY_ARGUMENTS = {
+    Call.COPY_RATES_RANGE: {
+        "timeframe": mirror.TIMEFRAME_M1,
+        "date_from": UTC_EPOCH,
+        "date_to": UTC_EPOCH + 60,
+    },
+    Call.COPY_TICKS_RANGE: {"date_from": UTC_EPOCH, "date_to": UTC_EPOCH + 60, "flags": 1},
+    Call.RANGES: {},
+}
 
 
 def tick(epoch=BROKER_EPOCH, msc=123, bid=1.085):
@@ -229,19 +239,13 @@ async def test_a_request_no_ea_of_its_role_serves_is_deferred_at_once_and_its_ch
     server.close()
 
 
-async def test_a_tick_history_read_with_no_history_ea_asks_the_spawner_for_its_history_chart():
+@pytest.mark.parametrize("call", list(HISTORY_ARGUMENTS), ids=lambda call: call.name.lower())
+async def test_a_history_read_with_no_history_ea_asks_the_spawner_for_its_history_chart(call):
     hub, server, port = await run_hub()
     async with verified(port) as spawner:
         consumer = await Consumer.connect(port)
 
-        await consumer.ask(
-            1,
-            Call.COPY_TICKS_RANGE,
-            symbol="EURUSD",
-            date_from=UTC_EPOCH,
-            date_to=UTC_EPOCH + 60,
-            flags=1,
-        )
+        await consumer.ask(1, call, symbol="EURUSD", **HISTORY_ARGUMENTS[call])
         refused = await consumer.received()
 
         assert error_of(refused) == deferred(ErrorKind.NO_PUBLISHER)
@@ -396,57 +400,21 @@ async def test_a_read_its_ea_never_answers_is_answered_timeout_at_the_read_deadl
     server.close()
 
 
-async def test_a_tick_read_its_ea_sends_no_busy_for_outlives_the_history_deadline_to_the_tick_bound(
-    monkeypatch,
+@pytest.mark.parametrize("call", list(HISTORY_ARGUMENTS), ids=lambda call: call.name.lower())
+async def test_a_history_read_its_ea_sends_no_busy_for_is_held_at_the_hub_for_the_history_bound(
+    call,
 ):
-    monkeypatch.setattr(calls, "HISTORY_DEADLINE_S", 0.1)
-    monkeypatch.setattr(calls, "TICK_BUSY_S", 0.6)
-    hub, server, port = await run_hub()
-    loop = asyncio.get_running_loop()
-    async with verified(port) as spawner:
-        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
-        consumer = await Consumer.connect(port)
-
-        await consumer.ask(
-            5,
-            Call.COPY_TICKS_RANGE,
-            symbol="EURUSD",
-            date_from=UTC_EPOCH,
-            date_to=UTC_EPOCH,
-            flags=1,
-        )
-        await eurusd.request()
-        started = loop.time()
-        timed = await consumer.received()
-        waited = loop.time() - started
-
-        assert 0.55 <= waited < 0.75
-        assert (timed.request_id, error_of(timed)) == (5, (ErrorKind.TIMEOUT, None))
-        await consumer.close()
-        await eurusd.close()
-        await spawner.close()
-    server.close()
-
-
-async def test_a_tick_read_its_ea_sends_no_busy_for_is_held_at_the_hub_for_the_whole_tick_bound():
     hub, server, port = await run_hub()
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
 
         asked = time.monotonic()
-        await consumer.ask(
-            5,
-            Call.COPY_TICKS_RANGE,
-            symbol="EURUSD",
-            date_from=UTC_EPOCH,
-            date_to=UTC_EPOCH,
-            flags=1,
-        )
+        await consumer.ask(5, call, symbol="EURUSD", **HISTORY_ARGUMENTS[call])
         await eurusd.request()
         (pending,) = hub._requests.all()
 
-        assert calls.TICK_BUSY_S <= pending.deadline - asked < calls.TICK_BUSY_S + 1
+        assert 900 <= pending.deadline - asked < 901
         await consumer.close()
         await eurusd.close()
         await spawner.close()
@@ -512,7 +480,7 @@ async def test_a_busy_holds_off_the_keepalive_until_its_bound_and_margin_pass(mo
     await _end(peers, tasks)
 
 
-async def test_a_tick_reads_busy_holds_its_request_and_its_eas_keepalive_for_its_whole_bound(
+async def test_a_history_reads_busy_holds_its_request_and_its_eas_keepalive_for_its_whole_bound(
     monkeypatch,
 ):
     monkeypatch.setattr(ws_server, "PING_INTERVAL_S", 0.02)
@@ -526,11 +494,11 @@ async def test_a_tick_reads_busy_holds_its_request_and_its_eas_keepalive_for_its
     monkeypatch.setattr(asyncio, "wait", timed_wait)
     hub, peers, tasks, eurusd = await _asked_a_deaf_publisher(settings())
     told = time.monotonic()
-    eurusd.put_ea(binary.Busy(eurusd.asked, calls.TICK_BUSY_S))
+    eurusd.put_ea(binary.Busy(eurusd.asked, calls.HISTORY_BUSY_S))
 
     await asyncio.sleep(0.5)
     (pending,) = hub._requests.all()
-    bound = calls.TICK_BUSY_S + calls.BUSY_MARGIN_S
+    bound = calls.HISTORY_BUSY_S + calls.BUSY_MARGIN_S
 
     assert eurusd.closed is None
     assert bound <= pending.deadline - told < bound + 1
@@ -623,7 +591,7 @@ async def test_a_request_its_eas_queue_has_no_room_for_is_answered_overflow():
 async def test_a_bar_window_reaches_the_ea_on_the_brokers_clock_and_its_rows_return_in_true_utc():
     hub, server, port = await run_hub()
     async with verified(port) as spawner:
-        eurusd = await FakeEa.connect(port, ChartRole.PUBLISHER, "EURUSD")
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
 
         await consumer.ask(
@@ -678,13 +646,7 @@ async def test_an_answer_in_parts_reaches_the_consumer_part_by_part_in_true_utc(
             answer(request.request_id, Call.COPY_TICKS_RANGE, [tick(msc=1)], last=False)
         )
         await eurusd.send(
-            answer(
-                request.request_id,
-                Call.COPY_TICKS_RANGE,
-                [tick(msc=2), tick(msc=3)],
-                stub_floor(BROKER_EPOCH * 1000),
-                part=1,
-            )
+            answer(request.request_id, Call.COPY_TICKS_RANGE, [tick(msc=2), tick(msc=3)], part=1)
         )
         first, second = await consumer.received(), await consumer.received()
         row = calls.CALLS[Call.COPY_TICKS_RANGE]
@@ -746,45 +708,154 @@ async def test_an_ea_answering_a_kind_the_hub_alone_answers_is_refused_and_its_r
     server.close()
 
 
-async def test_a_history_reads_floor_reaches_the_ranges_with_the_terminals_maxbars():
+async def test_a_tick_read_reaches_the_history_ea_on_its_broker_window_with_no_fact_after_it():
     hub, server, port = await run_hub()
     async with verified(port) as spawner:
-        eurusd = await FakeEa.connect(port, ChartRole.PUBLISHER, "EURUSD")
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
+
         await consumer.ask(
             1,
-            Call.COPY_RATES_RANGE,
+            Call.COPY_TICKS_RANGE,
             symbol="EURUSD",
-            timeframe=mirror.TIMEFRAME_H1,
             date_from=UTC_EPOCH,
-            date_to=UTC_EPOCH + 3_600,
+            date_to=UTC_EPOCH + 60,
+            flags=1,
         )
         request = await eurusd.request()
-        await eurusd.send(
-            answer(request.request_id, Call.COPY_RATES_RANGE, [], stub_floor(BROKER_EPOCH))
-        )
-        await consumer.received()
-        before = int(time.time())
-
-        await consumer.ask(2, Call.RANGES, symbol="EURUSD")
-        asked = await spawner.request()
-        terminal = zeroed(binary.layout(mirror.STRUCTS[mirror.StructName.TERMINAL_INFO]))
-        await spawner.send(
-            answer(asked.request_id, Call.TERMINAL_INFO, terminal | {"maxbars": 100_000})
-        )
+        await eurusd.send(answer(request.request_id, Call.COPY_TICKS_RANGE, [tick()]))
         reply = await consumer.received()
-        ranges = calls.read_hub_result(calls.CALLS[Call.RANGES], reply)
+        ticks = calls.read_hub_result(calls.CALLS[Call.COPY_TICKS_RANGE], reply)
 
-        assert arguments_of(asked) == (Call.TERMINAL_INFO, {})
-        assert ranges.maxbars == 100_000
-        assert list(ranges.series) == [Series.H1]
-        assert (ranges.series[Series.H1].floor, ranges.series[Series.H1].generation) == (
-            UTC_EPOCH,
-            1,
+        assert arguments_of(request) == (
+            Call.COPY_TICKS_RANGE,
+            {
+                "symbol": "EURUSD",
+                "date_from": BROKER_EPOCH,
+                "date_to": BROKER_EPOCH + 60,
+                "flags": 1,
+            },
         )
-        assert before - 1 <= ranges.series[Series.H1].measured_at <= int(time.time())
+        assert (reply.request_id, reply.error, reply.last) == (1, None, True)
+        assert ticks["time_msc"].tolist() == [UTC_EPOCH * 1000 + 123]
         await consumer.close()
         await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+async def ranges_read(consumer, ea, request_id: int, floors: list[tuple[int, int]]):
+    """A ranges read the history EA answers with a MaxBars of 100,000 and the floors, each a
+    timeframe and its broker second: the request the EA received, and the ranges the consumer
+    received."""
+    await consumer.ask(request_id, Call.RANGES, symbol="EURUSD")
+    request = await ea.request()
+    await ea.send(answer(request.request_id, Call.RANGES, (100_000, floors)))
+    reply = await consumer.received()
+    return request, calls.read_hub_result(calls.CALLS[Call.RANGES], reply)
+
+
+def floors_of(ranges: calls.Ranges) -> dict[Series, tuple[int, int]]:
+    return {series: (entry.floor, entry.generation) for series, entry in ranges.series.items()}
+
+
+async def test_a_ranges_answer_is_stored_and_reaches_the_consumer_in_true_utc_by_generation():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+        consumer = await Consumer.connect(port)
+        h1 = (mirror.TIMEFRAME_H1, BROKER_EPOCH)
+        ticks = (TICK_TIMEFRAME, BROKER_EPOCH + 30)
+        before = int(time.time())
+
+        request, first = await ranges_read(
+            consumer, eurusd, 1, [h1, (mirror.TIMEFRAME_M1, BROKER_EPOCH + HOUR), ticks]
+        )
+        _, again = await ranges_read(
+            consumer, eurusd, 2, [h1, (mirror.TIMEFRAME_M1, BROKER_EPOCH + HOUR), ticks]
+        )
+        _, moved = await ranges_read(
+            consumer, eurusd, 3, [h1, (mirror.TIMEFRAME_M1, BROKER_EPOCH + 2 * HOUR), ticks]
+        )
+
+        assert arguments_of(request) == (Call.RANGES, {"symbol": "EURUSD"})
+        assert first.maxbars == 100_000
+        assert list(first.series) == [Series.M1, Series.H1, Series.TICKS]
+        assert floors_of(first) == {
+            Series.M1: (UTC_EPOCH + HOUR, 1),
+            Series.H1: (UTC_EPOCH, 1),
+            Series.TICKS: (UTC_EPOCH + 30, 1),
+        }
+        assert all(
+            before - 1 <= entry.measured_at <= int(time.time()) for entry in first.series.values()
+        )
+        assert floors_of(again) == floors_of(first)
+        assert floors_of(moved) == {
+            Series.M1: (UTC_EPOCH + 2 * HOUR, 2),
+            Series.H1: (UTC_EPOCH, 1),
+            Series.TICKS: (UTC_EPOCH + 30, 1),
+        }
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+async def test_a_ranges_answer_omitting_a_series_the_last_one_carried_no_longer_advertises_it():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+        consumer = await Consumer.connect(port)
+        h1 = (mirror.TIMEFRAME_H1, BROKER_EPOCH)
+        ticks = (TICK_TIMEFRAME, BROKER_EPOCH + 30)
+
+        await ranges_read(consumer, eurusd, 1, [h1, (mirror.TIMEFRAME_M1, BROKER_EPOCH), ticks])
+        _, emptied = await ranges_read(consumer, eurusd, 2, [h1, ticks])
+
+        assert floors_of(emptied) == {
+            Series.H1: (UTC_EPOCH, 1),
+            Series.TICKS: (UTC_EPOCH + 30, 1),
+        }
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+async def test_a_series_back_in_a_ranges_answer_after_one_omitted_it_steps_its_generation():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+        consumer = await Consumer.connect(port)
+        h1 = (mirror.TIMEFRAME_H1, BROKER_EPOCH)
+        m1 = (mirror.TIMEFRAME_M1, BROKER_EPOCH)
+
+        await ranges_read(consumer, eurusd, 1, [h1, m1])
+        await ranges_read(consumer, eurusd, 2, [h1])
+        _, back = await ranges_read(consumer, eurusd, 3, [h1, m1])
+
+        assert floors_of(back) == {Series.M1: (UTC_EPOCH, 2), Series.H1: (UTC_EPOCH, 1)}
+        await consumer.close()
+        await eurusd.close()
+        await spawner.close()
+    server.close()
+
+
+@pytest.mark.parametrize("call", [Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE])
+async def test_a_window_starting_past_the_clocks_range_after_it_ends_is_refused_invalid(call):
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        consumer = await Consumer.connect(port)
+        window = {"symbol": "EURUSD", "date_from": 10**12, "date_to": UTC_EPOCH}
+        if call is Call.COPY_RATES_RANGE:
+            await consumer.ask(1, call, timeframe=mirror.TIMEFRAME_M1, **window)
+        else:
+            await consumer.ask(1, call, flags=1, **window)
+        reply = await consumer.received()
+
+        assert (reply.request_id, error_of(reply)) == (1, (ErrorKind.INVALID_WINDOW, None))
+        assert reply.error.message == "the window starts after it ends"
+        await consumer.close()
         await spawner.close()
     server.close()
 
@@ -1278,26 +1349,6 @@ async def test_a_window_before_the_terminals_time_on_a_constant_offset_day_reach
         day + 10 * HOUR,
         day + 10 * HOUR + 60,
     )
-    server.close()
-
-
-async def test_a_ranges_terminal_info_answered_in_a_part_before_the_last_ends_it_once(monkeypatch):
-    monkeypatch.setattr(calls, "READ_DEADLINE_S", 0.2)
-    hub, server, port = await run_hub()
-    async with verified(port) as spawner:
-        consumer = await Consumer.connect(port)
-        await consumer.ask(17, Call.RANGES, symbol="EURUSD")
-        asked = await spawner.request()
-        terminal = zeroed(binary.layout(mirror.STRUCTS[mirror.StructName.TERMINAL_INFO]))
-
-        await spawner.send(
-            answer(asked.request_id, Call.TERMINAL_INFO, terminal | {"maxbars": 1}, last=False)
-        )
-        reply = await consumer.received()
-
-        assert (reply.request_id, error_of(reply)) == (17, (ErrorKind.EA_GONE, None))
-        await nothing(consumer.ws, timeout=0.4)
-        await consumer.close()
     server.close()
 
 

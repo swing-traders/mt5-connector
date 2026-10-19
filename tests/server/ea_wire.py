@@ -9,7 +9,6 @@ import websockets
 
 from mt5connector.server.wire import binary, calls, mirror
 from mt5connector.server.wire.binary import FrameKind, Reader, Writer
-from mt5connector.server.wire.history_wire import FloorOrigin
 from mt5connector.server.wire.push_wire import ChartRole, Role
 
 _RATES = np.dtype(list(mirror.RATES.dtype))
@@ -99,9 +98,9 @@ def arguments_of(request: binary.Request) -> tuple[calls.Call, dict]:
     return row.call, calls.decode_arguments(row, request)
 
 
-def ea_result(call: calls.Call, value, floor: calls.FloorFact | None = None, *, last=True):
-    """The count and bytes of an EA's answer part: rows as the EA packs them, and on a history
-    read's last part its floor fact."""
+def ea_result(call: calls.Call, value):
+    """The count and bytes of an EA's answer part: rows as the EA packs them, and a ranges answer,
+    `value` its MaxBars and its (timeframe, floor) pairs, as the MaxBars then each pair."""
     row = calls.CALLS[call]
     if row.shape is calls.Shape.RATES:
         rows = np.array([tuple(r[name] for name in mirror.RATES.names) for r in value], _RATES)
@@ -109,29 +108,22 @@ def ea_result(call: calls.Call, value, floor: calls.FloorFact | None = None, *, 
     elif row.shape is calls.Shape.TICKS:
         rows = np.array([tuple(r[name] for name in mirror.TICKS.names) for r in value], _TICKS)
         count, body = len(rows), rows.tobytes()
+    elif row.shape is calls.Shape.RANGES:
+        maxbars, floors = value
+        writer = Writer()
+        writer.i64(maxbars)
+        for timeframe, floor in floors:
+            writer.i32(timeframe)
+            writer.i64(floor)
+        count, body = len(floors), writer.payload()
     else:
         count, body = calls.write_result(row, value)
-    if row.shape in (calls.Shape.RATES, calls.Shape.TICKS) and last:
-        writer = Writer()
-        if floor is None:
-            writer.u8(0)
-        else:
-            writer.u8(1)
-            writer.i64(floor.floor)
-            writer.string(floor.origin)
-        body += writer.payload()
     return count, body
 
 
-def answer(
-    request_id: int, call: calls.Call, value, floor=None, *, part=0, last=True, last_error=0
-):
-    count, body = ea_result(call, value, floor, last=last)
+def answer(request_id: int, call: calls.Call, value, *, part=0, last=True, last_error=0):
+    count, body = ea_result(call, value)
     return binary.Answer(request_id, part, last, last_error, count, body)
-
-
-def stub_floor(value: int) -> calls.FloorFact:
-    return calls.FloorFact(value, FloorOrigin.STUB)
 
 
 @dataclass

@@ -258,10 +258,9 @@ class MT5DataDownloader:
         convert: Callable[[np.ndarray], list],
     ) -> None:
         """Requests the windows newest-first, writing the rows each answers, until the next lies
-        wholly before the series' floor, and records the floor when it lies after `first`. A window
-        the hub fails or whose answer is lost is recorded as an error and the walk goes on. The
-        floor is read again after a window answered no rows and once the walk ends, since the hub
-        measures one while answering."""
+        wholly before the series' floor, and records the floor when it lies after `first`; a window
+        that fails is recorded as an error. The floor is read again after a window answering no rows
+        and at the end, since a capped frame's floor moves as its oldest bars are trimmed."""
         for lo, hi in windows:
             if floor is not None and hi < floor:
                 break
@@ -322,7 +321,7 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 def _advertised_floor(ranges: calls.Ranges, series: Series) -> int | None:
-    """The series' floor among the ranges the hub holds, or None before it measures one."""
+    """The series' floor among the ranges the hub holds, or None for a series with no rows."""
     if series in ranges.series:
         return ranges.series[series].floor
     else:

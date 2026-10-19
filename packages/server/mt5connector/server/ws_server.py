@@ -8,7 +8,7 @@ EA serves, and those the spawner was sent; the MQL5 error the spawner met on eac
 open, standing until that chart opens or its EA says hello; when each chart was last in use, and
 when the spawner was last told to close each chart whose close is pending, which outlives the
 chart's EA; the true-UTC open of the last bar fanned out of each series; the latest commission
-schedule and trading sessions relayed for each symbol; the floors learned from history answers; the
+schedule and trading sessions relayed for each symbol; the floors learned from ranges answers; the
 pending requests and the clock gate. Nothing is persisted, and nothing is replayed to a consumer
 that reconnects."""
 
@@ -69,8 +69,6 @@ OVERFLOW = 4008
 _IDLE_SWEEP_S = 5
 _CLOSE_BOUND_S = 30
 _HOUR_S = 3_600
-_TERMINAL_INFO = calls.CALLS[calls.Call.TERMINAL_INFO]
-_RANGES = calls.CALLS[calls.Call.RANGES]
 
 logger = logging.getLogger(__name__)
 
@@ -531,13 +529,11 @@ class Hub:
             self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._commissions)
         elif call is calls.Call.TRADING_SESSIONS:
             self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._sessions)
-        elif call is calls.Call.RANGES:
-            self._send(ws, frame.request_id, row, _TERMINAL_INFO, {}, arguments["symbol"])
         elif call in WINDOWS:
             self._window_read(ws, frame.request_id, row, arguments)
         else:
             symbol = calls.routed_symbol(row, arguments)
-            self._send(ws, frame.request_id, row, row, arguments, symbol)
+            self._send(ws, frame.request_id, row, arguments, symbol)
 
     def _window_read(
         self, ws, client_id: int, row: calls.Row, arguments: dict[str, object]
@@ -547,44 +543,36 @@ class Hub:
         refusal = window_refusal(arguments, self._gate.terminal_time())
         if refusal is None:
             symbol = calls.routed_symbol(row, arguments)
-            self._send(ws, client_id, row, row, arguments, symbol)
+            self._send(ws, client_id, row, arguments, symbol)
         else:
             self._error(ws, client_id, 0, ErrorKind.INVALID_WINDOW, refusal)
 
     def _send(
-        self,
-        ws,
-        client_id: int,
-        asked: calls.Row,
-        served: calls.Row,
-        arguments: dict[str, object],
-        symbol: str | None,
+        self, ws, client_id: int, row: calls.Row, arguments: dict[str, object], symbol: str | None
     ) -> None:
         """Sends a request to the EA serving its role and symbol; with none, has the spawner open
         its chart and defers it, or refuses it once that chart failed to open."""
-        if served.role is ChartRole.SPAWNER:
+        if row.role is ChartRole.SPAWNER:
             key = (ChartRole.SPAWNER, None)
             state = None
         else:
-            key = (served.role, symbol)
+            key = (row.role, symbol)
             state = self.use_chart(key)
         ea = self._served.get(key)
         if ea is not None and self._eas[ea].outbound.queue.qsize() < self._settings.ea_queue_bound:
-            results = Results(served, arguments, self._clock, self._repeated_hours)
-            pending = self._requests.add(ws, client_id, asked, served, symbol, ea, results)
-            count, body = calls.encode_arguments(
-                served, broker_arguments(served, arguments, self._clock)
-            )
-            self._to_ea(ea, binary.Request(pending.hub_id, served.call, count, body))
+            results = Results(row, arguments, self._clock, self._repeated_hours)
+            pending = self._requests.add(ws, client_id, row, symbol, ea, results)
+            count, body = calls.encode_arguments(row, broker_arguments(row, arguments, self._clock))
+            self._to_ea(ea, binary.Request(pending.hub_id, row.call, count, body))
         elif ea is not None:
             message = f"{self._settings.ea_queue_bound} frames queued for the EA"
             self._error(ws, client_id, 0, ErrorKind.OVERFLOW, message)
         elif state is ChartState.FAILED:
             self._chart_failed(ws, client_id, key)
-        elif served.role is ChartRole.SPAWNER:
+        elif row.role is ChartRole.SPAWNER:
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no spawner is connected")
         else:
-            message = f"no {served.role} EA for {symbol}; chart requested"
+            message = f"no {row.role} EA for {symbol}; chart requested"
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
 
     def _relay_read(
@@ -640,18 +628,14 @@ class Hub:
         else:
             # Composed before the request leaves: a part the hub cannot pass on refuses its EA, and
             # the request, still pending on it, is answered ea_gone.
-            value, fact = calls.read_ea_result(pending.served, answer)
-            if fact is not None:
-                self._learn_floor(pending, fact)
-            if pending.asked is pending.served:
+            value = calls.read_ea_result(pending.served, answer)
+            if pending.served.shape is calls.Shape.RANGES:
+                passed = self._measured(pending, answer, value)
+            else:
                 count, result = calls.write_result(pending.served, pending.results.part(value))
                 passed = binary.Answer(
                     pending.client_id, answer.part, answer.last, answer.last_error, count, result
                 )
-            else:
-                ranges = self._ranges(pending.symbol, value["maxbars"])
-                count, result = calls.write_result(_RANGES, ranges)
-                passed = binary.Answer(pending.client_id, 0, True, answer.last_error, count, result)
             pending.next_part += 1
             if answer.last:
                 self._requests.remove(pending)
@@ -686,12 +670,15 @@ class Hub:
             pending.consumer, pending.client_id, pending.next_part, ErrorKind.TIMEOUT, message
         )
 
-    def _learn_floor(self, pending: Pending, fact: calls.FloorFact) -> None:
-        if pending.served.shape is calls.Shape.TICKS:
-            series = Series.TICKS
-        else:
-            series = pending.results.series
-        self._floors.write(pending.symbol, series, fact.floor, int(time.time()), fact.origin)
+    def _measured(
+        self, pending: Pending, answer: binary.Answer, measured: calls.MeasuredFloors
+    ) -> binary.Answer:
+        """Takes a history EA's ranges answer as the symbol's floors, and answers the consumer the
+        symbol's ranges from the store."""
+        self._floors.replace(pending.symbol, measured.floors, int(time.time()))
+        ranges = self._ranges(pending.symbol, measured.maxbars)
+        count, result = calls.write_result(pending.served, ranges)
+        return binary.Answer(pending.client_id, 0, True, answer.last_error, count, result)
 
     def _ranges(self, symbol: str, maxbars: int) -> calls.Ranges:
         """The terminal's MaxBars and every floor held for the symbol, in true UTC."""
@@ -701,16 +688,9 @@ class Hub:
         for name in Series:
             if name in floors:
                 floor = floors[name]
-                where = f"{symbol} {name}"
-                if name is Series.TICKS:
-                    utc_msc = conversion.utc(
-                        mirror.EpochUnit.MILLISECONDS, floor.value, where, "floor"
-                    )
-                    advertised = utc_msc // 1000
-                else:
-                    advertised = conversion.utc(
-                        mirror.EpochUnit.SECONDS, floor.value, where, "floor"
-                    )
+                advertised = conversion.utc(
+                    mirror.EpochUnit.SECONDS, floor.value, f"{symbol} {name}", "floor"
+                )
                 series[name] = calls.SeriesRange(advertised, floor.measured_at, floor.generation)
         return calls.Ranges(maxbars, series)
 

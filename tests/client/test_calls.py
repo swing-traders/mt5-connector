@@ -6,7 +6,7 @@ import pytest
 
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import CodecError, Writer
-from mt5connector.wire.history_wire import BARS, FloorOrigin, Series
+from mt5connector.wire.history_wire import BARS, TICK_TIMEFRAME, Series
 from mt5connector.wire.push_wire import ChartRole, TransactionType
 
 Call = calls.Call
@@ -23,16 +23,10 @@ SPAWNER_CALLS = {
     Call.HISTORY_ORDERS_GET,
     Call.HISTORY_DEALS_GET,
 }
-HISTORY_CALLS = {Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE}
-# The tick history, which the history EA reads in its own thread.
-TICK_CALLS = {Call.COPY_TICKS_RANGE}
-PUBLISHER_CALLS = {
-    Call.SYMBOL_INFO,
-    Call.SYMBOL_INFO_TICK,
-    Call.ORDER_SEND,
-    Call.OUTCOMES,
-} | (HISTORY_CALLS - TICK_CALLS)
-HUB_CALLS = {Call.RANGES, Call.COMMISSION_SCHEDULE, Call.TRADING_SESSIONS}
+# The symbol's history, which the history EA reads in its own thread.
+HISTORY_CALLS = {Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE, Call.RANGES}
+PUBLISHER_CALLS = {Call.SYMBOL_INFO, Call.SYMBOL_INFO_TICK, Call.ORDER_SEND, Call.OUTCOMES}
+HUB_CALLS = {Call.COMMISSION_SCHEDULE, Call.TRADING_SESSIONS}
 
 
 def zeroed(layout: binary.Layout, **values) -> dict:
@@ -87,19 +81,18 @@ def test_each_call_is_served_by_the_role_the_design_gives_it():
     assert served == {
         ChartRole.SPAWNER: SPAWNER_CALLS,
         ChartRole.PUBLISHER: PUBLISHER_CALLS,
-        ChartRole.HISTORY: TICK_CALLS,
+        ChartRole.HISTORY: HISTORY_CALLS,
         None: HUB_CALLS,
     }
 
 
-def test_a_command_waits_under_the_command_deadline_a_copy_under_its_historys_the_rest_reads():
+def test_a_command_waits_under_the_command_deadline_the_history_under_its_own_the_rest_reads():
     waits = {call: row.wait for call, row in calls.CALLS.items()}
 
+    assert set(calls.Wait) == {calls.Wait.READ, calls.Wait.COMMAND, calls.Wait.HISTORY}
+    assert calls.HISTORY_BUSY_S == 900
     assert {call for call, wait in waits.items() if wait is calls.Wait.COMMAND} == {Call.ORDER_SEND}
-    assert {call for call, wait in waits.items() if wait is calls.Wait.HISTORY} == (
-        HISTORY_CALLS - TICK_CALLS
-    )
-    assert {call for call, wait in waits.items() if wait is calls.Wait.TICKS} == TICK_CALLS
+    assert {call for call, wait in waits.items() if wait is calls.Wait.HISTORY} == HISTORY_CALLS
     assert all(
         wait is calls.Wait.READ
         for call, wait in waits.items()
@@ -237,7 +230,7 @@ def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_it
         (Call.POSITIONS_GET, {"symbol": "EURUSD"}, None),
         (Call.RANGES, {"symbol": "GBPUSD"}, "GBPUSD"),
     ],
-    ids=["read", "history", "command", "spawner", "hub"],
+    ids=["read", "history", "command", "spawner", "ranges"],
 )
 def test_a_request_is_routed_by_its_calls_symbol(call, arguments, symbol):
     assert calls.routed_symbol(calls.CALLS[call], arguments) == symbol
@@ -418,9 +411,9 @@ def test_an_eas_outcomes_are_read_as_the_three_structs_of_each_transaction_back_
         binary.write_record(writer, binary.TRADE_REQUEST, outcome(request_id).request)
         binary.write_record(writer, binary.TRADE_RESULT, outcome(request_id).result)
 
-    held, fact = calls.read_ea_result(row, binary.Answer(1, 0, True, 0, 2, writer.payload()))
+    held = calls.read_ea_result(row, binary.Answer(1, 0, True, 0, 2, writer.payload()))
 
-    assert (held, fact) == ([outcome(7), outcome(9)], None)
+    assert held == [outcome(7), outcome(9)]
 
 
 def test_tick_rows_in_parts_join_into_one_array():
@@ -493,52 +486,60 @@ def test_a_struct_result_of_two_records_is_refused():
 # ── An EA's history answer ────────────────────────────────────────────────────
 
 
-def _ea_part(rows, facts: bytes | None, *, last=True):
-    body = rows.tobytes()
-    if facts is not None:
-        body += facts
-    return binary.Answer(1, 0, last, 0, len(rows), body)
-
-
-def _floor(value: int, origin: FloorOrigin) -> bytes:
-    writer = Writer()
-    writer.u8(1)
-    writer.i64(value)
-    writer.string(origin)
-    return writer.payload()
-
-
-def test_the_last_part_of_a_history_read_carries_its_floor_fact():
+@pytest.mark.parametrize("last", [True, False], ids=["last", "before-the-last"])
+def test_a_part_of_an_eas_history_read_is_its_rows_alone(last):
     row = calls.CALLS[Call.COPY_TICKS_RANGE]
+    rows = ticks(5_000)
 
-    rows, fact = calls.read_ea_result(
-        row, _ea_part(ticks(5_000), _floor(1_000_000, FloorOrigin.COARSE))
+    held = calls.read_ea_result(row, binary.Answer(1, 0, last, 0, 1, rows.tobytes()))
+
+    assert held["time_msc"].tolist() == [5_000]
+    with pytest.raises(CodecError, match="1 bytes past the end"):
+        calls.read_ea_result(row, binary.Answer(1, 0, last, 0, 1, rows.tobytes() + b"\x00"))
+
+
+def _ea_ranges(maxbars: int, floors: list[tuple[int, int]], *, last=True) -> binary.Answer:
+    """An EA's ranges answer: its MaxBars, then each floor by its timeframe."""
+    writer = Writer()
+    writer.i64(maxbars)
+    for timeframe, floor in floors:
+        writer.i32(timeframe)
+        writer.i64(floor)
+    return binary.Answer(1, 0, last, 0, len(floors), writer.payload())
+
+
+def test_an_eas_ranges_answer_is_its_maxbars_and_each_series_floor_on_the_brokers_clock():
+    row = calls.CALLS[Call.RANGES]
+    floors = [(mirror.TIMEFRAME_M1, 1_500_000_000), (TICK_TIMEFRAME, 1_500_000_030)]
+
+    held = calls.read_ea_result(row, _ea_ranges(100_000, floors))
+
+    assert held == calls.MeasuredFloors(
+        100_000, {Series.M1: 1_500_000_000, Series.TICKS: 1_500_000_030}
     )
 
-    assert rows["time_msc"].tolist() == [5_000]
-    assert fact == calls.FloorFact(1_000_000, FloorOrigin.COARSE)
+
+@pytest.mark.parametrize(
+    ("floors", "message"),
+    [
+        ([(mirror.TIMEFRAME_MN1, 1)], f"result offset 8: timeframe {mirror.TIMEFRAME_MN1} has no"),
+        (
+            [(mirror.TIMEFRAME_H1, 1), (mirror.TIMEFRAME_H1, 2)],
+            f"result offset 20: timeframe {mirror.TIMEFRAME_H1} is repeated",
+        ),
+    ],
+    ids=["unserved", "repeated"],
+)
+def test_an_eas_ranges_answer_naming_a_timeframe_no_series_serves_or_one_twice_is_refused(
+    floors, message
+):
+    with pytest.raises(CodecError, match=f"^{message}"):
+        calls.read_ea_result(calls.CALLS[Call.RANGES], _ea_ranges(100_000, floors))
 
 
-def test_a_history_read_that_measured_no_floor_says_so():
-    row = calls.CALLS[Call.COPY_TICKS_RANGE]
-
-    assert calls.read_ea_result(row, _ea_part(ticks(), b"\x00"))[1] is None
-
-
-def test_a_part_before_the_last_carries_no_floor_fact():
-    row = calls.CALLS[Call.COPY_TICKS_RANGE]
-
-    rows, fact = calls.read_ea_result(row, _ea_part(ticks(5_000), None, last=False))
-    assert (len(rows), fact) == (1, None)
-    with pytest.raises(CodecError, match="bytes past the end"):
-        calls.read_ea_result(row, _ea_part(ticks(5_000), b"\x00", last=False))
-
-
-def test_a_history_answer_with_two_floors_is_refused():
-    row = calls.CALLS[Call.COPY_TICKS_RANGE]
-
-    with pytest.raises(CodecError, match="2 floors on one answer"):
-        calls.read_ea_result(row, _ea_part(ticks(), b"\x02"))
+def test_an_eas_ranges_answer_in_a_part_before_its_last_is_refused():
+    with pytest.raises(CodecError, match="ranges: a ranges answer in a part before its last"):
+        calls.read_ea_result(calls.CALLS[Call.RANGES], _ea_ranges(1, [], last=False))
 
 
 def test_an_eas_single_record_result_in_a_part_before_its_last_is_refused():

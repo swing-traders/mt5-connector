@@ -1,11 +1,11 @@
 """The requests the hub has sent an EA and not yet answered, each under its deadline.
 
 State: each pending request under the hub's own id — the consumer that asked it, none once that
-consumer left; the consumer's id for it; the call the consumer asked and the call its EA serves; the
-EA; its deadline and the timer armed for it; how long a busy said its EA would wait; the next answer
-part expected, and the conversion its parts go through. A request leaves on its last part, on an
-error, on its deadline and when its EA leaves; whatever its EA sends for it after that is dropped
-with a warning. Nothing is persisted."""
+consumer left; the consumer's id for it; the call it asks; the EA; its deadline and the timer armed
+for it; how long a busy said its EA would wait; the next answer part expected, and the conversion
+its parts go through. A request leaves on its last part, on an error, on its deadline and when its
+EA leaves; whatever its EA sends for it after that is dropped with a warning. Nothing is
+persisted."""
 
 import asyncio
 import logging
@@ -26,9 +26,6 @@ class Pending:
     hub_id: int
     consumer: object | None
     client_id: int
-    # The call the consumer asked, and the call its EA serves: one call but for the ranges, which
-    # the hub answers from a terminal_info.
-    asked: calls.Row
     served: calls.Row
     symbol: str | None
     ea: object
@@ -52,7 +49,6 @@ class Requests:
         self,
         consumer: object,
         client_id: int,
-        asked: calls.Row,
         served: calls.Row,
         symbol: str | None,
         ea: object,
@@ -63,7 +59,7 @@ class Requests:
         hub_id = self._next_id
         self._next_id += 1
         deadline = time.monotonic() + _deadline_s(served.wait)
-        pending = Pending(hub_id, consumer, client_id, asked, served, symbol, ea, results, deadline)
+        pending = Pending(hub_id, consumer, client_id, served, symbol, ea, results, deadline)
         self._pending[hub_id] = pending
         self._asked_by[consumer] = self._asked_by.get(consumer, 0) + 1
         self._arm(pending)
@@ -137,7 +133,5 @@ def _deadline_s(wait: calls.Wait) -> float:
         return calls.READ_DEADLINE_S
     elif wait is calls.Wait.COMMAND:
         return calls.COMMAND_DEADLINE_S
-    elif wait is calls.Wait.HISTORY:
-        return calls.HISTORY_DEADLINE_S
     else:
-        return calls.TICK_BUSY_S
+        return calls.HISTORY_BUSY_S
