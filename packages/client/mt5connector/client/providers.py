@@ -43,6 +43,8 @@ from mt5connector.wire import calls
 from mt5connector.wire.push_wire import MqlError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from nautilus_trader.common.component import Clock
     from nautilus_trader.config import InstrumentProviderConfig
 
@@ -227,30 +229,39 @@ def _listed_pairs(listing: tuple) -> _Listed:
 def _needed_pairs(
     info, rule: CommissionRule | None, account_currency: str, listed: _Listed
 ) -> set[tuple[str, str]]:
-    """The pairs a symbol's conversions need: those on the shortest walk over the listed pairs, each
-    a step either way, from its settlement currency to the account currency, and the pair joining a
-    converted rule's currency directly to the settlement currency. Equal choices are settled in the
+    """The pairs a symbol's conversions need: those on the walk over the listed pairs from its
+    settlement currency to the account currency and, for a converted rule, from the rule's currency
+    to its settlement currency."""
+    needed = set()
+    settlement = _walk(info.currency_profit, account_currency, listed)
+    if settlement is not None:
+        needed |= set(settlement)
+    if rule is not None and rule.mode in CONVERTED_MODES:
+        fee = _walk(rule.currency, info.currency_profit, listed)
+        if fee is not None:
+            needed |= set(fee)
+    return needed
+
+
+def _walk(
+    source: str, target: str, pairs: Iterable[tuple[str, str]]
+) -> tuple[tuple[str, str], ...] | None:
+    """The (base, profit) pairs on the shortest walk over `pairs` from `source` to `target`, in walk
+    order, each a step either way; None where no walk joins them. Equal choices are settled in the
     pairs' alphabetical order."""
     joins: dict[str, list[tuple[str, tuple[str, str]]]] = {}
-    for base, profit in sorted(listed):
+    for base, profit in sorted(pairs):
         joins.setdefault(base, []).append((profit, (base, profit)))
         joins.setdefault(profit, []).append((base, (base, profit)))
-    walks = {info.currency_profit: ()}
-    frontier = deque([info.currency_profit])
-    while frontier and account_currency not in walks:
+    walks = {source: ()}
+    frontier = deque([source])
+    while frontier and target not in walks:
         currency = frontier.popleft()
         for other, pair in joins.get(currency, []):
             if other not in walks:
                 walks[other] = (*walks[currency], pair)
                 frontier.append(other)
-    needed = set(walks.get(account_currency, ()))
-    if rule is not None and rule.mode in CONVERTED_MODES:
-        direct = [
-            pair for other, pair in joins.get(rule.currency, []) if other == info.currency_profit
-        ]
-        if direct:
-            needed.add(direct[0])
-    return needed
+    return walks.get(target)
 
 
 async def _quote_conversions(
@@ -329,26 +340,23 @@ async def _taker_fee(
 
 
 async def _rate(session: HubSession, source: str, target: str, pairs: _Pairs) -> Decimal:
-    """`target` units per `source` unit at the mid of the venue's quote for the pair."""
-    if source == target:
-        return Decimal(1)
-    else:
-        symbol, inverse = _conversion(source, target, pairs)
-        if inverse:
-            return 1 / await _mid(session, symbol)
-        else:
-            return await _mid(session, symbol)
-
-
-def _conversion(source: str, target: str, pairs: _Pairs) -> tuple[str, bool]:
-    """The venue symbol quoting `source` against `target`, and whether it quotes it inversely;
-    raises MT5InstrumentError for a pair the venue does not quote."""
-    if (source, target) in pairs:
-        return pairs[(source, target)], False
-    elif (target, source) in pairs:
-        return pairs[(target, source)], True
-    else:
+    """`target` units per `source` unit along the walk over `pairs`: each pair's quoting symbol at
+    its mid, taken inversely where the walk crosses the pair from its profit currency to its base.
+    Raises MT5InstrumentError where no walk joins them."""
+    walk = _walk(source, target, pairs)
+    if walk is None:
         raise MT5InstrumentError(f"no venue symbol converts {source} into {target}")
+    else:
+        rate = Decimal(1)
+        currency = source
+        for base, profit in walk:
+            if currency == base:
+                rate *= await _mid(session, pairs[(base, profit)])
+                currency = profit
+            else:
+                rate /= await _mid(session, pairs[(base, profit)])
+                currency = base
+        return rate
 
 
 async def _mid(session: HubSession, symbol: str) -> Decimal:

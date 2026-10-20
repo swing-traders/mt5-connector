@@ -867,6 +867,51 @@ async def test_a_money_rule_in_another_currency_resolves_its_pair_and_converts_t
     assert abs(fee - value * rate / price) < Decimal("1e-18")
 
 
+async def test_a_money_rule_with_no_direct_pair_to_the_settlement_converts_along_the_walk(venue):
+    venue.add(
+        forex("USTUSD", "UST", "USD", mirror.SYMBOL_TRADE_MODE_DISABLED),
+        bid=1.0,
+        ask=1.0,
+    )
+    venue.add(forex("USDJPY", "USD", "JPY"), bid=150.0, ask=150.0)
+    venue.add(
+        index_cfd("JP225", "JPY"),
+        bid=38000.0,
+        ask=38000.0,
+        schedule=schedule(
+            2.0, "UST", mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT
+        ),
+    )
+    provider = provider_for(venue, "JP225", currency="UST")
+    await provider.initialize()
+    assert provider.quoted_pairs() == {("UST", "USD"): "USTUSD", ("USD", "JPY"): "USDJPY"}
+    assert loaded_ids(provider) == ["JP225.MT5", "USDJPY.MT5", "USTUSD.MT5"]
+    fee = provider.get_instrument("JP225").taker_fee
+    value, ust_usd, usd_jpy = Decimal(2), Decimal("1.0"), Decimal("150.0")
+    contract_size, price = Decimal(1), Decimal(38000)
+    assert abs(fee - value * ust_usd * usd_jpy / (contract_size * price)) < Decimal("1e-18")
+
+
+async def test_a_money_rule_converts_through_a_hop_the_venue_quotes_the_other_way_round(venue):
+    """The second hop runs from GBPUSD's profit currency to its base and is therefore inverted."""
+    venue.add(forex("EURUSD", "EUR", "USD"), bid=1.25, ask=1.25)
+    venue.add(forex("GBPUSD", "GBP", "USD"), bid=1.5, ask=1.5)
+    venue.add(
+        index_cfd("UK100", "GBP"),
+        bid=8000.0,
+        ask=8000.0,
+        schedule=schedule(
+            0.5, "EUR", mode=CommissionMode.MONEY_SPECIFIED, entry=CommissionEntryMode.INOUT
+        ),
+    )
+    provider = provider_for(venue, "UK100")
+    await provider.initialize()
+    assert provider.quoted_pairs() == {("EUR", "USD"): "EURUSD", ("GBP", "USD"): "GBPUSD"}
+    fee = provider.get_instrument("UK100").taker_fee
+    value, rate, price = Decimal("0.5"), Decimal("1.25") / Decimal("1.5"), Decimal(8000)
+    assert abs(fee - value * rate / price) < Decimal("1e-18")
+
+
 async def test_a_conversion_symbol_whose_quote_the_hub_fails_fails_the_load_with_its_error(venue):
     venue.add(symbol_info(name="EURUSD", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL), 1.25, 1.25)
     venue.add(
