@@ -9,6 +9,9 @@ from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.client.parsing import finite_decimal
 from mt5connector.wire.push_wire import CommissionEntryMode, CommissionMode
 
+# The modes whose fee converts out of the rule's currency.
+CONVERTED_MODES = frozenset({CommissionMode.MONEY_DEPOSIT, CommissionMode.MONEY_SPECIFIED})
+
 
 @dataclass(frozen=True)
 class CommissionRule:
