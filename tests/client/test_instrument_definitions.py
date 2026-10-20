@@ -2,6 +2,7 @@
 definition, its currencies, the conversion pairs it finds, and the taker fees it derives."""
 
 import asyncio
+import itertools
 import threading
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -378,11 +379,8 @@ async def test_loading_every_symbol_lists_the_terminals_symbols_once_for_the_loa
     provider = provider_of(venue, InstrumentProviderConfig(load_all=True))
     await provider.load_all_async()
     assert [call for call, _ in venue.asked].count(Call.SYMBOLS_GET) == 1
-    assert provider.quoted_pairs() == {
-        ("EUR", "USD"): "EURUSDm",
-        ("GBP", "USD"): "GBPUSDm",
-        ("USD", "JPY"): "USDJPYm",
-    }
+    assert provider.quoted_pairs() == {("USD", "JPY"): "USDJPYm"}
+    assert Call.SYMBOL_INFO_TICK not in [call for call, _ in venue.asked]
 
 
 @pytest.mark.parametrize(
@@ -505,14 +503,168 @@ async def test_a_metal_whose_base_has_no_known_precision_still_loads(venue):
 
 # ── Conversion pairs ─────────────────────────────────────────────────────────
 
+CURRENCIES = (
+    "AUD",
+    "CAD",
+    "CHF",
+    "CNH",
+    "CZK",
+    "DKK",
+    "EUR",
+    "GBP",
+    "HKD",
+    "HUF",
+    "JPY",
+    "MXN",
+    "NOK",
+    "NZD",
+    "PLN",
+    "SEK",
+    "SGD",
+    "USD",
+    "ZAR",
+)
+
+
+def forex(name, base, profit, trade_mode=mirror.SYMBOL_TRADE_MODE_FULL):
+    """A FOREX symbol quoting `base` in `profit`."""
+    return symbol_info(
+        name=name,
+        currency_base=base,
+        currency_profit=profit,
+        currency_margin=base,
+        trade_mode=trade_mode,
+    )
+
+
+def index_cfd(name, settlement):
+    """An index CFD settling in `settlement`."""
+    return symbol_info(
+        name=name,
+        digits=2,
+        point=0.01,
+        trade_tick_size=0.01,
+        trade_contract_size=1.0,
+        currency_base=settlement,
+        currency_profit=settlement,
+        trade_calc_mode=mirror.SYMBOL_CALC_MODE_CFDINDEX,
+    )
+
+
+def listed_pairs(count):
+    """The first `count` pairs of CURRENCIES, in alphabetical order."""
+    return list(itertools.islice(itertools.combinations(CURRENCIES, 2), count))
+
+
+def asked_beyond(venue, *symbols):
+    """The symbols outside `symbols` the provider asked anything of."""
+    return [name for name in venue.definitions if name not in symbols and venue.asked_of(name)]
+
+
+def loaded_ids(provider):
+    return sorted(instrument.id.value for instrument in provider.list_all())
+
+
+async def test_a_run_settling_in_the_account_currency_asks_nothing_of_the_listed_pairs(venue):
+    pairs = listed_pairs(75)
+    for base, profit in pairs:
+        venue.add(
+            forex(f"{base}{profit}", base, profit, mirror.SYMBOL_TRADE_MODE_CLOSEONLY),
+            bid=1.0,
+            ask=1.0,
+        )
+    for base, profit in pairs[-2:]:
+        venue.add(forex(f"{base}{profit}.a", base, profit))
+    venue.add(
+        symbol_info(
+            name="BTCUSD.a",
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_contract_size=1.0,
+            currency_base="BTC",
+            currency_profit="USD",
+            trade_calc_mode=mirror.SYMBOL_CALC_MODE_CFD,
+        )
+    )
+    provider = provider_for(venue, "BTCUSD.a")
+    await provider.initialize()
+    assert asked_beyond(venue, "BTCUSD.a") == []
+    assert provider.quoted_pairs() == {}
+
+
+async def test_an_account_in_another_currency_resolves_and_loads_the_one_pair_its_settlement_needs(
+    venue,
+):
+    for base, profit in listed_pairs(101):
+        venue.add(forex(f"{base}{profit}.r", base, profit))
+    venue.add(index_cfd("US30", "USD"))
+    provider = provider_for(venue, "US30", currency="AUD")
+    await provider.initialize()
+    assert provider.quoted_pairs() == {("AUD", "USD"): "AUDUSD.r"}
+    assert loaded_ids(provider) == ["AUDUSD.r.MT5", "US30.MT5"]
+    assert venue.asked_of("AUDUSD.r") == [
+        Call.SYMBOL_INFO,
+        Call.COMMISSION_SCHEDULE,
+        Call.TRADING_SESSIONS,
+    ]
+    assert asked_beyond(venue, "US30", "AUDUSD.r") == []
+
+
+async def test_a_settlement_two_pairs_from_the_account_currency_resolves_and_loads_both(venue):
+    venue.add(forex("GBPUSD", "GBP", "USD"))
+    venue.add(forex("AUDUSD", "AUD", "USD"))
+    venue.add(index_cfd("UK100", "GBP"))
+    provider = provider_for(venue, "UK100", currency="AUD")
+    await provider.initialize()
+    assert provider.quoted_pairs() == {("GBP", "USD"): "GBPUSD", ("AUD", "USD"): "AUDUSD"}
+    assert loaded_ids(provider) == ["AUDUSD.MT5", "GBPUSD.MT5", "UK100.MT5"]
+    assert Call.SYMBOL_INFO_TICK not in [call for call, _ in venue.asked]
+
+
+async def test_a_quoting_symbols_own_conversions_are_resolved_and_loaded_in_turn(venue):
+    venue.add(
+        forex("AUDUSD", "AUD", "USD"),
+        bid=0.65,
+        ask=0.65,
+        schedule=schedule(
+            2.0, "EUR", mode=CommissionMode.MONEY_SPECIFIED, entry=CommissionEntryMode.INOUT
+        ),
+    )
+    venue.add(forex("EURUSD", "EUR", "USD"), bid=1.25, ask=1.25)
+    venue.add(forex("GBPUSD", "GBP", "USD"), bid=1.5, ask=1.5)
+    venue.add(index_cfd("US500", "USD"))
+    provider = provider_for(venue, "US500", currency="AUD")
+    await provider.initialize()
+    assert provider.quoted_pairs() == {("AUD", "USD"): "AUDUSD", ("EUR", "USD"): "EURUSD"}
+    assert loaded_ids(provider) == ["AUDUSD.MT5", "EURUSD.MT5", "US500.MT5"]
+    assert venue.asked_of("GBPUSD") == []
+    fee = provider.get_instrument("AUDUSD").taker_fee
+    value, rate, price = Decimal(2), Decimal("1.25"), Decimal("0.65")
+    assert abs(fee - value * rate / price) < Decimal("1e-18")
+
+
+async def test_successive_loads_keep_every_instrument_and_the_last_loads_quoting_symbols(venue):
+    venue.add(forex("EURUSD", "EUR", "USD"))
+    venue.add(forex("GBPUSD", "GBP", "USD"))
+    venue.add(index_cfd("DE40", "EUR"))
+    venue.add(index_cfd("UK100", "GBP"))
+    provider = provider_for(venue)
+    await provider.load_ids_async([InstrumentId.from_str("DE40.MT5")])
+    assert provider.quoted_pairs() == {("EUR", "USD"): "EURUSD"}
+    await provider.load_ids_async([InstrumentId.from_str("UK100.MT5")])
+    assert provider.quoted_pairs() == {("GBP", "USD"): "GBPUSD"}
+    assert loaded_ids(provider) == ["DE40.MT5", "EURUSD.MT5", "GBPUSD.MT5", "UK100.MT5"]
+
 
 async def test_a_pair_prefers_the_fully_tradable_symbol_over_a_disabled_one(venue):
     venue.add(symbol_info(name="EURUSD", trade_mode=mirror.SYMBOL_TRADE_MODE_DISABLED))
     venue.add(symbol_info(name="EURUSD+", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL))
     venue.add(symbol_info(name="GBPUSD+", currency_base="GBP"))
-    provider = provider_for(venue, "GBPUSD+")
+    provider = provider_for(venue, "GBPUSD+", currency="EUR")
     await provider.initialize()
     assert provider.quoted_pairs()[("EUR", "USD")] == "EURUSD+"
+    assert venue.asked_of("EURUSD") == []
 
 
 async def test_a_pair_no_symbol_trades_fully_is_the_first_that_prices(venue):
@@ -529,8 +681,13 @@ async def test_a_pair_no_symbol_trades_fully_is_the_first_that_prices(venue):
     venue.add(symbol_info(name="EURUSD+"))
     provider = provider_for(venue, "EURUSD+", currency="UST")
     await provider.initialize()
-    assert provider.quoted_pairs()[("UST", "USD")] == "USTUSD"
-    assert Call.SYMBOL_INFO_TICK in venue.asked_of("USTUSD")
+    assert provider.quoted_pairs() == {("UST", "USD"): "USTUSD"}
+    assert venue.asked_of("USTUSD") == [
+        Call.SYMBOL_INFO_TICK,
+        Call.SYMBOL_INFO,
+        Call.COMMISSION_SCHEDULE,
+        Call.TRADING_SESSIONS,
+    ]
 
 
 async def test_a_pair_whose_candidates_all_quote_zeros_has_no_quoting_symbol(venue):
@@ -543,32 +700,34 @@ async def test_a_pair_whose_candidates_all_quote_zeros_has_no_quoting_symbol(ven
         )
     )
     venue.add(symbol_info(name="EURUSD+"))
-    provider = provider_for(venue, "EURUSD+")
+    provider = provider_for(venue, "EURUSD+", currency="UST")
     await provider.initialize()
-    assert ("UST", "USD") not in provider.quoted_pairs()
+    assert provider.quoted_pairs() == {}
+    assert venue.asked_of("USTUSD") == [Call.SYMBOL_INFO_TICK]
 
 
 async def test_a_pair_the_run_trades_is_its_own_quote(venue):
     venue.add(symbol_info(name="EURUSD+", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL))
     venue.add(symbol_info(name="EURUSD.a", trade_mode=mirror.SYMBOL_TRADE_MODE_FULL))
-    provider = provider_for(venue, "EURUSD.a")
+    provider = provider_for(venue, "EURUSD.a", currency="EUR")
     await provider.initialize()
     assert provider.quoted_pairs()[("EUR", "USD")] == "EURUSD.a"
 
 
 async def test_only_forex_symbols_quote_a_pair(venue):
-    venue.add(symbol_info(name="EURUSD"))
     venue.add(
         symbol_info(
-            name="XAUUSD",
-            currency_base="XAU",
+            name="EURUSD",
+            currency_base="EUR",
             currency_profit="USD",
             trade_calc_mode=mirror.SYMBOL_CALC_MODE_CFD,
         )
     )
-    provider = provider_for(venue, "EURUSD")
+    venue.add(forex("EURUSDx", "EUR", "USD"))
+    venue.add(index_cfd("US500", "USD"))
+    provider = provider_for(venue, "US500", currency="EUR")
     await provider.initialize()
-    assert set(provider.quoted_pairs()) == {("EUR", "USD")}
+    assert provider.quoted_pairs() == {("EUR", "USD"): "EURUSDx"}
 
 
 async def test_the_account_currency_is_the_accounts(venue):
@@ -683,6 +842,29 @@ async def test_a_rule_in_a_currency_the_venue_quotes_inversely_is_converted_thro
     assert abs(fee - Decimal(5) / Decimal("1.25") / (Decimal(1) * Decimal(20000))) < Decimal(
         "1e-18"
     )
+
+
+async def test_a_money_rule_in_another_currency_resolves_its_pair_and_converts_through_its_symbol(
+    venue,
+):
+    venue.add(forex("EURUSD", "EUR", "USD"), bid=1.25, ask=1.25)
+    venue.add(forex("GBPUSD", "GBP", "USD"), bid=1.5, ask=1.5)
+    venue.add(
+        index_cfd("US500", "USD"),
+        bid=5000.0,
+        ask=5000.0,
+        schedule=schedule(
+            0.5, "EUR", mode=CommissionMode.MONEY_SPECIFIED, entry=CommissionEntryMode.INOUT
+        ),
+    )
+    provider = provider_for(venue, "US500")
+    await provider.initialize()
+    assert provider.quoted_pairs() == {("EUR", "USD"): "EURUSD"}
+    assert loaded_ids(provider) == ["EURUSD.MT5", "US500.MT5"]
+    assert venue.asked_of("GBPUSD") == []
+    fee = provider.get_instrument("US500").taker_fee
+    value, rate, price = Decimal("0.5"), Decimal("1.25"), Decimal(5000)
+    assert abs(fee - value * rate / price) < Decimal("1e-18")
 
 
 async def test_a_conversion_symbol_whose_quote_the_hub_fails_fails_the_load_with_its_error(venue):

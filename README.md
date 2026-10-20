@@ -233,7 +233,11 @@ The instrument provider loads a symbol by this exact name — one a client's `in
 
 The provider also answers what a consumer discovers its settlement currencies by:
 
-- `quoted_pairs() -> dict[tuple[str, str], str]` — the venue symbol quoting each `(base, profit)` currency pair the venue's FOREX symbols cover, as the last load found it: a symbol the run loads, else one fully tradable, else the first whose quote is not the all-zero struct, each rung in alphabetical order.
+- `quoted_pairs() -> dict[tuple[str, str], str]` — the venue symbol quoting each `(base, profit)` currency pair the last load's conversions need:
+  - The pairs needed are those on the shortest walk over the venue's FOREX pairs, either way round, from each loaded instrument's settlement currency to the account currency, and the pair joining the currency of a commission rule stated in money directly to its instrument's settlement currency.
+  - A pair's symbol is one the run loads, else one fully tradable, else the first whose quote is not the all-zero struct, each rung in alphabetical order.
+  - The chosen symbol is loaded as an instrument itself.
+  - A pair no symbol quotes is left out, and no pair beyond the needed ones is priced.
 - `async account_currency() -> str` — the account's currency code, as the account reports it at the call.
 
 Its loads — NautilusTrader's `load_all_async` and `load_ids_async`, and `load_symbol(symbol)`, which answers the symbol's instrument — are coroutines on the loop the connection was connected on: that loop runs on while the hub defers a read, and cancelling a load ends its reads and adds nothing. `load_all_async` lists the terminal's symbols once, for its symbols and its conversion pairs alike.
@@ -311,7 +315,7 @@ asyncio.run(main())
 The data and execution clients run in NautilusTrader's `TradingNode`, and the node's instrument set is NT's own: each client loads what its `instrument_provider` config names, as NT's adapters do.
 
 - `build_mt5_node_config` makes both clients the node's default route and gives each its `InstrumentProviderConfig(load_ids=...)`: the data client the instruments the node reads, those it trades and those it follows; the execution client those it trades.
-- A client loads what its config names when it connects: its `load_ids`, or with `load_all=True` every symbol the terminal serves — reading each opens its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
+- A client loads what its config names when it connects — its `load_ids`, or with `load_all=True` every symbol the terminal serves — with the symbols quoting the currency pairs their conversions need (`quoted_pairs()`); reading each opens its chart, of which the terminal holds at most `CHARTS_MAX` (100) at once. A config that names neither is refused at connect with `MT5ConfigError`.
 - A symbol no config names is loaded when it is requested (`request_instrument`): the server serves any symbol the account has, so another deployment's instruments need no change to it.
 - The factories, registered before `node.build()` under the config's venue, build the clients on one connection per account, server and loop, and one instrument provider per connection, venue and `instrument_provider` config.
 - The factories connect the account's connection on the node's loop at `node.build()`, before the loop runs. A `create` on a loop whose registry already holds the account's connection drives nothing, so one made inside a running loop then succeeds; one for an account not yet connected on that loop raises asyncio's `RuntimeError`.
