@@ -8,7 +8,7 @@ import pytest
 from nautilus_trader.model.data import Bar, BarType, QuoteTick
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.identifiers import InstrumentId, Venue
-from nautilus_trader.model.instruments import CurrencyPair
+from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Price, Quantity
 from venue_doubles import account_info, relayed_sessions, symbol_info
 
@@ -153,14 +153,14 @@ class TestVenueBarType:
     @pytest.mark.parametrize("info", [{}, None])
     def test_a_definition_stating_no_chart_mode_is_last(self, info):
         eurusd = instrument(name="EURUSD")
-        unstated = CurrencyPair.from_dict(CurrencyPair.to_dict(eurusd) | {"info": info})
+        unstated = Cfd.from_dict(Cfd.to_dict(eurusd) | {"info": info})
         assert venue_bar_type(unstated, mirror.TIMEFRAME_M5) == BarType.from_str(
             "EURUSD.MT5-5-MINUTE-LAST-EXTERNAL"
         )
 
     def test_a_chart_mode_outside_the_venues_is_refused(self):
         eurusd = instrument(name="EURUSD")
-        odd = CurrencyPair.from_dict(CurrencyPair.to_dict(eurusd) | {"info": {"chart_mode": "ASK"}})
+        odd = Cfd.from_dict(Cfd.to_dict(eurusd) | {"info": {"chart_mode": "ASK"}})
         with pytest.raises(ValueError, match="ASK"):
             venue_bar_type(odd, mirror.TIMEFRAME_H1)
 

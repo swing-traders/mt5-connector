@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, MarkPriceUpdate, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
-from nautilus_trader.model.instruments import Cfd, CurrencyPair
+from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Price, Quantity
 
 from mt5connector.client.currencies import base_currency, venue_currency
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from mt5connector.client.connection import AccountSnapshot
     from mt5connector.client.sessions import TradingSessions
 
-InstrumentAny = CurrencyPair | Cfd
+InstrumentAny = Cfd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +103,15 @@ _CHART_MODES = {
 }
 
 FOREX_MODES = frozenset({CalcMode.FOREX, CalcMode.FOREX_NO_LEVERAGE})
-CFD_MODES = frozenset({CalcMode.CFD, CalcMode.CFDINDEX, CalcMode.CFDLEVERAGE})
+
+# MT5's CFD mode covers metals, energies, crypto and stock CFDs alike and states nothing finer.
+_ASSET_CLASSES = {
+    CalcMode.FOREX: AssetClass.FX,
+    CalcMode.FOREX_NO_LEVERAGE: AssetClass.FX,
+    CalcMode.CFDINDEX: AssetClass.INDEX,
+    CalcMode.CFD: AssetClass.ALTERNATIVE,
+    CalcMode.CFDLEVERAGE: AssetClass.ALTERNATIVE,
+}
 
 # The venue's bar day opens at broker midnight, 17:00 in New York, and its bar week on Sunday's.
 _BAR_TZ = "America/New_York"
@@ -147,16 +155,14 @@ def parse_symbol_info(
     ts: int,
 ) -> InstrumentAny:
     """The instrument an mt5.symbol_info() definition describes at `venue`, `fee` its maker and
-    taker fee and `fee_stamp` the info keys stating what that fee derives from: a FOREX calc mode is
-    a CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
-    Margins stay NT's defaults: the venue states them as money per lot, which no ratio expresses
-    without a price."""
+    taker fee and `fee_stamp` the info keys stating what that fee derives from: a FOREX or CFD calc
+    mode is a Cfd of the asset class its mode states, so NT never applies its spot-currency rule to
+    a margined position; any other mode raises MT5InstrumentError naming it. Margins stay NT's
+    defaults: the venue states them as money per lot, which no ratio expresses without a price."""
     kind = calc_mode(info)
-    if kind in FOREX_MODES:
-        return CurrencyPair(**_definition(info, kind, venue, account, fee, fee_stamp, sessions, ts))
-    elif kind in CFD_MODES:
+    if kind in _ASSET_CLASSES:
         return Cfd(
-            asset_class=_asset_class(kind),
+            asset_class=_ASSET_CLASSES[kind],
             **_definition(info, kind, venue, account, fee, fee_stamp, sessions, ts),
         )
     else:
@@ -211,13 +217,6 @@ def _definition(
             **fee_stamp,
         },
     }
-
-
-def _asset_class(kind: CalcMode) -> AssetClass:
-    if kind == CalcMode.CFDINDEX:
-        return AssetClass.INDEX
-    else:
-        return AssetClass.ALTERNATIVE
 
 
 def finite_decimal(value: float, field: str) -> Decimal:
