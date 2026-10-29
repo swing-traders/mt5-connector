@@ -3,7 +3,8 @@ venue bars pushed over the hub, and its history read on the same hub session.
 
 State: the symbols whose quotes and whose marks NT subscribes, which share one tick stream; per
 venue bar type, the earliest close the next bar handed to NT may have, and from a reconnect until
-the bars it missed are read back, the bars pushed since."""
+the bars it missed are read back, the bars pushed since; and while connected, the instrument refresh
+the config times."""
 
 from __future__ import annotations
 
@@ -98,11 +99,12 @@ class MT5DataClient(LiveMarketDataClient):
         self._read_backs: set[asyncio.Task] = set()
         # The task NT runs `_connect` as, while it runs, for a disconnect to end.
         self._connecting: asyncio.Task | None = None
+        self._update_instruments_task: asyncio.Task | None = None
 
     async def _connect(self) -> None:
         """Loads what the instrument provider's config names, hands NT every instrument the provider
-        holds and connects the hub session; raises MT5ConfigError for a config that names nothing to
-        load."""
+        holds, connects the hub session and starts the config's instrument refresh; raises
+        MT5ConfigError for a config that names nothing to load."""
         self._connecting = asyncio.current_task()
         try:
             self._conn.ensure_connected()
@@ -116,6 +118,10 @@ class MT5DataClient(LiveMarketDataClient):
             self._log.info(
                 f"MT5DataClient: connected, the hub session at {self._config.ws_display_url}"
             )
+            if self._config.update_instruments_interval_mins is not None:
+                self._update_instruments_task = self.create_task(
+                    self._update_instruments(self._config.update_instruments_interval_mins)
+                )
         finally:
             self._connecting = None
 
@@ -126,6 +132,9 @@ class MT5DataClient(LiveMarketDataClient):
         for task in self._read_backs:
             task.cancel()
         self._recoveries.clear()
+        if self._update_instruments_task is not None:
+            self._update_instruments_task.cancel()
+            self._update_instruments_task = None
         if self._connecting is not None:
             self._connecting.cancel()
             try:
@@ -135,6 +144,26 @@ class MT5DataClient(LiveMarketDataClient):
         else:
             await self._hub.disconnect()
         self._log.info("MT5DataClient: disconnected")
+
+    async def _update_instruments(self, interval_mins: int) -> None:
+        """Reloads the instruments every `interval_mins`."""
+        while True:
+            await asyncio.sleep(interval_mins * 60)
+            await self._reload_instruments()
+
+    async def _reload_instruments(self) -> None:
+        """Reloads what the instrument provider's config names, re-deriving each fee at the current
+        mid, and hands NT every instrument the provider holds; a failed reload is logged and the
+        previous definitions stand."""
+        try:
+            await self._provider.initialize(reload=True)
+        except Exception as exc:
+            self._log.error(f"MT5DataClient: the instrument reload failed: {exc!r}")
+        else:
+            instruments = self._provider.list_all()
+            _register_settlement(instruments)
+            for instrument in instruments:
+                self._handle_data(instrument)
 
     # ── Quotes and marks ──────────────────────────────────────────────────────
 

@@ -200,3 +200,8 @@ def test_a_ws_url_with_a_port_in_range_or_none_is_kept(ws_url):
 )
 def test_the_hubs_display_url_is_its_scheme_host_port_and_path(ws_url, shown):
     assert _config(ws_url=ws_url).ws_display_url == shown
+
+
+def test_an_instrument_refresh_interval_of_nan_is_refused_naming_it():
+    with pytest.raises(MT5ConfigError, match="update_instruments_interval_mins"):
+        _config(update_instruments_interval_mins=float("nan"))

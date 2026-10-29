@@ -180,6 +180,9 @@ config = MT5Config(
     account_refresh_seconds = 10,  # the longest the account goes unreported between events
     history_lookback_mins   = 60,  # the venue history read when NT names no window, and at connect
 
+    # How often the data client reloads its instruments, re-deriving their fees; None turns it off
+    update_instruments_interval_mins = 60,  # minutes, positive
+
     # The hub sessions' reconnect backoff, which never gives up
     reconnect_initial_delay_s = 1.0,   # at least 0.001, and at most reconnect_max_delay_s
     reconnect_max_delay_s     = 60.0,  # at least 0.001
@@ -224,10 +227,26 @@ The instrument provider loads a symbol by this exact name — one a client's `in
   - An instrument's settlement currency is registered with NT before every instrument NT receives.
   - The account currency, with every loaded settlement currency, is registered before the first account state.
   - Base-only codes are never registered.
-- **Taker fee** from the commission schedule the symbol's EA relays, its first rule's first tier: money per lot in the deposit currency or per unit in a named currency, converted into the quote currency at the venue's own quotes, along the shortest walk over its FOREX pairs that `quoted_pairs()` resolves, each pair at its mid and inverted where the walk crosses it from its profit currency to its base; a percentage of the deal's value; or points of the price. It is halved when charged on entry alone. Loading waits for the symbol's EA to relay its schedule — the hub has its chart opened when none publishes it; a relayed schedule with no rule gives zero; a refused relay, a chart that fails to open, and a rule of any other mode or charged on exit alone, fail the load naming the symbol.
+- **Fees** from the commission schedule the symbol's EA relays, as one fraction of each fill's notional that is both the maker and the taker fee, since the venue charges by deal, never by liquidity side. Loading waits for the symbol's EA to relay its schedule — the hub has its chart opened when none publishes it — and a refused relay or a chart that fails to open fails the load naming the symbol.
+  - A schedule with no rule, or a tier whose mode is `DISABLED`, gives zero.
+  - Otherwise the schedule holds one rule with one tier, and the tier's mode and volume type give the fraction at the symbol's mid `P`, contract size `CS` and point:
+
+    | Tier mode × volume type | Fraction per fill |
+    |---|---|
+    | money in a named currency (`MONEY_DEPOSIT`, `MONEY_SPECIFIED`, `MONEY_SYMBOL_PROFIT`, `MONEY_SYMBOL_MARGIN`) × `VOLUME` | `value × rate / (CS × P)` |
+    | `MONEY_SYMBOL_BASE` × `VOLUME` | `value / CS` |
+    | `PERCENT` × `TURNOVER` | `value / 100` |
+    | `PIPS` × `VOLUME` | `value × point / P` |
+
+    `rate` converts the tier's currency into the quote currency at the venue's own quotes, along the shortest walk over its FOREX pairs that `quoted_pairs()` resolves, each pair at its mid and inverted where the walk crosses it from its profit currency to its base.
+  - A rule charged on both legs (`INOUT`) charges the fraction on every fill; one charged on entry or exit alone (`IN`, `OUT`) half of it on every fill.
+  - Every other schedule fails the load naming the symbol and the field: more than one rule or tier, a `mode_charge` other than `INSTANT`, a `mode_direction` other than `BOTH`, a `mode_profit` other than `ALL`, a non-zero `min_value` or `max_value`, the `PERCENT_PROFIT` mode, and any other mode and volume type, `TRADE` among them.
+  - The data client reloads what its instrument provider's config names every `update_instruments_interval_mins`, re-deriving each fraction at the then-current mid, and hands NT the result; a failed reload is logged as an error and the previous definitions stand.
 - **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, where the bar day and the bar week open (`bar_tz`, `bar_day_open`, `bar_week_open`), `bar_volume` (`tick_count`), and the symbol's sessions:
   - `quote_sessions` — the broker's quote sessions, as `SymbolInfoSessionQuote` states them: seven days, Sunday first, each a list of `[from, to]` in seconds from the broker day's 00:00, unconverted;
   - `trade_sessions` — the broker's trade sessions, as `SymbolInfoSessionTrade` states them, in the same shape.
+  - `fee_rule` — the commission rule the fees derive from, as relayed: `entry`, `mode`, `volume_type`, `value` and `currency`, each a string; `null` where the symbol has no rule;
+  - `fee_basis` — what the fees were valued at: `mid`, `rate` (quote units per unit of the rule's currency, `"1"` where the mode converts none), `contract_size` and `point`, each a string; `null` where the symbol has no rule.
 
   Loading waits for the symbol's EA to relay its sessions as it waits for its commission schedule, and a refused relay, or an answer out of that shape, fails the load naming the symbol.
 
@@ -455,7 +474,7 @@ mt5-connector/
 │   │   ├── pyproject.toml
 │   │   └── mt5connector/
 │   │       ├── client/
-│   │       │   ├── commissions.py   # the relayed commission rule and the taker fee it implies
+│   │       │   ├── commissions.py   # the relayed commission rule and the fee per fill it implies
 │   │       │   ├── config.py        # MT5Config — all user-facing configuration
 │   │       │   ├── connection.py    # MT5Connection — its lifecycle and hub session
 │   │       │   ├── constants.py     # venue, account-loop and reconnect defaults

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import ParseResult, urlparse, urlunparse
 
+from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.model.identifiers import Venue
 
 from mt5connector.client.constants import (
@@ -43,6 +44,7 @@ class MT5Config:
     deviation_points: int = 20
     account_refresh_seconds: int = 10
     history_lookback_mins: int = 60
+    update_instruments_interval_mins: PositiveInt | None = 60
     reconnect_initial_delay_s: float = RECONNECT_INITIAL_DELAY_S
     reconnect_max_delay_s: float = RECONNECT_MAX_DELAY_S
     timeout_s: float = 10.0
@@ -70,6 +72,15 @@ class MT5Config:
             raise ValueError("account_refresh_seconds must be at least 1.")
         if self.history_lookback_mins <= 0:
             raise ValueError("history_lookback_mins must be positive.")
+        # `type` rather than `isinstance`, since a bool is an int.
+        if self.update_instruments_interval_mins is not None and (
+            type(self.update_instruments_interval_mins) is not int
+            or self.update_instruments_interval_mins <= 0
+        ):
+            raise MT5ConfigError(
+                f"MT5Config.update_instruments_interval_mins "
+                f"{self.update_instruments_interval_mins!r} is not a positive integer"
+            )
         if not (math.isfinite(self.timeout_s) and self.timeout_s > 0):
             raise ValueError(f"MT5Config.timeout_s {self.timeout_s} is not finite and positive")
         if not (
