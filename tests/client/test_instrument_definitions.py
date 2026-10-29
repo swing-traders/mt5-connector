@@ -67,7 +67,13 @@ REFUSED_MODES = [
 ]
 
 
-def schedule(value, currency, mode=CommissionMode.MONEY_DEPOSIT, entry=CommissionEntryMode.INOUT):
+def schedule(
+    value,
+    currency,
+    mode=CommissionMode.MONEY_DEPOSIT,
+    entry=CommissionEntryMode.INOUT,
+    volume_type=CommissionVolumeType.VOLUME,
+):
     """One relayed SymbolInfoCommissions answer, as the session reads it: one rule with one volume
     tier."""
     return {
@@ -84,7 +90,7 @@ def schedule(value, currency, mode=CommissionMode.MONEY_DEPOSIT, entry=Commissio
                 "tiers": [
                     {
                         "mode": mode,
-                        "volume_type": CommissionVolumeType.VOLUME,
+                        "volume_type": volume_type,
                         "value": value,
                         "min_value": 0.0,
                         "max_value": 0.0,
@@ -275,6 +281,8 @@ async def test_the_info_carries_the_venue_facts_and_bar_calendar(venue):
         "bar_volume": "tick_count",
         "quote_sessions": relayed_sessions()["quote"],
         "trade_sessions": relayed_sessions()["trade"],
+        "fee_rule": None,
+        "fee_basis": None,
     }
 
 
@@ -640,8 +648,13 @@ async def test_a_quoting_symbols_own_conversions_are_resolved_and_loaded_in_turn
     assert loaded_ids(provider) == ["AUDUSD.MT5", "EURUSD.MT5", "US500.MT5"]
     assert venue.asked_of("GBPUSD") == []
     fee = provider.get_instrument("AUDUSD").taker_fee
-    value, rate, price = Decimal(2), Decimal("1.25"), Decimal("0.65")
-    assert abs(fee - value * rate / price) < Decimal("1e-18")
+    value, rate, contract_size, price = (
+        Decimal(2),
+        Decimal("1.25"),
+        Decimal(100000),
+        Decimal("0.65"),
+    )
+    assert abs(fee - value * rate / (contract_size * price)) < Decimal("1e-18")
 
 
 async def test_successive_loads_keep_every_instrument_and_the_last_loads_quoting_symbols(venue):
@@ -741,6 +754,120 @@ async def test_the_account_currency_is_the_accounts(venue):
 async def test_a_relayed_schedule_without_a_rule_is_a_zero_taker_fee(venue):
     instrument = await loaded(venue, symbol_info(name="DE40.a"))
     assert instrument.taker_fee == Decimal(0)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        CommissionMode.MONEY_SPECIFIED,
+        CommissionMode.MONEY_DEPOSIT,
+        CommissionMode.MONEY_SYMBOL_PROFIT,
+        CommissionMode.MONEY_SYMBOL_MARGIN,
+    ],
+)
+async def test_a_money_rule_per_lot_is_one_fraction_of_the_notional_for_maker_and_taker(
+    venue, mode
+):
+    """3.50 USD per lot on each fill of 100,000 EURUSD at a mid of 1.08500: 3.50 / 108,500 =
+    0.0000322581 of the notional."""
+    venue.add(
+        symbol_info(name="EURUSD", trade_contract_size=100000.0),
+        bid=1.08500,
+        ask=1.08500,
+        schedule=schedule(3.5, "USD", mode=mode, entry=CommissionEntryMode.INOUT),
+    )
+    provider = provider_for(venue, "EURUSD")
+    await provider.initialize()
+    instrument = provider.get_instrument("EURUSD")
+    places = Decimal("0.0000000001")
+    assert instrument.taker_fee.quantize(places) == Decimal("0.0000322581")
+    assert instrument.maker_fee.quantize(places) == Decimal("0.0000322581")
+
+
+@pytest.mark.parametrize("entry", [CommissionEntryMode.IN, CommissionEntryMode.OUT])
+async def test_a_money_rule_charged_on_one_leg_is_half_of_it_on_every_fill(venue, entry):
+    """6.00 USD per lot on one deal of 100-ounce XAUUSD at a mid of 2,650: 6.00 / 265,000 / 2 =
+    0.0000113208 of each fill's notional."""
+    venue.add(
+        symbol_info(
+            name="XAUUSD",
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_contract_size=100.0,
+            currency_base="XAU",
+            currency_profit="USD",
+            currency_margin="XAU",
+            trade_calc_mode=mirror.SYMBOL_CALC_MODE_CFD,
+        ),
+        bid=2650.0,
+        ask=2650.0,
+        schedule=schedule(6.0, "USD", mode=CommissionMode.MONEY_DEPOSIT, entry=entry),
+    )
+    provider = provider_for(venue, "XAUUSD")
+    await provider.initialize()
+    instrument = provider.get_instrument("XAUUSD")
+    places = Decimal("0.0000000001")
+    assert instrument.taker_fee.quantize(places) == Decimal("0.0000113208")
+    assert instrument.maker_fee.quantize(places) == Decimal("0.0000113208")
+
+
+async def test_a_base_currency_rule_per_lot_is_its_value_over_the_contract_size(venue):
+    """3.50 EUR per lot of 100,000 EURUSD is 3.50 / 100,000 = 0.000035 of the notional."""
+    venue.add(
+        symbol_info(name="EURUSD", trade_contract_size=100000.0),
+        bid=1.085,
+        ask=1.085,
+        schedule=schedule(3.5, "EUR", mode=CommissionMode.MONEY_SYMBOL_BASE),
+    )
+    provider = provider_for(venue, "EURUSD")
+    await provider.initialize()
+    instrument = provider.get_instrument("EURUSD")
+    assert instrument.taker_fee == Decimal("0.000035")
+    assert instrument.maker_fee == Decimal("0.000035")
+
+
+@pytest.mark.parametrize(
+    "relayed",
+    [schedule(3.5, "USD", mode=CommissionMode.DISABLED), None],
+    ids=["disabled", "no-rule"],
+)
+async def test_a_disabled_rule_or_none_is_a_zero_fee_for_maker_and_taker(venue, relayed):
+    venue.add(symbol_info(name="EURUSD"), bid=1.085, ask=1.085, schedule=relayed)
+    provider = provider_for(venue, "EURUSD")
+    await provider.initialize()
+    instrument = provider.get_instrument("EURUSD")
+    assert (instrument.maker_fee, instrument.taker_fee) == (Decimal(0), Decimal(0))
+
+
+async def test_the_info_states_the_rule_and_the_basis_the_fee_derives_from(venue):
+    venue.add(forex("EURUSD", "EUR", "USD"), bid=1.25, ask=1.25)
+    venue.add(
+        index_cfd("US500", "USD"),
+        bid=5000.0,
+        ask=5000.0,
+        schedule=schedule(
+            0.5, "EUR", mode=CommissionMode.MONEY_SPECIFIED, entry=CommissionEntryMode.INOUT
+        ),
+    )
+    provider = provider_for(venue, "US500")
+    await provider.initialize()
+    info = provider.get_instrument("US500").info
+    rule, basis = info["fee_rule"], info["fee_basis"]
+    assert all(isinstance(value, str) for value in [*rule.values(), *basis.values()])
+    assert {name: value for name, value in rule.items() if name != "value"} == {
+        "entry": "SYMBOL_COMMISSION_ENTRY_INOUT",
+        "mode": "SYMBOL_COMMISSION_MONEY_SPECIFIED",
+        "volume_type": "SYMBOL_COMMISSION_VOLUME_TYPE_VOLUME",
+        "currency": "EUR",
+    }
+    assert Decimal(rule["value"]) == Decimal("0.5")
+    assert {name: Decimal(value) for name, value in basis.items()} == {
+        "mid": Decimal(5000),
+        "rate": Decimal("1.25"),
+        "contract_size": Decimal(1),
+        "point": Decimal("0.01"),
+    }
 
 
 async def test_a_deposit_currency_rule_charged_on_both_legs_is_a_whole_fee_per_fill(venue):
@@ -955,18 +1082,25 @@ async def test_a_rule_in_a_currency_the_venue_cannot_convert_fails_the_load_nami
     assert "GBP" in str(refused.value)
 
 
-async def test_a_percent_rule_charged_on_both_legs_is_its_percentage_of_the_notional(venue):
+async def test_a_percent_of_turnover_rule_is_its_percentage_for_maker_and_taker(venue):
+    """0.08% of the turnover on each fill is 0.0008 of the notional."""
     venue.add(
         symbol_info(name="EURUSD.a"),
         bid=1.08490,
         ask=1.08510,
-        schedule=schedule(0.002, "", mode=CommissionMode.PERCENT, entry=CommissionEntryMode.INOUT),
+        schedule=schedule(
+            0.08,
+            "",
+            mode=CommissionMode.PERCENT,
+            entry=CommissionEntryMode.INOUT,
+            volume_type=CommissionVolumeType.TURNOVER,
+        ),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
-    fee = provider.get_instrument("EURUSD.a").taker_fee
-    pct = Decimal("0.002")
-    assert fee == pct / 100
+    instrument = provider.get_instrument("EURUSD.a")
+    assert instrument.taker_fee == Decimal("0.0008")
+    assert instrument.maker_fee == Decimal("0.0008")
 
 
 async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
@@ -974,7 +1108,13 @@ async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
         symbol_info(name="EURUSD.a"),
         bid=1.085,
         ask=1.085,
-        schedule=schedule(0.004, "", mode=CommissionMode.PERCENT, entry=CommissionEntryMode.IN),
+        schedule=schedule(
+            0.004,
+            "",
+            mode=CommissionMode.PERCENT,
+            entry=CommissionEntryMode.IN,
+            volume_type=CommissionVolumeType.TURNOVER,
+        ),
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
@@ -992,10 +1132,12 @@ async def test_a_points_rule_is_its_points_in_price_over_the_price(venue):
     )
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
-    fee = provider.get_instrument("EURUSD.a").taker_fee
+    instrument = provider.get_instrument("EURUSD.a")
+    fee = instrument.taker_fee
     pts, point, price = Decimal(30), Decimal("0.00001"), Decimal("1.08500")
     assert abs(fee - pts * point / price) < Decimal("1e-18")
     assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0002765")
+    assert instrument.maker_fee == fee
 
 
 async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
@@ -1011,27 +1153,68 @@ async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
     assert abs(fee - Decimal(30) * Decimal("0.00001") / Decimal("1.085") / 2) < Decimal("1e-18")
 
 
+def refused_by(field, value):
+    """A money rule of 3.50 USD per lot with its rule's or tier's `field` set to `value`."""
+    relayed = schedule(3.5, "USD")
+    rule = relayed["rules"][0]
+    if field in rule:
+        rule[field] = value
+    else:
+        rule["tiers"][0][field] = value
+    return relayed
+
+
+def held_twice(level):
+    """A money rule of 3.50 USD per lot, held twice as rules or as its rule's tiers."""
+    relayed = schedule(3.5, "USD")
+    if level == "rules":
+        relayed["rules"] = relayed["rules"] * 2
+    else:
+        relayed["rules"][0]["tiers"] = relayed["rules"][0]["tiers"] * 2
+    return relayed
+
+
 @pytest.mark.parametrize(
-    ("mode", "entry", "named"),
+    ("relayed", "field"),
     [
-        (CommissionMode.PERCENT_PROFIT, CommissionEntryMode.INOUT, CommissionMode.PERCENT_PROFIT),
-        (CommissionMode.MONEY_DEPOSIT, CommissionEntryMode.OUT, CommissionEntryMode.OUT),
+        (refused_by("volume_type", CommissionVolumeType.TRADE), "volume_type"),
+        (
+            schedule(
+                0.08, "", mode=CommissionMode.PERCENT, volume_type=CommissionVolumeType.VOLUME
+            ),
+            "volume_type",
+        ),
+        (schedule(10.0, "", mode=CommissionMode.PERCENT_PROFIT), "mode"),
+        (refused_by("mode_profit", CommissionProfitMode.PROFIT), "mode_profit"),
+        (refused_by("mode_direction", CommissionDirectionMode.BUY), "mode_direction"),
+        (refused_by("min_value", 8.0), "min_value"),
+        (refused_by("max_value", 50.0), "max_value"),
+        (held_twice("rules"), "rules"),
+        (held_twice("tiers"), "tiers"),
+        (refused_by("mode_charge", CommissionChargeMode.DAILY), "mode_charge"),
     ],
-    ids=["mode-without-derivation", "exit-only"],
+    ids=[
+        "per-deal",
+        "percent-of-volume",
+        "percent-of-profit",
+        "profit-only",
+        "one-direction",
+        "minimum",
+        "maximum",
+        "two-rules",
+        "two-tiers",
+        "daily",
+    ],
 )
-async def test_a_commission_rule_without_a_fee_derivation_fails_the_load_naming_it(
-    venue, mode, entry, named
+async def test_a_schedule_no_per_fill_fraction_expresses_fails_the_load_naming_its_field(
+    venue, relayed, field
 ):
-    venue.add(
-        symbol_info(name="EURUSD.a"),
-        bid=1.085,
-        ask=1.085,
-        schedule=schedule(0.001, "USD", mode=mode, entry=entry),
-    )
+    venue.add(symbol_info(name="EURUSD.a"), bid=1.085, ask=1.085, schedule=relayed)
     provider = provider_for(venue, "EURUSD.a")
     with pytest.raises(MT5InstrumentError, match="EURUSD.a") as refused:
         await provider.initialize()
-    assert named in str(refused.value)
+    assert field in str(refused.value)
+    assert provider.list_all() == []
 
 
 async def test_a_non_finite_commission_value_fails_the_load_naming_the_symbol(venue):

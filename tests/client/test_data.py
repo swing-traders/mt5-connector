@@ -771,7 +771,11 @@ def terminal():
     return symbols
 
 
-def served_client(symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
+def served_client(
+    symbols: SymbolVenue,
+    provider_config: InstrumentProviderConfig,
+    client_class=MT5DataClient,
+):
     """A data client over a real provider whose config is `provider_config`, its connection's hub
     session reads `symbols`, what it hands NT as data recorded."""
     conn = MagicMock(spec=MT5Connection)
@@ -780,7 +784,7 @@ def served_client(symbols: SymbolVenue, provider_config: InstrumentProviderConfi
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
     )
     with patch.object(data, "HubSession", SessionDouble):
-        client = MT5DataClient(
+        client = client_class(
             loop=asyncio.get_running_loop(),
             connection=conn,
             msgbus=TestComponentStubs.msgbus(),
@@ -903,6 +907,29 @@ class TestInstrumentsNtNames:
         assert terminal.asked_of("GBPUSD") == [calls.Call.SYMBOL_INFO]
         assert responses == []
         assert loaded_ids(provider) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_instrument_reload_is_an_error_and_the_previous_definitions_stand(
+        self, terminal
+    ):
+        client, provider = served_client(
+            terminal,
+            InstrumentProviderConfig(load_ids=frozenset({EURUSD})),
+            client_class=RecordedDataClient,
+        )
+        await client._connect()
+        loaded = provider.get_instrument("EURUSD")
+        client._handle_data.reset_mock()
+        terminal.refusals[(calls.Call.SYMBOL_INFO, "EURUSD")] = [
+            EaError("symbol_info: SymbolInfoString failed", 4756)
+        ]
+
+        await client._reload_instruments()
+
+        assert client.recorded_log.error.call_count == 1
+        assert provider.get_instrument("EURUSD") is loaded
+        client._handle_data.assert_not_called()
+        await client._disconnect()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

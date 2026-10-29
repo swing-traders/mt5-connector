@@ -34,7 +34,7 @@ def instrument(**fields):
     """The instrument the parser builds from a symbol definition under `fields`."""
     account = AccountSnapshot.from_mt5(account_info())
     sessions = parse_sessions(relayed_sessions())
-    return parse_symbol_info(symbol_info(**fields), MT5_VENUE, account, Decimal(0), sessions, 0)
+    return parse_symbol_info(symbol_info(**fields), MT5_VENUE, account, Decimal(0), {}, sessions, 0)
 
 
 TICKS = np.dtype(list(mirror.TICKS.dtype))
@@ -72,6 +72,7 @@ class TestParseSymbolInfo:
             Venue("MT5_ALPHA"),
             account,
             Decimal(0),
+            {},
             parse_sessions(relayed_sessions()),
             0,
         )

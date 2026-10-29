@@ -159,13 +159,13 @@ class MT5InstrumentProvider(InstrumentProvider):
         pairs: _Pairs,
         ts: int,
     ):
-        """Builds the instrument a symbol's definition describes, its taker fee from its commission
-        rule and its trading sessions as relayed."""
+        """Builds the instrument a symbol's definition describes, its fee from its commission rule
+        and its trading sessions as relayed."""
         sessions = parse_sessions(
             await _asked(session, calls.Call.TRADING_SESSIONS, symbol=info.name)
         )
-        fee = await _taker_fee(session, info, rule, pairs)
-        return parse_symbol_info(info, self._venue, account, fee, sessions, ts)
+        fee, fee_stamp = await _fee(session, info, rule, pairs)
+        return parse_symbol_info(info, self._venue, account, fee, fee_stamp, sessions, ts)
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
 
@@ -322,21 +322,42 @@ async def _select_quoting_symbol(
     return None
 
 
-async def _taker_fee(
+async def _fee(
     session: HubSession, info, rule: CommissionRule | None, pairs: _Pairs
-) -> Decimal:
-    """The symbol's taker fee under its commission rule, zero without one; the conversion into its
-    quote currency is the venue's own quote, never NT's."""
+) -> tuple[Decimal, dict]:
+    """The symbol's fee per fill under its commission rule, zero without one, and the info keys
+    stating what it derives from: `fee_rule`, the rule as relayed, and `fee_basis`, the mid, the
+    rate, the contract size and the point it was valued at, each as a string, both None without a
+    rule. The conversion into its quote currency is the venue's own quote, never NT's."""
     if rule is None:
-        return Decimal(0)
+        return Decimal(0), {"fee_rule": None, "fee_basis": None}
     else:
-        return await taker_fee(
-            rule,
-            price=await _mid(session, info.name),
-            contract_size=finite_decimal(info.trade_contract_size, "trade_contract_size"),
-            point=finite_decimal(info.point, "point"),
-            rate=lambda currency: _rate(session, currency, info.currency_profit, pairs),
-        )
+        mid = await _mid(session, info.name)
+        contract_size = finite_decimal(info.trade_contract_size, "trade_contract_size")
+        point = finite_decimal(info.point, "point")
+        # The quote units per unit of the rule's currency, kept as the fee was valued at them.
+        rates: dict[str, Decimal] = {}
+
+        async def rate(currency: str) -> Decimal:
+            rates[currency] = await _rate(session, currency, info.currency_profit, pairs)
+            return rates[currency]
+
+        fee = await taker_fee(rule, price=mid, contract_size=contract_size, point=point, rate=rate)
+        return fee, {
+            "fee_rule": {
+                "entry": rule.entry.value,
+                "mode": rule.mode.value,
+                "volume_type": rule.volume_type.value,
+                "value": str(rule.value),
+                "currency": rule.currency,
+            },
+            "fee_basis": {
+                "mid": str(mid),
+                "rate": str(rates.get(rule.currency, Decimal(1))),
+                "contract_size": str(contract_size),
+                "point": str(point),
+            },
+        }
 
 
 async def _rate(session: HubSession, source: str, target: str, pairs: _Pairs) -> Decimal:

@@ -141,21 +141,23 @@ def parse_symbol_info(
     info,
     venue: Venue,
     account: AccountSnapshot,
-    taker_fee: Decimal,
+    fee: Decimal,
+    fee_stamp: dict,
     sessions: TradingSessions,
     ts: int,
 ) -> InstrumentAny:
-    """The instrument an mt5.symbol_info() definition describes at `venue`: a FOREX calc mode is a
-    CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
+    """The instrument an mt5.symbol_info() definition describes at `venue`, `fee` its maker and
+    taker fee and `fee_stamp` the info keys stating what that fee derives from: a FOREX calc mode is
+    a CurrencyPair and a CFD calc mode a Cfd; any other mode raises MT5InstrumentError naming it.
     Margins stay NT's defaults: the venue states them as money per lot, which no ratio expresses
     without a price."""
     kind = calc_mode(info)
     if kind in FOREX_MODES:
-        return CurrencyPair(**_definition(info, kind, venue, account, taker_fee, sessions, ts))
+        return CurrencyPair(**_definition(info, kind, venue, account, fee, fee_stamp, sessions, ts))
     elif kind in CFD_MODES:
         return Cfd(
             asset_class=_asset_class(kind),
-            **_definition(info, kind, venue, account, taker_fee, sessions, ts),
+            **_definition(info, kind, venue, account, fee, fee_stamp, sessions, ts),
         )
     else:
         raise MT5InstrumentError(f"trade_calc_mode {kind} is not one this adapter trades")
@@ -166,7 +168,8 @@ def _definition(
     kind: CalcMode,
     venue: Venue,
     account: AccountSnapshot,
-    taker_fee: Decimal,
+    fee: Decimal,
+    fee_stamp: dict,
     sessions: TradingSessions,
     ts: int,
 ) -> dict:
@@ -185,8 +188,9 @@ def _definition(
         "multiplier": Quantity(info.trade_contract_size, _decimals(info.trade_contract_size)),
         "min_quantity": Quantity(info.volume_min, size_precision),
         "max_quantity": Quantity(info.volume_max, size_precision),
-        "maker_fee": Decimal(0),
-        "taker_fee": taker_fee,
+        # The venue charges by deal, never by liquidity side.
+        "maker_fee": fee,
+        "taker_fee": fee,
         "ts_event": ts,
         "ts_init": ts,
         "info": {
@@ -204,6 +208,7 @@ def _definition(
             "bar_volume": BarVolume.TICK_COUNT.value,
             "quote_sessions": sessions.quote,
             "trade_sessions": sessions.trade,
+            **fee_stamp,
         },
     }
 
