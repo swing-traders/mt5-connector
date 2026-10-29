@@ -218,7 +218,7 @@ Different brokers use different symbol names. Always use the **exact name shown 
 
 The instrument provider loads a symbol by this exact name — one a client's `instrument_provider` config names, or one requested later — and builds it from the venue's own definition, read over its connection's hub session; nothing is inferred from a symbol's name:
 
-- **Type** by its calc mode: a FOREX mode is a `CurrencyPair`, a CFD mode (CFD, CFD index, CFD leverage) a `Cfd`; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
+- **Type** by its calc mode: every symbol the adapter trades is a `Cfd`, its asset class the one its mode states — FX for a FOREX mode, INDEX for CFD index, ALTERNATIVE for CFD and CFD leverage; any other mode (futures, exchange stocks, bonds, …) is refused at load, naming the symbol.
 - **Grid and limits**: price precision is `digits`, the price increment `trade_tick_size`, the size increment and limits the volume step, minimum and maximum, and the multiplier the contract size.
 - **Currencies**:
   - The base is `currency_base` and the quote — the settlement currency — `currency_profit`.

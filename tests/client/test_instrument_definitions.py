@@ -11,9 +11,10 @@ import pytest
 from hub_double import eventually
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue as NtVenue
-from nautilus_trader.model.instruments import Cfd, CurrencyPair
+from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Price, Quantity
 from venue_doubles import (
     SymbolVenue,
@@ -54,8 +55,8 @@ Call = calls.Call
 NOW_NS = 1_760_000_000_000_000_000
 
 TRADED_MODES = {
-    mirror.SYMBOL_CALC_MODE_FOREX: CurrencyPair,
-    mirror.SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE: CurrencyPair,
+    mirror.SYMBOL_CALC_MODE_FOREX: Cfd,
+    mirror.SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE: Cfd,
     mirror.SYMBOL_CALC_MODE_CFD: Cfd,
     mirror.SYMBOL_CALC_MODE_CFDINDEX: Cfd,
     mirror.SYMBOL_CALC_MODE_CFDLEVERAGE: Cfd,
@@ -152,6 +153,42 @@ async def loaded(venue, info, **account):
 async def test_the_calc_mode_types_the_instrument(venue, calc_mode, kind):
     instrument = await loaded(venue, symbol_info(trade_calc_mode=calc_mode))
     assert type(instrument) is kind
+
+
+@pytest.mark.parametrize(
+    ("calc_mode", "asset_class"),
+    [
+        (mirror.SYMBOL_CALC_MODE_FOREX, AssetClass.FX),
+        (mirror.SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE, AssetClass.FX),
+        (mirror.SYMBOL_CALC_MODE_CFDINDEX, AssetClass.INDEX),
+        (mirror.SYMBOL_CALC_MODE_CFD, AssetClass.ALTERNATIVE),
+        (mirror.SYMBOL_CALC_MODE_CFDLEVERAGE, AssetClass.ALTERNATIVE),
+    ],
+)
+async def test_the_calc_mode_states_the_asset_class(venue, calc_mode, asset_class):
+    instrument = await loaded(venue, symbol_info(trade_calc_mode=calc_mode))
+    assert instrument.asset_class == asset_class
+
+
+async def test_a_forex_symbol_is_an_fx_cfd_carrying_its_currencies_and_contract_size(venue):
+    instrument = await loaded(
+        venue,
+        symbol_info(
+            name="EURJPY.a",
+            digits=3,
+            point=0.001,
+            trade_tick_size=0.001,
+            trade_contract_size=100000.0,
+            currency_base="EUR",
+            currency_profit="JPY",
+            trade_calc_mode=mirror.SYMBOL_CALC_MODE_FOREX,
+        ),
+    )
+    assert type(instrument) is Cfd
+    assert instrument.asset_class == AssetClass.FX
+    assert instrument.base_currency.code == "EUR"
+    assert instrument.quote_currency.code == "JPY"
+    assert instrument.multiplier == Quantity.from_str("100000")
 
 
 async def test_a_crypto_cfd_is_a_cfd(venue):
