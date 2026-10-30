@@ -24,11 +24,12 @@ from nautilus_trader.model.enums import (
     TimeInForce,
     TriggerType,
 )
-from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
+from nautilus_trader.model.identifiers import InstrumentId, PositionId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 from venue_doubles import trade_deal, trade_order, trade_position
 
 from mt5connector.client import errors, execution
+from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import mirror
 
 
@@ -340,6 +341,61 @@ async def test_open_only_order_reports_read_no_history(h):
     h.venue.history_orders_get.assert_not_called()
 
 
+async def test_bulk_order_reports_skip_unloaded_symbols(h):
+    h.venue.orders_get.return_value = (
+        ours_order(ticket=9102, symbol="GBPUSD"),
+        ours_order(ticket=9101),
+    )
+    reports = await order_reports(h, open_only=True)
+    assert [(report.instrument_id, report.venue_order_id) for report in reports] == [
+        (EURUSD, VenueOrderId("9101"))
+    ]
+
+
+async def test_bulk_exit_bracket_reports_skip_unloaded_symbols(h):
+    h.place(
+        h.factory.stop_market(
+            InstrumentId.from_str("GBPUSD.MT5"),
+            OrderSide.SELL,
+            Quantity.from_str("0.01"),
+            Price.from_str("1.25000"),
+            reduce_only=True,
+        ),
+        ticket="9002-SL-1",
+        position=9002,
+    )
+    loaded_stop = h.place(
+        h.stop_market(OrderSide.SELL, trigger="1.07000", reduce_only=True),
+        ticket="9001-SL-1",
+        position=9001,
+    )
+    h.venue.positions_get.return_value = (
+        ours_position(ticket=9002, identifier=9002, symbol="GBPUSD", sl=1.25),
+        ours_position(ticket=9001, identifier=9001, sl=1.07),
+    )
+
+    reports = await order_reports(h, open_only=True)
+
+    assert [
+        (
+            report.instrument_id,
+            report.client_order_id,
+            report.venue_order_id,
+            report.order_status,
+            report.trigger_price,
+        )
+        for report in reports
+    ] == [
+        (
+            EURUSD,
+            loaded_stop.client_order_id,
+            VenueOrderId("9001-SL-1"),
+            OrderStatus.ACCEPTED,
+            Price.from_str("1.07000"),
+        )
+    ]
+
+
 # ── Fills ────────────────────────────────────────────────────────────────────
 
 
@@ -405,6 +461,46 @@ async def test_fill_reports_pass_the_commands_window_and_filter_by_its_order(h):
     )
 
 
+async def test_bulk_fill_reports_skip_unloaded_symbols(h):
+    h.venue.history_deals_get.return_value = (
+        ours_deal(ticket=7002, order=9002, symbol="GBPUSD"),
+        ours_deal(ticket=7001, order=9001),
+    )
+    reports = await fill_reports(
+        h,
+        start=pd.Timestamp("2025-10-09T00:00:00Z"),
+        end=pd.Timestamp("2025-10-10T00:00:00Z"),
+    )
+    assert [(report.instrument_id, report.trade_id) for report in reports] == [
+        (EURUSD, TradeId("7001"))
+    ]
+
+
+async def test_fill_reports_ignore_empty_symbol_deposits_among_trades(h):
+    provider = MT5InstrumentProvider(h.conn, EURUSD.venue, h.client._clock)
+    provider.add(h.instruments["EURUSD"])
+    h.client._provider.get_instrument.side_effect = provider.get_instrument
+    h.venue.history_deals_get.return_value = (
+        ours_deal(ticket=7001, order=9001),
+        ours_deal(
+            ticket=7002,
+            order=0,
+            type=mirror.DEAL_TYPE_BALANCE,
+            symbol="",
+            volume=0.0,
+            profit=1000.0,
+        ),
+        ours_deal(ticket=7003, order=9003),
+    )
+
+    reports = await fill_reports(h)
+
+    assert [(report.instrument_id, report.trade_id) for report in reports] == [
+        (EURUSD, TradeId("7001")),
+        (EURUSD, TradeId("7003")),
+    ]
+
+
 # ── Positions ────────────────────────────────────────────────────────────────
 
 
@@ -461,3 +557,41 @@ async def test_each_position_of_this_magic_reports_under_its_identifier(h):
             1_760_000_004_000_000_000,
         ),
     ]
+
+
+async def test_bulk_position_reports_skip_unloaded_symbols(h):
+    h.venue.positions_get.return_value = (
+        ours_position(ticket=9002, identifier=9002, symbol="GBPUSD"),
+        ours_position(ticket=9001, identifier=9001),
+    )
+    reports = await position_reports(h)
+    assert [(report.instrument_id, report.venue_position_id) for report in reports] == [
+        (EURUSD, PositionId("9001"))
+    ]
+
+
+async def test_mass_status_skips_unloaded_symbols(h):
+    h.venue.orders_get.return_value = (
+        ours_order(ticket=9002, symbol="GBPUSD"),
+        ours_order(ticket=9001),
+    )
+    h.venue.history_deals_get.return_value = (
+        ours_deal(ticket=7002, order=9002, position_id=9002, symbol="GBPUSD"),
+        ours_deal(ticket=7001, order=9001, position_id=9001),
+    )
+    h.venue.positions_get.return_value = (
+        ours_position(ticket=9002, identifier=9002, symbol="GBPUSD"),
+        ours_position(ticket=9001, identifier=9001),
+    )
+    report = await h.client.generate_mass_status()
+    assert report is not None
+    assert list(report.order_reports) == [VenueOrderId("9001")]
+    assert [
+        (fill.instrument_id, fill.trade_id) for fill in report.fill_reports[VenueOrderId("9001")]
+    ] == [(EURUSD, TradeId("7001"))]
+    assert list(report.fill_reports) == [VenueOrderId("9001")]
+    assert [
+        (position.instrument_id, position.venue_position_id)
+        for position in report.position_reports[EURUSD]
+    ] == [(EURUSD, PositionId("9001"))]
+    assert list(report.position_reports) == [EURUSD]

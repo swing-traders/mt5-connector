@@ -1650,6 +1650,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         reports = []
         executed = {}
         for venue_order in venue_orders.values():
+            if self._provider.get_instrument(venue_order.symbol) is None:
+                self._log.debug(
+                    f"Skipping order status report for instrument not loaded: {venue_order.symbol}"
+                )
+                continue
             exit_order = self._bound_exit(venue_order.ticket)
             if exit_order is None:
                 reports.append(self._venue_order_report(venue_order))
@@ -1683,6 +1688,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 and _in_scope(deal.symbol, command.instrument_id)
                 and _of_order(deal, owner, command.venue_order_id)
             ):
+                if self._provider.get_instrument(deal.symbol) is None:
+                    self._log.debug(
+                        f"Skipping fill report for instrument not loaded: {deal.symbol}"
+                    )
+                    continue
                 reports.append(await self._fill_report(deal, owner))
         return reports
 
@@ -1695,6 +1705,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._conn.ensure_connected()
         reports = []
         for position in await self._venue_positions(command.instrument_id):
+            if self._provider.get_instrument(position.symbol) is None:
+                self._log.debug(
+                    f"Skipping position status report for instrument not loaded: {position.symbol}"
+                )
+                continue
             if position.magic == self._magic:
                 reports.append(self._position_report(position))
         return reports
@@ -1768,9 +1783,13 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 for position in await self._venue_positions(instrument_id)
             }
             for identifier, slot in sorted(brackets):
-                reports += await self._bracket_reports(
-                    identifier, slot, orders, positions.get(identifier)
-                )
+                position = positions.get(identifier)
+                if position is not None and self._provider.get_instrument(position.symbol) is None:
+                    self._log.debug(
+                        f"Skipping bracket report for instrument not loaded: {position.symbol}"
+                    )
+                    continue
+                reports += await self._bracket_reports(identifier, slot, orders, position)
         return reports
 
     async def _bracket_reports(
