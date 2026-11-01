@@ -1,7 +1,8 @@
 // The tick-generator acceptance's raw collector, a startup script: the venue's own ticks of every
 // kind and M1 bars of each window MQL5/Files/tickgen_raw.txt names, read with the terminal's native
-// calls alone, written under MQL5/Files/tickgen-raw/ with outcome.txt last. The file's first line
-// is the symbol, each further line a window's label, first and last broker second.
+// calls alone, written under MQL5/Files/tickgen-raw/ with outcome.txt last, which names M1's first
+// date as the terminal held it before any read. The file's first line is the symbol, each further
+// line a window's label, first and last broker second.
 
 #define PARAMETERS "tickgen_raw.txt"
 #define OUTPUT "tickgen-raw\\"
@@ -183,7 +184,15 @@ void OnStart()
         outcome = "failed: the terminal did not connect";
     if (outcome == "" && !SymbolSelect(symbol, true))
         outcome = StringFormat("failed: SymbolSelect '%s', error %d", symbol, GetLastError());
-    string summary = "";
+    long m1First = 0;
+    const ulong asked = GetTickCount64();
+    while (outcome == ""
+           && !(SeriesInfoInteger(symbol, PERIOD_M1, SERIES_FIRSTDATE, m1First) && m1First > 0)
+           && !IsStopped() && GetTickCount64() - asked < READ_BOUND_S * 1000)
+        Sleep(1000);
+    if (outcome == "" && m1First <= 0)
+        outcome = "failed: M1's first date is not known";
+    string summary = StringFormat("m1_first %I64d\n", m1First);
     for (int w = 0; w < ArraySize(labels) && outcome == ""; w++)
     {
         MqlTick ticks[];

@@ -71,6 +71,20 @@ def test_a_port_outside_the_port_range_is_refused_before_any_command(monkeypatch
     assert commands == []
 
 
+def test_shorten_cache_with_cleanup_is_refused_before_any_command(monkeypatch, commands):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_tickgen.py", "--name", "probe", "--shorten-cache", "--cleanup"],
+    )
+
+    with pytest.raises(SystemExit) as refused:
+        prepare_tickgen.main()
+
+    assert refused.value.code == 2
+    assert commands == []
+
+
 def test_an_output_directory_holding_an_earlier_capture_is_refused_before_any_command(
     monkeypatch, commands, tmp_path
 ):

@@ -1049,8 +1049,10 @@ public:
     int error;
     // The error the latest read left.
     int lastError;
+    // What a syncing answer names beyond the request, empty for all but a frame build's timeout.
+    string told;
 
-    HistoryRun() : state(RUN_GOING), why(""), error(0), lastError(0) {}
+    HistoryRun() : state(RUN_GOING), why(""), error(0), lastError(0), told("") {}
 
     bool Going() const { return state == RUN_GOING; }
 
@@ -1639,42 +1641,143 @@ void WatchStill(const HistoryRequest *r, int &still, int &idleReads, const long 
     }
 }
 
-// The frame's bar count once it is built, asked to build by one read before any history; 0, the run
-// going, for a frame a stalled store leaves unbuilt after its polls.
-int BuiltBars(const HistoryRequest *r, HistoryRun &run, const int timeframe, const int period,
-              const string name)
-{
-    int bars = Bars(r.symbol, (ENUM_TIMEFRAMES)timeframe);
-    if (bars == 0)
-    {
-        MqlRates rows[];
-        ResetLastError();
-        const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)timeframe,
-                                     (datetime)BEFORE_HISTORY_SECONDS,
-                                     (datetime)(BEFORE_HISTORY_SECONDS + period), rows);
-        const int error = GetLastError();
-        PrintFormat("ticks: %s %s: the build read answered %d rows, error %d", r.symbol, name,
-                    copied, error);
-        ReadHub();
-        const string late = StringFormat("%s %s: the frame is not built within %d s", r.symbol,
-                                         name, HUB_HISTORY_BUSY_S);
-        int polls = 0;
-        while (bars == 0 && !(g_storeStalled && polls >= STALLED_FRAME_POLLS)
-               && KeepWaiting(r, run, late))
-        {
-            Pause();
-            polls++;
-            bars = Bars(r.symbol, (ENUM_TIMEFRAMES)timeframe);
-        }
-    }
-    return bars;
-}
-
 bool FirstDate(const string symbol, const int timeframe, long &first)
 {
     ResetLastError();
     return SeriesInfoInteger(symbol, (ENUM_TIMEFRAMES)timeframe, SERIES_FIRSTDATE, first)
            && first > 0;
+}
+
+// How far the symbol's bar store reaches back; false for a not-yet answer or a zero.
+bool StoreFirst(const string symbol, long &storeFirst)
+{
+    ResetLastError();
+    return SeriesInfoInteger(symbol, PERIOD_M1, SERIES_TERMINAL_FIRSTDATE, storeFirst)
+           && storeFirst > 0;
+}
+
+// Whether the frame is built: capped, or holding the period of the store's first row. A frame's
+// cache can stop short of the store it was built from, and is then built again.
+bool FrameBuilt(const int bars, const long maxbars, const bool known, const long frameFirst,
+                const long storeFirst)
+{
+    return bars >= maxbars || (bars > 0 && known && frameFirst <= storeFirst);
+}
+
+// The blocking read of the frame's window before any history, which builds the frame from the
+// store; what it answers proves nothing, so it is logged and never judged.
+void BuildRead(const HistoryRequest *r, const int timeframe, const int period, const string name)
+{
+    MqlRates rows[];
+    ResetLastError();
+    const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)timeframe,
+                                 (datetime)BEFORE_HISTORY_SECONDS,
+                                 (datetime)(BEFORE_HISTORY_SECONDS + period), rows);
+    const int error = GetLastError();
+    PrintFormat("ticks: %s %s: the build read answered %d rows, error %d", r.symbol, name, copied,
+                error);
+    ReadHub();
+}
+
+// The bound's reason for a frame not yet built, naming its first date, the store's and the build
+// reads.
+string FrameLate(const HistoryRequest *r, const string name, const long frameFirst,
+                 const long storeFirst, const int reads)
+{
+    return StringFormat("%s %s: the frame is not built within %d s: the frame stops at broker "
+                        "%I64d, the store reaches broker %I64d, after %d build reads", r.symbol,
+                        name, HUB_HISTORY_BUSY_S, frameFirst, storeFirst, reads);
+}
+
+// Whether the request goes on while a frame is built; its bound passing here stops it with the
+// frame's facts, which its syncing answer names.
+bool KeepBuilding(const HistoryRequest *r, HistoryRun &run, const string name,
+                  const long frameFirst, const long storeFirst, const int reads)
+{
+    const bool was = run.Going();
+    const bool going = KeepWaiting(r, run, FrameLate(r, name, frameFirst, storeFirst, reads));
+    if (was && !going && run.error == ERR_HISTORY_TIMEOUT)
+        run.told = run.why;
+    return going;
+}
+
+// The frame's bar count once it is built, a frame short of the store built by a read before any
+// history and polled; its first date standing still 30 turns is read again, and three build reads
+// without a movement fail the run. Every build read and the return wait on the request's bound.
+// 0, the run going, for a frame a stalled store leaves unbuilt after its polls.
+int BuiltBars(const HistoryRequest *r, HistoryRun &run, const int timeframe, const int period,
+              const string name, const long maxbars)
+{
+    long storeFirst = 0;
+    const string unknown = StringFormat("%s: the history store's first date is not known within "
+                                        "%d s", r.symbol, HUB_HISTORY_BUSY_S);
+    while (!StoreFirst(r.symbol, storeFirst) && KeepWaiting(r, run, unknown))
+        Pause();
+    int bars = Bars(r.symbol, (ENUM_TIMEFRAMES)timeframe);
+    long frameFirst = 0;
+    bool known = FirstDate(r.symbol, timeframe, frameFirst);
+    int reads = 0;
+    if (run.Going() && !FrameBuilt(bars, maxbars, known, frameFirst, storeFirst)
+        && KeepBuilding(r, run, name, frameFirst, storeFirst, reads))
+    {
+        BuildRead(r, timeframe, period, name);
+        // The frame's first date as last read, consecutive turns it stood still since the last
+        // build read or movement, the build reads since the last movement, and all of them.
+        bool watching = known;
+        long watched = frameFirst;
+        int still = 0;
+        int idleReads = 1;
+        reads = 1;
+        int polls = 0;
+        bool built = false;
+        while (!built && !(bars == 0 && g_storeStalled && polls >= STALLED_FRAME_POLLS)
+               && KeepBuilding(r, run, name, frameFirst, storeFirst, reads))
+        {
+            Pause();
+            polls++;
+            bars = Bars(r.symbol, (ENUM_TIMEFRAMES)timeframe);
+            known = FirstDate(r.symbol, timeframe, frameFirst);
+            built = FrameBuilt(bars, maxbars, known, frameFirst, storeFirst);
+            // A pause can cross the bound, which answers syncing before any verdict or read.
+            if (!built && KeepBuilding(r, run, name, frameFirst, storeFirst, reads))
+            {
+                // A turn whose first date is not yet known counts nothing.
+                if (known && watching && frameFirst != watched)
+                {
+                    still = 0;
+                    idleReads = 0;
+                }
+                else if (known && watching)
+                {
+                    still++;
+                }
+                if (known)
+                {
+                    watching = true;
+                    watched = frameFirst;
+                }
+                if (still == STORE_STILL_TURNS && idleReads == STORE_DEEP_READS)
+                {
+                    run.Stop(RUN_FAILED, StringFormat("%s %s: the frame stops at broker %I64d, "
+                                                      "the store reaches broker %I64d, after %d "
+                                                      "build reads", r.symbol, name, frameFirst,
+                                                      storeFirst, reads),
+                             0);
+                }
+                else if (still == STORE_STILL_TURNS)
+                {
+                    BuildRead(r, timeframe, period, name);
+                    idleReads++;
+                    reads++;
+                    still = 0;
+                }
+            }
+        }
+    }
+    // A frame built while a wait crossed the bound answers syncing like one still short.
+    if (run.Going())
+        KeepBuilding(r, run, name, frameFirst, storeFirst, reads);
+    return bars;
 }
 
 // The open of the frame's first available row: once the frame holds more bars than the terminal's
@@ -1858,7 +1961,7 @@ void MeasureFrame(const HistoryRequest *r, HistoryRun &run, const int timeframe,
     long maxbars = 0;
     int bars = 0;
     if (ReadMaxbars(r, run, maxbars))
-        bars = BuiltBars(r, run, timeframe, period, name);
+        bars = BuiltBars(r, run, timeframe, period, name, maxbars);
     if (run.Going() && bars == 0)
     {
         if (KeepFloor(timeframe, (long)TimeTradeServer(), true, false))
@@ -2733,10 +2836,13 @@ void DropAllHistory()
         DropHistory(g_history[i]);
 }
 
-void AnswerSyncing(HistoryRequest *r, const string reason, const int error)
+void AnswerSyncing(HistoryRequest *r, const string reason, const string told, const int error)
 {
     PrintFormat("ticks: request %I64u, %s: syncing: %s", r.id, Described(r), reason);
-    SendError(r.id, HUB_ERROR_SYNCING, Described(r) + ": syncing", error);
+    if (told == "")
+        SendError(r.id, HUB_ERROR_SYNCING, Described(r) + ": syncing", error);
+    else
+        SendError(r.id, HUB_ERROR_SYNCING, Described(r) + ": syncing: " + told, error);
     DropHistory(r);
 }
 
@@ -2825,7 +2931,7 @@ void Evaluate(HistoryRequest *r)
     switch (run.state)
     {
     case RUN_UNPROVEN:
-        AnswerSyncing(r, run.why, run.error);
+        AnswerSyncing(r, run.why, run.told, run.error);
         break;
     case RUN_FAILED:
         PrintFormat("ticks: request %I64u, %s: %s", r.id, Described(r), run.why);

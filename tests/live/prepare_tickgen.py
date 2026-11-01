@@ -1,8 +1,10 @@
 """Prepares the tick-generator acceptance: two private copies of a seed container's synced history,
 the venue's raw ticks and M1 bars of a mixed window captured on one by a native collector, a hub
 from the candidate image on the other, healthy with its symbol's ranges settled, and the provenance
-of all of it. The seed container is only read. `--cleanup` removes the containers and the volumes
-this driver labels with its name."""
+of all of it. With `--shorten-cache` the collector reads the candidate's own copy, whose M1 frame
+cache it rewrites short, and the driver records that copy's M1 first date before the candidate
+starts; the shortened-cache test fails unless it is after 2023-01-14. The seed container is only
+read. `--cleanup` removes the containers and the volumes this driver labels with its name."""
 
 import argparse
 import asyncio
@@ -55,6 +57,7 @@ SOURCES = (
     "tests/live/tickgen_capture.py",
     "tests/live/prepare_tickgen.py",
     "tests/live/test_tickgen_history.py",
+    "tests/live/test_tickgen_shortened_cache.py",
 )
 
 
@@ -206,15 +209,37 @@ def clone_history(image: str, name: str, seed_volume: str, clone: str) -> str:
     return clone
 
 
+def m1_cache_bytes(image: str, clone: str) -> int:
+    """The size of the symbol's M1 frame cache in the clone."""
+    found = podman(
+        "run",
+        "--rm",
+        "--user",
+        "root",
+        "--entrypoint",
+        "sh",
+        "-v",
+        f"{clone}:/bases:ro",
+        image,
+        "-c",
+        f"stat -c %s /bases/*/history/{SYMBOL}/cache/M1.hc",
+    ).split()
+    if len(found) != 1:
+        raise Unprepared(f"{clone} holds {len(found)} {SYMBOL} M1 frame caches")
+    return int(found[0])
+
+
 def collect(
     image: str,
     name: str,
     env_file: Path,
     clone: str,
     windows: list[tuple[str, int, int]],
+    capture: str,
     output: Path,
 ) -> Path:
-    """The collector's capture of each broker window, read in its own terminal on the clone."""
+    """The collector's capture of each broker window, read in its own terminal on the clone, under
+    raw-`capture`."""
     container = f"{name}-raw"
     collector = output / "collector"
     parameters = collector / "tickgen_raw.txt"
@@ -258,14 +283,24 @@ def collect(
         outcome = podman("exec", container, "cat", outcome_path, check=False)
         if outcome == "":
             time.sleep(POLL_S)
-    target = output / f"raw-{windows[0][0]}"
+    target = output / f"raw-{capture}"
     podman("cp", f"{container}:{TERMINAL}/MQL5/Files/tickgen-raw", str(target))
     podman("stop", "--time", "190", container)
     podman("rm", container)
     if not outcome.startswith("done"):
         raise Unprepared(f"the collector {outcome.strip()}")
-    log(f"captured {', '.join(label for label, _, _ in windows)}")
+    log(f"captured {capture}: {', '.join(label for label, _, _ in windows)}")
     return target
+
+
+def outcome_m1_first(directory: Path, clock: BrokerClock) -> int:
+    """The first date of the symbol's M1 frame a collector capture's outcome names, in true UTC:
+    as its terminal held it before any read."""
+    lines = (directory / "outcome.txt").read_text().splitlines()
+    broker = [int(line.split()[1]) for line in lines if line.startswith("m1_first ")]
+    if len(broker) != 1:
+        raise Unprepared(f"the collector's outcome names {len(broker)} M1 first dates")
+    return clock.to_utc(broker[0])
 
 
 def utc_epoch(moment: datetime) -> int:
@@ -282,7 +317,7 @@ def mixed_fixture(image, name, env_file, clone, clock, output) -> dict:
     day; fails naming every inspected window without one."""
     inspected = []
     baseline = window(clock, "baseline", *BASELINE)
-    directory = collect(image, name, env_file, clone, [baseline], output)
+    directory = collect(image, name, env_file, clone, [baseline], baseline[0], output)
     capture = tickgen_capture.load(directory, "baseline")
     found = tickgen_capture.identify(capture, DIGITS)
     inspected.append({"window": baseline, **tickgen_capture.counts(capture)})
@@ -292,7 +327,7 @@ def mixed_fixture(image, name, env_file, clone, clock, output) -> dict:
         while len(batch) < FALLBACK_BATCH_DAYS and day <= FALLBACK_LAST_DAY:
             batch.append(window(clock, f"day-{day:%Y%m%d}", day, day + DAY))
             day += DAY
-        directory = collect(image, name, env_file, clone, batch, output)
+        directory = collect(image, name, env_file, clone, batch, batch[0][0], output)
         for label, lo, hi in batch:
             if found is None:
                 capture = tickgen_capture.load(directory, label)
@@ -418,15 +453,29 @@ def prepare(arguments: argparse.Namespace) -> None:
         descriptor = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as file:
             file.write("".join(f"{key}={value}\n" for key, value in settings.items()))
-        # The collector's terminal rewrites its volume's M1 frame cache short, so it reads its own
-        # copy of the history and the candidate another.
-        raw_clone = clone_history(
-            arguments.image, arguments.name, seed_volume, f"{arguments.name}-raw-bases"
-        )
         clone = clone_history(
             arguments.image, arguments.name, seed_volume, f"{arguments.name}-bases"
         )
+        if arguments.shorten_cache:
+            raw_clone = clone
+            cloned = m1_cache_bytes(arguments.image, clone)
+        else:
+            # The collector's terminal rewrites its volume's M1 frame cache short, so it reads its
+            # own copy of the history and the candidate another.
+            raw_clone = clone_history(
+                arguments.image, arguments.name, seed_volume, f"{arguments.name}-raw-bases"
+            )
         fixture = mixed_fixture(arguments.image, arguments.name, env_file, raw_clone, clock, output)
+        if arguments.shorten_cache:
+            collected = m1_cache_bytes(arguments.image, clone)
+            probe = collect(
+                arguments.image, arguments.name, env_file, clone, [], "m1-first", output
+            )
+            first = outcome_m1_first(probe, clock)
+            log(
+                f"{SYMBOL} M1 frame cache: {cloned} bytes cloned, {collected} collected, "
+                f"first date UTC {first}"
+            )
         start_candidate(arguments.image, arguments.name, env_file, clone, arguments.port)
     finally:
         for path in private.iterdir():
@@ -465,6 +514,9 @@ def prepare(arguments: argparse.Namespace) -> None:
         "fixture": fixture,
         "raw_sha256": {path.name: sha256(path) for path in sorted(raw.iterdir())},
     }
+    if arguments.shorten_cache:
+        provenance["m1_cache_bytes"] = {"cloned": cloned, "collected": collected}
+        provenance["m1_first_utc"] = first
     (output / "provenance.json").write_text(json.dumps(provenance, indent=1) + "\n")
     log(f"prepared: {output / 'provenance.json'}")
 
@@ -477,12 +529,19 @@ def main() -> int:
     parser.add_argument("--port", type=int, help="The loopback port the candidate's hub binds.")
     parser.add_argument("--output", help="The capture and provenance directory, under scripts/.")
     parser.add_argument(
+        "--shorten-cache",
+        action="store_true",
+        help="Collect on the candidate's own copy and record its M1 first date. Default: off.",
+    )
+    parser.add_argument(
         "--cleanup", action="store_true", help="Remove what a run for --name started."
     )
     arguments = parser.parse_args()
     output = CHECKOUT / (arguments.output or "")
     try:
-        if arguments.cleanup:
+        if arguments.cleanup and arguments.shorten_cache:
+            parser.error("--shorten-cache does not combine with --cleanup")
+        elif arguments.cleanup:
             cleanup(arguments.name)
         elif None in (arguments.image, arguments.seed_container, arguments.port, arguments.output):
             parser.error("--image, --seed-container, --port and --output are required")
