@@ -7,16 +7,19 @@ import asyncio
 import logging
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
+import tickgen_oracle as oracle
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import InvalidWindow, NoPublisher
 from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls, mirror
+from mt5connector.wire.broker_clock import BrokerClock
 from mt5connector.wire.history_wire import BAR_TIMEFRAME, Series
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
@@ -37,8 +40,8 @@ MAGIC = 7_114_001
 DAY_S = 86_400
 HOUR_S = 3_600
 MINUTE_S = 60
-# The offsets in a minute, in milliseconds, of the four ticks the kline-quote rule makes of its bar.
-KLINE_OFFSETS_MS = (0, 20_000, 40_000, 59_999)
+# The hub's default broker clock, on whose bar opens the generator stamps a minute's ticks.
+CLOCK = BrokerClock(ZoneInfo("America/New_York"), timedelta(hours=7))
 # How far before a read began a bar must have opened to be the same in every read of it.
 STABLE_S = 15 * MINUTE_S
 # The account history a deal read by its ticket is picked from.
@@ -174,21 +177,24 @@ async def ranges(session: HubSession) -> calls.Ranges:
     return (await synced(session, Call.RANGES, symbol=SYMBOL)).result
 
 
-def kline_quotes(bar, digits: int) -> list[tuple]:
-    """The four ticks the kline-quote rule makes of a bar, inside its minute: the bid its open, low,
-    high and close, or open, high, low and close for a bar closing below its open, the ask the bid
-    plus the bar's own spread in points, zero included, and no volume."""
-    if bar["close"] < bar["open"]:
-        bids = (bar["open"], bar["high"], bar["low"], bar["close"])
-    else:
-        bids = (bar["open"], bar["low"], bar["high"], bar["close"])
-    opened = int(bar["time"]) * 1000
+def generated_quotes(bar, direction: int, digits: int) -> list[tuple]:
+    """The ticks the every-tick generator makes of a bar in `direction`, inside its minute: the bid
+    path and stamps of the fitted rules, the ask the bid plus the bar's own spread in points, zero
+    included, and no volume."""
+    o, h, low, c = (
+        round(float(bar[field]) * 10**digits) for field in ("open", "high", "low", "close")
+    )
+    volume = int(bar["tick_volume"])
+    bids = oracle.bids(o, h, low, c, volume, direction)
+    opened = int(bar["time"])
+    offsets = oracle.offsets_ms(CLOCK.to_broker(opened), volume, len(bids))
     flags = mirror.TICK_FLAG_BID | mirror.TICK_FLAG_ASK
     quotes = []
-    for offset, bid in zip(KLINE_OFFSETS_MS, bids, strict=True):
-        ask = round(float(bid) + int(bar["spread"]) * 10.0**-digits, digits)
-        stamp = opened + offset
-        quotes.append((stamp // 1000, float(bid), ask, 0.0, 0, stamp, flags, 0.0))
+    for offset, points in zip(offsets, bids, strict=True):
+        bid = round(points * 10.0**-digits, digits)
+        ask = round(bid + int(bar["spread"]) * 10.0**-digits, digits)
+        stamp = opened * 1000 + offset
+        quotes.append((stamp // 1000, bid, ask, 0.0, 0, stamp, flags, 0.0))
     return quotes
 
 
@@ -245,11 +251,16 @@ def minute_times(ticks: np.ndarray, bar) -> list[int]:
     return [int(stamp) for stamp in ticks["time_msc"] if opened <= stamp < opened + 60_000]
 
 
-def at_the_rules_offsets(ticks: np.ndarray, bar) -> bool:
-    """Whether the bar's minute holds exactly four ticks at the kline-quote rule's offsets, whatever
-    their prices: the synthesis's signature, which no venue tick history carries."""
-    opened = int(bar["time"]) * 1000
-    return [stamp - opened for stamp in minute_times(ticks, bar)] == list(KLINE_OFFSETS_MS)
+def at_the_generators_offsets(stamps: list[int], opened: int, volumes: tuple[int, ...]) -> bool:
+    """Whether the stamps of the minute opened at `opened`, true-UTC seconds, are the generator's
+    schedule for one of `volumes` and their count: the synthesis's signature, which no venue tick
+    history carries."""
+    offsets = [stamp - opened * 1000 for stamp in stamps]
+    return len(offsets) > 0 and any(
+        offsets == oracle.offsets_ms(CLOCK.to_broker(opened), volume, len(offsets))
+        for volume in volumes
+        if volume >= 1
+    )
 
 
 def _iso(epoch: int) -> str:
@@ -594,11 +605,15 @@ async def test_a_day_of_ticks_between_the_capped_terminals_floors_holds_no_synth
         await hub_session.disconnect()
 
     minutes = ticks["time_msc"] // 60_000
-    opened, counts = np.unique(minutes, return_counts=True)
+    # No M1 bar lies there, so a minute's volume is taken as either count the generator emits.
     synthesised = [
-        minute
-        for minute in opened[counts == len(KLINE_OFFSETS_MS)]
-        if list(ticks["time_msc"][minutes == minute] - minute * 60_000) == list(KLINE_OFFSETS_MS)
+        int(minute)
+        for minute in np.unique(minutes)
+        if at_the_generators_offsets(
+            [int(stamp) for stamp in ticks["time_msc"][minutes == minute]],
+            int(minute) * MINUTE_S,
+            (int(np.sum(minutes == minute)), int(np.sum(minutes == minute)) + 1),
+        )
     ]
 
     logger.info(
@@ -666,7 +681,7 @@ async def test_a_week_of_ticks_answers_within_five_minutes_while_the_publishers_
     assert max(durations) <= TICK_READ_S
 
 
-async def test_a_tickless_minute_from_the_spread_floor_on_holds_its_bars_kline_quotes(session):
+async def test_a_tickless_minute_from_the_spread_floor_on_holds_its_bars_generated_ticks(session):
     hub_session, _ = session
     m1 = (await ranges(hub_session)).series[Series.M1].floor
     digits = await symbol_digits(hub_session)
@@ -676,12 +691,28 @@ async def test_a_tickless_minute_from_the_spread_floor_on_holds_its_bars_kline_q
 
     ticks = await info_ticks(hub_session, day, day + DAY_S - 1)
     bars = await m1_bars(hub_session, day, day + DAY_S - 1)
-    synthesised = next((bar for bar in bars if at_the_rules_offsets(ticks, bar)), None)
+    # The direction of a doji is resolved from the day's bars alone, so one before the day's first
+    # non-doji is passed over.
+    synthesised = None
+    last = None
+    for bar in bars:
+        moved = int(np.sign(float(bar["close"]) - float(bar["open"])))
+        if moved != 0:
+            last = moved
+        direction = moved or (-last if last is not None else 0)
+        volume = int(bar["tick_volume"])
+        if (
+            synthesised is None
+            and direction != 0
+            and at_the_generators_offsets(minute_times(ticks, bar), int(bar["time"]), (volume,))
+        ):
+            synthesised = (bar, direction)
     if synthesised is None:
-        pytest.skip(f"{SYMBOL}: no minute of {_iso(day)} holds four quotes at the rule's offsets")
+        pytest.skip(f"{SYMBOL}: no minute of {_iso(day)} holds the generator's stamps")
+    bar, direction = synthesised
 
-    assert minute_quotes(ticks, int(synthesised["time"]), digits) == kline_quotes(
-        synthesised, digits
+    assert minute_quotes(ticks, int(bar["time"]), digits) == generated_quotes(
+        bar, direction, digits
     )
 
 

@@ -2060,39 +2060,424 @@ bool ReadM1(const HistoryRequest *r, HistoryRun &run, const long lo, const long 
     return read;
 }
 
-// Appends the bar's four ticks, each ask `spread` above its bid at the symbol's digits.
-void AppendBarTicks(const MqlRates &bar, const double spread, const int digits, MqlTick &rows[])
+// ── The every-tick generator ─────────────────────────────────────────────────────────────────────
+
+// The bid path and stamps MT5's "Every tick" mode generates from an M1 bar, by rules fitted to its
+// tester's output. Prices are integer points; `d` is +1 for a rising bar, -1 for a falling one.
+
+// The documented split of the nominal reference count beyond Open, 3 to 11, into the opening
+// shadow's, the range's and the closing shadow's points.
+const int SPLIT_OPENING[12] = {0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3};
+const int SPLIT_RANGE[12] = {0, 0, 0, 1, 2, 3, 4, 3, 4, 5, 6, 5};
+const int SPLIT_CLOSING[12] = {0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3};
+// The step back a direction lookback reads at a time, within the span cap.
+#define LOOKBACK_SECONDS (7 * DAY_SECONDS)
+
+long PointsOf(const double price, const double point)
 {
-    double bids[4];
-    bids[0] = bar.open;
-    if (bar.close < bar.open)
+    return (long)MathRound(price / point);
+}
+
+// The floor of a / b for b > 0, which MQL5's integer division truncates toward zero.
+long FloorDiv(const long a, const long b)
+{
+    long q = a / b;
+    if (a % b != 0 && a < 0)
+        q--;
+    return q;
+}
+
+long SignOf(const long value)
+{
+    if (value > 0)
+        return 1;
+    else if (value < 0)
+        return -1;
+    else
+        return 0;
+}
+
+void Push(long &values[], const long value)
+{
+    const int n = ArraySize(values);
+    ArrayResize(values, n + 1, 64);
+    values[n] = value;
+}
+
+// The opening-side extreme `e` and the terminal extreme `t`.
+void Extremes(const long h, const long l, const long d, long &e, long &t)
+{
+    if (d > 0)
     {
-        bids[1] = bar.high;
-        bids[2] = bar.low;
+        e = l;
+        t = h;
     }
     else
     {
-        bids[1] = bar.low;
-        bids[2] = bar.high;
+        e = h;
+        t = l;
     }
-    bids[3] = bar.close;
-    const long open = (long)bar.time * 1000;
-    long stamps[4];
-    stamps[0] = open;
-    stamps[1] = open + MINUTE_MS / 3;
-    stamps[2] = open + 2 * MINUTE_MS / 3;
-    stamps[3] = open + MINUTE_MS - 1;
-    const int n = ArraySize(rows);
-    ArrayResize(rows, n + 4, 4096);
-    for (int k = 0; k < 4; k++)
+}
+
+// Each price from `from` on that would leave [l, h] emitted as its step from the price before it
+// taken the other way.
+void ReverseOutside(long &prices[], const int from, long anchor, const long h, const long l)
+{
+    for (int i = from; i < ArraySize(prices); i++)
     {
+        const long step = prices[i] - anchor;
+        if (prices[i] < l || prices[i] > h)
+            prices[i] = anchor - step;
+        anchor = prices[i];
+    }
+}
+
+// Open followed by the opening shadow's, the range's and the closing shadow's reference points.
+void Scaffold(const long o, const long h, const long l, const long c, const long v, const long d,
+              long &points[])
+{
+    long e = 0;
+    long t = 0;
+    Extremes(h, l, d, e, t);
+    const int nominal = (int)Earliest(11, v - 1);
+    int a = SPLIT_OPENING[nominal];
+    int r = SPLIT_RANGE[nominal];
+    int z = SPLIT_CLOSING[nominal];
+    if (o == e)
+    {
+        r += a;
+        a = 0;
+    }
+    if (c == t)
+    {
+        r += z;
+        z = 0;
+    }
+    if (r % 2 == 0)
+    {
+        r--;
+        if (a == 2)
+            a = 3;
+        else if (z == 2)
+            z = 3;
+    }
+    ArrayResize(points, 0);
+    Push(points, o);
+    if (a == 3 && FloorDiv(o + 3 * e, 4) == FloorDiv(o + e, 2))
+    {
+        Push(points, o - d);
+        Push(points, o);
+    }
+    else if (a == 3)
+    {
+        Push(points, FloorDiv(o + 3 * e, 4));
+        Push(points, FloorDiv(o + e, 2));
+    }
+    else if (a == 2)
+    {
+        Push(points, o + d);
+    }
+    if (a > 0)
+        Push(points, e);
+    const long waves = (r + 1) / 2;
+    const long step = FloorDiv(h - l - 1, waves) + 1;
+    long previous = e;
+    for (int pair = 0; pair < (r - 1) / 2; pair++)
+    {
+        Push(points, previous + d * step);
+        previous = previous + d * step - d;
+        Push(points, previous);
+    }
+    Push(points, t);
+    if (z == 3 && FloorDiv(t + 3 * c, 4) == FloorDiv(t + c, 2))
+    {
+        Push(points, t - d);
+        Push(points, t);
+    }
+    else if (z == 3)
+    {
+        Push(points, FloorDiv(t + 3 * c, 4));
+        Push(points, FloorDiv(t + c, 2));
+    }
+    else if (z == 2 && c - d >= l && c - d <= h)
+    {
+        Push(points, c - d);
+    }
+    else if (z == 2)
+    {
+        Push(points, t - d);
+    }
+    if (z > 0)
+        Push(points, c);
+    ReverseOutside(points, 1, o, h, l);
+}
+
+// Appends a segment's prices given `n` ticks, `a` excluded and `b` included: a linear run when it
+// spans at least `n` points, else a one-point saw drifting toward `b`, a price equal to the one
+// before it dropped. Answers how many it appended.
+int AppendSegment(const long a, const long b, const long n, const long h, const long l,
+                  long &prices[])
+{
+    const int start = ArraySize(prices);
+    const long s = SignOf(b - a);
+    if (n <= s * (b - a))
+    {
+        for (long k = 1; k < n; k++)
+            Push(prices, a + k * (b - a) / n);
+        Push(prices, b);
+    }
+    else
+    {
+        const double u = (double)(b - a) / (double)n;
+        const bool bounded = n % 2 == 0 && (a - s < l || a - s > h);
+        const bool toward = n % 2 == 1 || bounded;
+        long m = n;
+        if (bounded)
+            m = n - 1;
+        // One running sum of `u` per segment: the fitted drift is repeated binary64 addition.
+        double x = (double)a;
+        long added = 0;
+        long previous = a;
+        for (long k = 1; k < m; k++)
+        {
+            long j = k / 2;
+            if (toward)
+                j = (k + 1) / 2;
+            while (added < j)
+            {
+                x += u;
+                added++;
+            }
+            const long base = a + (long)(x - (double)a);
+            long candidate = base;
+            if (k % 2 == 1 && toward)
+                candidate = base + s;
+            else if (k % 2 == 1)
+                candidate = base - s;
+            if (candidate != previous)
+            {
+                Push(prices, candidate);
+                previous = candidate;
+            }
+        }
+        if (b != previous)
+            Push(prices, b);
+    }
+    ReverseOutside(prices, start, a, h, l);
+    return ArraySize(prices) - start;
+}
+
+// The scaffold of a bar of volume 4 or 5, a midpoint added where it is one short.
+void LowVolumeBids(const long o, const long h, const long l, const long c, const long v,
+                   const long d, long &bids[])
+{
+    long points[];
+    Scaffold(o, h, l, c, v, d, points);
+    long e = 0;
+    long t = 0;
+    Extremes(h, l, d, e, t);
+    ArrayResize(bids, 0);
+    int j = -1;
+    if (ArraySize(points) < v && v == 4 && o == e && c != t)
+    {
+        j = 0;
+    }
+    else if (ArraySize(points) < v)
+    {
+        long longest = -1;
+        for (int k = 0; k + 1 < ArraySize(points); k++)
+        {
+            const long span = SignOf(points[k + 1] - points[k]) * (points[k + 1] - points[k]);
+            if (span >= longest)
+            {
+                longest = span;
+                j = k;
+            }
+        }
+    }
+    for (int k = 0; k < ArraySize(points); k++)
+    {
+        Push(bids, points[k]);
+        if (k == j && o == e && c == t)
+            Push(bids, points[k] + (points[k + 1] - points[k]) / 2);
+        else if (k == j)
+            Push(bids, FloorDiv(points[k] + points[k + 1], 2));
+    }
+}
+
+// The minute's bids in integer points.
+void BarBids(const long o, const long h, const long l, const long c, const long v, const long d,
+             long &bids[])
+{
+    ArrayResize(bids, 0);
+    if (v >= 2 && o == h && o == l && o == c)
+    {
+        for (long k = 0; k < v; k++)
+            Push(bids, o);
+    }
+    else if (v == 1)
+    {
+        Push(bids, c);
+    }
+    else if (v == 2)
+    {
+        Push(bids, o);
+        Push(bids, c);
+    }
+    else if (v == 3)
+    {
+        Push(bids, o);
+        if ((o == l && c == h) || (o == h && c == l))
+            Push(bids, FloorDiv(o + c, 2));
+        else if (o == l || c == l)
+            Push(bids, h);
+        else
+            Push(bids, l);
+        Push(bids, c);
+    }
+    else if (v <= 5)
+    {
+        LowVolumeBids(o, h, l, c, v, d, bids);
+    }
+    else
+    {
+        long points[];
+        Scaffold(o, h, l, c, v, d, points);
+        const long segments = ArraySize(points) - 1;
+        const long quota = Latest(1, (v - 2) / segments);
+        long emitted = 0;
+        Push(bids, o);
+        for (long i = 0; i < segments; i++)
+        {
+            const long left = segments - i;
+            const long budget = v - 1 - emitted;
+            long n = quota;
+            if (left == 1)
+                n = budget;
+            else if (quota == 1 && budget > left + 1)
+                n = 2;
+            else if (quota == 1)
+                n = 1;
+            else if (quota == 2)
+                n = Latest(1, Earliest(Latest(2, (budget - 1) / left), budget - left));
+            emitted += AppendSegment(points[(int)i], points[(int)i + 1], n, h, l, bids);
+        }
+    }
+}
+
+// Each of `n` ticks' offset from the open, in milliseconds, of a bar of volume `v` opened at broker
+// second `t`: a step of 60/(v+1) s added to the open in binary64, the last tick apart.
+void TickOffsets(const long t, const long v, const long n, long &offsets[])
+{
+    ArrayResize(offsets, 0);
+    if (v == 1)
+    {
+        Push(offsets, 30000);
+    }
+    else if (v == 2)
+    {
+        Push(offsets, 0);
+        Push(offsets, 30000);
+    }
+    else if (v == 3)
+    {
+        Push(offsets, 0);
+        Push(offsets, 30000);
+        Push(offsets, 59000);
+    }
+    else
+    {
+        double clock = (double)t;
+        const double delta = 60.0 / (double)(v + 1);
+        for (long k = 0; k + 1 < n; k++)
+        {
+            if (delta >= 1.0)
+                Push(offsets, (long)clock * 1000 - t * 1000);
+            else
+                Push(offsets, (long)(clock * 1000.0) - t * 1000);
+            clock += delta;
+        }
+        if (v <= 59)
+            Push(offsets, 59000);
+        else
+            Push(offsets, 59000 + ((n - 1) * 60000 % ((v + 1) * 1000) + v) / (v + 1));
+    }
+}
+
+// Appends the ticks the generator makes of the bar in direction `d`, each ask the bar's spread above
+// its bid at the symbol's digits.
+void AppendBarTicks(const MqlRates &bar, const long d, const double point, const int digits,
+                    MqlTick &rows[])
+{
+    long bids[];
+    BarBids(PointsOf(bar.open, point), PointsOf(bar.high, point), PointsOf(bar.low, point),
+            PointsOf(bar.close, point), bar.tick_volume, d, bids);
+    long offsets[];
+    const int count = ArraySize(bids);
+    TickOffsets((long)bar.time, bar.tick_volume, count, offsets);
+    const double spread = bar.spread * point;
+    const int n = ArraySize(rows);
+    ArrayResize(rows, n + count, 4096);
+    for (int k = 0; k < count; k++)
+    {
+        const long stamp = (long)bar.time * 1000 + offsets[k];
+        const double bid = NormalizeDouble(bids[k] * point, digits);
         ZeroMemory(rows[n + k]);
-        rows[n + k].time = (datetime)(stamps[k] / 1000);
-        rows[n + k].time_msc = stamps[k];
-        rows[n + k].bid = bids[k];
-        rows[n + k].ask = NormalizeDouble(bids[k] + spread, digits);
+        rows[n + k].time = (datetime)(stamp / 1000);
+        rows[n + k].time_msc = stamp;
+        rows[n + k].bid = bid;
+        rows[n + k].ask = NormalizeDouble(bid + spread, digits);
         rows[n + k].flags = (uint)(TICK_FLAG_BID | TICK_FLAG_ASK);
     }
+}
+
+// The direction of the last M1 bar opened before `before` whose close differs from its open, read
+// back to the M1 floor; 0 when none does. False, the run stopped, for a read that fails or a row
+// off the grid.
+bool LastDirection(const HistoryRequest *r, HistoryRun &run, const long before, const double point,
+                   long &direction)
+{
+    const long floor = g_floors[FloorIndex((int)PERIOD_M1)].value;
+    long span = 0;
+    bool read = SpanSeconds(r, run, MINUTE_SECONDS, span);
+    const long step = Earliest(LOOKBACK_SECONDS, span);
+    bool found = false;
+    long hi = before - 1;
+    direction = 0;
+    while (read && !found && hi >= floor)
+    {
+        const long lo = Latest(floor, hi - step + 1);
+        MqlRates part[];
+        read = SettleBars(r, run, READ_BARS_RANGE, (int)PERIOD_M1, lo, hi, part);
+        int offGrid = -1;
+        if (read)
+        {
+            KeepRatesWithin(part, lo, hi);
+            offGrid = FirstOffGrid(part, MINUTE_SECONDS);
+        }
+        if (offGrid >= 0)
+        {
+            run.Stop(RUN_FAILED, StringFormat("%s %s: row broker %I64d is off the grid", r.symbol,
+                                              EnumToString(PERIOD_M1), (long)part[offGrid].time),
+                     0);
+            read = false;
+        }
+        else if (read)
+        {
+            for (int i = ArraySize(part) - 1; i >= 0 && !found; i--)
+            {
+                const long moved = SignOf(PointsOf(part[i].close, point)
+                                          - PointsOf(part[i].open, point));
+                if (moved != 0)
+                {
+                    direction = moved;
+                    found = true;
+                }
+            }
+        }
+        hi = lo - 1;
+    }
+    return read;
 }
 
 // Clears the mark of each bar whose minute holds one of the ticks, which lie in time order.
@@ -2143,9 +2528,9 @@ void MarkTickless(const HistoryRequest *r, HistoryRun &run, const MqlRates &bars
     }
 }
 
-// Four ticks synthesised by the kline-quote rule from each M1 bar opened in [from, hi] whose minute
-// holds no real tick, in time order, each with its bar's own spread. A bar opened after the time no
-// bar opens after may be forming, its ticks unread, and yields none.
+// The generator's ticks of each M1 bar opened in [from, hi] whose minute holds no real tick, in time
+// order, each with its bar's own spread. A bar opened after the time no bar opens after may be
+// forming, its ticks unread, and yields none.
 void SynthesiseBars(const HistoryRequest *r, HistoryRun &run, const long from, const long hi,
                     const MqlTick &real[], MqlTick &rows[])
 {
@@ -2170,11 +2555,45 @@ void SynthesiseBars(const HistoryRequest *r, HistoryRun &run, const long from, c
             run.Stop(RUN_FAILED, StringFormat("SYMBOL_DIGITS of '%s' could not be read", r.symbol),
                      GetLastError());
     }
+    if (run.Going() && ArraySize(bars) > 0)
+        AppendTickless(r, run, bars, tickless, (int)digits, rows);
+}
+
+// Appends the generator's ticks of each marked bar, in order: a doji goes opposite the last bar at
+// or before it whose close differs from its open, read back past the first bar where none of the
+// bars before it does, and rises when none lies above the M1 floor. A bar recording no tick volume
+// yields no tick.
+void AppendTickless(const HistoryRequest *r, HistoryRun &run, const MqlRates &bars[],
+                    const bool &tickless[], const int digits, MqlTick &rows[])
+{
     // One point is 10^-digits, the unit MqlRates.spread counts in.
     const double point = MathPow(10.0, -(double)digits);
+    int firstMoving = 0;
+    while (firstMoving < ArraySize(bars)
+           && PointsOf(bars[firstMoving].close, point) == PointsOf(bars[firstMoving].open, point))
+        firstMoving++;
+    bool lookback = false;
+    for (int i = 0; i < firstMoving; i++)
+        lookback = lookback || tickless[i];
+    long direction = 0;
+    if (lookback)
+        LastDirection(r, run, (long)bars[0].time, point, direction);
     for (int i = 0; i < ArraySize(bars) && run.Going(); i++)
-        if (tickless[i])
-            AppendBarTicks(bars[i], bars[i].spread * point, (int)digits, rows);
+    {
+        const long moved = SignOf(PointsOf(bars[i].close, point) - PointsOf(bars[i].open, point));
+        long d = 1;
+        if (moved != 0)
+        {
+            direction = moved;
+            d = moved;
+        }
+        else if (direction != 0)
+        {
+            d = -direction;
+        }
+        if (tickless[i] && bars[i].tick_volume > 0)
+            AppendBarTicks(bars[i], d, point, digits, rows);
+    }
 }
 
 // The ticks synthesised for the window's tickless minutes from the spread floor on, and from the M1

@@ -140,7 +140,7 @@ The terminal answers a history request with whatever it has synced, substitutes 
 - **One measurement per series.** A bar series' floor is the first of its first two rows one period apart, whatever rows lie before them; a daily or weekly series' floor is its first row. A series holding no such pair is empty history: answered with no rows, without a read, and in no `ranges`. A floor stands for the history EA's life, but a capped series' — one holding more bars than the terminal's `MaxBars`, whose oldest bars the terminal trims as new ones form — is measured at every request, and may answer from one period after its floor when a minute turns between the two.
 - **A stalled store**, one whose first date stands still across three deep reads short of the server's first date, is measured from where it stopped; the history chart's next life measures it again.
 - **The quote floor**, the tick series' floor `ranges` reports, is the earlier of the first real tick and the spread floor: the first M1 bar from the M1 floor on that records a spread.
-- **The era spread rule.** Each minute of a tick read from the spread floor on that holds no real tick of any kind, and whose M1 bar the terminal holds, is answered with four ticks synthesised from that bar by the kline-quote rule ([The EA](#the-ea)), with the bar's own spread, zero included; a minute before the spread floor holds no synthesised tick. Real ticks are answered as the venue has them.
+- **The era spread rule.** Each minute of a tick read from the spread floor on that holds no real tick of any kind, and whose M1 bar the terminal holds, is answered with the ticks MT5's "Every tick" mode generates from that bar, by the fitted rules ([The EA](#the-ea)), with the bar's own spread, zero included; a minute before the spread floor holds no synthesised tick. A minute holding any real tick is answered with the venue's ticks, unchanged.
 - **Every history read is served on the history chart** by blocking reads, one request at a time, busy to the hub between calls under one bound. A bar read settles when two identical calls agree, a tick read when a call answers without a loading error; a read not settled within the bound answers `syncing` and is asked again.
 - A bar read names its timeframe from `M1` to `W1`: a month has no fixed period, so `MN1` is refused.
 - A window that starts after it ends, or after the terminal's time — the spawner's latest server-time sample, advanced by its age — is answered `invalid_window` by the hub, judged in true UTC before the window is widened to its broker bounds.
@@ -189,11 +189,13 @@ What it does inside the terminal:
   - A read is one call to the terminal, made again at most once a second while it answers loading — −1 with no error, or error 4401 or 4403; 0 rows with no error is a settled empty window, a hole. A tick call can wait 45 s. A bar read's answer stands once the identical call, made at once, answers the same rows; an answer with another error is `ea_error` for bars and `syncing` for ticks. After every call the EA reads the hub, so its pings are answered and new requests are queued; the EA is single-threaded, so while a call waits nothing else of it runs. A read stops on the chart closing, the program stopping or the hub connection lost.
   - **The measurement.** One blocking read of 1970-01-02 on the broker's clock, never judged, starts the bar store's backfill, and the EA waits a second at a time until `SERIES_TERMINAL_FIRSTDATE` reaches `SERIES_SERVER_FIRSTDATE`; a first date standing still 30 turns is read deep again, and three deep reads without a movement settle the store where it stopped. Each bar series is then built — a frame not yet built is asked by a read before any history and polled — and walked forward from its first available row, a day of bars by position per read, each read anchored by time with `iBarShift`, to its first two rows one period apart. A capped series' first available row is the bar at position `maxbars − 1`. Then one `CopyTicks` of one tick from the first millisecond syncs the whole tick history and answers the first tick, and the same walk over M1 from its floor finds the first bar recording a spread, the forming bar untested.
   - `copy_rates_range` and `copy_ticks_range` follow the rules of [History](#history) over the broker bounds the hub sends: a window that starts after it ends, or after `TimeTradeServer()`, is `invalid_window`; a window wholly before its series' floor, or of an empty series, is answered with no rows without a read; any other is read from the floor on, a bar window in spans within the cap.
-  - A tick window's whole minutes are read first. Each minute from the spread floor on that holds no real tick of any kind — judged by a read of every kind where the request selects fewer — and whose M1 bar the terminal holds is answered from that bar, read with `CopyRates` in spans within the cap, as four ticks merged in time order with the real ones — the kline-quote rule:
-    - stamped at the bar's open, a third of the minute in, two thirds in and at the minute's last millisecond;
-    - the bid the bar's open, low, high and close, or open, high, low and close for a bar closing below its open;
+  - A tick window's whole minutes are read first. Each minute from the spread floor on that holds no real tick of any kind — judged by a read of every kind where the request selects fewer — and whose M1 bar the terminal holds is answered from that bar, read with `CopyRates` in spans within the cap, as the ticks MT5's "Every tick" mode generates from it, merged in time order with the real ones. The generator follows rules fitted to the strategy tester's output, a pure function of the bar, so the same bar always yields the same ticks:
+    - its inputs are the bar's open, high, low and close in points, its tick volume `V`, its spread, and its direction: rising for a close above the open, falling below it, and a doji the opposite of the last bar at or before it whose close differs from its open — read back from the window's start, a week of M1 bars at a time, where the window holds none, and rising when none lies at or above the M1 floor;
+    - the bid path visits the low first on a rising bar and the high first on a falling one: Open, a reference scaffold of opening shadow, range waves and closing shadow, and between its points linear runs or one-point saws, a step that would leave the bar taken the other way; it holds `V` ticks, the open included, or `V − 1` where the fitted saw yields one fewer, and a flat bar holds `V` ticks at its one price;
+    - each tick is stamped from the bar's open: a volume-1 bar's tick at 30 s, a volume-2 bar's at 0 and 30 s, a volume-3 bar's at 0, 30 and 59 s, and from volume 4 on every tick but the last on a step of `60/(V+1)` seconds added to the open in binary64, the last at 59 s or just after it;
     - the ask the bid plus the bar's own `spread` in points, a point 10^-`SYMBOL_DIGITS`, zero included;
-    - `flags` bid and ask, and no volume.
+    - `flags` bid and ask, and no volume;
+    - a bar recording no tick volume yields no tick.
   - A bar opened after the symbol's last quote as the window's reads begin may be forming, its ticks not yet read, and yields no tick; a read of trade ticks alone, `COPY_TICKS_TRADE`, is answered no synthesised tick.
   - `ranges` answers the terminal's `maxbars` and every floor the EA holds of a series with rows.
   - The rows go out in parts, more than one part's worth a part per timer pass.
@@ -636,3 +638,29 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
    ```
 
 `docker` takes the same commands.
+
+### The tick generator's historical lane
+
+`tests/live/test_tickgen_history.py` measures the generator of a candidate image against two weeks the strategy tester exported in its "Every tick" mode, and against the venue's own ticks of a window mixing real-tick minutes with a later tickless one. It runs on its own, never with the order-placement cases of the live tier, and reads only: it places no order and runs no tester. Its expectations come from `tests/live/tickgen_oracle.py`, the fitted rules written from their formulas alone, whose worked examples `tests/live/test_tickgen_oracle.py` pins in every test run.
+
+1. Build the candidate image as [Building](#building) states, tagged `localhost/mt5-tickgen-candidate`.
+2. Prepare it from a running container of the image family whose volume has synced the exported symbol, logged into a read-only login. The driver copies that container's history into two volumes of its own, captures the venue's ticks and M1 bars of the mixed window on one with a test-only collector script that calls `CopyTicksRange` and `CopyRates` alone — its terminal rewrites that volume's M1 frame short — starts the candidate's hub on the other and waits until it is healthy with the symbol's ranges settled, then writes `provenance.json` beside the capture. It reads the login from the seed container, which it never changes, and writes no credential:
+
+   ```bash
+   python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \
+     --seed-container <container> --name mt5-tickgen-acceptance --port 21588 \
+     --output scripts/tickgen-acceptance
+   ```
+
+3. Run the lane against it:
+
+   ```bash
+   MT5_LIVE_HUB_SYMBOL=AUDCAD+ MT5_LIVE_HUB_URL=ws://127.0.0.1:21588 \
+   MT5_TICK_EXPORT_DIR=<tester jobs directory> \
+   MT5_TICK_RAW_DIR="$PWD/scripts/tickgen-acceptance" MT5_TICK_ACCEPTANCE_REQUIRED=1 \
+   python -B -m pytest tests/live/test_tickgen_history.py -q -rA
+   ```
+
+   `MT5_TICK_EXPORT_DIR` names the tester's `jobs/` directory holding `ticks-202301/out/` and `ticks-202310/out/`, each with its `bars.csv`, `ticks.csv` and `metadata.csv`, which the lane checks against their recorded hashes. Without `MT5_TICK_ACCEPTANCE_REQUIRED=1` a case whose inputs or hub are missing is skipped; with it, it fails.
+
+4. Remove the driver's containers and volumes: `python tests/live/prepare_tickgen.py --cleanup --name mt5-tickgen-acceptance`.
