@@ -47,7 +47,7 @@ Inside a payload a `str` is a u16 byte count, then that many bytes of UTF-8; a S
 
 - each member in the package's field order, as the MQL5 function that reads it returns it: an `*InfoInteger`/`*GetInteger` property — a `bool` as 0 or 1, an enum, a `datetime` in epoch seconds, a `long` `*_msc` in epoch milliseconds, a `ulong` ticket — as an int64, a `*InfoDouble` as a float64, a `*InfoString` as a `str`; `MqlTradeRequest`, `MqlTradeResult` and `MqlTradeTransaction` members travel by the same rule;
 - `mirror.py` declares each member's MQL5 type beside it, from the MQL5 reference page its struct names;
-- a `SymbolInfo` record travels its `name` first, as a `str` key ahead of its 95 typed members;
+- a `SymbolInfo` record travels its `name` first, as a `str` key ahead of its 102 typed members;
 - a `SymbolListing` record, `symbols_get`'s, travels a symbol's `name` key and its definition members alone, in `SymbolInfo`'s order: the members `mirror.py` marks `selected` — the symbol's market state, which the terminal refuses for a symbol outside Market Watch — are left out;
 - `TerminalInfo` travels without `tradeapi_disabled`, which no MQL5 property backs, and without `community_balance`, which the terminal refuses without an MQL5 community login; an `order_send` result travels as `MqlTradeResult` alone, without the request the package appends to it.
 

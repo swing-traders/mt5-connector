@@ -51,15 +51,15 @@ TABLE = {
         "volumelow_real option_strike point trade_tick_value trade_tick_value_profit "
         "trade_tick_value_loss trade_tick_size trade_contract_size trade_accrued_interest "
         "trade_face_value trade_liquidity_rate volume_min volume_max volume_step volume_limit "
-        "swap_long swap_short margin_initial margin_maintenance session_volume session_turnover "
-        "session_interest session_buy_orders_volume session_sell_orders_volume session_open "
-        "session_close session_aw session_price_settlement session_price_limit_min "
+        "swap_long swap_short swap_sunday swap_monday swap_tuesday swap_wednesday swap_thursday "
+        "swap_friday swap_saturday margin_initial margin_maintenance session_volume "
+        "session_turnover session_interest session_buy_orders_volume session_sell_orders_volume "
+        "session_open session_close session_aw session_price_settlement session_price_limit_min "
         "session_price_limit_max margin_hedged price_change price_volatility price_theoretical "
         "price_greeks_delta price_greeks_theta price_greeks_gamma price_greeks_vega "
         "price_greeks_rho price_greeks_omega price_sensitivity basis category currency_base "
         "currency_profit currency_margin bank description exchange formula isin page path ".split(),
-        "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDSSS"
-        "SSSSSSSSS",
+        "I" * 31 + "D" * 59 + "S" * 12,
         ["custom", "margin_hedged_use_leg", "select", "spread_float", "visible"],
     ),
     "TradePosition": (
@@ -239,7 +239,8 @@ LISTING_FIELDS = (
     "order_gtc_mode option_mode option_right option_strike point trade_tick_value "
     "trade_tick_value_profit trade_tick_value_loss trade_tick_size trade_contract_size "
     "trade_accrued_interest trade_face_value trade_liquidity_rate volume_min volume_max "
-    "volume_step volume_limit swap_long swap_short margin_initial margin_maintenance "
+    "volume_step volume_limit swap_long swap_short swap_sunday swap_monday swap_tuesday "
+    "swap_wednesday swap_thursday swap_friday swap_saturday margin_initial margin_maintenance "
     "margin_hedged basis category currency_base currency_profit currency_margin description "
     "exchange formula isin name page path".split()
 )
