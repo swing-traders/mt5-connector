@@ -7,7 +7,7 @@ import calendar
 import time
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, MarkPriceUpdate, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
@@ -72,6 +72,41 @@ class BarVolume(StrEnum):
     """What a bar's volume counts."""
 
     TICK_COUNT = "tick_count"
+
+
+class CarryKind(StrEnum):
+    SWAP = "SWAP"
+
+
+class CarryBasis(StrEnum):
+    DISABLED = "DISABLED"
+    POINTS = "POINTS"
+    BASE_CURRENCY = "BASE_CURRENCY"
+    MARGIN_CURRENCY = "MARGIN_CURRENCY"
+    DEPOSIT_CURRENCY = "DEPOSIT_CURRENCY"
+    INTEREST_CURRENT = "INTEREST_CURRENT"
+    INTEREST_OPEN = "INTEREST_OPEN"
+    REOPEN_CURRENT = "REOPEN_CURRENT"
+    REOPEN_BID = "REOPEN_BID"
+    PROFIT_CURRENCY = "PROFIT_CURRENCY"
+
+
+class CarrySettlement(StrEnum):
+    AT_CLOSE = "AT_CLOSE"
+
+
+_SWAP_BASES = {
+    mirror.SYMBOL_SWAP_MODE_DISABLED: CarryBasis.DISABLED,
+    mirror.SYMBOL_SWAP_MODE_POINTS: CarryBasis.POINTS,
+    mirror.SYMBOL_SWAP_MODE_CURRENCY_SYMBOL: CarryBasis.BASE_CURRENCY,
+    mirror.SYMBOL_SWAP_MODE_CURRENCY_MARGIN: CarryBasis.MARGIN_CURRENCY,
+    mirror.SYMBOL_SWAP_MODE_CURRENCY_DEPOSIT: CarryBasis.DEPOSIT_CURRENCY,
+    mirror.SYMBOL_SWAP_MODE_INTEREST_CURRENT: CarryBasis.INTEREST_CURRENT,
+    mirror.SYMBOL_SWAP_MODE_INTEREST_OPEN: CarryBasis.INTEREST_OPEN,
+    mirror.SYMBOL_SWAP_MODE_REOPEN_CURRENT: CarryBasis.REOPEN_CURRENT,
+    mirror.SYMBOL_SWAP_MODE_REOPEN_BID: CarryBasis.REOPEN_BID,
+    mirror.SYMBOL_SWAP_MODE_CURRENCY_PROFIT: CarryBasis.PROFIT_CURRENCY,
+}
 
 
 _CALC_MODES = {
@@ -182,6 +217,26 @@ def _definition(
     if info.trade_tick_size <= 0:
         raise MT5InstrumentError(f"trade_tick_size {info.trade_tick_size} is not positive")
     size_precision = _decimals(info.volume_step)
+    basis = _member(info.swap_mode, _SWAP_BASES, "swap_mode")
+    match basis:
+        case CarryBasis.BASE_CURRENCY:
+            currency = info.currency_base
+        case CarryBasis.MARGIN_CURRENCY:
+            currency = info.currency_margin
+        case CarryBasis.DEPOSIT_CURRENCY:
+            currency = account.currency
+        case (
+            CarryBasis.DISABLED
+            | CarryBasis.POINTS
+            | CarryBasis.INTEREST_CURRENT
+            | CarryBasis.INTEREST_OPEN
+            | CarryBasis.REOPEN_CURRENT
+            | CarryBasis.REOPEN_BID
+            | CarryBasis.PROFIT_CURRENCY
+        ):
+            currency = info.currency_profit
+        case unreachable:
+            assert_never(unreachable)
     return {
         "instrument_id": InstrumentId(Symbol(info.name), venue),
         "raw_symbol": Symbol(info.name),
@@ -214,6 +269,37 @@ def _definition(
             "bar_volume": BarVolume.TICK_COUNT.value,
             "quote_sessions": sessions.quote,
             "trade_sessions": sessions.trade,
+            "point": format(finite_decimal(info.point, "point").normalize(), "f"),
+            "carry": [
+                {
+                    "kind": CarryKind.SWAP.value,
+                    "basis": basis.value,
+                    "rates": {
+                        "long": format(
+                            finite_decimal(info.swap_long, "swap_long").normalize(), "f"
+                        ),
+                        "short": format(
+                            finite_decimal(info.swap_short, "swap_short").normalize(), "f"
+                        ),
+                    },
+                    "currency": currency,
+                    "schedule": {
+                        "tz": _BAR_TZ,
+                        "times": [_BAR_DAY_OPEN],
+                        "weekday_ratios": {
+                            day.name: format(
+                                finite_decimal(
+                                    getattr(info, f"swap_{day.name.lower()}"),
+                                    f"swap_{day.name.lower()}",
+                                ).normalize(),
+                                "f",
+                            )
+                            for day in calendar.Day
+                        },
+                    },
+                    "settlement": CarrySettlement.AT_CLOSE.value,
+                }
+            ],
             **fee_stamp,
         },
     }

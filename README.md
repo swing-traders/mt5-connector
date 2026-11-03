@@ -245,10 +245,22 @@ The instrument provider loads a symbol by this exact name — one a client's `in
 - **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, where the bar day and the bar week open (`bar_tz`, `bar_day_open`, `bar_week_open`), `bar_volume` (`tick_count`), and the symbol's sessions:
   - `quote_sessions` — the broker's quote sessions, as `SymbolInfoSessionQuote` states them: seven days, Sunday first, each a list of `[from, to]` in seconds from the broker day's 00:00, unconverted;
   - `trade_sessions` — the broker's trade sessions, as `SymbolInfoSessionTrade` states them, in the same shape.
-  - `fee_rule` — the commission rule the fees derive from, as relayed: `entry`, `mode`, `volume_type`, `value` and `currency`, each a string; `null` where the symbol has no rule;
-  - `fee_basis` — what the fees were valued at: `mid`, `rate` (quote units per unit of the rule's currency, `"1"` where the mode converts none), `contract_size` and `point`, each a string; `null` where the symbol has no rule.
 
   Loading waits for the symbol's EA to relay its sessions as it waits for its commission schedule, and a refused relay, or an answer out of that shape, fails the load naming the symbol.
+
+  Price unit and carry:
+
+  - `point` — `SYMBOL_POINT` as a Decimal string, distinct from the tick size held in `price_increment`;
+  - `carry` — one generic financing rule, with `kind` `SWAP`, `settlement` `AT_CLOSE`, and:
+    - `basis` from the symbol's swap mode: `DISABLED`, `POINTS`, `BASE_CURRENCY`, `MARGIN_CURRENCY`, `DEPOSIT_CURRENCY`, `PROFIT_CURRENCY`, `INTEREST_CURRENT`, `INTEREST_OPEN`, `REOPEN_CURRENT` or `REOPEN_BID`; an unknown mode fails the load;
+    - `rates.long` and `rates.short` as Decimal strings, positive for credits;
+    - `currency` from the base, margin or ingest account currency for those currency bases, and the profit currency for every other basis, including `DISABLED`;
+    - `schedule.tz` equal to `bar_tz`, `schedule.times` containing `bar_day_open`, and `schedule.weekday_ratios` with the seven `MONDAY` through `SUNDAY` keys, each the corresponding `SYMBOL_SWAP_<DAY>` as a Decimal string.
+
+  Commission metadata:
+
+  - `fee_rule` — the commission rule the fees derive from, as relayed: `entry`, `mode`, `volume_type`, `value` and `currency`, each a string; `null` where the symbol has no rule;
+  - `fee_basis` — what the fees were valued at: `mid`, `rate` (quote units per unit of the rule's currency, `"1"` where the mode converts none), `contract_size` and `point`, each a string; `null` where the symbol has no rule.
 
 The provider also answers what a consumer discovers its settlement currencies by:
 

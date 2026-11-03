@@ -370,7 +370,7 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 - **The venue is the judge of what exists.** `symbol_info` says what a symbol is; no in-repo list of symbols, suffixes or currencies decides a request. Suffixed pairs (`EURUSD.a`) can be the tradeable universe while the base names are close-only.
 - **`currency_profit` alone names settlement.** `currency_base` is meaningless for a CFD (a `DE40` listed with base USD settles EUR) and `currency_margin` is not always the base. Account currencies can be non-ISO (`UST`).
 - **An unselected or closed symbol quotes zeros**: `symbol_info_tick` returns an all-zero struct with `time=0`; a real tick has `time != 0`.
-- **`symbol_info` carries 96 fields and no commission**; deals carry `commission` and `fee`. A commission schedule exists only in MQL5 (`SymbolInfoCommissions`), one rule with one tier per symbol, charged on both legs by one broker and on entry alone by another.
+- **`symbol_info` carries 103 fields and no commission**; deals carry `commission` and `fee`. A commission schedule exists only in MQL5 (`SymbolInfoCommissions`), one rule with one tier per symbol, charged on both legs by one broker and on entry alone by another.
 - **A week's bar opens broker Sunday 00:00 on every symbol**, though FX and metals have no weekend bars; a symbol that trades weekends has Saturday and Sunday D1 bars. H2 and coarser bars open on broker-midnight multiples.
 
 ### Orders, positions and the transaction stream

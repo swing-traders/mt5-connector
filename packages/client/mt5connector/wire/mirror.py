@@ -535,6 +535,13 @@ STRUCTS: dict[StructName, Struct] = {
                 Member("volume_limit", MqlType.DOUBLE, "SYMBOL_VOLUME_LIMIT"),
                 Member("swap_long", MqlType.DOUBLE, "SYMBOL_SWAP_LONG"),
                 Member("swap_short", MqlType.DOUBLE, "SYMBOL_SWAP_SHORT"),
+                Member("swap_sunday", MqlType.DOUBLE, "SYMBOL_SWAP_SUNDAY"),
+                Member("swap_monday", MqlType.DOUBLE, "SYMBOL_SWAP_MONDAY"),
+                Member("swap_tuesday", MqlType.DOUBLE, "SYMBOL_SWAP_TUESDAY"),
+                Member("swap_wednesday", MqlType.DOUBLE, "SYMBOL_SWAP_WEDNESDAY"),
+                Member("swap_thursday", MqlType.DOUBLE, "SYMBOL_SWAP_THURSDAY"),
+                Member("swap_friday", MqlType.DOUBLE, "SYMBOL_SWAP_FRIDAY"),
+                Member("swap_saturday", MqlType.DOUBLE, "SYMBOL_SWAP_SATURDAY"),
                 Member("margin_initial", MqlType.DOUBLE, "SYMBOL_MARGIN_INITIAL"),
                 Member("margin_maintenance", MqlType.DOUBLE, "SYMBOL_MARGIN_MAINTENANCE"),
                 Member("session_volume", MqlType.DOUBLE, "SYMBOL_SESSION_VOLUME", selected=True),
@@ -862,6 +869,7 @@ SYMBOL_SWAP_MODE_INTEREST_CURRENT = 5
 SYMBOL_SWAP_MODE_INTEREST_OPEN = 6
 SYMBOL_SWAP_MODE_REOPEN_CURRENT = 7
 SYMBOL_SWAP_MODE_REOPEN_BID = 8
+SYMBOL_SWAP_MODE_CURRENCY_PROFIT = 9
 
 # ENUM_DAY_OF_WEEK
 DAY_OF_WEEK_SUNDAY = 0

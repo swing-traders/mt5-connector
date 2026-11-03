@@ -318,6 +318,29 @@ async def test_the_info_carries_the_venue_facts_and_bar_calendar(venue):
         "bar_volume": "tick_count",
         "quote_sessions": relayed_sessions()["quote"],
         "trade_sessions": relayed_sessions()["trade"],
+        "point": "0.00001",
+        "carry": [
+            {
+                "kind": "SWAP",
+                "basis": "DISABLED",
+                "rates": {"long": "0", "short": "0"},
+                "currency": "USD",
+                "schedule": {
+                    "tz": "America/New_York",
+                    "times": ["17:00"],
+                    "weekday_ratios": {
+                        "MONDAY": "0",
+                        "TUESDAY": "0",
+                        "WEDNESDAY": "0",
+                        "THURSDAY": "0",
+                        "FRIDAY": "0",
+                        "SATURDAY": "0",
+                        "SUNDAY": "0",
+                    },
+                },
+                "settlement": "AT_CLOSE",
+            }
+        ],
         "fee_rule": None,
         "fee_basis": None,
     }
