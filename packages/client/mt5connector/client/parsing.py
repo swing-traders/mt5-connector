@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import calendar
 import time
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
@@ -18,6 +18,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from mt5connector.client.currencies import base_currency, venue_currency
 from mt5connector.client.errors import MT5InstrumentError
 from mt5connector.wire import mirror
+from mt5connector.wire.calls import SymbolMarginRate
 from mt5connector.wire.history_wire import BAR_CLOSE, Series, bar_series
 
 if TYPE_CHECKING:
@@ -93,6 +94,38 @@ class CarryBasis(StrEnum):
 
 class CarrySettlement(StrEnum):
     AT_CLOSE = "AT_CLOSE"
+
+
+class MarginBasis(StrEnum):
+    FIXED_AMOUNT = "FIXED_AMOUNT"
+    CONTRACT = "CONTRACT"
+    CONTRACT_VALUE = "CONTRACT_VALUE"
+    CONTRACT_VALUE_TICK = "CONTRACT_VALUE_TICK"
+
+
+class ValuedAt(StrEnum):
+    OPEN_PRICE = "OPEN_PRICE"
+
+
+class Hedging(StrEnum):
+    SUM_SIDES_COVERED_AT_HEDGED_AMOUNT = "SUM_SIDES_COVERED_AT_HEDGED_AMOUNT"
+    LARGER_SIDE = "LARGER_SIDE"
+
+
+class UntriggeredReserve(StrEnum):
+    NONE = "NONE"
+
+
+class TriggerCheck(StrEnum):
+    FREE_MARGIN = "FREE_MARGIN"
+
+
+class FeeTerms(StrEnum):
+    NONE = "NONE"
+
+
+class LiquidationRule(StrEnum):
+    STOP_OUT_LEVEL = "STOP_OUT_LEVEL"
 
 
 _SWAP_BASES = {
@@ -188,17 +221,14 @@ def parse_symbol_info(
     fee_stamp: dict,
     sessions: TradingSessions,
     ts: int,
+    margin_rates: SymbolMarginRate,
 ) -> InstrumentAny:
-    """The instrument an mt5.symbol_info() definition describes at `venue`, `fee` its maker and
-    taker fee and `fee_stamp` the info keys stating what that fee derives from: a FOREX or CFD calc
-    mode is a Cfd of the asset class its mode states, so NT never applies its spot-currency rule to
-    a margined position; any other mode raises MT5InstrumentError naming it. Margins stay NT's
-    defaults: the venue states them as money per lot, which no ratio expresses without a price."""
+    """Build a Cfd from the terminal's definition, account, margin rates and relayed sessions."""
     kind = calc_mode(info)
     if kind in _ASSET_CLASSES:
         return Cfd(
             asset_class=_ASSET_CLASSES[kind],
-            **_definition(info, kind, venue, account, fee, fee_stamp, sessions, ts),
+            **_definition(info, kind, venue, account, fee, fee_stamp, sessions, ts, margin_rates),
         )
     else:
         raise MT5InstrumentError(f"trade_calc_mode {kind} is not one this adapter trades")
@@ -213,6 +243,7 @@ def _definition(
     fee_stamp: dict,
     sessions: TradingSessions,
     ts: int,
+    margin_rates: SymbolMarginRate,
 ) -> dict:
     if info.trade_tick_size <= 0:
         raise MT5InstrumentError(f"trade_tick_size {info.trade_tick_size} is not positive")
@@ -270,6 +301,16 @@ def _definition(
             "quote_sessions": sessions.quote,
             "trade_sessions": sessions.trade,
             "point": format(finite_decimal(info.point, "point").normalize(), "f"),
+            "margin": _margin(info, kind, account, margin_rates),
+            "account": {
+                "leverage": format(account.leverage.normalize(), "f"),
+                "margin_mode": account.margin_mode.value,
+                "stop_out_mode": account.stop_out_mode.value,
+                "margin_call_level": format(account.margin_call_level.normalize(), "f"),
+                "stop_out_level": format(account.stop_out_level.normalize(), "f"),
+                "currency": account.currency,
+            },
+            "liquidation": {"rule": LiquidationRule.STOP_OUT_LEVEL.value},
             "carry": [
                 {
                     "kind": CarryKind.SWAP.value,
@@ -303,6 +344,73 @@ def _definition(
             **fee_stamp,
         },
     }
+
+
+def _margin(info, kind: CalcMode, account: AccountSnapshot, margin_rates: SymbolMarginRate) -> dict:
+    initial = finite_decimal(info.margin_initial, "margin_initial")
+    match kind:
+        case CalcMode.FOREX | CalcMode.FOREX_NO_LEVERAGE:
+            basis = MarginBasis.CONTRACT
+        case CalcMode.CFD | CalcMode.CFDLEVERAGE:
+            basis = MarginBasis.CONTRACT_VALUE
+        case CalcMode.CFDINDEX:
+            basis = MarginBasis.CONTRACT_VALUE_TICK
+    if initial > 0:
+        basis = MarginBasis.FIXED_AMOUNT
+    rates = {}
+    for order_kind in mirror.MarginOrderKind:
+        rates[order_kind.value] = {
+            rate: format(
+                finite_decimal(
+                    getattr(margin_rates, f"{order_kind.value.lower()}_{rate}"),
+                    f"margin rates {order_kind.value}.{rate}",
+                ).normalize(),
+                "f",
+            )
+            for rate in ("initial", "maintenance")
+        }
+        if order_kind not in (mirror.MarginOrderKind.BUY, mirror.MarginOrderKind.SELL):
+            rates[order_kind.value]["initial"] = "0"
+    if kind in (CalcMode.FOREX_NO_LEVERAGE, CalcMode.CFD, CalcMode.CFDINDEX):
+        buy_initial = Decimal(rates[mirror.MarginOrderKind.BUY.value]["initial"])
+        if buy_initial == 0:
+            raise MT5InstrumentError(f"margin rates BUY.initial {buy_initial} is zero")
+        with localcontext() as context:
+            context.prec = 28
+            leverage = Decimal(1) / buy_initial
+    else:
+        leverage = account.leverage
+    if info.margin_hedged_use_leg:
+        hedging = Hedging.LARGER_SIDE
+    else:
+        hedging = Hedging.SUM_SIDES_COVERED_AT_HEDGED_AMOUNT
+    margin = {
+        "basis": basis.value,
+        "account_leverage_divides": kind in (CalcMode.FOREX, CalcMode.CFDLEVERAGE),
+        "valued_at": ValuedAt.OPEN_PRICE.value,
+        "amount": {
+            "initial": format(initial.normalize(), "f"),
+            "maintenance": format(
+                finite_decimal(info.margin_maintenance, "margin_maintenance").normalize(), "f"
+            ),
+            "hedged": format(finite_decimal(info.margin_hedged, "margin_hedged").normalize(), "f"),
+        },
+        "leverage": format(leverage.normalize(), "f"),
+        "currency": info.currency_margin,
+        "rates": rates,
+        "hedging": hedging.value,
+        "fee_terms": FeeTerms.NONE.value,
+        "untriggered_reserve": UntriggeredReserve.NONE.value,
+        "trigger_check": TriggerCheck.FREE_MARGIN.value,
+    }
+    if basis is MarginBasis.CONTRACT_VALUE_TICK:
+        margin["tick_value"] = format(
+            finite_decimal(info.trade_tick_value, "trade_tick_value").normalize(), "f"
+        )
+        margin["tick_size"] = format(
+            finite_decimal(info.trade_tick_size, "trade_tick_size").normalize(), "f"
+        )
+    return margin
 
 
 def finite_decimal(value: float, field: str) -> Decimal:

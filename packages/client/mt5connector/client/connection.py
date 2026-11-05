@@ -61,6 +61,17 @@ _MARGIN_MODES = {
 }
 
 
+class StopOutMode(StrEnum):
+    PERCENT = "PERCENT"
+    MONEY = "MONEY"
+
+
+_STOP_OUT_MODES = {
+    mirror.ACCOUNT_STOPOUT_MODE_PERCENT: StopOutMode.PERCENT,
+    mirror.ACCOUNT_STOPOUT_MODE_MONEY: StopOutMode.MONEY,
+}
+
+
 @dataclass
 class AccountSnapshot:
     """The account as `account_info()` reports it, its money in `Decimal`."""
@@ -82,6 +93,9 @@ class AccountSnapshot:
     currency_digits: int
     leverage: Decimal
     margin_mode: MarginMode
+    stop_out_mode: StopOutMode
+    margin_call_level: Decimal
+    stop_out_level: Decimal
     trade_allowed: bool
     name: str
     company: str
@@ -92,6 +106,10 @@ class AccountSnapshot:
         mode the package does not define."""
         if info.margin_mode not in _MARGIN_MODES:
             raise MT5ConnectionError(f"account_info: margin mode {info.margin_mode} is unknown")
+        if info.margin_so_mode not in _STOP_OUT_MODES:
+            raise MT5ConnectionError(
+                f"account_info: stop-out mode {info.margin_so_mode} is unknown"
+            )
         return cls(
             login=info.login,
             server=info.server,
@@ -107,6 +125,9 @@ class AccountSnapshot:
             currency_digits=info.currency_digits,
             leverage=_finite(info.leverage, "leverage"),
             margin_mode=_MARGIN_MODES[info.margin_mode],
+            stop_out_mode=_STOP_OUT_MODES[info.margin_so_mode],
+            margin_call_level=_finite(info.margin_so_call, "margin_so_call"),
+            stop_out_level=_finite(info.margin_so_so, "margin_so_so"),
             trade_allowed=info.trade_allowed,
             name=info.name,
             company=info.company,

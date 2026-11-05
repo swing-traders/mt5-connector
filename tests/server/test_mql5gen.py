@@ -22,6 +22,7 @@ class Failure(StrEnum):
 
     ANSWERED = "answered"
     LEFT = "left"
+    PAIRED = "paired"
 
 
 # Each record an EA writes: its layout's name, and how MQL5 reads a member of it — a family's
@@ -32,6 +33,12 @@ WRITERS = {
     "WriteTerminalInfo": ("TerminalInfo", "TerminalInfo", "", Failure.LEFT),
     "WriteSymbolInfo": ("SymbolInfo", "SymbolInfo", "symbol, ", Failure.ANSWERED),
     "WriteSymbolListing": ("SymbolListing", "SymbolInfo", "symbol, ", Failure.ANSWERED),
+    "WriteSymbolMarginRate": (
+        "SymbolMarginRate",
+        "SymbolInfoMarginRate",
+        "symbol, ",
+        Failure.PAIRED,
+    ),
     "WritePosition": ("TradePosition", "PositionGet", "", Failure.ANSWERED),
     "WriteOrder": ("TradeOrder", "OrderGet", "", Failure.ANSWERED),
     "WriteHistoryOrder": ("TradeOrder", "HistoryOrderGet", "ticket, ", Failure.ANSWERED),
@@ -64,6 +71,7 @@ _DECLARE = re.compile(r"(long|double|string) (\w+) = (?:0|0\.0|\"\");")
 _WRITE = re.compile(r"w\.(I64|I64Bool|F64|String)\((?:\(long\))?(?:(\w+)\.(\w+)|(\w+))\);")
 _ANSWERED = re.compile(r"if \((\w+?)(Integer|Double|String)\((\w+, )?(\w+), (\w+)\)\)")
 _LEFT = re.compile(r"(\w+) = (\w+?)(Integer|Double|String)\((\w+, )?(\w+)\);")
+_PAIRED = re.compile(r"if \(!(\w+)\((\w+, )?(\w+), (\w+), (\w+)\)\)")
 _FAILED = re.compile(r'HubPropertyFailed\(failures, "(\w+)"\);')
 _READ = re.compile(r"request\.(\w+) = (?:\((\w+)\))?r\.(I64|F64|String)\(\);")
 
@@ -117,11 +125,32 @@ def written(body: str) -> tuple[dict[str, str], list[tuple]]:
         kind, name = _DECLARE.fullmatch(lines[at]).groups()
         declared[name] = kind
         at += 1
-    while at < len(lines) and lines[at] != "return failures.count == 0;":
+    while at < len(lines) and lines[at] not in ("return failures.count == 0;", "return true;"):
         if lines[at] == "w.String(symbol);":
             writes.append(("key", "symbol"))
             at += 1
         elif lines[at] == "ResetLastError();":
+            paired = _PAIRED.fullmatch(lines[at + 1])
+            if paired is not None:
+                family, leading, prop, first, second = paired.groups()
+                assert lines[at + 2] == "return false;"
+                at += 3
+                for variable in (first, second):
+                    write = _WRITE.fullmatch(lines[at])
+                    assert write is not None and write.group(4) == variable, lines[at]
+                    writes.append(
+                        (
+                            write.group(1),
+                            family,
+                            "Double",
+                            leading or "",
+                            prop,
+                            Failure.PAIRED,
+                            variable,
+                        )
+                    )
+                    at += 1
+                continue
             # The read's own error, whichever way the family tells it.
             answered = _ANSWERED.fullmatch(lines[at + 1])
             if answered is not None:
@@ -164,7 +193,10 @@ def expected_writes(
             if leading is None:
                 writes.append((wire_type(member), family, member.property))
             else:
-                variable, _ = _VARIABLES[kind]
+                if how is Failure.PAIRED:
+                    variable = member.name.rsplit("_", 1)[1]
+                else:
+                    variable, _ = _VARIABLES[kind]
                 writes.append(
                     (
                         wire_type(member),
@@ -205,7 +237,8 @@ def test_a_writer_reads_each_typed_member_once_in_order_by_its_property(text, na
 
 
 @pytest.mark.parametrize(
-    "name", [name for name, writer in WRITERS.items() if writer[3] is not None]
+    "name",
+    [name for name, writer in WRITERS.items() if writer[3] in (Failure.ANSWERED, Failure.LEFT)],
 )
 def test_a_property_writer_reads_past_a_failed_read_and_answers_whether_every_one_succeeded(
     text, name
@@ -233,6 +266,20 @@ def test_a_struct_writer_reads_fields_that_cannot_fail(text, name):
 
     assert returns == "void"
     assert parameters == f"BinaryWriter &w, const {layout_name} &{variable}"
+
+
+@pytest.mark.parametrize(
+    "name", [name for name, writer in WRITERS.items() if writer[3] is Failure.PAIRED]
+)
+def test_a_paired_output_writer_stops_on_a_failed_read_and_writes_double_outputs(text, name):
+    returns, parameters, body = functions(text)[name]
+
+    declared, _ = written(body)
+
+    assert returns == "bool"
+    assert parameters == "BinaryWriter &w, const string symbol"
+    assert declared == {"initial": "double", "maintenance": "double"}
+    assert body.rstrip().endswith("return true;")
 
 
 def test_every_typed_member_of_a_struct_an_ea_sends_names_its_mql5_property():

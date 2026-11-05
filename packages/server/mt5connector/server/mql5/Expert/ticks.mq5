@@ -767,6 +767,13 @@ void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer 
     case HUB_CALL_SYMBOLS_GET:
         AnswerSymbols(arguments, answer);
         break;
+    case HUB_CALL_SYMBOL_MARGIN_RATE:
+        if (WriteSymbolMarginRate(
+                answer.rows, arguments.String(HUB_ARG_SYMBOL_MARGIN_RATE_SYMBOL)))
+            answer.Record();
+        else
+            answer.Fail("SymbolInfoMarginRate failed", GetLastError());
+        break;
     case HUB_CALL_POSITIONS_GET:
         AnswerPositions(arguments, answer);
         break;

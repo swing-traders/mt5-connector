@@ -10,7 +10,7 @@ from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Price, Quantity
-from venue_doubles import account_info, relayed_sessions, symbol_info
+from venue_doubles import account_info, relayed_sessions, symbol_info, symbol_margin_rates
 
 from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.constants import MT5_VENUE
@@ -34,7 +34,16 @@ def instrument(**fields):
     """The instrument the parser builds from a symbol definition under `fields`."""
     account = AccountSnapshot.from_mt5(account_info())
     sessions = parse_sessions(relayed_sessions())
-    return parse_symbol_info(symbol_info(**fields), MT5_VENUE, account, Decimal(0), {}, sessions, 0)
+    return parse_symbol_info(
+        symbol_info(**fields),
+        MT5_VENUE,
+        account,
+        Decimal(0),
+        {},
+        sessions,
+        0,
+        symbol_margin_rates(),
+    )
 
 
 TICKS = np.dtype(list(mirror.TICKS.dtype))
@@ -75,6 +84,7 @@ class TestParseSymbolInfo:
             {},
             parse_sessions(relayed_sessions()),
             0,
+            symbol_margin_rates(),
         )
         assert result.id == InstrumentId.from_str("XAUUSD.MT5_ALPHA")
 

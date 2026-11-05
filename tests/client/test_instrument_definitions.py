@@ -22,6 +22,7 @@ from venue_doubles import (
     relayed_sessions,
     serve,
     symbol_info,
+    symbol_margin_rates,
 )
 
 from mt5connector.client.commissions import parse_schedule
@@ -289,6 +290,26 @@ async def test_a_zero_tick_size_fails_the_load_naming_the_symbol(venue):
         await provider.initialize()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        mirror.SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE,
+        mirror.SYMBOL_CALC_MODE_CFD,
+        mirror.SYMBOL_CALC_MODE_CFDINDEX,
+    ],
+)
+async def test_a_zero_buy_initial_rate_refuses_the_load_naming_the_symbol_and_field(venue, mode):
+    venue.add(symbol_info(name="BROKEN", trade_calc_mode=mode))
+    venue.margin_rates["BROKEN"] = symbol_margin_rates(buy_initial=0.0)
+    provider = provider_for(venue, "BROKEN")
+
+    with pytest.raises(MT5InstrumentError) as failure:
+        await provider.initialize()
+
+    assert "BROKEN" in str(failure.value)
+    assert "BUY.initial" in str(failure.value)
+
+
 async def test_the_info_carries_the_venue_facts_and_bar_calendar(venue):
     instrument = await loaded(
         venue,
@@ -319,6 +340,37 @@ async def test_the_info_carries_the_venue_facts_and_bar_calendar(venue):
         "quote_sessions": relayed_sessions()["quote"],
         "trade_sessions": relayed_sessions()["trade"],
         "point": "0.00001",
+        "margin": {
+            "basis": "CONTRACT",
+            "account_leverage_divides": True,
+            "valued_at": "OPEN_PRICE",
+            "amount": {"initial": "0", "maintenance": "0", "hedged": "0"},
+            "leverage": "500",
+            "currency": "EUR",
+            "rates": {
+                "BUY": {"initial": "1", "maintenance": "1"},
+                "SELL": {"initial": "1", "maintenance": "1"},
+                "BUY_LIMIT": {"initial": "0", "maintenance": "1"},
+                "SELL_LIMIT": {"initial": "0", "maintenance": "1"},
+                "BUY_STOP": {"initial": "0", "maintenance": "1"},
+                "SELL_STOP": {"initial": "0", "maintenance": "1"},
+                "BUY_STOP_LIMIT": {"initial": "0", "maintenance": "1"},
+                "SELL_STOP_LIMIT": {"initial": "0", "maintenance": "1"},
+            },
+            "hedging": "SUM_SIDES_COVERED_AT_HEDGED_AMOUNT",
+            "fee_terms": "NONE",
+            "untriggered_reserve": "NONE",
+            "trigger_check": "FREE_MARGIN",
+        },
+        "account": {
+            "leverage": "500",
+            "margin_mode": "RETAIL_HEDGING",
+            "stop_out_mode": "PERCENT",
+            "margin_call_level": "0",
+            "stop_out_level": "0",
+            "currency": "USD",
+        },
+        "liquidation": {"rule": "STOP_OUT_LEVEL"},
         "carry": [
             {
                 "kind": "SWAP",
@@ -465,7 +517,7 @@ async def test_initializing_a_config_that_names_nothing_to_load_is_refused(venue
     assert venue.asked == []
 
 
-async def test_a_symbol_is_read_by_its_definition_schedule_and_sessions_alone(venue):
+async def test_a_symbol_is_read_by_its_definition_schedule_sessions_and_margin_rates(venue):
     venue.add(symbol_info(name="EURUSDm"))
     provider = provider_for(venue, "EURUSDm")
     await provider.initialize()
@@ -473,6 +525,7 @@ async def test_a_symbol_is_read_by_its_definition_schedule_and_sessions_alone(ve
         Call.SYMBOL_INFO,
         Call.COMMISSION_SCHEDULE,
         Call.TRADING_SESSIONS,
+        Call.SYMBOL_MARGIN_RATE,
     ]
 
 
@@ -675,6 +728,7 @@ async def test_an_account_in_another_currency_resolves_and_loads_the_one_pair_it
         Call.SYMBOL_INFO,
         Call.COMMISSION_SCHEDULE,
         Call.TRADING_SESSIONS,
+        Call.SYMBOL_MARGIN_RATE,
     ]
     assert asked_beyond(venue, "US30", "AUDUSD.r") == []
 
@@ -760,6 +814,7 @@ async def test_a_pair_no_symbol_trades_fully_is_the_first_that_prices(venue):
         Call.SYMBOL_INFO,
         Call.COMMISSION_SCHEDULE,
         Call.TRADING_SESSIONS,
+        Call.SYMBOL_MARGIN_RATE,
     ]
 
 
@@ -845,9 +900,8 @@ async def test_a_money_rule_per_lot_is_one_fraction_of_the_notional_for_maker_an
 
 
 @pytest.mark.parametrize("entry", [CommissionEntryMode.IN, CommissionEntryMode.OUT])
-async def test_a_money_rule_charged_on_one_leg_is_half_of_it_on_every_fill(venue, entry):
-    """6.00 USD per lot on one deal of 100-ounce XAUUSD at a mid of 2,650: 6.00 / 265,000 / 2 =
-    0.0000113208 of each fill's notional."""
+async def test_a_money_rule_charged_on_one_leg_keeps_its_full_rate(venue, entry):
+    """6.00 USD per lot of 100-ounce XAUUSD at 2,650: 6 / 265,000 = 0.0000226415."""
     venue.add(
         symbol_info(
             name="XAUUSD",
@@ -868,8 +922,8 @@ async def test_a_money_rule_charged_on_one_leg_is_half_of_it_on_every_fill(venue
     await provider.initialize()
     instrument = provider.get_instrument("XAUUSD")
     places = Decimal("0.0000000001")
-    assert instrument.taker_fee.quantize(places) == Decimal("0.0000113208")
-    assert instrument.maker_fee.quantize(places) == Decimal("0.0000113208")
+    assert instrument.taker_fee.quantize(places) == Decimal("0.0000226415")
+    assert instrument.maker_fee.quantize(places) == Decimal("0.0000226415")
 
 
 async def test_a_base_currency_rule_per_lot_is_its_value_over_the_contract_size(venue):
@@ -948,7 +1002,7 @@ async def test_a_deposit_currency_rule_charged_on_both_legs_is_a_whole_fee_per_f
     assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000323")
 
 
-async def test_an_entry_only_rule_in_the_deposit_currency_is_halved_and_converted(venue):
+async def test_an_entry_only_rule_in_the_deposit_currency_is_converted_at_its_full_rate(venue):
     venue.add(
         symbol_info(
             name="USTUSD",
@@ -971,8 +1025,8 @@ async def test_an_entry_only_rule_in_the_deposit_currency_is_halved_and_converte
     await provider.initialize()
     fee = provider.get_instrument("EURUSD+").taker_fee
     value, rate, contract_size, price = Decimal(6), Decimal(1), Decimal(100000), Decimal("1.085")
-    assert abs(fee - value * rate / 2 / (contract_size * price)) < Decimal("1e-18")
-    assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000276")
+    assert abs(fee - value * rate / (contract_size * price)) < Decimal("1e-18")
+    assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000553")
 
 
 async def test_a_per_share_rule_in_a_named_currency_is_divided_by_the_price(venue):
@@ -998,8 +1052,8 @@ async def test_a_per_share_rule_in_a_named_currency_is_divided_by_the_price(venu
     provider = provider_for(venue, "AAPL")
     await provider.initialize()
     fee = provider.get_instrument("AAPL").taker_fee
-    assert abs(fee - Decimal("0.02") / 2 / Decimal(230)) < Decimal("1e-18")
-    assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000435")
+    assert abs(fee - Decimal("0.02") / Decimal(230)) < Decimal("1e-18")
+    assert fee.quantize(Decimal("0.0000001")) == Decimal("0.0000870")
 
 
 async def test_a_rule_in_a_currency_the_venue_quotes_inversely_is_converted_through_that_pair(
@@ -1163,7 +1217,7 @@ async def test_a_percent_of_turnover_rule_is_its_percentage_for_maker_and_taker(
     assert instrument.maker_fee == Decimal("0.0008")
 
 
-async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
+async def test_a_percent_rule_charged_on_entry_alone_keeps_its_full_rate(venue):
     venue.add(
         symbol_info(name="EURUSD.a"),
         bid=1.085,
@@ -1180,7 +1234,7 @@ async def test_a_percent_rule_charged_on_entry_alone_is_halved(venue):
     await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
     pct = Decimal("0.004")
-    assert fee == pct / 100 / 2
+    assert fee == pct / 100
 
 
 async def test_a_points_rule_is_its_points_in_price_over_the_price(venue):
@@ -1200,7 +1254,7 @@ async def test_a_points_rule_is_its_points_in_price_over_the_price(venue):
     assert instrument.maker_fee == fee
 
 
-async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
+async def test_a_points_rule_charged_on_entry_alone_keeps_its_full_rate(venue):
     venue.add(
         symbol_info(name="EURUSD.a", point=0.00001),
         bid=1.085,
@@ -1210,7 +1264,7 @@ async def test_a_points_rule_charged_on_entry_alone_is_halved(venue):
     provider = provider_for(venue, "EURUSD.a")
     await provider.initialize()
     fee = provider.get_instrument("EURUSD.a").taker_fee
-    assert abs(fee - Decimal(30) * Decimal("0.00001") / Decimal("1.085") / 2) < Decimal("1e-18")
+    assert abs(fee - Decimal(30) * Decimal("0.00001") / Decimal("1.085")) < Decimal("1e-18")
 
 
 def refused_by(field, value):

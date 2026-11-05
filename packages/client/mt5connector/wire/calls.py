@@ -54,6 +54,7 @@ class Call(IntEnum):
     OUTCOMES = 18
     COMMISSION_SCHEDULE = 19
     TRADING_SESSIONS = 20
+    SYMBOL_MARGIN_RATE = 21
 
 
 class ArgType(StrEnum):
@@ -243,6 +244,12 @@ CALLS: dict[Call, Row] = {
         ),
         Row(Call.COMMISSION_SCHEDULE, (_SYMBOL,), Shape.SCHEDULE, None, Wait.READ),
         Row(Call.TRADING_SESSIONS, (_SYMBOL,), Shape.SESSIONS, None, Wait.READ),
+        _package(
+            Call.SYMBOL_MARGIN_RATE,
+            mirror.FunctionName.SYMBOL_MARGIN_RATE,
+            ChartRole.SPAWNER,
+            Wait.READ,
+        ),
     )
 }
 
@@ -253,6 +260,7 @@ STRUCT_TYPES: dict[str, type] = {
     if row.layout is not None
 }
 Tick = namedtuple("Tick", mirror.TICKS.names)
+SymbolMarginRate = STRUCT_TYPES[mirror.StructName.SYMBOL_MARGIN_RATE]
 
 
 def routed_symbol(row: Row, arguments: dict[str, object]) -> str | None:
