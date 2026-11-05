@@ -94,6 +94,11 @@ def tick(bid: float, ask: float, time: int = 1_760_000_000):
     )
 
 
+def symbol_margin_rates(**fields):
+    struct = calls.STRUCT_TYPES[mirror.StructName.SYMBOL_MARGIN_RATE]
+    return struct(**({field: 1.0 for field in struct._fields} | fields))
+
+
 def _struct(name: str, strings: frozenset[str], fields: dict):
     struct = calls.STRUCT_TYPES[name]
     values = {field: "" if field in strings else 0 for field in struct._fields}
@@ -214,6 +219,7 @@ class SymbolVenue:
         self.ticks = {}
         self.schedules = {}
         self.sessions = {}
+        self.margin_rates = {}
         self.refusals: dict[tuple[calls.Call, str | None], list[Exception]] = {}
         self.asked: list[tuple[calls.Call, str | None]] = []
         self._log = MagicMock()
@@ -254,6 +260,8 @@ class SymbolVenue:
             return Answered(self.schedules.get(symbol, {"ret": 0, "last_error": 0, "rules": []}), 0)
         elif call is Call.TRADING_SESSIONS:
             return Answered(self.sessions.get(symbol, relayed_sessions()), 0)
+        elif call is Call.SYMBOL_MARGIN_RATE:
+            return Answered(self.margin_rates.get(symbol, symbol_margin_rates()), 0)
         else:
             raise ValueError(f"{call.name.lower()}: not a call an instrument provider asks")
 

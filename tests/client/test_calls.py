@@ -18,6 +18,7 @@ SPAWNER_CALLS = {
     Call.ACCOUNT_INFO,
     Call.TERMINAL_INFO,
     Call.SYMBOLS_GET,
+    Call.SYMBOL_MARGIN_RATE,
     Call.POSITIONS_GET,
     Call.ORDERS_GET,
     Call.HISTORY_ORDERS_GET,
@@ -52,7 +53,34 @@ def ticks(*milliseconds):
 # ── The registry ──────────────────────────────────────────────────────────────
 
 
-def test_the_registry_serves_the_sixteen_calls():
+def test_margin_rates_decode_in_the_eight_terminal_order_kinds_order():
+    writer = Writer()
+    for value in range(1, 17):
+        writer.f64(float(value))
+
+    row = calls.CALLS[calls.Call.SYMBOL_MARGIN_RATE]
+    answer = binary.Answer(1, 0, True, 0, 1, writer.payload())
+    result = calls.typed(row, calls.joined(row, [calls.read_hub_result(row, answer)]))
+
+    assert result.buy_initial == 1.0
+    assert result.buy_maintenance == 2.0
+    assert result.sell_initial == 3.0
+    assert result.sell_maintenance == 4.0
+    assert result.buy_limit_initial == 5.0
+    assert result.buy_limit_maintenance == 6.0
+    assert result.sell_limit_initial == 7.0
+    assert result.sell_limit_maintenance == 8.0
+    assert result.buy_stop_initial == 9.0
+    assert result.buy_stop_maintenance == 10.0
+    assert result.sell_stop_initial == 11.0
+    assert result.sell_stop_maintenance == 12.0
+    assert result.buy_stop_limit_initial == 13.0
+    assert result.buy_stop_limit_maintenance == 14.0
+    assert result.sell_stop_limit_initial == 15.0
+    assert result.sell_stop_limit_maintenance == 16.0
+
+
+def test_the_registry_serves_the_seventeen_calls():
     assert {call.name.lower() for call in calls.CALLS} == {
         "account_info",
         "terminal_info",
@@ -70,6 +98,7 @@ def test_the_registry_serves_the_sixteen_calls():
         "outcomes",
         "commission_schedule",
         "trading_sessions",
+        "symbol_margin_rate",
     }
 
 

@@ -5,6 +5,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 
+class MarginOrderKind(StrEnum):
+    BUY = "BUY"
+    SELL = "SELL"
+    BUY_LIMIT = "BUY_LIMIT"
+    SELL_LIMIT = "SELL_LIMIT"
+    BUY_STOP = "BUY_STOP"
+    SELL_STOP = "SELL_STOP"
+    BUY_STOP_LIMIT = "BUY_STOP_LIMIT"
+    SELL_STOP_LIMIT = "SELL_STOP_LIMIT"
+
+
 class FunctionName(StrEnum):
     TERMINAL_INFO = "terminal_info"
     ACCOUNT_INFO = "account_info"
@@ -18,6 +29,7 @@ class FunctionName(StrEnum):
     SYMBOL_INFO = "symbol_info"
     SYMBOL_INFO_TICK = "symbol_info_tick"
     SYMBOLS_GET = "symbols_get"
+    SYMBOL_MARGIN_RATE = "symbol_margin_rate"
 
 
 class StructName(StrEnum):
@@ -30,6 +42,7 @@ class StructName(StrEnum):
     TERMINAL_INFO = "TerminalInfo"
     SYMBOL_INFO = "SymbolInfo"
     ACCOUNT_INFO = "AccountInfo"
+    SYMBOL_MARGIN_RATE = "SymbolMarginRate"
 
 
 class ArrayName(StrEnum):
@@ -272,12 +285,26 @@ FUNCTIONS: dict[FunctionName, Function] = {
             ResultKind.STRUCTS,
             struct=StructName.SYMBOL_INFO,
         ),
+        Function(
+            FunctionName.SYMBOL_MARGIN_RATE,
+            (_SYMBOL,),
+            ResultKind.STRUCT,
+            struct=StructName.SYMBOL_MARGIN_RATE,
+        ),
     )
 }
 
 STRUCTS: dict[StructName, Struct] = {
     struct.name: struct
     for struct in (
+        Struct(
+            StructName.SYMBOL_MARGIN_RATE,
+            tuple(
+                Member(f"{kind.value.lower()}_{rate}", MqlType.DOUBLE, f"ORDER_TYPE_{kind.value}")
+                for kind in MarginOrderKind
+                for rate in ("initial", "maintenance")
+            ),
+        ),
         # https://www.mql5.com/en/docs/constants/tradingconstants/positionproperties
         Struct(
             StructName.TRADE_POSITION,

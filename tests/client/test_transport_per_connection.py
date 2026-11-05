@@ -11,7 +11,14 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from venue_doubles import account_info, listing, relayed_sessions, symbol_info, tick
+from venue_doubles import (
+    account_info,
+    listing,
+    relayed_sessions,
+    symbol_info,
+    symbol_margin_rates,
+    tick,
+)
 from websockets.asyncio.server import serve
 
 from mt5connector.client.config import MT5Config
@@ -72,6 +79,7 @@ class Terminal:
             Call.SYMBOL_INFO_TICK: [tick(bid=1.085, ask=1.0852)._asdict()],
             Call.COMMISSION_SCHEDULE: [SCHEDULE],
             Call.TRADING_SESSIONS: [relayed_sessions()],
+            Call.SYMBOL_MARGIN_RATE: [symbol_margin_rates()._asdict()],
             Call.RANGES: [calls.Ranges(100_000, {})],
             Call.COPY_RATES_RANGE: [np.zeros(0, dtype=np.dtype(list(BARS.dtype)))],
             Call.COPY_TICKS_RANGE: [np.zeros(0, dtype=np.dtype(list(mirror.TICKS.dtype)))],
@@ -195,6 +203,7 @@ async def test_an_instrument_load_after_another_connection_connects_reaches_its_
         Call.COMMISSION_SCHEDULE,
         Call.TRADING_SESSIONS,
         Call.SYMBOL_INFO_TICK,
+        Call.SYMBOL_MARGIN_RATE,
     }
     assert beta.calls() == []
 

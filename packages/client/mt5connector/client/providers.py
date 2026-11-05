@@ -165,7 +165,10 @@ class MT5InstrumentProvider(InstrumentProvider):
             await _asked(session, calls.Call.TRADING_SESSIONS, symbol=info.name)
         )
         fee, fee_stamp = await _fee(session, info, rule, pairs)
-        return parse_symbol_info(info, self._venue, account, fee, fee_stamp, sessions, ts)
+        margin_rates = await _asked(session, calls.Call.SYMBOL_MARGIN_RATE, symbol=info.name)
+        return parse_symbol_info(
+            info, self._venue, account, fee, fee_stamp, sessions, ts, margin_rates
+        )
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
 

@@ -239,7 +239,7 @@ The instrument provider loads a symbol by this exact name — one a client's `in
     | `PIPS` × `VOLUME` | `value × point / P` |
 
     `rate` converts the tier's currency into the quote currency at the venue's own quotes, along the shortest walk over its FOREX pairs that `quoted_pairs()` resolves, each pair at its mid and inverted where the walk crosses it from its profit currency to its base.
-  - A rule charged on both legs (`INOUT`) charges the fraction on every fill; one charged on entry or exit alone (`IN`, `OUT`) half of it on every fill.
+  - Every entry mode (`IN`, `OUT`, `INOUT`) keeps the full fraction. `fee_rule.entry` states which part of a trade the broker charges.
   - Every other schedule fails the load naming the symbol and the field: more than one rule or tier, a `mode_charge` other than `INSTANT`, a `mode_direction` other than `BOTH`, a `mode_profit` other than `ALL`, a non-zero `min_value` or `max_value`, the `PERCENT_PROFIT` mode, and any other mode and volume type, `TRADE` among them.
   - The data client reloads what its instrument provider's config names every `update_instruments_interval_mins`, re-deriving each fraction at the then-current mid, and hands NT the result; a failed reload is logged as an error and the previous definitions stand.
 - **`info`** carries the venue facts a consumer reads: chart, filling, calc and trade modes, stops and freeze levels, the volume limit, the margin currency, where the bar day and the bar week open (`bar_tz`, `bar_day_open`, `bar_week_open`), `bar_volume` (`tick_count`), and the symbol's sessions:
@@ -247,6 +247,13 @@ The instrument provider loads a symbol by this exact name — one a client's `in
   - `trade_sessions` — the broker's trade sessions, as `SymbolInfoSessionTrade` states them, in the same shape.
 
   Loading waits for the symbol's EA to relay its sessions as it waits for its commission schedule, and a refused relay, or an answer out of that shape, fails the load naming the symbol.
+
+  Margin and stop-out:
+
+  - `margin` — the symbol's fixed amounts or contract-value basis, margin currency, tick facts, hedging method and eight order kinds' initial and maintenance rates. The spawner reads the rates through `symbol_margin_rate`; the stamp sets pending kinds' initial rates to zero, `untriggered_reserve` to `NONE`, `trigger_check` to `FREE_MARGIN` and `fee_terms` to `NONE`.
+  - `margin.leverage` — the reciprocal of the buy initial rate for Forex No Leverage, CFD and CFD Index; the account's leverage for Forex and CFD Leverage. A non-terminating reciprocal is written at 28 Decimal digits.
+  - `account` — the login's leverage, margin mode, stop-out mode (`PERCENT` or `MONEY`), margin-call level, stop-out level and currency, with numbers as Decimal strings.
+  - `liquidation` — `{"rule": "STOP_OUT_LEVEL"}`.
 
   Price unit and carry:
 

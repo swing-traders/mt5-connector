@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from nautilus_trader.model.identifiers import Venue
-from venue_doubles import account_info, relayed_sessions, symbol_info
+from venue_doubles import account_info, relayed_sessions, symbol_info, symbol_margin_rates
 
 from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.errors import MT5InstrumentError
@@ -57,6 +57,7 @@ def test_each_swap_mode_stamps_its_basis_currency_rates_and_weekdays(mode, basis
         {},
         parse_sessions(relayed_sessions()),
         0,
+        symbol_margin_rates(),
     )
 
     assert instrument.info["point"] == "0.00001"
@@ -105,6 +106,7 @@ def test_a_whole_point_and_seven_distinct_weekday_ratios_keep_their_values():
         {},
         parse_sessions(relayed_sessions()),
         0,
+        symbol_margin_rates(),
     )
 
     assert instrument.info["point"] == "1"
@@ -130,6 +132,7 @@ def test_a_disabled_symbol_keeps_its_profit_currency_and_zero_rates():
         {},
         parse_sessions(relayed_sessions()),
         0,
+        symbol_margin_rates(),
     )
 
     rule = instrument.info["carry"][0]
@@ -150,6 +153,7 @@ def test_an_unknown_swap_mode_refuses_the_definition():
             {},
             parse_sessions(relayed_sessions()),
             0,
+            symbol_margin_rates(),
         )
 
 
@@ -173,6 +177,7 @@ def test_a_captured_symbol_listing_and_account_decode_to_the_generic_carry_contr
         {},
         parse_sessions(relayed_sessions()),
         0,
+        symbol_margin_rates(),
     )
 
     assert {

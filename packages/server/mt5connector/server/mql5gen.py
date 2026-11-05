@@ -77,13 +77,32 @@ class _Fields:
 
 
 @dataclass(frozen=True)
+class _OutputPairs:
+    """Pairs of double outputs read by one MQL5 function per property."""
+
+    function: str
+    leading: str
+    outputs: tuple[str, str]
+
+    def read(self, first: mirror.Member, second: mirror.Member) -> list[str]:
+        left, right = self.outputs
+        return [
+            "    ResetLastError();",
+            f"    if (!{self.function}({self.leading}{first.property}, {left}, {right}))",
+            "        return false;",
+            _write(first, left),
+            _write(second, right),
+        ]
+
+
+@dataclass(frozen=True)
 class _Writer:
     """A generated function writing one record of a layout."""
 
     name: str
     layout: binary.Layout
     parameters: str
-    source: _Properties | _Fields
+    source: _Properties | _Fields | _OutputPairs
     # Which record it reads, where its name does not say.
     note: str | None
 
@@ -116,6 +135,13 @@ _WRITERS = (
         f"const string {_SYMBOL}",
         _Properties("SymbolInfo", f"{_SYMBOL}, "),
         "A symbol's definition, its name the key ahead of its members.",
+    ),
+    _Writer(
+        "WriteSymbolMarginRate",
+        calls.CALLS[calls.Call.SYMBOL_MARGIN_RATE].layout,
+        f"const string {_SYMBOL}",
+        _OutputPairs("SymbolInfoMarginRate", f"{_SYMBOL}, ", ("initial", "maintenance")),
+        None,
     ),
     _Writer(
         "WritePosition",
@@ -411,8 +437,7 @@ def _write(member: mirror.Member, value: str) -> str:
 
 
 def _writer(writer: _Writer) -> str:
-    """A writer of a property family reads past a read that fails, records it in `failures`, and
-    answers whether every read succeeded; a writer of struct fields reads nothing that can fail."""
+    """Property-family reads accumulate failures; paired-output reads stop at the first failure."""
     parameters = "BinaryWriter &w"
     if writer.parameters:
         parameters += f", {writer.parameters}"
@@ -423,14 +448,23 @@ def _writer(writer: _Writer) -> str:
         parameters += ", HubPropertyFailures &failures"
         used = {mirror.accessor(member.declared) for member in typed}
         lines += [f"    {_VARIABLES[kind][1]}" for kind in mirror.Accessor if kind in used]
+    elif isinstance(writer.source, _OutputPairs):
+        returns = "bool"
+        lines += [f"    double {variable} = 0.0;" for variable in writer.source.outputs]
     else:
         returns = "void"
     if writer.layout.key is not None:
         lines.append(f"    w.String({_SYMBOL});")
-    for member in typed:
-        lines += writer.source.read(member)
+    if isinstance(writer.source, _OutputPairs):
+        for first, second in zip(typed[::2], typed[1::2], strict=True):
+            lines += writer.source.read(first, second)
+    else:
+        for member in typed:
+            lines += writer.source.read(member)
     if isinstance(writer.source, _Properties):
         lines.append("    return failures.count == 0;")
+    elif isinstance(writer.source, _OutputPairs):
+        lines.append("    return true;")
     body = "\n".join(lines)
     function = f"{returns} {writer.name}({parameters})\n{{\n{body}\n}}"
     if writer.note is None:

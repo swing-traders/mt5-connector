@@ -1,0 +1,315 @@
+{
+  "captured_at_utc": "2026-11-05T07:13:47.037362+00:00",
+  "account_info": {
+    "trade_mode": 2,
+    "margin_so_mode": 0,
+    "margin_so_call": 100,
+    "margin_so_so": 50,
+    "margin_mode": 2,
+    "leverage": 500,
+    "currency": "UST",
+    "currency_digits": 2,
+    "balance": 0,
+    "equity": 0,
+    "margin": 0,
+    "margin_initial": 0,
+    "margin_maintenance": 0,
+    "margin_free": 0,
+    "margin_level": 0,
+    "credit": 0,
+    "profit": 0,
+    "trade_allowed": false
+  },
+  "symbols_get": [
+    {
+      "custom": false,
+      "chart_mode": 0,
+      "select": true,
+      "digits": 5,
+      "spread_float": true,
+      "ticks_bookdepth": 1,
+      "trade_calc_mode": 5,
+      "trade_mode": 4,
+      "start_time": 0,
+      "expiration_time": 0,
+      "trade_stops_level": 0,
+      "trade_freeze_level": 0,
+      "trade_exemode": 2,
+      "swap_mode": 1,
+      "swap_rollover3days": 3,
+      "margin_hedged_use_leg": false,
+      "expiration_mode": 15,
+      "filling_mode": 2,
+      "order_mode": 127,
+      "order_gtc_mode": 0,
+      "option_mode": 0,
+      "option_right": 0,
+      "option_strike": 0,
+      "point": 0.00001,
+      "trade_tick_value": 0,
+      "trade_tick_value_profit": 0,
+      "trade_tick_value_loss": 0,
+      "trade_tick_size": 0.00001,
+      "trade_contract_size": 100000,
+      "trade_accrued_interest": 0,
+      "trade_face_value": 0,
+      "trade_liquidity_rate": 0,
+      "volume_min": 0.01,
+      "volume_max": 100,
+      "volume_step": 0.01,
+      "volume_limit": 0,
+      "swap_long": 3.91,
+      "swap_short": -7.2,
+      "swap_sunday": 0,
+      "swap_monday": 1,
+      "swap_tuesday": 1,
+      "swap_wednesday": 3,
+      "swap_thursday": 1,
+      "swap_friday": 1,
+      "swap_saturday": 0,
+      "margin_initial": 100000,
+      "margin_maintenance": 0,
+      "margin_hedged": 100000,
+      "basis": "",
+      "category": "",
+      "currency_base": "AUD",
+      "currency_profit": "CAD",
+      "currency_margin": "AUD",
+      "description": "Australian Dollar vs Canadian Dollar",
+      "exchange": "",
+      "formula": "",
+      "isin": "",
+      "name": "AUDCAD+",
+      "page": "",
+      "path": "Forex+\\Forex Major\\AUDCAD+"
+    },
+    {
+      "custom": false,
+      "chart_mode": 0,
+      "select": true,
+      "digits": 5,
+      "spread_float": true,
+      "ticks_bookdepth": 1,
+      "trade_calc_mode": 5,
+      "trade_mode": 4,
+      "start_time": 0,
+      "expiration_time": 0,
+      "trade_stops_level": 0,
+      "trade_freeze_level": 0,
+      "trade_exemode": 2,
+      "swap_mode": 1,
+      "swap_rollover3days": 3,
+      "margin_hedged_use_leg": false,
+      "expiration_mode": 15,
+      "filling_mode": 2,
+      "order_mode": 127,
+      "order_gtc_mode": 0,
+      "option_mode": 0,
+      "option_right": 0,
+      "option_strike": 0,
+      "point": 0.00001,
+      "trade_tick_value": 0,
+      "trade_tick_value_profit": 0,
+      "trade_tick_value_loss": 0,
+      "trade_tick_size": 0.00001,
+      "trade_contract_size": 100000,
+      "trade_accrued_interest": 0,
+      "trade_face_value": 0,
+      "trade_liquidity_rate": 0,
+      "volume_min": 0.01,
+      "volume_max": 100,
+      "volume_step": 0.01,
+      "volume_limit": 0,
+      "swap_long": 3.19,
+      "swap_short": -9.66,
+      "swap_sunday": 0,
+      "swap_monday": 1,
+      "swap_tuesday": 1,
+      "swap_wednesday": 3,
+      "swap_thursday": 1,
+      "swap_friday": 1,
+      "swap_saturday": 0,
+      "margin_initial": 100000,
+      "margin_maintenance": 0,
+      "margin_hedged": 100000,
+      "basis": "",
+      "category": "",
+      "currency_base": "USD",
+      "currency_profit": "CAD",
+      "currency_margin": "USD",
+      "description": "US Dollar vs Canadian Dollar",
+      "exchange": "",
+      "formula": "",
+      "isin": "",
+      "name": "USDCAD+",
+      "page": "",
+      "path": "Forex+\\Forex Major\\USDCAD+"
+    }
+  ],
+  "symbol_margin_rate": {
+    "AUDCAD+": {
+      "buy_initial": 0.0005,
+      "buy_maintenance": 0.0005,
+      "sell_initial": 0.0005,
+      "sell_maintenance": 0.0005,
+      "buy_limit_initial": 0,
+      "buy_limit_maintenance": 0,
+      "sell_limit_initial": 0,
+      "sell_limit_maintenance": 0,
+      "buy_stop_initial": 0,
+      "buy_stop_maintenance": 0,
+      "sell_stop_initial": 0,
+      "sell_stop_maintenance": 0,
+      "buy_stop_limit_initial": 0,
+      "buy_stop_limit_maintenance": 0,
+      "sell_stop_limit_initial": 0,
+      "sell_stop_limit_maintenance": 0
+    },
+    "USDCAD+": {
+      "buy_initial": 0.0005,
+      "buy_maintenance": 0.0005,
+      "sell_initial": 0.0005,
+      "sell_maintenance": 0.0005,
+      "buy_limit_initial": 0,
+      "buy_limit_maintenance": 0,
+      "sell_limit_initial": 0,
+      "sell_limit_maintenance": 0,
+      "buy_stop_initial": 0,
+      "buy_stop_maintenance": 0,
+      "sell_stop_initial": 0,
+      "sell_stop_maintenance": 0,
+      "buy_stop_limit_initial": 0,
+      "buy_stop_limit_maintenance": 0,
+      "sell_stop_limit_initial": 0,
+      "sell_stop_limit_maintenance": 0
+    }
+  },
+  "info": {
+    "AUDCAD+": {
+      "margin": {
+        "basis": "FIXED_AMOUNT",
+        "account_leverage_divides": false,
+        "valued_at": "OPEN_PRICE",
+        "amount": {
+          "initial": "100000",
+          "maintenance": "0",
+          "hedged": "100000"
+        },
+        "leverage": "2000",
+        "currency": "AUD",
+        "rates": {
+          "BUY": {
+            "initial": "0.0005",
+            "maintenance": "0.0005"
+          },
+          "SELL": {
+            "initial": "0.0005",
+            "maintenance": "0.0005"
+          },
+          "BUY_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "SELL_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "BUY_STOP": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "SELL_STOP": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "BUY_STOP_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "SELL_STOP_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          }
+        },
+        "hedging": "SUM_SIDES_COVERED_AT_HEDGED_AMOUNT",
+        "fee_terms": "NONE",
+        "untriggered_reserve": "NONE",
+        "trigger_check": "FREE_MARGIN"
+      },
+      "account": {
+        "leverage": "500",
+        "margin_mode": "RETAIL_HEDGING",
+        "stop_out_mode": "PERCENT",
+        "margin_call_level": "100",
+        "stop_out_level": "50",
+        "currency": "UST"
+      },
+      "liquidation": {
+        "rule": "STOP_OUT_LEVEL"
+      }
+    },
+    "USDCAD+": {
+      "margin": {
+        "basis": "FIXED_AMOUNT",
+        "account_leverage_divides": false,
+        "valued_at": "OPEN_PRICE",
+        "amount": {
+          "initial": "100000",
+          "maintenance": "0",
+          "hedged": "100000"
+        },
+        "leverage": "2000",
+        "currency": "USD",
+        "rates": {
+          "BUY": {
+            "initial": "0.0005",
+            "maintenance": "0.0005"
+          },
+          "SELL": {
+            "initial": "0.0005",
+            "maintenance": "0.0005"
+          },
+          "BUY_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "SELL_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "BUY_STOP": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "SELL_STOP": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "BUY_STOP_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          },
+          "SELL_STOP_LIMIT": {
+            "initial": "0",
+            "maintenance": "0"
+          }
+        },
+        "hedging": "SUM_SIDES_COVERED_AT_HEDGED_AMOUNT",
+        "fee_terms": "NONE",
+        "untriggered_reserve": "NONE",
+        "trigger_check": "FREE_MARGIN"
+      },
+      "account": {
+        "leverage": "500",
+        "margin_mode": "RETAIL_HEDGING",
+        "stop_out_mode": "PERCENT",
+        "margin_call_level": "100",
+        "stop_out_level": "50",
+        "currency": "UST"
+      },
+      "liquidation": {
+        "rule": "STOP_OUT_LEVEL"
+      }
+    }
+  }
+}

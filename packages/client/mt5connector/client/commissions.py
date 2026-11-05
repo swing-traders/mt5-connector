@@ -106,8 +106,4 @@ async def taker_fee(
         raise MT5InstrumentError(
             f"the commission rule's volume_type is {rule.volume_type} under mode {rule.mode}"
         )
-    # NT charges a fee on every fill, so a rule charged on one leg alone spreads over both.
-    if rule.entry == CommissionEntryMode.INOUT:
-        return fee
-    else:
-        return fee / 2
+    return fee
