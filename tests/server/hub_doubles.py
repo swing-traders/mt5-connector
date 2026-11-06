@@ -142,8 +142,13 @@ class Peer:
         # Its pings are never answered.
         self.deaf = deaf
         self.remote_address = ("127.0.0.1", 0)
+        # Set while the handler waits on an empty queue: every frame put so far is handled.
+        self.waiting = asyncio.Event()
+        # Notified on each frame the hub sends.
+        self.sent_changed = asyncio.Condition()
 
     def put(self, raw: bytes) -> None:
+        self.waiting.clear()
         self.incoming.put_nowait(raw)
 
     def put_ea(self, sent) -> None:
@@ -156,6 +161,8 @@ class Peer:
         return self
 
     async def __anext__(self):
+        if self.incoming.empty():
+            self.waiting.set()
         raw = await self.incoming.get()
         if raw is None:
             raise StopAsyncIteration
@@ -165,6 +172,8 @@ class Peer:
         if self.stuck:
             await asyncio.Event().wait()
         self.sent.append(raw)
+        async with self.sent_changed:
+            self.sent_changed.notify_all()
 
     async def ping(self):
         pong = asyncio.get_running_loop().create_future()

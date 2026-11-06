@@ -3,6 +3,7 @@ true UTC, and the frames the hub refuses."""
 
 import asyncio
 import calendar
+import collections
 import logging
 import time
 from types import SimpleNamespace
@@ -418,9 +419,56 @@ def sent_to_ea(peer: Peer) -> list:
     return [decode_to_ea(raw) for raw in peer.sent]
 
 
+def queued_to_eas(hub) -> dict:
+    """Every frame the hub queues for each EA, recorded as it is queued."""
+    queued = collections.defaultdict(list)
+    queue_frame = hub._to_ea
+
+    def recording(ws, frame):
+        if ws in hub._eas:
+            queued[ws].append(frame)
+        queue_frame(ws, frame)
+
+    hub._to_ea = recording
+    return queued
+
+
+async def delivered(queued, *peers, timeout=1.0):
+    """Waits until each EA double has been sent every frame the hub queued for it."""
+    for peer in peers:
+        async with peer.sent_changed:
+            await asyncio.wait_for(
+                peer.sent_changed.wait_for(lambda peer=peer: len(peer.sent) >= len(queued[peer])),
+                timeout,
+            )
+
+
+async def handled(*peers, timeout=1.0):
+    """Waits until the hub has handled every frame put to each double."""
+    for peer in peers:
+        await asyncio.wait_for(peer.waiting.wait(), timeout)
+
+
+async def _greeted(hub, *eas) -> dict:
+    """Each EA double served by the hub, its hello handled; each one's handler task."""
+    tasks = {}
+    for peer, chart_role, symbol in eas:
+        tasks[peer] = asyncio.create_task(hub.handler(peer))
+        peer.put_ea(binary.EaHello(chart_role, symbol))
+    await handled(*tasks)
+    return tasks
+
+
+async def _left(tasks, peer, timeout=1.0):
+    """Closes a double and waits until the hub has dropped it."""
+    await peer.close()
+    await asyncio.wait_for(tasks[peer], timeout)
+
+
 async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_until_it_opens(caplog):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
     spawner = Peer()
     tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"))
 
@@ -431,16 +479,125 @@ async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_until_it_op
     spawner.put_ea(binary.ChartOpened(PUBLISHER, "XYZ"))
     await settle()
     opened = hub.use_chart((PUBLISHER, "XYZ"))
+    await delivered(queued, spawner)
 
     assert (requested, failed, opened) == (
         ChartState.REQUESTED,
         [ChartState.FAILED, ChartState.FAILED],
         ChartState.REQUESTED,
     )
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")]
+    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
     (warning,) = warnings(caplog)
     assert "4301" in warning
     await _closed(tasks, spawner)
+
+
+async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_for_twice_the_retry_delay(
+    clock, caplog
+):
+    caplog.set_level(logging.INFO, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner = Peer()
+    tasks = await _greeted(hub, (spawner, SPAWNER, "EURUSD"))
+    requested = hub.use_chart((PUBLISHER, "XYZ"))
+    spawner.put_ea(binary.ChartFailed(PUBLISHER, "XYZ", 4102))
+    await handled(spawner)
+
+    clock[0] = 1_009.9
+    within = hub.use_chart((PUBLISHER, "XYZ"))
+    clock[0] = 1_010.0
+    past = hub.use_chart((PUBLISHER, "XYZ"))
+    await delivered(queued, spawner)
+
+    assert (requested, within, past) == (
+        ChartState.REQUESTED,
+        ChartState.FAILED,
+        ChartState.REQUESTED,
+    )
+    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
+    assert (PUBLISHER, "XYZ") not in hub._failed
+    (warning,) = warnings(caplog)
+    assert "4102" in warning
+    (asking,) = [
+        record.getMessage()
+        for record in caplog.records
+        if "asking the spawner again" in record.getMessage()
+    ]
+    assert "4102" in asking
+    await _closed(tasks.values(), spawner)
+
+
+async def test_a_subscription_to_a_failed_chart_asks_again_only_past_the_hold(clock):
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner, early, late = Peer(), Peer(), Peer()
+    tasks = list((await _greeted(hub, (spawner, SPAWNER, "EURUSD"))).values())
+    hub.use_chart((PUBLISHER, "XYZ"))
+    spawner.put_ea(binary.ChartFailed(PUBLISHER, "XYZ", 4102))
+    await handled(spawner)
+
+    clock[0] = 1_005.0
+    tasks.append(asyncio.create_task(hub.handler(early)))
+    early.put_frame(binary.AdapterHello())
+    early.put_frame(binary.Subscribe(1, ticks_of("XYZ")))
+    await handled(early)
+    await delivered(queued, spawner)
+    within = sent_to_ea(spawner)
+    clock[0] = 1_010.0
+    tasks.append(asyncio.create_task(hub.handler(late)))
+    late.put_frame(binary.AdapterHello())
+    late.put_frame(binary.Subscribe(1, ticks_of("XYZ")))
+    await handled(late)
+    await delivered(queued, spawner)
+
+    assert within == [binary.OpenChart(PUBLISHER, "XYZ")]
+    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
+    await _closed(tasks, spawner, early, late)
+
+
+async def _spawner_failed_then_left(hub):
+    """A spawner that failed to open XYZ at the clock's start and left, and its handler's task."""
+    spawner = Peer()
+    tasks = await _greeted(hub, (spawner, SPAWNER, "EURUSD"))
+    hub.use_chart((PUBLISHER, "XYZ"))
+    spawner.put_ea(binary.ChartFailed(PUBLISHER, "XYZ", 4102))
+    await handled(spawner)
+    await _left(tasks, spawner)
+
+
+async def test_a_spawner_reconnecting_within_the_hold_does_not_replay_the_failed_chart(clock):
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    await _spawner_failed_then_left(hub)
+
+    clock[0] = 1_005.0
+    reconnected = Peer()
+    tasks = await _greeted(hub, (reconnected, SPAWNER, "EURUSD"))
+    await delivered(queued, reconnected)
+    within = sent_to_ea(reconnected)
+    clock[0] = 1_010.0
+    past = hub.use_chart((PUBLISHER, "XYZ"))
+    await delivered(queued, reconnected)
+
+    assert within == []
+    assert past == ChartState.REQUESTED
+    assert sent_to_ea(reconnected) == [binary.OpenChart(PUBLISHER, "XYZ")]
+    await _closed(tasks.values(), reconnected)
+
+
+async def test_a_spawner_reconnecting_past_the_hold_replays_the_failed_chart(clock):
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    await _spawner_failed_then_left(hub)
+
+    clock[0] = 1_010.0
+    reconnected = Peer()
+    tasks = await _greeted(hub, (reconnected, SPAWNER, "EURUSD"))
+    await delivered(queued, reconnected)
+
+    assert sent_to_ea(reconnected) == [binary.OpenChart(PUBLISHER, "XYZ")]
+    await _closed(tasks.values(), reconnected)
 
 
 async def test_a_failed_chart_clears_on_its_eas_hello_and_a_use_after_the_ea_left_requests_it():
@@ -747,6 +904,104 @@ async def test_a_close_that_overflows_the_spawners_queue_leaves_no_close_pending
     assert early == []
     assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "XAUUSD")]
     await _closed(tasks, spawner, gbpusd, usdjpy, again)
+
+
+async def test_a_chart_asked_for_and_never_served_is_closed_and_withdrawn_once_out_of_use(
+    clock, caplog
+):
+    caplog.set_level(logging.INFO, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner = Peer()
+    tasks = await _greeted(hub, (spawner, SPAWNER, "EURUSD"))
+    key = (PUBLISHER, "USDJPY")
+    requested = hub.use_chart(key)
+
+    clock[0] = 1_899.9
+    hub.close_idle_charts()
+    await delivered(queued, spawner)
+    in_use = sent_to_ea(spawner)
+    clock[0] = 1_900.0
+    hub.close_idle_charts()
+    withdrawn = key not in hub._requested and key not in hub._sent
+    again = hub.use_chart(key)
+    await delivered(queued, spawner)
+
+    assert (requested, again) == (ChartState.REQUESTED, ChartState.REQUESTED)
+    assert in_use == [binary.OpenChart(*key)]
+    assert withdrawn
+    assert sent_to_ea(spawner) == [
+        binary.OpenChart(*key),
+        binary.CloseChart(*key),
+        binary.OpenChart(*key),
+    ]
+    assert len([r for r in caplog.records if "never served" in r.getMessage()]) == 1
+    await _closed(tasks.values(), spawner)
+
+
+async def test_a_chart_asked_for_and_never_served_stays_while_a_consumer_subscribes(clock):
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner, consumer = Peer(), Peer()
+    tasks = list((await _greeted(hub, (spawner, SPAWNER, "EURUSD"))).values())
+    hub.use_chart((PUBLISHER, "USDJPY"))
+    tasks.append(asyncio.create_task(hub.handler(consumer)))
+    consumer.put_frame(binary.AdapterHello())
+    consumer.put_frame(binary.Subscribe(1, ticks_of("USDJPY")))
+    await handled(consumer)
+
+    clock[0] = 1_900.0
+    hub.close_idle_charts()
+    await delivered(queued, spawner)
+
+    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "USDJPY")]
+    await _closed(tasks, spawner, consumer)
+
+
+async def test_an_ea_leaving_a_chart_out_of_use_has_the_spawner_close_it(clock, caplog):
+    caplog.set_level(logging.INFO, logger="mt5connector.server.ws_server")
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner, usdjpy = Peer(), Peer()
+    tasks = await _greeted(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+
+    clock[0] = 1_900.0
+    await _left(tasks, usdjpy)
+    await delivered(queued, spawner)
+
+    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    assert len([r for r in caplog.records if "left its chart out of use" in r.getMessage()]) == 1
+    await _closed(tasks.values(), spawner)
+
+
+async def test_an_ea_leaving_a_chart_used_within_the_idle_period_has_it_requested_again(clock):
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner, usdjpy = Peer(), Peer()
+    tasks = await _greeted(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+
+    clock[0] = 1_899.9
+    await _left(tasks, usdjpy)
+    await delivered(queued, spawner)
+
+    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "USDJPY")]
+    await _closed(tasks.values(), spawner)
+
+
+async def test_an_ea_leaving_while_its_close_is_pending_is_not_closed_again(clock):
+    hub = Hub(CLOCK, settings())
+    queued = queued_to_eas(hub)
+    spawner, usdjpy = Peer(), Peer()
+    tasks = await _greeted(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+
+    clock[0] = 1_900.0
+    hub.close_idle_charts()
+    clock[0] = 1_901.0
+    await _left(tasks, usdjpy)
+    await delivered(queued, spawner)
+
+    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    await _closed(tasks.values(), spawner)
 
 
 # ── The broker's repeated and skipped hours ───────────────────────────────────

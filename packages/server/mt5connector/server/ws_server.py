@@ -5,12 +5,12 @@ State: the connections that said hello — each consumer's subscriptions, each E
 symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
 wanted frame last told each publisher; the spawner; the chart requests held for a role and symbol no
 EA serves, and those the spawner was sent; the MQL5 error the spawner met on each chart it failed to
-open, standing until that chart opens or its EA says hello; when each chart was last in use, and
-when the spawner was last told to close each chart whose close is pending, which outlives the
-chart's EA; the true-UTC open of the last bar fanned out of each series; the latest commission
-schedule and trading sessions relayed for each symbol; the floors learned from ranges answers; the
-pending requests and the clock gate. Nothing is persisted, and nothing is replayed to a consumer
-that reconnects."""
+open, and when, standing for the failure hold or until that chart opens or its EA says hello; when
+each chart was last in use, and when the spawner was last told to close each chart whose close is
+pending, which outlives the chart's EA; the true-UTC open of the last bar fanned out of each series;
+the latest commission schedule and trading sessions relayed for each symbol; the floors learned
+from ranges answers; the pending requests and the clock gate. Nothing is persisted, and nothing is
+replayed to a consumer that reconnects."""
 
 import asyncio
 import dataclasses
@@ -68,6 +68,9 @@ from mt5connector.server.wire.push_wire import (
 OVERFLOW = 4008
 _IDLE_SWEEP_S = 5
 _CLOSE_BOUND_S = 30
+# How long the spawner's failure to open a chart stands, in the consumers' retry delays: every
+# consumer deferred on the chart asks again within one and is answered the failure.
+_FAILED_HOLD_RETRIES = 2
 _HOUR_S = 3_600
 
 logger = logging.getLogger(__name__)
@@ -126,7 +129,7 @@ class Hub:
         self._spawner: object | None = None
         self._requested: set[ChartKey] = set()
         self._sent: set[ChartKey] = set()
-        self._failed: dict[ChartKey, int] = {}
+        self._failed: dict[ChartKey, tuple[int, float]] = {}
         self._used: dict[ChartKey, float] = {}
         self._close_sent: dict[ChartKey, float] = {}
         self._bar_opens: dict[Subscription, int] = {}
@@ -176,20 +179,22 @@ class Hub:
 
     def use_chart(self, key: ChartKey) -> ChartState:
         """Records a use of the chart of a role and symbol, and requests it while no EA serves it
-        and the spawner has not failed to open it."""
-        self._used[key] = time.monotonic()
+        and the spawner's failure to open it does not stand."""
+        now = time.monotonic()
+        self._used[key] = now
         if key in self._served:
             return ChartState.PUBLISHED
-        elif key in self._failed:
+        elif self._failure_stands(key, now):
             return ChartState.FAILED
         else:
             self._request_chart(key)
             return ChartState.REQUESTED
 
     def close_idle_charts(self) -> None:
-        """Tells the spawner to close each chart out of use for the idle period, and settles each
-        close pending for the bound: sent again while an EA serves the chart out of use, else ended.
-        The spawner's own chart never closes."""
+        """Tells the spawner to close each chart the hub has allocated — one an EA serves, or one
+        whose open is outstanding — out of use for the idle period, withdrawing an open nobody waits
+        for, and settles each close pending for the bound: sent again while an EA serves the chart
+        out of use, else ended. The spawner's own chart never closes."""
         now = time.monotonic()
         # The spawner is read per key: a close that overflows its queue drops it mid-sweep.
         for key, sent in list(self._close_sent.items()):
@@ -206,7 +211,7 @@ class Hub:
                         _CLOSE_BOUND_S,
                     )
                     self._close_chart(key, now)
-        for key in sorted(self._served, key=str):
+        for key in sorted(self._served.keys() | self._sent, key=str):
             chart_role, symbol = key
             if (
                 self._spawner is not None
@@ -214,12 +219,23 @@ class Hub:
                 and key not in self._close_sent
                 and not self._in_use(key, now)
             ):
-                logger.info(
-                    "the %s chart of %s out of use for %d s: closing it",
-                    chart_role,
-                    symbol,
-                    self._settings.chart_idle_seconds,
-                )
+                if key in self._served:
+                    logger.info(
+                        "the %s chart of %s out of use for %d s: closing it",
+                        chart_role,
+                        symbol,
+                        self._settings.chart_idle_seconds,
+                    )
+                else:
+                    logger.info(
+                        "the %s chart of %s, asked for and never served, out of use for %d s: "
+                        "closing it and withdrawing the request",
+                        chart_role,
+                        symbol,
+                        self._settings.chart_idle_seconds,
+                    )
+                    self._requested.discard(key)
+                    self._sent.discard(key)
                 self._close_chart(key, now)
 
     # ── Frames ────────────────────────────────────────────────────────────────
@@ -460,7 +476,8 @@ class Hub:
                 frame.symbol,
                 frame.error,
             )
-            self._failed[key] = frame.error
+            self._failed[key] = (frame.error, time.monotonic())
+            self._sent.discard(key)
         else:
             logger.info(
                 "the spawner keeps the %s chart of %s open: %d positions, %d pending orders",
@@ -479,11 +496,30 @@ class Hub:
 
     def _request_chart(self, key: ChartKey) -> None:
         """Holds a chart request until its EA says hello, sending it to the spawner once per spawner
-        connection."""
+        connection and not while its failure to open the chart stands; a failure past its hold is
+        dropped first."""
+        now = time.monotonic()
         self._requested.add(key)
-        if self._spawner is not None and key not in self._sent:
+        if key in self._failed and not self._failure_stands(key, now):
+            chart_role, symbol = key
+            mql5_error, failed_at = self._failed.pop(key)
+            logger.info(
+                "the %s chart of %s failed to open %d s ago with MQL5 error %d: asking the spawner "
+                "again",
+                chart_role,
+                symbol,
+                now - failed_at,
+                mql5_error,
+            )
+        if self._spawner is not None and key not in self._sent and key not in self._failed:
             self._sent.add(key)
             self._to_ea(self._spawner, binary.OpenChart(*key))
+
+    def _failure_stands(self, key: ChartKey, now: float) -> bool:
+        """Whether the spawner's failure to open the chart is within its hold."""
+        failed = self._failed.get(key)
+        hold_s = _FAILED_HOLD_RETRIES * self._settings.retry_after_s
+        return failed is not None and now - failed[1] < hold_s
 
     def _in_use(self, key: ChartKey, now: float) -> bool:
         """Whether a consumer subscribes to the symbol of a publisher chart, a request waits on the
@@ -706,7 +742,7 @@ class Hub:
         """Answers a request ea_error naming its chart that failed to open, with the MQL5 error the
         spawner met."""
         chart_role, symbol = key
-        mql5_error = self._failed[key]
+        mql5_error, _failed_at = self._failed[key]
         message = f"the {chart_role} chart of {symbol} failed to open: MQL5 error {mql5_error}"
         error = binary.AnswerError(ErrorKind.EA_ERROR, message)
         self._to_consumer(ws, binary.Answer(client_id, 0, True, mql5_error, error=error))
@@ -806,7 +842,7 @@ class Hub:
         """Forgets a connection. A consumer's subscriptions leave the wanted frames with it and its
         pending requests are answered to no one; an EA that served its role and symbol leaves them
         unserved, each of its pending requests answered ea_gone, a close pending on its chart still
-        pending, and a chart still in use is requested again."""
+        pending, a chart still in use requested again, and one out of use closed."""
         consumer = self._consumers.pop(ws, None)
         ea = self._eas.pop(ws, None)
         if consumer is not None:
@@ -838,8 +874,16 @@ class Hub:
                 else:
                     if ea.chart_role is ChartRole.PUBLISHER:
                         del self._told[ea.symbol]
-                    if self._in_use(ea.key, time.monotonic()):
+                    now = time.monotonic()
+                    if self._in_use(ea.key, now):
                         self._request_chart(ea.key)
+                    elif self._spawner is not None and ea.key not in self._close_sent:
+                        logger.info(
+                            "%s EA for %s left its chart out of use: closing it",
+                            ea.chart_role,
+                            ea.symbol,
+                        )
+                        self._close_chart(ea.key, now)
 
 
 def serve_hub(hub: Hub, host: str, port: int):
