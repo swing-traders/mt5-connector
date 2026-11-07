@@ -162,6 +162,7 @@ class MT5LiveExecClientFactory(LiveExecClientFactory):
                 conn, mt5_config.venue, config.instrument_provider, clock
             ),
             config=mt5_config,
+            loads=config.instrument_provider,
         )
 
 

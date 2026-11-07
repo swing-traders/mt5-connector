@@ -108,6 +108,7 @@ from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
 
 if TYPE_CHECKING:
+    from nautilus_trader.config import InstrumentProviderConfig
     from nautilus_trader.model.orders import Order
 
     from mt5connector.client.config import MT5Config
@@ -430,6 +431,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         clock: LiveClock,
         instrument_provider: MT5InstrumentProvider,
         config: MT5Config,
+        loads: InstrumentProviderConfig,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -447,6 +449,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._conn = connection
         self._config = config
         self._provider = instrument_provider
+        # What the client's config names as its instruments, which its provider loads beside the
+        # symbols quoting the pairs their fee conversions need.
+        self._loads = loads
         self._magic = magic_for(self.trader_id)
         self._hub = HubSession(config, loop, self._on_push_frame, None, self._log)
         self._account_task: asyncio.Task | None = None
@@ -860,9 +865,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     async def _refresh_account(self) -> None:
         """Reports the account: its balance and credit in total, its margin locked and the rest
         free, and one account-level margin — the margin the venue states as used as initial, the
-        maintenance floor as maintenance; NT's portfolio adds the open positions' unrealised P&L. A
-        report that fails stays owed to the next account turn, and so does one an event owes while
-        the read is in flight, since the answer may predate the event."""
+        maintenance floor as maintenance; NT's portfolio adds the open positions' unrealised P&L —
+        then gives NT's account each traded instrument's leverage. A report that fails stays owed to
+        the next account turn, and so does one an event owes while the read is in flight, since the
+        answer may predate the event."""
         self._account_owed = False
         try:
             answered = await self._hub.request(calls.Call.ACCOUNT_INFO)
@@ -881,12 +887,29 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 reported=True,
                 ts_event=self._clock.timestamp_ns(),
             )
+            self._write_leverages()
         except BaseException:
             self._account_owed = True
             raise
         self._account_due_ns = (
             self._clock.timestamp_ns() + self._config.account_refresh_seconds * 1_000_000_000
         )
+
+    def _traded(self) -> list[InstrumentAny]:
+        """The instruments this client's config names as its own: every symbol loaded under
+        `load_all`, else those its `load_ids` name — `load_all` first, as NT's provider loads."""
+        if self._loads.load_all:
+            return self._provider.list_all()
+        return [self._provider.find(instrument_id) for instrument_id in self._loads.load_ids]
+
+    def _write_leverages(self) -> None:
+        """Gives NT's account, for each instrument this client trades, the leverage its margin stamp
+        states: from the definition NT's cache holds, which the data client restates, else from the
+        one this client's provider loaded. A stamp below 1 meets NT's refusal."""
+        account = self.get_account()
+        for loaded in self._traded():
+            definition = self._cache.instrument(loaded.id) or loaded
+            account.set_leverage(loaded.id, Decimal(definition.info["margin"]["leverage"]))
 
     # ── Submit ────────────────────────────────────────────────────────────────
 

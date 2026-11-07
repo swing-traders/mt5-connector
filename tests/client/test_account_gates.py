@@ -106,6 +106,7 @@ def _client(
             clock=clock,
             instrument_provider=_provider(instruments),
             config=_config(venue),
+            loads=InstrumentProviderConfig(load_ids=frozenset()),
         )
     client.generate_account_state = MagicMock()
     return client
@@ -349,6 +350,7 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
             clock=clock,
             instrument_provider=_provider(()),
             config=_config(),
+            loads=InstrumentProviderConfig(load_ids=frozenset()),
         )
     try:
         await client._connect()
@@ -526,6 +528,9 @@ def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProvi
     conn.account_info.return_value = AccountSnapshot.from_mt5(account_info())
     conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
     clock = LiveClock()
+    msgbus = MessageBus(trader_id=TraderId("TESTER-001"), clock=clock)
+    cache = TestComponentStubs.cache()
+    Portfolio(msgbus, cache, clock)
     provider = MT5InstrumentProvider(
         connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
     )
@@ -534,13 +539,14 @@ def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProvi
             loop=asyncio.get_running_loop(),
             connection=conn,
             account=AccountSnapshot.from_mt5(account_info()),
-            msgbus=MessageBus(trader_id=TraderId("TESTER-001"), clock=clock),
-            cache=TestComponentStubs.cache(),
+            msgbus=msgbus,
+            cache=cache,
             clock=clock,
             instrument_provider=provider,
             config=_config(),
+            loads=provider_config,
         )
-    client.generate_account_state = MagicMock()
+    client.generate_account_state = MagicMock(wraps=client.generate_account_state)
     return client, provider
 
 
