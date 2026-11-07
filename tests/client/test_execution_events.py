@@ -942,7 +942,7 @@ async def test_an_account_query_is_answered_with_the_account_the_venue_reports_n
     h.client.query_account(
         QueryAccount(trader_id=TRADER_ID, account_id=ACCOUNT_ID, command_id=UUID4(), ts_init=0)
     )
-    await asyncio.gather(*h.client._tasks)
+    await asyncio.wait_for(asyncio.gather(*h.client._tasks), timeout=5)
 
     assert h.names() == ["AccountState"]
     state = h.ledger[-1]
