@@ -5,10 +5,21 @@ import asyncio
 from decimal import Decimal
 
 import pytest
-from exec_harness import ACCOUNT_ID, MAGIC, STRATEGY_ID, TRADER_ID, build, ours_deal, ours_order
+from exec_harness import (
+    ACCOUNT_ID,
+    EURUSD,
+    MAGIC,
+    STRATEGY_ID,
+    TRADER_ID,
+    build,
+    instrument,
+    ours_deal,
+    ours_order,
+)
 from hub_double import eventually
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.common.enums import LogLevel
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     CancelOrder,
@@ -18,7 +29,7 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, OrderType
-from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
+from nautilus_trader.model.identifiers import InstrumentId, PositionId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from session_double import deal_added, order_left, request_done, transaction_frame
@@ -931,6 +942,81 @@ async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec
     account.apply(h.ledger[-1])
     assert account.account_margins_init() == {USD: Money(Decimal("200.00"), USD)}
     assert account.account_margins_maint() == {USD: Money(Decimal("150.00"), USD)}
+
+
+AUDCAD = InstrumentId.from_str("AUDCAD+.MT5")
+AUDUSD = InstrumentId.from_str("AUDUSD.MT5")
+
+
+async def test_the_account_holds_the_leverage_of_each_instrument_its_load_ids_name(exec_venue):
+    # EURUSD margins at the login's 1:500; AUDCAD+ at 1 / its BUY initial rate of 0.004; AUDUSD,
+    # loaded only to quote a conversion, at 1 / its BUY initial rate of 2.
+    h = build(
+        exec_venue,
+        instruments=[
+            instrument("EURUSD", leverage="500"),
+            instrument("AUDCAD+", leverage="250"),
+            instrument("AUDUSD", leverage="0.5"),
+        ],
+        loads=InstrumentProviderConfig(load_ids=frozenset({EURUSD, AUDCAD})),
+    )
+
+    await h.connect()
+
+    account = h.cache.account(ACCOUNT_ID)
+    assert account.leverage(EURUSD) == Decimal("500")
+    assert account.leverage(AUDCAD) == Decimal("250")
+    assert account.leverage(AUDUSD) is None
+
+
+async def test_the_account_takes_the_leverage_of_a_definition_restated_in_the_cache(exec_venue):
+    h = build(
+        exec_venue,
+        instruments=[
+            instrument("EURUSD", leverage="500"),
+            instrument("AUDCAD+", leverage="250"),
+            instrument("AUDUSD", leverage="0.5"),
+        ],
+        loads=InstrumentProviderConfig(load_ids=frozenset({EURUSD, AUDCAD})),
+    )
+    await h.connect()
+
+    h.cache.add_instrument(instrument("AUDCAD+", leverage="200"))
+    h.client._account_owed = True
+    await h.client._account_turn()
+
+    account = h.cache.account(ACCOUNT_ID)
+    assert account.leverage(AUDCAD) == Decimal("200")
+    assert account.leverage(EURUSD) == Decimal("500")
+
+
+async def test_the_account_holds_the_leverage_of_every_symbol_loaded_under_load_all(exec_venue):
+    h = build(
+        exec_venue,
+        instruments=[instrument("EURUSD", leverage="500"), instrument("AUDUSD", leverage="400")],
+        loads=InstrumentProviderConfig(load_all=True),
+    )
+
+    await h.connect()
+
+    account = h.cache.account(ACCOUNT_ID)
+    assert account.leverage(EURUSD) == Decimal("500")
+    assert account.leverage(AUDUSD) == Decimal("400")
+
+
+async def test_a_load_all_symbol_stamped_below_one_fails_the_connect(exec_venue):
+    h = build(
+        exec_venue,
+        instruments=[instrument("EURUSD", leverage="500"), instrument("AUDUSD", leverage="0.5")],
+        loads=InstrumentProviderConfig(load_all=True),
+    )
+
+    with pytest.raises(ValueError):
+        await h.client._connect()
+
+    account = h.cache.account(ACCOUNT_ID)
+    assert account.leverage(EURUSD) == Decimal("500")
+    assert account.leverage(AUDUSD) is None
 
 
 async def test_an_account_query_is_answered_with_the_account_the_venue_reports_now(exec_venue):

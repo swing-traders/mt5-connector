@@ -12,6 +12,7 @@ import pandas as pd
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.identifiers import (
@@ -26,6 +27,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
+from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from session_double import ExecSession, deal_added, verdict_of
@@ -65,9 +67,10 @@ def instrument(
     symbol: str = "EURUSD",
     filling_mode: int = FILLING_FOK | FILLING_IOC,
     lot_step: str = "0.01",
+    leverage: str = "500",
 ):
-    """A five-digit pair settling in USD, sized in steps of `lot_step` lots, as the provider types
-    it."""
+    """A five-digit pair settling in USD, sized in steps of `lot_step` lots, its margin stamped at
+    `leverage`, as the provider types it."""
     step = Quantity.from_str(lot_step)
     return CurrencyPair(
         instrument_id=InstrumentId(Symbol(symbol), EURUSD.venue),
@@ -85,7 +88,7 @@ def instrument(
         taker_fee=Decimal(0),
         ts_event=0,
         ts_init=0,
-        info={"filling_mode": filling_mode},
+        info={"filling_mode": filling_mode, "margin": {"leverage": leverage}},
     )
 
 
@@ -251,18 +254,22 @@ def gtd(day: str = "2026-10-04T00:00:00Z") -> dict:
     return {"time_in_force": TimeInForce.GTD, "expire_time": pd.Timestamp(day)}
 
 
-def build(venue, *, instruments=None, account=None, cache=None, **settings) -> Harness:
+def build(venue, *, instruments=None, account=None, cache=None, loads=None, **settings) -> Harness:
     """A client of the trader TRADER_ID whose hub session `venue` answers, with EURUSD loaded unless
-    `instruments` names others, its connection and its session reporting `account`, over `cache`
-    when one is given: a restart's client over what NT kept."""
+    `instruments` names others, trading what `loads` names, else every instrument loaded, by id, its
+    connection and its session reporting `account`, over `cache` when one is given: a restart's
+    client over what NT kept. NT's portfolio keeps the account the client reports."""
     clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
     ledger = []
     msgbus.register(endpoint="ExecEngine.process", handler=ledger.append)
-    msgbus.register(endpoint="Portfolio.update_account", handler=ledger.append)
     if cache is None:
         cache = TestComponentStubs.cache()
+    Portfolio(msgbus, cache, clock)
+    msgbus.subscribe(topic="events.account.*", handler=ledger.append)
     loaded = {item.raw_symbol.value: item for item in (instruments or [instrument()])}
+    if loads is None:
+        loads = InstrumentProviderConfig(load_ids=frozenset(item.id for item in loaded.values()))
 
     conn = MagicMock(spec=MT5Connection)
     conn.account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
@@ -273,6 +280,7 @@ def build(venue, *, instruments=None, account=None, cache=None, **settings) -> H
     provider.initialize = AsyncMock()
     provider.list_all.return_value = list(loaded.values())
     provider.get_instrument.side_effect = loaded.get
+    provider.find.side_effect = {item.id: item for item in loaded.values()}.get
 
     with patch.object(execution, "HubSession", partial(ExecSession, venue)):
         client = RecordedExecClient(
@@ -284,6 +292,7 @@ def build(venue, *, instruments=None, account=None, cache=None, **settings) -> H
             clock=clock,
             instrument_provider=provider,
             config=config(**settings),
+            loads=loads,
         )
     factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
     return Harness(client, client._hub, venue, conn, cache, factory, ledger, loaded)

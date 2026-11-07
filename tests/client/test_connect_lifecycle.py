@@ -80,6 +80,7 @@ def exec_client(conn: MT5Connection, config: MT5Config) -> MT5LiveExecutionClien
         clock=clock,
         instrument_provider=provider_of(conn),
         config=config,
+        loads=EURUSD_ONLY,
     )
 
 
