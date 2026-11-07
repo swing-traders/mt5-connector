@@ -10,7 +10,12 @@ from hub_double import eventually
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import CancelOrder, GenerateFillReports, SubmitOrder
+from nautilus_trader.execution.messages import (
+    CancelOrder,
+    GenerateFillReports,
+    QueryAccount,
+    SubmitOrder,
+)
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderStatus, OrderType
 from nautilus_trader.model.identifiers import PositionId, TradeId, VenueOrderId
@@ -926,6 +931,31 @@ async def test_a_margin_account_reads_the_reported_margin_back_per_currency(exec
     account.apply(h.ledger[-1])
     assert account.account_margins_init() == {USD: Money(Decimal("200.00"), USD)}
     assert account.account_margins_maint() == {USD: Money(Decimal("150.00"), USD)}
+
+
+async def test_an_account_query_is_answered_with_the_account_the_venue_reports_now(exec_venue):
+    h = await connected(exec_venue)
+    exec_venue.account_info.return_value = account_info(
+        balance=20000.0, credit=50.0, margin=300.0, equity=20120.0, margin_free=19820.0
+    )
+
+    h.client.query_account(
+        QueryAccount(trader_id=TRADER_ID, account_id=ACCOUNT_ID, command_id=UUID4(), ts_init=0)
+    )
+    await asyncio.wait_for(asyncio.gather(*h.client._tasks), timeout=5)
+
+    assert h.names() == ["AccountState"]
+    state = h.ledger[-1]
+    assert state.account_id == ACCOUNT_ID
+    assert state.is_reported
+    (balance,) = state.balances
+    assert (balance.total, balance.locked, balance.free) == (
+        Money(Decimal("20050.00"), USD),
+        Money(Decimal("300.00"), USD),
+        Money(Decimal("19750.00"), USD),
+    )
+    assert h.logged(LogLevel.ERROR) == []
+    h.client.recorded_log.exception.assert_not_called()
 
 
 async def test_a_turn_owing_no_report_and_before_the_refresh_period_reports_nothing(exec_venue):
