@@ -48,6 +48,7 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
     ModifyOrder,
+    QueryAccount,
     SubmitOrder,
     SubmitOrderList,
 )
@@ -612,6 +613,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 if self._account_unanswered:
                     self._account_unanswered = False
                     self._log.info("account report: the hub answers again")
+
+    async def _query_account(self, command: QueryAccount) -> None:
+        """Answers NT's account query with the account as the venue reports it now."""
+        await self._refresh_account()
 
     # ── The hub session ──────────────────────────────────────────────────────
 
