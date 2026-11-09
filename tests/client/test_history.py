@@ -101,7 +101,13 @@ async def test_ticks_are_the_rows_the_hub_answers_asked_by_the_flags_value(hub, 
 
 
 async def test_ranges_are_the_hubs_ranges_of_the_symbol(hub, session):
-    held = calls.Ranges(100_000, {Series.M1: calls.SeriesRange(NINE, NINE + 5, 2)})
+    held = calls.Ranges(
+        100_000,
+        {Series.M1: calls.SeriesRange(NINE, NINE + 5, 2)},
+        first_tick=NINE + 30,
+        claimable_through=NINE + 86_400,
+        resync_failure="202611: the month did not return",
+    )
     hub.answers[Call.RANGES] = [held]
 
     read = await asyncio.wait_for(history.ranges(session, "X"), 2)

@@ -527,10 +527,13 @@ def test_a_part_of_an_eas_history_read_is_its_rows_alone(last):
         calls.read_ea_result(row, binary.Answer(1, 0, last, 0, 1, rows.tobytes() + b"\x00"))
 
 
-def _ea_ranges(maxbars: int, floors: list[tuple[int, int]], *, last=True) -> binary.Answer:
-    """An EA's ranges answer: its MaxBars, then each floor by its timeframe."""
+def _ea_ranges(
+    maxbars: int, floors: list[tuple[int, int]], *, last=True, first_tick=0
+) -> binary.Answer:
+    """An EA's MaxBars, first real tick and each floor by its timeframe."""
     writer = Writer()
     writer.i64(maxbars)
+    writer.i64(first_tick)
     for timeframe, floor in floors:
         writer.i32(timeframe)
         writer.i64(floor)
@@ -548,13 +551,36 @@ def test_an_eas_ranges_answer_is_its_maxbars_and_each_series_floor_on_the_broker
     )
 
 
+def test_an_eas_ranges_answer_carries_the_first_real_tick_after_maxbars():
+    row = calls.CALLS[Call.RANGES]
+    held = calls.read_ea_result(
+        row, _ea_ranges(100_000, [(TICK_TIMEFRAME, 1_500_000_000)], first_tick=1_600_000_000)
+    )
+
+    assert held.first_tick == 1_600_000_000
+    assert held.floors == {Series.TICKS: 1_500_000_000}
+
+
+def test_ranges_carry_the_download_bound_and_failure_beside_the_tick_era():
+    row = calls.CALLS[Call.RANGES]
+    value = calls.Ranges(
+        100_000,
+        {Series.TICKS: calls.SeriesRange(1_500_000_000, 1_752_570_000, 1)},
+        first_tick=1_600_000_000,
+        claimable_through=1_752_537_600,
+        resync_failure="202611: the month did not return",
+    )
+
+    assert calls.read_hub_result(row, _answer(Call.RANGES, value)) == value
+
+
 @pytest.mark.parametrize(
     ("floors", "message"),
     [
-        ([(mirror.TIMEFRAME_MN1, 1)], f"result offset 8: timeframe {mirror.TIMEFRAME_MN1} has no"),
+        ([(mirror.TIMEFRAME_MN1, 1)], f"result offset 16: timeframe {mirror.TIMEFRAME_MN1} has no"),
         (
             [(mirror.TIMEFRAME_H1, 1), (mirror.TIMEFRAME_H1, 2)],
-            f"result offset 20: timeframe {mirror.TIMEFRAME_H1} is repeated",
+            f"result offset 28: timeframe {mirror.TIMEFRAME_H1} is repeated",
         ),
     ],
     ids=["unserved", "repeated"],

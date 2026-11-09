@@ -109,9 +109,10 @@ def ea_result(call: calls.Call, value):
         rows = np.array([tuple(r[name] for name in mirror.TICKS.names) for r in value], _TICKS)
         count, body = len(rows), rows.tobytes()
     elif row.shape is calls.Shape.RANGES:
-        maxbars, floors = value
+        maxbars, floors, *first_tick = value
         writer = Writer()
         writer.i64(maxbars)
+        writer.i64(first_tick[0] if first_tick else 0)
         for timeframe, floor in floors:
             writer.i32(timeframe)
             writer.i64(floor)
