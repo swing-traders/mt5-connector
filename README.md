@@ -437,7 +437,7 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 
 `mt5connector.client.history` reads history as coroutines on the hub session each is handed as its first argument, every epoch true-UTC seconds:
 
-- `bars(session, symbol, series, first_open_s, last_open_s)` answers the bars of a `Series` opened in that window as a numpy array of `MqlRates`' fields and each bar's `time_close`; `ticks(session, symbol, start_s, end_s, flags=TickFlags.INFO)` the ticks of those seconds as the package's array; and `ranges(session, symbol)` the hub's `Ranges`: the terminal's `maxbars` and each series' `SeriesRange` floor.
+- `bars(session, symbol, series, first_open_s, last_open_s)` answers the bars of a `Series` opened in that window as a numpy array of `MqlRates`' fields and each bar's `time_close`; `ticks(session, symbol, start_s, end_s, flags=TickFlags.INFO)` the ticks of those seconds as the package's array; and `ranges(session, symbol)` the hub's `Ranges`: the terminal's `maxbars`, each series' `SeriesRange` floor, the first real tick's `first_tick`, the exclusive UTC-day edge `claimable_through` certified by the hub's re-sync record, and its latest `resync_failure`, empty after success.
 - Each reads through the session's `deferring`: a `syncing`, `not_ready` or `no_publisher` answer is asked again after its delay, with no deadline of its own, until the hub answers otherwise or the caller cancels. Any other error is the hub's `HubAnswerError` raised — `InvalidWindow` for a window starting after the terminal's time — and an answer lost to the session's deadline or a reconnect raises `ResponseLost`.
 - `opens_closing(series, first_close, last_close)` gives the opens a window of closes is read by, and `closing(rows, first_close, last_close)` keeps the bars closing in it.
 - A caller awaits one on its connection's session, on the loop the connection was connected on: `await history.bars(conn.session, "EURUSDm", Series.H1, first_open_s, last_open_s)`.
@@ -477,7 +477,7 @@ The live hub tier, `tests/live/`, runs against two running images' hubs on one a
 - the symbol's ticks and M1 bars;
 - a pending order whose expiration has passed, which the venue refuses, and a command for a symbol no publisher serves;
 - its history: the floors `ranges` reports against a bar read from 1970 and the first real tick, windows before the M1 floor, before the ticks' floor and in the daily lead-in, one starting after the terminal's time, a cold M1 window, a day of ticks from the ticks' floor and a month back, and a week of ticks, timing a publisher read every second while it downloads;
-- the era spread rule: a day's tickless minutes from the spread floor on synthesised from their M1 bars with each bar's own spread;
+- the era spread rule: minutes from the spread floor on and before the first real tick synthesised from their M1 bars with each bar's own spread; a positive-volume bar with no tick inside the tick era fails the read;
 - on the terminal whose `MaxBars` is capped, the one window over the span cap a capped frame allows, whole and as thirds, a wide read beginning at the M1 floor `ranges` reports or one period after it, and a day of ticks between the ticks' floor and the M1 floor, settled with no minute synthesised.
 
 ---
