@@ -460,6 +460,55 @@ async def test_a_cold_m1_window_a_week_back_answers_its_bars_and_the_m1_floor(se
     assert Series.M1 in held.series
 
 
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (datetime(2026, 11, 2, tzinfo=UTC), datetime(2026, 11, 7, tzinfo=UTC)),
+        (datetime(2026, 11, 2, 14, 24, tzinfo=UTC), datetime(2026, 11, 2, 14, 25, tzinfo=UTC)),
+    ],
+    ids=["five-days", "minute-1424"],
+)
+async def test_each_real_tick_minute_has_its_m1_tick_volume_of_bid_flagged_ticks(
+    session, start, end
+):
+    hub_session, _ = session
+    held = await ranges(hub_session)
+    if held.first_tick == 0:
+        pytest.skip(f"{SYMBOL}: no real tick history")
+    # Exclude the first real tick's partial minute and the forming minute.
+    first_full_minute = (held.first_tick + MINUTE_S - 1) // MINUTE_S * MINUTE_S
+    began = max(int(start.timestamp()), first_full_minute)
+    ended = min(int(end.timestamp()), int(time.time()) // MINUTE_S * MINUTE_S)
+    if began >= ended:
+        pytest.skip(f"{SYMBOL}: the window holds no complete minute in the real tick era")
+
+    compared = 0
+    mismatches = []
+    for day in range(began, ended, DAY_S):
+        until = min(day + DAY_S, ended)
+        bars = await m1_bars(hub_session, day, until - MINUTE_S)
+        ticks = await info_ticks(hub_session, day, until - 1)
+        bid_ticks = ticks[(ticks["flags"] & mirror.TICK_FLAG_BID) != 0]
+        minutes, counts = np.unique(bid_ticks["time_msc"] // 60_000, return_counts=True)
+        by_minute = dict(zip(minutes, counts, strict=True))
+        for bar in bars:
+            opened = int(bar["time"])
+            actual = int(by_minute.get(opened // MINUTE_S, 0))
+            expected = int(bar["tick_volume"])
+            if actual != expected:
+                mismatches.append(
+                    f"{_iso(opened)}: bid-flagged ticks={actual}, tick_volume={expected}"
+                )
+        compared += len(bars)
+        logger.info(
+            "%s: %s to %s: compared %d M1 minutes", SYMBOL, _iso(day), _iso(until), len(bars)
+        )
+
+    assert compared > 0, f"{SYMBOL}: no M1 bars in {_iso(began)} to {_iso(ended)}"
+    assert not mismatches, f"{compared} M1 minutes compared; " + "; ".join(mismatches)
+    logger.info("%s: %d M1 minutes compared, no bid-flag count mismatch", SYMBOL, compared)
+
+
 async def test_the_ranges_report_every_series_the_m1_floor_a_read_from_1970_begins_at(session):
     hub_session, _ = session
 
