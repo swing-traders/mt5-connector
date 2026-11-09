@@ -8,17 +8,40 @@ import pytest
 from mt5connector.server.settings import HubSettings, SettingsError, read_hub_settings
 
 
-def test_hub_settings_read_the_environment_with_defaults():
-    settings = read_hub_settings({})
+def test_resync_settings_read_the_defaults_and_an_existing_store(tmp_path):
+    settings = read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path)})
+
+    assert settings.resync_hour == 1
+    assert settings.resync_idle_seconds == 600
+    assert settings.history_store == tmp_path
+
+
+@pytest.mark.parametrize("hour", ["-1", "24"])
+def test_the_resync_hour_is_a_broker_hour(hour, tmp_path):
+    with pytest.raises(SettingsError, match="MT5_RESYNC_HOUR"):
+        read_hub_settings({"MT5_RESYNC_HOUR": hour, "MT5_HISTORY_STORE": str(tmp_path)})
+
+
+def test_the_history_store_must_be_a_directory(tmp_path):
+    path = tmp_path / "file"
+    path.touch()
+
+    with pytest.raises(SettingsError, match="MT5_HISTORY_STORE"):
+        read_hub_settings({"MT5_HISTORY_STORE": str(path)})
+
+
+def test_hub_settings_read_the_environment_with_defaults(tmp_path):
+    settings = read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path)})
     assert settings.hub_port == 9000
     assert settings.broker_tz == ZoneInfo("America/New_York")
     assert settings.broker_offset_hours == 7
     assert settings.chart_idle_seconds == 900
 
 
-def test_hub_settings_take_overrides():
+def test_hub_settings_take_overrides(tmp_path):
     settings = read_hub_settings(
         {
+            "MT5_HISTORY_STORE": str(tmp_path),
             "MT5_HUB_PORT": "9100",
             "MT5_BROKER_TZ": "Europe/Helsinki",
             "MT5_BROKER_OFFSET_HOURS": "0",
@@ -31,9 +54,9 @@ def test_hub_settings_take_overrides():
 
 
 @pytest.mark.parametrize("value", ["Mars/Olympus", "", "../etc/zone"])
-def test_hub_settings_refuse_an_unknown_broker_zone(value):
+def test_hub_settings_refuse_an_unknown_broker_zone(value, tmp_path):
     with pytest.raises(SettingsError, match="MT5_BROKER_TZ"):
-        read_hub_settings({"MT5_BROKER_TZ": value})
+        read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path), "MT5_BROKER_TZ": value})
 
 
 @pytest.mark.parametrize(
@@ -47,9 +70,9 @@ def test_hub_settings_refuse_an_unknown_broker_zone(value):
     ],
 )
 @pytest.mark.parametrize("value", ["7.5", "seven", ""])
-def test_hub_settings_refuse_a_clock_setting_that_is_not_an_integer(variable, value):
+def test_hub_settings_refuse_a_clock_setting_that_is_not_an_integer(variable, value, tmp_path):
     with pytest.raises(SettingsError, match=f"^{variable}=.* is not an integer$"):
-        read_hub_settings({variable: value})
+        read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path), variable: value})
 
 
 @pytest.mark.parametrize(
@@ -73,9 +96,9 @@ def test_hub_settings_refuse_a_clock_setting_that_is_not_an_integer(variable, va
         ("MT5_HUB_PENDING_BOUND", "0"),
     ],
 )
-def test_hub_settings_name_the_variable_and_its_value_when_refusing(variable, value):
+def test_hub_settings_name_the_variable_and_its_value_when_refusing(variable, value, tmp_path):
     with pytest.raises(SettingsError) as refused:
-        read_hub_settings({variable: value})
+        read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path), variable: value})
     assert str(refused.value).startswith(f"{variable}=")
     assert value in str(refused.value)
 
@@ -96,8 +119,10 @@ def test_hub_settings_name_the_variable_and_its_value_when_refusing(variable, va
         ("pending_bound", 0, "MT5_HUB_PENDING_BOUND"),
     ],
 )
-def test_hub_settings_built_out_of_range_are_refused_naming_the_variable(field, value, variable):
-    settings = read_hub_settings({})
+def test_hub_settings_built_out_of_range_are_refused_naming_the_variable(
+    field, value, variable, tmp_path
+):
+    settings = read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path)})
     built = dataclasses.asdict(settings) | {"broker_tz": settings.broker_tz, field: value}
 
     with pytest.raises(SettingsError) as constructed:
@@ -110,9 +135,9 @@ def test_hub_settings_built_out_of_range_are_refused_naming_the_variable(field, 
         assert str(value) in str(refused.value)
 
 
-def test_hub_settings_built_with_positive_fractional_durations_are_accepted():
+def test_hub_settings_built_with_positive_fractional_durations_are_accepted(tmp_path):
     settings = dataclasses.replace(
-        read_hub_settings({}),
+        read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path)}),
         retry_after_s=0.5,
         clock_sample_max_age_seconds=0.2,
         clock_bootstrap_seconds=0.05,
