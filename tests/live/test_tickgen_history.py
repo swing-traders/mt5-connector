@@ -1,8 +1,8 @@
 """The every-tick generator's historical acceptance against the candidate hub tests/live/
-prepare_tickgen.py starts: the tester's exported weeks, a doji read alone, and a window mixing the
-venue's real ticks with a later tickless minute, each against the fitted rules' oracle. It runs only
-when MT5_TICK_EXPORT_DIR and MT5_TICK_RAW_DIR are set; MT5_TICK_ACCEPTANCE_REQUIRED=1 fails every
-case whose inputs or hub are missing instead of skipping it."""
+prepare_tickgen.py starts: the tester's exported weeks, a doji read alone, the venue's real ticks,
+and a later tickless minute rejected inside the tick era. It runs only when MT5_TICK_EXPORT_DIR and
+MT5_TICK_RAW_DIR are set; MT5_TICK_ACCEPTANCE_REQUIRED=1 fails every case whose inputs or hub are
+missing instead of skipping it."""
 
 import asyncio
 import csv
@@ -20,6 +20,7 @@ import tickgen_capture
 import tickgen_oracle as oracle
 
 from mt5connector.client.config import MT5Config
+from mt5connector.client.errors import EaError
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import calls, mirror
 from mt5connector.wire.broker_clock import BrokerClock
@@ -459,64 +460,26 @@ def test_a_doji_read_alone_goes_opposite_the_rising_bar_before_its_window(weeks)
     assert bid_points(narrow, export.digits) == oracle.bids(*doji[1:6], -1)
 
 
-def test_real_tick_minutes_answer_the_venues_ticks_and_a_later_empty_minute_the_fitted_path(
+def test_a_tick_era_gap_fails_and_the_preceding_real_minutes_answer_the_venues_ticks(
     provenance, weeks
 ):
     fixture = provenance["fixture"]
-    digits = weeks[0][0].digits
     capture = tickgen_capture.load(Path(RAW_DIR) / fixture["directory"], fixture["label"])
     raw = capture.minutes()
-    start, end, empty = fixture["start"], fixture["end"], fixture["empty"]
+    start, empty = fixture["start"], fixture["empty"]
+    last_real = max(minute for minute in raw if start <= minute < empty)
 
     async def reads(session: HubSession):
-        return await every_tick(session, CLOCK.to_utc(start), CLOCK.to_utc(end))
+        with pytest.raises(EaError, match=f"minute broker {empty} holds a bar and no tick"):
+            await every_tick(session, CLOCK.to_utc(start), CLOCK.to_utc(empty) + MINUTE_S - 1)
+        return await every_tick(
+            session, CLOCK.to_utc(start), CLOCK.to_utc(last_real) + MINUTE_S - 1
+        )
 
     answered = by_minute(asyncio.run(session_reads(reads)))
-    real = {minute: rows for minute, rows in raw.items() if start <= minute <= end}
-    synthesised: dict[int, list[tuple]] = {}
-    last = None
-    for bar in capture.bars:
-        t = bar[0]
-        o, h, low, c = (tickgen_capture.points(price, digits) for price in bar[1:5])
-        v, spread = bar[5], bar[6]
-        if c != o:
-            last = oracle.sign(c - o)
-            d = last
-        elif last is not None:
-            d = -last
-        else:
-            d = None
-        if start <= t <= end and t not in raw:
-            assert d is not None, f"no non-doji before broker minute {t} in the capture"
-            bids = oracle.bids(o, h, low, c, v, d)
-            synthesised[t] = [
-                (
-                    CLOCK.to_utc_msc(t * 1000 + offset),
-                    bid,
-                    bid + spread,
-                    mirror.TICK_FLAG_BID | mirror.TICK_FLAG_ASK,
-                )
-                for bid, offset in zip(bids, oracle.offsets_ms(t, v, len(bids)), strict=True)
-            ]
-
-    assert empty in synthesised
-    assert any(minute < empty for minute in real)
-    assert set(answered) == {CLOCK.to_utc(minute) for minute in real | synthesised}
+    real = {minute: rows for minute, rows in raw.items() if start <= minute <= last_real}
+    assert set(answered) == {CLOCK.to_utc(minute) for minute in real}
     for minute, rows in real.items():
         venue = [(CLOCK.to_utc(tick[0]), CLOCK.to_utc_msc(tick[1]), *tick[2:]) for tick in rows]
 
         assert answered[CLOCK.to_utc(minute)] == venue, f"broker minute {minute}"
-    for minute, rows in synthesised.items():
-        emitted = [
-            (
-                row[1],
-                tickgen_capture.points(row[2], digits),
-                tickgen_capture.points(row[3], digits),
-                row[6],
-            )
-            for row in answered[CLOCK.to_utc(minute)]
-        ]
-
-        assert emitted == rows, f"broker minute {minute}"
-        assert all(row[0] == row[1] // 1000 for row in answered[CLOCK.to_utc(minute)])
-        assert all(row[4:6] == (0.0, 0) for row in answered[CLOCK.to_utc(minute)])
