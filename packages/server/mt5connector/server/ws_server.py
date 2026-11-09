@@ -9,8 +9,8 @@ open, and when, standing for the failure hold or until that chart opens or its E
 each chart was last in use, and when the spawner was last told to close each chart whose close is
 pending, which outlives the chart's EA; the true-UTC open of the last bar fanned out of each series;
 the latest commission schedule and trading sessions relayed for each symbol; the floors learned
-from ranges answers; the pending requests and the clock gate. Nothing is persisted, and nothing is
-replayed to a consumer that reconnects."""
+from ranges answers; the pending requests and the clock gate. The history re-sync record alone is
+persisted on the history volume. Nothing is replayed to a consumer that reconnects."""
 
 import asyncio
 import dataclasses
@@ -39,6 +39,7 @@ from mt5connector.server.floors import FloorStore
 from mt5connector.server.hub_gate import ClockGate
 from mt5connector.server.hub_health import health
 from mt5connector.server.hub_requests import Pending, Requests
+from mt5connector.server.hub_resync import Resync
 from mt5connector.server.hub_utc import (
     WINDOWS,
     Conversion,
@@ -136,8 +137,35 @@ class Hub:
         self._commissions = CommissionStore()
         self._sessions = SessionStore()
         self._floors = FloorStore()
+        self._first_ticks: dict[str, int] = {}
         self._repeated_hours = RepeatedHours()
         self._closing: set[asyncio.Task] = set()
+        self._resync = Resync(
+            clock,
+            settings,
+            ready=lambda: self._gate.verification is not None and self._spawner is not None,
+            idle=self._resync_idle,
+            request=self._resync_request,
+        )
+
+    def _resync_idle(self, symbol: str) -> bool:
+        key = (ChartRole.HISTORY, symbol)
+        margin = self._settings.chart_idle_seconds + self._settings.resync_idle_seconds
+        return (
+            key not in self._served
+            and key not in self._requested
+            and not self._in_use(key, time.monotonic())
+            and time.monotonic() - self._used.get(key, -math.inf) >= margin
+        )
+
+    def _resync_request(self, call: calls.Call, arguments: dict) -> bool:
+        """Sends the pass's read once its history EA serves the requested chart."""
+        key = (ChartRole.HISTORY, arguments["symbol"])
+        state = self.use_chart(key)
+        if key in self._served or state is ChartState.FAILED:
+            self._send(None, -1, calls.CALLS[call], arguments, arguments["symbol"])
+            return True
+        return False
 
     def start(self) -> None:
         """Arms the clock gate's bootstrap window."""
@@ -712,12 +740,15 @@ class Hub:
         """Takes a history EA's ranges answer as the symbol's floors, and answers the consumer the
         symbol's ranges from the store."""
         self._floors.replace(pending.symbol, measured.floors, int(time.time()))
+        self._first_ticks[pending.symbol] = Conversion(self._clock, self._repeated_hours).utc(
+            mirror.EpochUnit.SECONDS, measured.first_tick, pending.symbol, "first_tick"
+        )
         ranges = self._ranges(pending.symbol, measured.maxbars)
         count, result = calls.write_result(pending.served, ranges)
         return binary.Answer(pending.client_id, 0, True, answer.last_error, count, result)
 
     def _ranges(self, symbol: str, maxbars: int) -> calls.Ranges:
-        """The terminal's MaxBars and every floor held for the symbol, in true UTC."""
+        """The symbol's ranges and certified UTC-day edge."""
         conversion = Conversion(self._clock, self._repeated_hours)
         floors = self._floors.of_symbol(symbol)
         series = {}
@@ -728,7 +759,14 @@ class Hub:
                     mirror.EpochUnit.SECONDS, floor.value, f"{symbol} {name}", "floor"
                 )
                 series[name] = calls.SeriesRange(advertised, floor.measured_at, floor.generation)
-        return calls.Ranges(maxbars, series)
+        first_tick = self._first_ticks.get(symbol, 0)
+        return calls.Ranges(
+            maxbars,
+            series,
+            first_tick,
+            self._resync.claimable_through(symbol, first_tick, int(time.time())),
+            self._resync.failure(symbol),
+        )
 
     def _deferred(self, ws, client_id: int, kind: ErrorKind, message: str) -> None:
         error = binary.AnswerError(kind, message, int(self._settings.retry_after_s * 1000))
@@ -755,6 +793,9 @@ class Hub:
 
     def _to_consumer(self, ws, frame: binary.Frame) -> None:
         """Queues a frame for a consumer still connected."""
+        if ws is None and isinstance(frame, binary.Answer) and frame.request_id == -1:
+            self._resync.answer(frame, int(time.time()))
+            return
         consumer = self._consumers.get(ws)
         if consumer is not None:
             self._enqueue(ws, consumer, binary.encode(frame))
@@ -907,6 +948,7 @@ async def _serve(settings: HubSettings) -> None:
         while True:
             await asyncio.sleep(_IDLE_SWEEP_S)
             hub.close_idle_charts()
+            hub._resync.sweep(int(time.time()))
 
 
 def main() -> None:

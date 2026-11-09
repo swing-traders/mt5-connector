@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -26,6 +27,11 @@ _VARIABLES = {
     "consumer_queue_bound": _Variable("MT5_HUB_CONSUMER_QUEUE_BOUND", "10000"),
     "ea_queue_bound": _Variable("MT5_HUB_EA_QUEUE_BOUND", "10000"),
     "pending_bound": _Variable("MT5_HUB_PENDING_BOUND", "1000"),
+    "resync_hour": _Variable("MT5_RESYNC_HOUR", "1"),
+    "resync_idle_seconds": _Variable("MT5_RESYNC_IDLE_SECONDS", "600"),
+    "history_store": _Variable(
+        "MT5_HISTORY_STORE", "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
+    ),
 }
 _POSITIVE = (
     "chart_idle_seconds",
@@ -36,6 +42,7 @@ _POSITIVE = (
     "consumer_queue_bound",
     "ea_queue_bound",
     "pending_bound",
+    "resync_idle_seconds",
 )
 
 
@@ -56,6 +63,9 @@ class HubSettings:
     consumer_queue_bound: int
     ea_queue_bound: int
     pending_bound: int
+    resync_hour: int
+    resync_idle_seconds: float
+    history_store: Path
 
     def __post_init__(self) -> None:
         """Refuses a setting out of range, naming its environment variable and its value."""
@@ -65,6 +75,10 @@ class HubSettings:
         elif not isinstance(self.broker_tz, ZoneInfo):
             variable = _VARIABLES["broker_tz"].name
             raise SettingsError(f"{variable}={self.broker_tz!r} is not a known time zone")
+        if not 0 <= self.resync_hour <= 23:
+            raise SettingsError(f"MT5_RESYNC_HOUR={self.resync_hour} is not an hour")
+        if not isinstance(self.history_store, Path) or not self.history_store.is_dir():
+            raise SettingsError(f"MT5_HISTORY_STORE={self.history_store} is not a directory")
         for name in _POSITIVE:
             value = getattr(self, name)
             if not value > 0:
@@ -80,6 +94,8 @@ def read_hub_settings(environ: Mapping[str, str]) -> HubSettings:
         text = environ.get(variable.name, variable.default)
         if setting.name == "broker_tz":
             values[setting.name] = _zone(variable.name, text)
+        elif setting.name == "history_store":
+            values[setting.name] = Path(text)
         else:
             values[setting.name] = _integer(variable.name, text)
     return HubSettings(**values)

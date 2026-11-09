@@ -1047,6 +1047,7 @@ bool g_storeSettled = false;
 bool g_storeStalled = false;
 bool g_spreadHeld = false;
 long g_spreadFloor = 0;
+long g_firstTick = 0;
 
 // One run of a request: the symbol's measurement where it is not done, then the request's reads.
 class HistoryRun
@@ -2066,6 +2067,7 @@ void MeasureTicks(const HistoryRequest *r, HistoryRun &run)
         KeepFloor(HUB_TICK_TIMEFRAME, quote, !ticked && !spread, false);
         g_spreadHeld = spread;
         g_spreadFloor = spreadFloor;
+        g_firstTick = firstTick;
         g_measured = true;
         PrintFormat("ticks: %s ticks: first tick broker %I64d, spread floor broker %I64d, quote "
                     "floor broker %I64d", r.symbol, firstTick, spreadFloor, quote);
@@ -2639,6 +2641,37 @@ void MarkTickless(const HistoryRequest *r, HistoryRun &run, const MqlRates &bars
     }
 }
 
+// A positive-volume bar inside the tick era must hold a real tick of some kind.
+void CheckTickEra(const HistoryRequest *r, HistoryRun &run, const long lo, const long hi,
+                  const MqlTick &real[])
+{
+    if (g_firstTick == 0)
+        return;
+    const long from = Latest(lo, g_firstTick - g_firstTick % MINUTE_SECONDS);
+    const long through = Earliest(hi, Present(r));
+    MqlRates bars[];
+    if (from <= through && ReadM1(r, run, from, through, bars))
+    {
+        KeepRatesWithin(bars, from, through);
+        const int offGrid = FirstOffGrid(bars, MINUTE_SECONDS);
+        if (offGrid >= 0)
+            run.Stop(RUN_FAILED, StringFormat("%s %s: row broker %I64d is off the grid", r.symbol,
+                                              EnumToString(PERIOD_M1), (long)bars[offGrid].time),
+                     0);
+    }
+    bool tickless[];
+    if (run.Going())
+        MarkTickless(r, run, bars, real, tickless);
+    for (int i = 0; i < ArraySize(bars) && run.Going(); i++)
+    {
+        if (tickless[i] && bars[i].tick_volume > 0)
+            run.Stop(RUN_FAILED,
+                     StringFormat("%s ticks: minute broker %I64d holds a bar and no tick",
+                                  r.symbol, (long)bars[i].time),
+                     0);
+    }
+}
+
 // The generator's ticks of each M1 bar opened in [from, hi] whose minute holds no real tick, in time
 // order, each with its bar's own spread. A bar opened after the time no bar opens after may be
 // forming, its ticks unread, and yields none.
@@ -2707,8 +2740,8 @@ void AppendTickless(const HistoryRequest *r, HistoryRun &run, const MqlRates &ba
     }
 }
 
-// The ticks synthesised for the window's tickless minutes from the spread floor on, and from the M1
-// floor on where a capped frame has trimmed older bars; none where no bar records a spread.
+// The window's generated ticks from the spread floor on and before the first real tick's minute,
+// bounded by the M1 floor where a capped frame has trimmed older bars.
 void Synthesise(const HistoryRequest *r, HistoryRun &run, const long lo, const long hi,
                 const MqlTick &real[], MqlTick &rows[])
 {
@@ -2716,8 +2749,11 @@ void Synthesise(const HistoryRequest *r, HistoryRun &run, const long lo, const l
     {
         const long m1lo = Latest(lo, Latest(g_floors[FloorIndex((int)PERIOD_M1)].value,
                                             g_spreadFloor));
-        if (m1lo <= hi)
-            SynthesiseBars(r, run, m1lo, hi, real, rows);
+        long m1hi = hi;
+        if (g_firstTick != 0)
+            m1hi = Earliest(hi, g_firstTick - g_firstTick % MINUTE_SECONDS - 1);
+        if (m1lo <= m1hi)
+            SynthesiseBars(r, run, m1lo, m1hi, real, rows);
     }
 }
 
@@ -2745,8 +2781,8 @@ void Merge(const MqlTick &a[], const MqlTick &b[], MqlTick &rows[])
 }
 
 // The request's ticks of [lo, hi] in time order, cut to its window: the real ticks of the minutes,
-// read first, merged with those synthesised from the M1 bar of each minute holding none; a minute
-// is real ticks or synthesised ones whole, so a minute the window cuts is read whole.
+// read first and checked against their bars inside the tick era, merged with generated ticks before
+// that era; a minute the window cuts is read whole.
 void ReadTickWindow(HistoryRequest *r, HistoryRun &run, const long lo, const long hi)
 {
     MqlTick real[];
@@ -2758,6 +2794,8 @@ void ReadTickWindow(HistoryRequest *r, HistoryRun &run, const long lo, const lon
             run.Stop(RUN_FAILED, StringFormat("%s ticks: row broker msc %I64d is out of order",
                                               r.symbol, real[decrease].time_msc),
                      0);
+        if (run.Going())
+            CheckTickEra(r, run, lo, hi, real);
         MqlTick synthesised[];
         // Synthesised ticks are quote ticks, which a selection of trade ticks holds none of.
         if (run.Going() && (r.flags & (uint)COPY_TICKS_INFO) == (uint)COPY_TICKS_INFO)
@@ -2854,10 +2892,11 @@ void AnswerSyncing(HistoryRequest *r, const string reason, const string told, co
     DropHistory(r);
 }
 
-// A ranges answer's records: the terminal's MaxBars, then each floor's timeframe and value.
+// A ranges answer: MaxBars, the first real tick, then each floor's timeframe and value.
 void WriteRanges(BinaryWriter &body, const HistoryRequest *r)
 {
     body.I64(r.maxbars);
+    body.I64(g_firstTick);
     for (int i = 0; i < ArraySize(r.rangeFloors); i++)
     {
         body.I32(r.rangeTimeframes[i]);

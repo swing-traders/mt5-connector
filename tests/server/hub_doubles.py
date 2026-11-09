@@ -4,6 +4,7 @@ connection double driving the handler directly, and a spawner relaying live serv
 import asyncio
 import contextlib
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -14,7 +15,7 @@ import websockets
 from ea_wire import FakeEa, encode_ea
 from mirror_samples import CLOCK
 
-from mt5connector.server.settings import HubSettings
+from mt5connector.server.settings import HubSettings, read_hub_settings
 from mt5connector.server.wire import binary, calls
 from mt5connector.server.wire.push_wire import ChartRole
 from mt5connector.server.ws_server import Hub, serve_hub
@@ -38,6 +39,11 @@ def settings(**overrides) -> HubSettings:
         "consumer_queue_bound": 10_000,
         "ea_queue_bound": 10_000,
         "pending_bound": 1_000,
+        "resync_hour": 1,
+        "resync_idle_seconds": 600,
+        "history_store": read_hub_settings(
+            {"MT5_HISTORY_STORE": os.environ["MT5_HISTORY_STORE"]}
+        ).history_store,
     }
     return HubSettings(**(defaults | overrides))
 

@@ -3,6 +3,7 @@ under its deadline and behind the clock gate, with every epoch converted at the 
 
 import asyncio
 import calendar
+import json
 import logging
 import time
 from datetime import UTC, datetime
@@ -750,7 +751,7 @@ async def ranges_read(consumer, ea, request_id: int, floors: list[tuple[int, int
     received."""
     await consumer.ask(request_id, Call.RANGES, symbol="EURUSD")
     request = await ea.request()
-    await ea.send(answer(request.request_id, Call.RANGES, (100_000, floors)))
+    await ea.send(answer(request.request_id, Call.RANGES, (100_000, floors, BROKER_EPOCH + 30)))
     reply = await consumer.received()
     return request, calls.read_hub_result(calls.CALLS[Call.RANGES], reply)
 
@@ -759,8 +760,37 @@ def floors_of(ranges: calls.Ranges) -> dict[Series, tuple[int, int]]:
     return {series: (entry.floor, entry.generation) for series, entry in ranges.series.items()}
 
 
-async def test_a_ranges_answer_is_stored_and_reaches_the_consumer_in_true_utc_by_generation():
-    hub, server, port = await run_hub()
+@pytest.fixture
+def ranges_store(tmp_path):
+    (tmp_path / "broker" / "ticks" / "EURUSD").mkdir(parents=True)
+    metadata = tmp_path / ".mt5-connector"
+    metadata.mkdir()
+    (metadata / "resync.json").write_text(
+        json.dumps(
+            {
+                "EURUSD": {
+                    "months": {},
+                    "outcome": "failed",
+                    "month": "202507",
+                    "reason": "the measurement did not restore the month",
+                }
+            }
+        )
+    )
+    return tmp_path
+
+
+def assert_ranges_facts(ranges):
+    assert ranges.first_tick == UTC_EPOCH + 30
+    # The first tick is July 15 09:00:30 UTC; no month in that era has been verified.
+    assert ranges.claimable_through == 1_752_537_600
+    assert ranges.resync_failure == "202507: the measurement did not restore the month"
+
+
+async def test_a_ranges_answer_is_stored_and_reaches_the_consumer_in_true_utc_by_generation(
+    ranges_store,
+):
+    hub, server, port = await run_hub(history_store=ranges_store)
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -795,14 +825,18 @@ async def test_a_ranges_answer_is_stored_and_reaches_the_consumer_in_true_utc_by
             Series.H1: (UTC_EPOCH, 1),
             Series.TICKS: (UTC_EPOCH + 30, 1),
         }
+        for ranges in (first, again, moved):
+            assert_ranges_facts(ranges)
         await consumer.close()
         await eurusd.close()
         await spawner.close()
     server.close()
 
 
-async def test_a_ranges_answer_omitting_a_series_the_last_one_carried_no_longer_advertises_it():
-    hub, server, port = await run_hub()
+async def test_a_ranges_answer_omitting_a_series_the_last_one_carried_no_longer_advertises_it(
+    ranges_store,
+):
+    hub, server, port = await run_hub(history_store=ranges_store)
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -816,14 +850,17 @@ async def test_a_ranges_answer_omitting_a_series_the_last_one_carried_no_longer_
             Series.H1: (UTC_EPOCH, 1),
             Series.TICKS: (UTC_EPOCH + 30, 1),
         }
+        assert_ranges_facts(emptied)
         await consumer.close()
         await eurusd.close()
         await spawner.close()
     server.close()
 
 
-async def test_a_series_back_in_a_ranges_answer_after_one_omitted_it_steps_its_generation():
-    hub, server, port = await run_hub()
+async def test_a_series_back_in_a_ranges_answer_after_one_omitted_it_steps_its_generation(
+    ranges_store,
+):
+    hub, server, port = await run_hub(history_store=ranges_store)
     async with verified(port) as spawner:
         eurusd = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
         consumer = await Consumer.connect(port)
@@ -835,6 +872,7 @@ async def test_a_series_back_in_a_ranges_answer_after_one_omitted_it_steps_its_g
         _, back = await ranges_read(consumer, eurusd, 3, [h1, m1])
 
         assert floors_of(back) == {Series.M1: (UTC_EPOCH, 2), Series.H1: (UTC_EPOCH, 1)}
+        assert_ranges_facts(back)
         await consumer.close()
         await eurusd.close()
         await spawner.close()

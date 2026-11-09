@@ -133,19 +133,22 @@ class SeriesRange:
 
 @dataclass(frozen=True)
 class Ranges:
-    """The terminal's MaxBars and every floor the hub holds for a symbol."""
+    """A symbol's floors, first real tick, certified UTC-day edge and latest re-sync failure."""
 
     maxbars: int
     series: dict[Series, SeriesRange]
+    first_tick: int = 0
+    claimable_through: int = 0
+    resync_failure: str = ""
 
 
 @dataclass(frozen=True)
 class MeasuredFloors:
-    """The terminal's MaxBars and each floor a history EA measured for a symbol, in broker seconds:
-    a ranges answer as the EA sends it."""
+    """The terminal's MaxBars, first real tick and measured floors, in broker seconds."""
 
     maxbars: int
     floors: dict[Series, int]
+    first_tick: int = 0
 
 
 _ARG_TYPES = {
@@ -429,6 +432,9 @@ def write_result(row: Row, value: object) -> tuple[int, bytes]:
     elif row.shape is Shape.RANGES:
         count = len(value.series)
         writer.i64(value.maxbars)
+        writer.i64(value.first_tick)
+        writer.i64(value.claimable_through)
+        writer.string(value.resync_failure)
         for series, entry in value.series.items():
             writer.string(series)
             writer.i64(entry.floor)
@@ -492,13 +498,16 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
         return _measured_floors(reader, count)
     elif row.shape is Shape.RANGES:
         maxbars = reader.i64("maxbars")
+        first_tick = reader.i64("first_tick")
+        claimable_through = reader.i64("claimable_through")
+        resync_failure = reader.string("resync_failure")
         series = {}
         for _ in range(count):
             name = reader.member(Series, "series")
             series[name] = SeriesRange(
                 reader.i64("floor"), reader.i64("measured_at"), reader.i64("generation")
             )
-        return Ranges(maxbars, series)
+        return Ranges(maxbars, series, first_tick, claimable_through, resync_failure)
     elif row.shape is Shape.SCHEDULE:
         _one(row, count)
         return binary.read_schedule(reader)
@@ -510,8 +519,9 @@ def _read_value(row: Row, reader: Reader, count: int, sender: binary.Sender) -> 
 
 
 def _measured_floors(reader: Reader, count: int) -> MeasuredFloors:
-    """An EA's ranges answer: the MaxBars, then each floor by the timeframe of its series."""
+    """An EA's MaxBars, first real tick and each floor by the timeframe of its series."""
     maxbars = reader.i64("maxbars")
+    first_tick = reader.i64("first_tick")
     floors: dict[Series, int] = {}
     for _ in range(count):
         at = reader.offset
@@ -526,7 +536,7 @@ def _measured_floors(reader: Reader, count: int) -> MeasuredFloors:
         if series in floors:
             raise CodecError(f"result offset {at}: timeframe {timeframe} is repeated")
         floors[series] = reader.i64("floor")
-    return MeasuredFloors(maxbars, floors)
+    return MeasuredFloors(maxbars, floors, first_tick)
 
 
 def _rows(reader: Reader, count: int, dtype: np.dtype) -> np.ndarray:
