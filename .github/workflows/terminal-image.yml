@@ -1,0 +1,54 @@
+name: terminal-image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: terminal-image
+  cancel-in-progress: false
+
+jobs:
+  terminal:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the container registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" \
+            | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build the terminal image
+        run: docker build -f Dockerfile.terminal -t mt5-terminal .
+
+      - name: Publish a new terminal build
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=$(docker create mt5-terminal /terminal-build)
+          trap 'docker rm "$container"' EXIT
+          docker cp "$container:/terminal-build" terminal-build
+          build=$(<terminal-build)
+          [[ "$build" =~ ^[0-9]+$ ]]
+          image=ghcr.io/swing-traders/mt5-terminal
+          if lookup=$(docker manifest inspect "$image:$build" 2>&1); then
+            result="build $build is already tagged; pushing nothing"
+          elif [[ "$lookup" == *"manifest unknown"* || "$lookup" == *"no such manifest"* ]]; then
+            docker tag mt5-terminal "$image:$build"
+            docker push "$image:$build"
+            result="build $build published"
+          else
+            printf 'tag lookup failed: %s\n' "$lookup" >&2
+            exit 1
+          fi
+          digest=$(docker buildx imagetools inspect "$image:$build" \
+            --format '{{json .Manifest}}' | jq -er .digest)
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf '%s\nterminal digest: %s\n' "$result" "$digest"
+          printf '%s\n\n%s@%s\n' "$result" "$image" "$digest" >> "$GITHUB_STEP_SUMMARY"
