@@ -25,7 +25,7 @@ jobs:
             | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Build the terminal image
-        run: docker build -f image/terminal.Dockerfile -t mt5-terminal .
+        run: docker build -f Dockerfile.terminal -t mt5-terminal .
 
       - name: Publish a new terminal build
         shell: bash
