@@ -34,13 +34,6 @@ jobs:
       - name: Layer the dev tooling and the server
         run: micromamba env update -n mt5-connector -f environment.dev.yml --yes
 
-      - name: Log in to the container registry
-        env:
-          REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          printf '%s' "$REGISTRY_TOKEN" \
-            | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-
       - name: Build the image
         run: docker build -t mt5-connector-server .
 

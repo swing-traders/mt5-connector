@@ -606,7 +606,7 @@ The connector `Dockerfile` pins the published terminal image by tag and digest i
 
 The connector's own EA and startup script compile with the copied terminal's `MetaEditor64.exe`. Each must produce its `.ex5` and a `Result:` line with `0 errors, 0 warnings`, or the build fails.
 
-`just terminal-latest` dispatches and waits for the manual Action, which prints the build it published and its digest. An upgrade edits the published image reference and its build label in the connector `Dockerfile`, in a PR whose image tier checks the new terminal. Published terminal tags pinned by any connector release are retained.
+An upgrade edits the published image reference and its build label in the connector `Dockerfile`, in a PR whose image tier checks the new terminal. Published terminal tags pinned by any connector release are retained.
 
 The files the build downloads itself are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend the server builds with, resolve at build time as `image/environment.yml` and the server's `pyproject.toml` declare them.
 

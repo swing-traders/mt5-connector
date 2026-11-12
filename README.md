@@ -450,7 +450,7 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 ## Releases
 
 - `VERSION` holds the one version both distributions carry.
-- The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The manual `terminal-image.yml` Action builds the terminal-only image and skips publishing a build already tagged. `just terminal-latest` dispatches and waits for it. A terminal upgrade changes that one image reference in a PR, checked by the image tier.
+- The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The manual `terminal-image.yml` Action builds the terminal-only image and skips publishing a build already tagged. A terminal upgrade changes that one image reference in a PR, checked by the image tier.
 - A `vX.Y.Z+st` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, and the server image. The image is pushed to `ghcr.io/swing-traders/mt5-connector-server:vX.Y.Z-st` once the image tier passes on it; only then are all four wheel files attached to one GitHub release and the PEP 503 index rebuilt on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
 - The image package is public. A new package's visibility is private by GitHub's default and no API sets it, so the first release's push is followed, once, by making the package public in its settings (Change visibility); later pushes keep it.
 - Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
