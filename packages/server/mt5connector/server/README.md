@@ -70,7 +70,7 @@ Inside a payload a `str` is a u16 byte count, then that many bytes of UTF-8; a S
 | `server_time` | 16 | spawner → hub | `symbol`, the spawner's; `trade_server`, `current`, `gmt` (int64); `connected` (u8) |
 | `commissions` | 17 | publisher → hub | `symbol`; `ret` and `last_error` (int32) of its `SymbolInfoCommissions` call; a u16 rule count, each rule its `currency`, its five enum fields by their `EnumToString` names and a u16 tier count, each tier its `mode` and `volume_type` by name, `value`, `min_value`, `max_value`, `range_from`, `range_to` (float64) and `currency` |
 | `sessions` | 18 | publisher → hub | `symbol`; then `quote` and `trade`, seven days each, Sunday first, each a u16 session count and each session its `from` and `to` (int32 seconds from the broker day's 00:00); then `last_error` (int32) |
-| `request` | 19 | consumer → hub → EA | `call` (u16), then `count` arguments, each its index in the call's arguments (u8, ascending) and its value |
+| `request` | 19 | consumer → hub → EA | `call` (u16), then `count` arguments, each its index in the call's arguments (u8, ascending) and its value; hub-only arguments follow the EA's and are never forwarded |
 | `answer` | 20 | EA → hub → consumer | `part` (u32), `last_error` (int32); a result's `count` records; or an error's `kind` (u8), `message`, and for a deferring kind `retry_after_ms` (u32) |
 | `busy` | 21 | EA → hub → consumer | `bound_s` (u32): the EA is about to wait on the request at most that long |
 
@@ -90,9 +90,9 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 | `history_orders_get` | 10 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeOrder` rows | read |
 | `history_deals_get` | 11 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeDeal` rows | read |
 | `order_send` | 12 | publisher of the request's `symbol` | `request` | `MqlTradeResult` | command |
-| `copy_rates_range` | 13 | history | `symbol`, `timeframe`, `date_from`, `date_to` | bars | history |
-| `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags` | `MqlTick` rows; `ea_error` for a tick-era minute holding a positive-volume bar and no tick | history |
-| `ranges` | 17 | history | `symbol` | `maxbars`, `first_tick`, `claimable_through` (int64), `resync_failure` (str), then each floor held: `series`, `floor`, `measured_at`, `generation` (int64) | history |
+| `copy_rates_range` | 13 | history | `symbol`, `timeframe`, `date_from`, `date_to`; hub-only `source` | bars | history |
+| `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags`; hub-only `source` | `MqlTick` rows; `ea_error` for a tick-era minute holding a positive-volume bar and no tick | history |
+| `ranges` | 17 | history | `symbol`; hub-only `source` | `maxbars`, `first_tick`, `claimable_through` (int64), `resync_failure` (str), then each floor held: `series`, `floor`, `measured_at`, `generation` (int64) | history |
 | `outcomes` | 18 | publisher | `symbol`, `request_ids` | per request id its outcome log holds, the `MqlTradeTransaction`, `MqlTradeRequest` and `MqlTradeResult` of its `REQUEST` transaction, back to back | read |
 | `commission_schedule` | 19 | the hub | `symbol` | the schedule, laid out as a `commissions` frame's after its symbol | read |
 | `trading_sessions` | 20 | the hub | `symbol` | the sessions, laid out as a `sessions` frame's after its symbol | read |
@@ -111,7 +111,7 @@ Every request is answered once, by a result or an error, and nothing comes after
 
 | Error | Answered by | `retry_after_ms` | When |
 |---|---|---|---|
-| `syncing` | EA, hub | yes | a history request its history EA has not settled within the history bound — the symbol's measurement, or a read the terminal is still loading; or a commission schedule or trading sessions not yet relayed |
+| `syncing` | EA, hub | yes | a history request its EA has not settled; a server-synced history request whose symbol's re-sync is due and not done; any history request while its symbol's months are deleted for re-sync; or a commission schedule or trading sessions not yet relayed |
 | `not_ready` | hub | yes | the broker clock is not verified |
 | `no_publisher` | hub | yes | no EA serves the call's role and symbol: its chart is requested from the spawner — once per spawner connection — and the request answered at once |
 | `invalid_window` | hub, EA | no | a history window starting after it ends or after the terminal's time: the hub judges the true-UTC window asked, the EA the broker bounds it is sent |
@@ -138,6 +138,10 @@ Every request is answered once, by a result or an error, and nothing comes after
 
 The terminal answers a history request with whatever it has synced, substitutes the nearest data it has, and answers a range it cannot serve with the same emptiness as one that has no data. So the history EA brings the terminal to its symbol's full picture before it answers anything: an empty stretch it then answers is a hole in the venue's history, and a request the terminal has not settled within the history bound is `syncing`, asked again by the consumer.
 
+Every history request states its source requirement through the optional int64 `source`: `0`, `SERVER_SYNCED`, is the default when absent; `1`, `TERMINAL`, accepts anything the terminal holds, including its live recording. It occupies argument index 4 on both window reads and index 1 on `ranges`, and is removed before the request reaches the EA. Unknown values refuse the frame.
+
+A server-synced read receives `syncing` while its symbol's re-sync is due and unfinished. A terminal read starts no re-sync and is routed except from the deletion until the pass's measurement confirms the months present again; it can read while the pass awaits running reads or verifies restored data. Both sources answer the same rows and ranges fields. Catalog writers use the default and claim only certified whole days; the data client's warmup and reconnect read-back explicitly use `TERMINAL`.
+
 - **The full picture first.** The first history request a history EA serves — `ranges`, a bar read or a tick read — brings the terminal to its symbol's full picture before anything is answered: the bar store downloaded to the server's first date, every bar series' floor measured, the whole tick history synced, and the first real tick and the spread floor read. On a fresh volume that request waits for the bar store and the whole tick history, minutes for a CFD and possibly hours for a symbol with a long tick history, answered `syncing` at each bound and asked again while the measurement goes on.
 - **One measurement per series.** A bar series is measured once its frame reaches the store's first date or the terminal's `MaxBars`, so a frame cache cut short never floors it; a frame the terminal will not build that far fails the request. Its floor is the first of its first two rows one period apart, whatever rows lie before them; a daily or weekly series' floor is its first row. A series holding no such pair is empty history: answered with no rows, without a read, and in no `ranges`. A floor stands for the history EA's life, but a capped series' — one holding more bars than the terminal's `MaxBars`, whose oldest bars the terminal trims as new ones form — is measured at every request, and may answer from one period after its floor when a minute turns between the two.
 - **A stalled store**, one whose first date stands still across three deep reads short of the server's first date, is measured from where it stopped; the history chart's next life measures it again.
@@ -151,11 +155,21 @@ The terminal answers a history request with whatever it has synced, substitutes 
 - The terminal answers a range spanning more than `maxbars − 11` periods with nothing, so a longer bar window is read in spans within that, `maxbars` read from the terminal.
 - Every bar must lie on its timeframe's grid, or the read fails naming the row; ticks must not go back in time.
 
-The hub re-syncs idle symbols' tick stores at start once the broker clock is verified and the spawner is connected, and daily at broker 01:00. It visits every symbol under the history store, one at a time. A broker month is due without a verified download, after another broker day of that month ends, or when its recorded file is missing. The pass waits until the history chart is neither served nor requested and its last use is at least `MT5_CHART_IDLE_SECONDS + MT5_RESYNC_IDLE_SECONDS` ago, deletes the due month files, and immediately requests a new history chart and its `ranges`. The fresh EA's measurement downloads missing months. Publisher charts and the terminal keep running.
+The hub re-syncs symbols' tick stores at start once the broker clock is verified and the spawner is connected, daily at `MT5_RESYNC_HOUR`, and when a new store appears. Every symbol progresses independently through the same dispatch path. A broker month is due without a verified download, after another broker day of that month ends, or when its recorded file is missing. A due symbol's running reads finish, then the hub closes its history chart at once and deletes the due month files. It reopens after `MT5_RESYNC_REOPEN_SECONDS` from that chart's actual close; a chart closed that long before dispatch reopens immediately after deletion. The fresh EA's measurement downloads missing months. Publisher charts and the terminal keep running.
 
-Before recording a download, the hub checks that the deleted files returned under that measurement. It also reads the newest due month's ended broker days' M1 bars and the last positive-volume bar's minute of INFO ticks; an empty set of such bars passes without a tick read. A failed verification waits for the chart's ordinary idle close and the idle margin before retrying, at most three attempts per pass. The latest failure names the month in `ranges.resync_failure`; a later successful pass clears it.
+The close anchor is the serving history EA's disconnect under a close the hub requested. An EA lost with no close pending leaves its chart open and is re-requested while in use, including during a re-sync. An unexpected history EA departure fails its running re-sync attempt, between reads included; a history chart-open failure does so in any stage. A due machine waits for that outstanding open's hello or failure, closes the served chart, and counts the wait from its resulting disconnect. A standing chart-open failure delays reopening until its hold expires.
 
-The verified downloads and latest outcome live in `Bases/.mt5-connector/resync.json`, written to a temporary file and renamed. Every month absent before the measurement and present after verification is recorded, including one the terminal lost itself. A crash before recording leaves that month unverified; a later pass's full sync can restore it and record it. Floors are learned again after a restart.
+Each deletion, including an attempt's wait for a previous deletion worker, has the history request bound `HISTORY_BUSY_S`. A timeout fails that attempt.
+
+The terminal can write a deleted month back from memory during the wait. Once the wait ends, the hub deletes any written-back due month again before reopening, so a month is recorded only if absent immediately before the reopen and present after the check. The hub makes one check of the newest due month's ended broker days' M1 bars and the last positive-volume bar's minute of INFO ticks; an empty set of such bars passes without a tick read. A measurement answering `syncing` is asked again after its delay, without spending an attempt. A failed check closes the chart at once and repeats deletion, wait and measurement, at most three attempts. The latest failure names the month in `ranges.resync_failure`; a later successful pass clears it. A failed symbol retries on the next scheduled day or after a restart.
+
+The verified downloads and latest outcome live in `Bases/.mt5-connector/resync.json`, written to a temporary file and renamed. Each symbol holds `months`, `outcome`, `month` and `reason`, and a new store's `synced_through`. A verified month is stamped at the fresh EA's hello, when the download began, rather than its later verification. A crash before recording leaves that month unverified; a later pass's full sync can restore it and record it. Floors are learned again after a restart. Store listing, deletion and persistence run off the serving event loop.
+
+The hub tracks a storeless symbol's first download from its first routed history request until its first result. It does not examine the symbol while that download is pending, even when its month files have appeared. An EA's `syncing` holds it for twice `MT5_HISTORY_RETRY_SECONDS` after the last pending request, so a re-ask joins the same download. Its history chart stays in use throughout the download and that hold. Other failures and an expired hold release the store for a full re-sync; a consumer disconnect leaves its request pending and does not lose the result.
+
+The first result records `synced_through`. Every month that ended before it is kept as server data, including a file listed later; only months touched since are re-synced. A first `ranges` with no real tick records nothing and keeps its zero edge. A server-synced `ranges` with a real first tick whose store is not listed yet answers `syncing` naming its creation. A store already present at hub startup has no first-download evidence and is re-synced in full once.
+
+A running re-sync owns its months until it ends; months becoming due meanwhile start a new re-sync immediately afterwards.
 
 `ranges.first_tick` is the first real tick's true-UTC second, zero where none exists. `claimable_through` is an exclusive UTC-day edge: ended days wholly before that tick era are claimable, and a day in the era is claimable only when every broker month containing it was verified after the broker day containing its last instant ended. Claims form a prefix, so an unverified month holds back its days and every later day. A UTC day crossing a broker month boundary needs both months verified. A symbol with no tick store answers zero. Ordinary history reads use the terminal's available rows and delete nothing; consumers claiming finalized days use this edge and refuse a nonempty `resync_failure`.
 
@@ -171,11 +185,12 @@ The verified downloads and latest outcome live in `Bases/.mt5-connector/resync.j
 - A consumer's frames wait in a queue of at most `MT5_HUB_CONSUMER_QUEUE_BOUND`; the frame that finds it full closes that consumer with code 4008, and the rest are served on. An EA's frames wait in one of at most `MT5_HUB_EA_QUEUE_BOUND`: a request that finds it full is answered `overflow`, any other frame closes the EA with code 4008.
 - The hub pings every connection every 10 s, one ping outstanding at a time. A pong 30 s overdue — or, while a `busy` of the EA's stands, overdue past its bound — fails the connection: its requests are answered `ea_gone` at once and the hub drops it within its 10 s close timeout. A peer that stops reading while the hub has frames queued to it holds back the ping and the close frame.
 - **Charts.** A subscription to the ticks or bars of a symbol no publisher serves, a request for a role and symbol no EA serves, and an EA going away while its chart is in use each request that chart. A request is held until its EA says hello, and sent to the spawner as `open_chart` once per spawner connection; one made while no spawner is connected is sent on the spawner's hello. The spawner answers `chart_opened` or `chart_failed`; the hub keeps a failure, with a warning, for twice `MT5_HISTORY_RETRY_SECONDS` or until the chart opens or its EA says hello, and answers a request needing that chart `ea_error` meanwhile. The first request, subscription or replay past that hold asks the spawner again, logged; nothing asks again within it.
-- **Idle charts.** A chart is in use while a consumer subscribes to its publisher's ticks or bars, a request waits on its EA, and for `MT5_CHART_IDLE_SECONDS` after its last use: a request or a subscription naming it, its EA's hello, the spawner's `chart_kept`. The hub tells the spawner to close a chart out of use for that long, as `close_chart`, and holds the close pending until `chart_kept`, which counts the chart in use for another period, or until the spawner's connection ends; the spawner's own chart never closes.
+- **Idle charts.** A chart is in use while a consumer subscribes to its publisher's ticks or bars, a request waits on its EA, a running re-sync holds its history chart, and for `MT5_CHART_IDLE_SECONDS` after its last use: a request or a subscription naming it, its EA's hello, the spawner's `chart_kept`. The hub tells the spawner to close a chart out of use for that long, as `close_chart`, and holds the close pending until `chart_kept`, which counts the chart in use for another period, or until the spawner's connection ends; the spawner's own chart never closes.
   - The same holds for a chart the hub asked for whose EA never said hello: out of use for that long, it is closed and its request withdrawn, so a later use asks for it again.
-  - An EA leaving a chart out of use has the chart closed at once; one leaving a chart in use has it requested again.
+  - An EA leaving a chart out of use has the chart closed at once; one leaving a chart in use has it requested again. Under a pending close, the running re-sync alone does not request it again; another use must hold it.
   - A hello while the close is pending is no use, since the terminal drops a closing chart's EA's socket before it unloads the EA, which says hello again in between; the EA's disconnect leaves the close pending.
   - A close pending 30 s is sent again, with a warning, while an EA serves the chart out of use, and ends once no EA serves it or the chart is in use again.
+  - The re-sync's own close is sent and renewed by its due machine, never by the idle sweep. A closing EA that returns puts the machine back in `DUE`. The pending close survives a spawner reconnect and ends when the machine reopens or ends.
 - **Relays.** The hub takes every `server_time` sample of the spawner naming its own symbol into its clock gate, and drops one naming another symbol with a warning. It keeps each publisher's latest commission schedule and trading sessions under its own symbol, or why they were refused, until a later one is accepted:
   - a schedule or sessions frame naming another symbol than its publisher's is refused, and so are sessions holding a session with a negative second or one that does not end after it starts, a `to` of 0 ending at midnight;
   - a schedule naming a member its field's enum lacks never decodes: it is a frame the hub cannot handle.
@@ -276,7 +291,7 @@ The entrypoint reads `MT5_MAX_BARS` and the hub the rest from the environment on
 | `MT5_BROKER_OFFSET_HOURS` | hours the broker's clock runs ahead of that zone | `7` |
 | `MT5_CHART_IDLE_SECONDS` | how long a chart out of use stays open | `900` |
 | `MT5_RESYNC_HOUR` | broker hour of the daily history re-sync, 0–23 | `1` |
-| `MT5_RESYNC_IDLE_SECONDS` | additional history idle time before deleting due tick months | `600` |
+| `MT5_RESYNC_REOPEN_SECONDS` | time from a due symbol's history chart's actual close before reopening | `600` |
 | `MT5_HISTORY_STORE` | existing directory containing the terminal's broker history stores and the hub's re-sync record | `/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases` |
 | `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS` | how long a server-time sample stays fresh, and how long the terminal must stay connected before one verifies the clock | `30` |
 | `MT5_CLOCK_BOOTSTRAP_SECONDS` | how long after start a verification is due before the hub logs its absence | `120` |
@@ -318,9 +333,11 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 - a dialog is opened by the command id its menu path holds in `terminal64.exe`'s own menu resources;
 - a control is found by its id and class, the Options page by its tab's name.
 
-The WebRequest list's text cannot be read, so its row count is what confirms the URL. Each action prints one line and is bounded at 40 s; a window or control it cannot find fails the start, naming it. The server's name reaches the driver through `MT5_SERVER` alone.
+The WebRequest list's text cannot be read, so its row count confirms the URL. An allowlist retry finding exactly one URL applies it without adding another. The server search and allowlist steps each get three attempts within the same start. Each attempt launches its terminal, waits up to 120 s for its window, and runs its GUI action bounded at 40 s. A failed attempt closes its terminal, killing it if it does not exit within 60 s, before the 5 s retry delay. Each failure names its step, attempt and driver error, including the last window poll's output; the third fails startup. The server's name reaches the driver through `MT5_SERVER` alone.
 
-A terminal window, dialog or control that never appears fails the start at once, naming the step. What the entrypoint cannot see — a server search that found nothing, a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
+Before every attempt, `dismiss-dialogs` lists owned dialogs, closes a recognised terminal update offer and cancels only that step's own dialog: Options or Open an Account. Unknown dialogs are named and left open. A main window that stays disabled also reports its owned dialogs.
+
+A terminal window, dialog or control that never appears exhausts its step's attempts and fails the start, naming the step. What the entrypoint cannot see — a server search that found nothing, a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
 
 ### Stop
 
@@ -550,7 +567,7 @@ podman build --format=docker --build-arg DEBUG=1 -t mt5-connector-server-debug .
 ```
 
 - The build context is the repository root, and `.dockerignore` admits `VERSION`, `packages/` and `image/` alone. Podman builds with `--format=docker`: its default OCI format drops the base image's `SHELL`, through which the build's `RUN` steps run in the activated environment. Docker needs no flag.
-- The download stage takes `image/artifacts.txt` and `image/first-start.sh` on their own, and the checkout comes in once the terminal is installed, so a change to a package or a boot script rebuilds neither Wine nor the terminal.
+- The download stage takes `image/artifacts.txt` and `image/copied-terminal-start.sh` on their own, and the checkout comes in once the terminal is in place, so a change to a package or a boot script rebuilds neither Wine nor the terminal.
 - The Linux Python is `image/environment.yml` — Python and pip alone — installed as the base environment, then made root-owned and read-only.
 - One wheel of `packages/server`, built with that Python from the checkout's copy at `/opt/mt5-connector` with the client's wire vocabulary its `wire` link names, installs there with its dependencies; nothing else of the client enters the image. Nothing of this repository's own comes from an index, and `pip check` fails the build when the installed dependencies no longer satisfy the server's pins.
 - `--build-arg DEBUG=1` adds x11vnc, which the entrypoint starts on the display listening on the container's loopback (`127.0.0.1:5900`) and nowhere else; the default build carries no VNC at all, and any other `DEBUG` value fails the build.
@@ -568,18 +585,28 @@ The build also:
 ### Pins
 
 - Every apt package the `Dockerfile` pins takes its version from an `ARG` named `VERSION_<PACKAGE>` — `VERSION_WINE` — used at every pin.
-- `image/artifacts.txt` lists every file the download stage fetches, one per line as `<name> <url> <sha256>`: its URL carries the version, its hash pins the bytes, and nothing else states that version. One build step fetches them all and checks every hash, so a changed upstream file fails the build.
+- `image/artifacts.txt` lists the pinned downloads, one row as `<name> <url> <sha256>`: its URL carries the version, its hash pins the bytes, and a changed upstream file fails the build. Only the terminal image fetches the installer; the connector's download stage skips that row.
 - A downloaded artifact is bumped by editing its row's URL and `sha256sum` and nothing else. The WineHQ packages are bumped by `VERSION_WINE` alone.
 
 ### The terminal build
 
-The build starts the installed terminal once with `/portable`, waits up to 180 s for its log to show the start and the finished first-start MQL5 recompile — so a running container does not pay that recompile — and fails the build if the log never shows both. It writes the build number the terminal logged to `/home/mt5/.terminal-build`:
+The terminal image's installation runs `image/first-start.sh`: it starts the terminal with `/portable` and waits up to 180 s for both its start and its finished first-start MQL5 recompile. Those compiled programs travel with the terminal tree, so a running container pays no recompile.
+
+The connector copies the terminal image's `/terminal-build` to `/home/mt5/.terminal-build` and runs `image/copied-terminal-start.sh` in its fresh Wine prefix. The script waits up to 120 s for this launch's start line and fails naming both builds if its number differs from that copied file. It stops Wine before the build continues. The image's `io.github.swing-traders.mt5-connector.terminal-build` label records the pinned build; the image tier checks that it equals the copied build file. Both are readable without starting the terminal:
 
 ```bash
+podman image inspect mt5-connector-server \
+    --format '{{index .Config.Labels "io.github.swing-traders.mt5-connector.terminal-build"}}'
 podman run --rm --entrypoint cat mt5-connector-server /home/mt5/.terminal-build
 ```
 
-`mt5setup.exe` is a web installer: its own bytes are pinned, but it installs whatever terminal build MetaQuotes currently serves, so two builds from identical inputs can carry different terminal builds. Nothing stops the terminal's own update check: it never applies an update by itself, so the build an image baked is the one it runs. The installer exits 1 after a successful install, so the build checks the terminal's first start rather than the installer's exit code; without network access, or with a terminal that cannot start, it hangs instead of failing and ignores a termination signal, so the build kills it after 600 s and fails the step.
+`Dockerfile.terminal` installs and starts the terminal, then exports only its terminal directory, MetaQuotes AppData and `/terminal-build` in a scratch image. Its installer is pinned in `image/artifacts.txt`; the web installer fetches the current terminal build only for this separate image. The manual `terminal-image.yml` Action publishes `ghcr.io/swing-traders/mt5-terminal:<build>` only when that build has no tag yet, and reports its digest. It logs in with the job's `GITHUB_TOKEN` and package-write permission. The Dockerfile and Action depend only on the existing artifact manifest and first-start script, so they can be merged and run before the connector changes.
+
+The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage, currently build 6316. It starts that terminal in its own Wine prefix and verifies its logged build against the image's own build file. It never runs the web installer. The terminal never applies an update by itself; the startup driver dismisses recognised update offers.
+
+The connector's own EA and startup script compile with the copied terminal's `MetaEditor64.exe`. Each must produce its `.ex5` and a `Result:` line with `0 errors, 0 warnings`, or the build fails.
+
+`just terminal-latest` dispatches and waits for the manual Action, which prints the build it published and its digest. An upgrade edits the published image reference and its build label in the connector `Dockerfile`, in a PR whose image tier checks the new terminal. Published terminal tags pinned by any connector release are retained.
 
 The files the build downloads itself are pinned by hash. The base images are pinned by tag, the Debian packages Wine depends on follow trixie's current updates, and the Linux Python's packages, with the build backend the server builds with, resolve at build time as `image/environment.yml` and the server's `pyproject.toml` declare them.
 
@@ -594,6 +621,8 @@ MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
 It pins that:
 
 - a start on that account boots up to the hub, printing the account's password nowhere;
+- the logged terminal build matches its copied build file, and the boot pays no full recompile;
+- the copied-terminal build check rejects another build naming both numbers and bounds a missing start at 120 s;
 - the startup ini carries `MaxBars` as `MT5_MAX_BARS` sets it, the terminal's ceiling when it is unset, and an `MT5_MAX_BARS` that is no positive integer fails the start naming it;
 - the first supervised process to exit — the hub, Xvfb, the terminal during the boot — ends the container with its status, naming it;
 - a display that never comes up, a restore that never returns and a driver action that never returns each fail the start naming the step and its bound;
