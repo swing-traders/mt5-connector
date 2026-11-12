@@ -41,6 +41,7 @@ from mt5connector.client.errors import (
     ServerUnreachable,
     Syncing,
 )
+from mt5connector.client.history import OnSyncing
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import ErrorKind
 from mt5connector.wire.history_wire import bar_series
@@ -249,13 +250,19 @@ class HubSession:
             raise
         return await flight.future
 
-    async def deferring(self, call: calls.Call, **arguments: object) -> Answered:
+    async def deferring(
+        self, call: calls.Call, *, on_syncing: OnSyncing = OnSyncing.WAIT, **arguments: object
+    ) -> Answered:
         """The answer to a call, asked again after the delay each deferring answer gives until it is
         answered otherwise or the caller cancels."""
+        if not isinstance(on_syncing, OnSyncing):
+            raise ValueError("on_syncing is not an OnSyncing member")
         while True:
             try:
                 return await self.request(call, **arguments)
             except Deferred as deferred:
+                if isinstance(deferred, Syncing) and on_syncing is OnSyncing.RAISE:
+                    raise
                 self._log.debug(f"hub session: {deferred}; asking again")
                 await asyncio.sleep(deferred.retry_after_s)
 

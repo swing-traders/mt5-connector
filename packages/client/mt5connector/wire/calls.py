@@ -70,6 +70,11 @@ class ArgType(StrEnum):
     REQUEST_IDS = "request_ids"
 
 
+class Source(IntEnum):
+    SERVER_SYNCED = 0
+    TERMINAL = 1
+
+
 class Shape(StrEnum):
     """What an answer's records are."""
 
@@ -120,6 +125,7 @@ class Row:
     layout: binary.Layout | None = None
     # The argument sets of which a call carries at least one in full.
     forms: tuple[tuple[str, ...], ...] = ()
+    hub_arguments: tuple[Argument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,7 @@ _ARG_TYPES = {
     mirror.ParamKind.REQUEST: ArgType.TRADE_REQUEST,
 }
 _SYMBOL = Argument("symbol", ArgType.STRING, required=True)
+_SOURCE = Argument("source", ArgType.INTEGER, required=False)
 
 
 def _package(call: Call, name: mirror.FunctionName, role: ChartRole, wait: Wait) -> Row:
@@ -186,7 +193,16 @@ def _package(call: Call, name: mirror.FunctionName, role: ChartRole, wait: Wait)
         shape = Shape.TICKS
     else:
         shape = Shape.RATES
-    return Row(call, arguments, shape, role, wait, struct_layout, function.forms)
+    return Row(
+        call,
+        arguments,
+        shape,
+        role,
+        wait,
+        struct_layout,
+        function.forms,
+        (_SOURCE,) if role is ChartRole.HISTORY else (),
+    )
 
 
 CALLS: dict[Call, Row] = {
@@ -236,7 +252,14 @@ CALLS: dict[Call, Row] = {
             Wait.HISTORY,
         ),
         # The history EA answers its symbol's floors, which the hub keeps and stamps.
-        Row(Call.RANGES, (_SYMBOL,), Shape.RANGES, ChartRole.HISTORY, Wait.HISTORY),
+        Row(
+            Call.RANGES,
+            (_SYMBOL,),
+            Shape.RANGES,
+            ChartRole.HISTORY,
+            Wait.HISTORY,
+            hub_arguments=(_SOURCE,),
+        ),
         # A publisher answers each request id its outcome log holds with its REQUEST transaction.
         Row(
             Call.OUTCOMES,
@@ -299,10 +322,14 @@ def trade_request(fields: dict[str, object]) -> dict[str, object]:
 # ── Arguments ─────────────────────────────────────────────────────────────────
 
 
+def _all_arguments(row: Row) -> tuple[Argument, ...]:
+    return row.arguments + row.hub_arguments
+
+
 def encode_arguments(row: Row, arguments: dict[str, object]) -> tuple[int, bytes]:
     """The count and the bytes of a request's arguments, each by its index in the row; raises
     ValueError for an argument the row does not take, one of the wrong type, or a missing one."""
-    known = {argument.name for argument in row.arguments}
+    known = {argument.name for argument in _all_arguments(row)}
     unknown = sorted(set(arguments) - known)
     if unknown:
         raise ValueError(f"{row.call.name.lower()}: unknown argument: {', '.join(unknown)}")
@@ -311,7 +338,7 @@ def encode_arguments(row: Row, arguments: dict[str, object]) -> tuple[int, bytes
         raise ValueError(refusal)
     writer = Writer()
     count = 0
-    for index, argument in enumerate(row.arguments):
+    for index, argument in enumerate(_all_arguments(row)):
         if argument.name in arguments:
             writer.u8(index)
             _write_argument(writer, row, argument, arguments[argument.name])
@@ -328,11 +355,16 @@ def decode_arguments(row: Row, request: binary.Request) -> dict[str, object]:
     for _ in range(request.count):
         at = reader.offset
         index = reader.u8("argument index")
-        if not last < index < len(row.arguments):
+        if not last < index < len(_all_arguments(row)):
             raise CodecError(f"argument offset {at}: index {index} is out of order or range")
         last = index
-        argument = row.arguments[index]
+        argument = _all_arguments(row)[index]
         arguments[argument.name] = _read_argument(reader, argument)
+        if argument is _SOURCE:
+            try:
+                arguments[argument.name] = Source(arguments[argument.name])
+            except ValueError:
+                raise CodecError(f"source {arguments[argument.name]} is unknown") from None
     reader.done()
     refusal = _arguments_refusal(row, set(arguments))
     if refusal is not None:
@@ -343,7 +375,7 @@ def decode_arguments(row: Row, request: binary.Request) -> dict[str, object]:
 def _arguments_refusal(row: Row, given: set[str]) -> str | None:
     missing = [
         argument.name
-        for argument in row.arguments
+        for argument in _all_arguments(row)
         if argument.required and argument.name not in given
     ]
     if missing:

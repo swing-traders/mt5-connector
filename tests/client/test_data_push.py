@@ -35,6 +35,7 @@ from mt5connector.client.data import MT5DataClient
 from mt5connector.client.errors import EaError, MT5InstrumentError, ProtocolError, ResponseLost
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import binary, mirror
+from mt5connector.wire.calls import Source
 from mt5connector.wire.history_wire import BAR_PERIOD_S, Series
 from mt5connector.wire.push_wire import Stream, Subscription
 
@@ -348,7 +349,7 @@ class History:
         self.reads = []
         self.gates = []
 
-    async def __call__(self, session, symbol, series, start, end):
+    async def __call__(self, session, symbol, series, start, end, *, source=None):
         gate = asyncio.Event()
         self.reads.append((symbol, series, start, end))
         self.gates.append(gate)
@@ -375,7 +376,7 @@ def closed_rows(*opens_and_closes):
 class ClosedHistory(History):
     """The history's bars, each with its close, answered as History answers."""
 
-    async def __call__(self, session, symbol, series, start, end):
+    async def __call__(self, session, symbol, series, start, end, *, source=None):
         gate = asyncio.Event()
         self.reads.append((symbol, series, start, end))
         self.gates.append(gate)
@@ -505,7 +506,9 @@ async def test_a_failed_read_back_is_an_error_and_the_held_bars_go_on(failed):
         c.push.deliver(bar(NINE + 180))
         await until(lambda: c.bars())
 
-    history_bars.assert_awaited_once_with(c.client._hub, "EURUSD", Series.M1, NINE - 89, NINE + 179)
+    history_bars.assert_awaited_once_with(
+        c.client._hub, "EURUSD", Series.M1, NINE - 89, NINE + 179, source=Source.TERMINAL
+    )
     assert opens(c) == [NINE + 180]
     (error,) = c.client._log.error.call_args_list
     assert error.args[0].endswith(f"not read back: {failed}")

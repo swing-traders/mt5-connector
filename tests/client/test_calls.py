@@ -177,6 +177,24 @@ def test_a_calls_arguments_travel_by_their_wire_types(call, arguments):
     ] == arguments
 
 
+@pytest.mark.parametrize("call", [Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE, Call.RANGES])
+def test_a_hub_argument_travels_after_the_eas_and_never_reaches_a_row_the_ea_reads(call):
+    row = calls.CALLS[call]
+    arguments = {"symbol": "EURUSD"}
+    if call is Call.COPY_RATES_RANGE:
+        arguments |= {"timeframe": 1, "date_from": 100, "date_to": 200}
+    elif call is Call.COPY_TICKS_RANGE:
+        arguments |= {"date_from": 100, "date_to": 200, "flags": 1}
+    ea_count, ea_body = calls.encode_arguments(row, arguments)
+    count, body = calls.encode_arguments(row, arguments | {"source": calls.Source.TERMINAL})
+    decoded = calls.decode_arguments(row, binary.Request(1, call, count, body))
+    assert decoded == arguments | {"source": calls.Source.TERMINAL}
+    assert row.hub_arguments == (calls.Argument("source", calls.ArgType.INTEGER, False),)
+    assert len(row.arguments) == ea_count
+    assert body[: len(ea_body)] == ea_body
+    assert body[len(ea_body)] == len(row.arguments)
+
+
 @pytest.mark.parametrize(
     ("call", "shape", "layout"),
     [
