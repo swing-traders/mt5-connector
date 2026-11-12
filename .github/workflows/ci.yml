@@ -31,6 +31,9 @@ jobs:
         run: just test
 
   image:
+    permissions:
+      contents: read
+      packages: read
     uses: ./.github/workflows/image.yml
     with:
       push: false

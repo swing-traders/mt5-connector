@@ -444,6 +444,151 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
 
 
 @_needs_image
+def test_the_booted_terminal_logs_the_pinned_build_and_pays_no_recompile():
+    runtime = _runtime()
+    expected = _image_build(runtime)
+    inspected = subprocess.run(
+        [runtime, "image", "inspect", _IMAGE],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    (image,) = json.loads(inspected.stdout)
+    assert image["Config"]["Labels"]["io.github.swing-traders.mt5-connector.terminal-build"] == (
+        expected
+    )
+    name = f"mt5-image-build-test-{os.getpid()}"
+    try:
+        subprocess.run(
+            [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
+            env={**os.environ, **_ACCOUNT},
+            check=True,
+            timeout=60,
+        )
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=420)
+        output = _logs(runtime, name)
+        builds = re.findall(r"MetaTrader 5 x64 build (\d+) started", output)
+        assert builds
+        assert set(builds) == {expected}
+        assert "full recompilation" not in output
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+
+
+def _image_build(runtime):
+    result = subprocess.run(
+        [runtime, "run", "--rm", "--entrypoint", "cat", _IMAGE, "/home/mt5/.terminal-build"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    build = result.stdout.strip()
+    assert build.isdecimal()
+    return build
+
+
+def _copied_start_check(tmp_path, *, logged_build, pinned_build="6316"):
+    (tmp_path / ".terminal-build").write_text(pinned_build + "\n")
+    terminal = tmp_path / "prefix/drive_c/Program Files/MetaTrader 5"
+    journal = terminal / "logs/journal.log"
+    journal.parent.mkdir(parents=True)
+    journal.write_bytes("Terminal MetaTrader 5 x64 build 6308 started\n".encode("utf-16-le"))
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    wine = "#!/bin/sh\n"
+    if logged_build is not None:
+        wine += (
+            f"printf '%s\\n' 'Terminal MetaTrader 5 x64 build {logged_build} started' "
+            f"| iconv -f UTF-8 -t UTF-16LE >> '{journal}'\n"
+        )
+    for name, body in {
+        "wine": wine,
+        "wineserver": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/stops"\n',
+        "sleep": '#!/bin/sh\nprintf "%s\\n" "$1" >> "$HOME/sleeps"\n',
+    }.items():
+        path = commands / name
+        path.write_text(body)
+        path.chmod(0o755)
+    return subprocess.run(
+        ["sh", str(_IMAGE_FILES / "copied-terminal-start.sh")],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "WINEPREFIX": str(tmp_path / "prefix"),
+            "PATH": f"{commands}:/usr/bin:/bin",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_the_copied_terminal_check_matches_this_start_to_its_build_file(tmp_path):
+    result = _copied_start_check(tmp_path, logged_build="6316")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / ".terminal-build").read_text().strip() == "6316"
+    assert "-k" in (tmp_path / "stops").read_text().splitlines()
+
+
+def test_the_copied_terminal_check_names_both_mismatched_builds(tmp_path):
+    result = _copied_start_check(tmp_path, logged_build="6316", pinned_build="6317")
+    assert result.returncode != 0
+    assert "copied terminal build 6316" in result.stderr
+    assert "pinned 6317" in result.stderr
+    assert "-k" in (tmp_path / "stops").read_text().splitlines()
+
+
+def test_the_copied_terminal_check_bounds_a_missing_start(tmp_path):
+    result = _copied_start_check(tmp_path, logged_build=None)
+    assert result.returncode != 0
+    assert "copied terminal" in result.stderr and "120s" in result.stderr
+    assert (tmp_path / "sleeps").read_text().splitlines() == ["1"] * 120
+    assert "-k" in (tmp_path / "stops").read_text().splitlines()
+
+
+@_needs_image
+def test_the_copied_start_fails_naming_a_terminal_of_another_build(tmp_path):
+    runtime = _runtime()
+    expected = _image_build(runtime)
+    wrong_build = str(int(expected) + 1)
+    copied_build = tmp_path / "terminal-build"
+    copied_build.write_text(wrong_build + "\n")
+    copied_build.chmod(0o644)
+    name = f"mt5-image-wrong-build-test-{os.getpid()}"
+    try:
+        result = subprocess.run(
+            [
+                runtime,
+                "run",
+                "--rm",
+                "--name",
+                name,
+                "-v",
+                f"{copied_build}:/home/mt5/.terminal-build:ro,z",
+                "--entrypoint",
+                "/usr/bin/tini",
+                _IMAGE,
+                "--",
+                "xvfb-run",
+                "-a",
+                "sh",
+                "/opt/mt5/copied-terminal-start.sh",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    finally:
+        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert f"copied terminal build {expected}" in output
+    assert f"pinned {wrong_build}" in output
+
+
+@_needs_image
 def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password() -> None:
     runtime = _runtime()
     name = f"mt5-image-boot-test-{os.getpid()}"

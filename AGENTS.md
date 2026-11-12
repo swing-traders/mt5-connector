@@ -24,6 +24,7 @@ Delivery:
 
 - PRs merge to `main`; CI runs `just lint` and `just test`, and builds the image and runs the image tier against it, on every PR and push to `main`.
 - `VERSION` is the one version both projects read. A release is a `vX.Y.Z+st` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, and the image, pushes the image once the image tier passes on it, then publishes the wheels as one GitHub release and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
+- The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The separate terminal image is built by its manual Action and tagged by terminal build; an already tagged build is never pushed again. A terminal upgrade changes that one image reference.
 - Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
 
 ---

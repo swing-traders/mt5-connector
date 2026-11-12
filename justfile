@@ -28,3 +28,19 @@ black-fix:
 
 test:
     pytest
+
+# Build the latest terminal through its logged manual Action.
+terminal-latest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dispatched=$(gh workflow run terminal-image.yml)
+    printf '%s\n' "$dispatched"
+    if [[ "$dispatched" =~ /actions/runs/([0-9]+) ]]; then
+        run_id=${BASH_REMATCH[1]}
+    else
+        echo "terminal dispatch returned no run URL" >&2
+        exit 1
+    fi
+    gh run watch "$run_id" --exit-status
+    gh run view "$run_id" --log \
+        | awk '/build [0-9]+ (published|is already tagged)|terminal digest:/'
