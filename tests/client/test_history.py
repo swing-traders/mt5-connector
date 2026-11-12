@@ -10,7 +10,7 @@ from hub_double import eventually
 
 from mt5connector.client import history
 from mt5connector.client.config import MT5Config
-from mt5connector.client.errors import InvalidWindow
+from mt5connector.client.errors import InvalidWindow, Syncing
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import ErrorKind
@@ -116,3 +116,51 @@ async def test_ranges_are_the_hubs_ranges_of_the_symbol(hub, session):
     (request,) = hub.asked(Call.RANGES)
     assert calls.decode_arguments(calls.CALLS[Call.RANGES], request) == {"symbol": "X"}
     assert read == held
+
+
+@pytest.mark.parametrize("kind", ["bars", "ticks", "ranges"])
+async def test_a_read_surfacing_syncing_raises_it_with_its_delay_after_one_answer(
+    hub, session, kind
+):
+    call = {
+        "bars": Call.COPY_RATES_RANGE,
+        "ticks": Call.COPY_TICKS_RANGE,
+        "ranges": Call.RANGES,
+    }[kind]
+    hub.answers[call] = [binary.AnswerError(ErrorKind.SYNCING, "X is measuring", 75)]
+    with pytest.raises(Syncing, match="X is measuring") as caught:
+        if kind == "bars":
+            await history.bars(
+                session, "X", Series.M1, NINE, NINE, on_syncing=history.OnSyncing.RAISE
+            )
+        elif kind == "ticks":
+            await history.ticks(session, "X", NINE, NINE, on_syncing=history.OnSyncing.RAISE)
+        else:
+            await history.ranges(session, "X", on_syncing=history.OnSyncing.RAISE)
+    assert caught.value.retry_after_s == 0.075
+    assert len(hub.asked(call)) == 1
+
+
+async def test_a_read_surfacing_syncing_still_asks_again_after_no_publisher(hub, session):
+    hub.answers[Call.RANGES] = [
+        binary.AnswerError(ErrorKind.NO_PUBLISHER, "chart requested", 1),
+        binary.AnswerError(ErrorKind.SYNCING, "measuring", 50),
+    ]
+    with pytest.raises(Syncing, match="measuring"):
+        await history.ranges(session, "X", on_syncing=history.OnSyncing.RAISE)
+    assert len(hub.asked(Call.RANGES)) == 2
+
+
+async def test_a_read_states_its_source_only_when_it_is_the_terminals(hub, session):
+    hub.answers[Call.COPY_RATES_RANGE] = [rows(1), rows(1)]
+    await history.bars(session, "X", Series.M1, NINE, NINE, source=calls.Source.TERMINAL)
+    await history.bars(session, "X", Series.M1, NINE, NINE)
+    terminal, synced = hub.asked(Call.COPY_RATES_RANGE)
+    row = calls.CALLS[Call.COPY_RATES_RANGE]
+    assert calls.decode_arguments(row, terminal)["source"] is calls.Source.TERMINAL
+    assert terminal.count == 5
+    assert "source" not in calls.decode_arguments(row, synced)
+    count, body = calls.encode_arguments(
+        row, {"symbol": "X", "timeframe": mirror.TIMEFRAME_M1, "date_from": NINE, "date_to": NINE}
+    )
+    assert (synced.count, synced.arguments) == (count, body)

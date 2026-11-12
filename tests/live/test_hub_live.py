@@ -697,6 +697,7 @@ async def test_a_week_of_ticks_answers_within_five_minutes_while_the_publishers_
     session,
 ):
     hub_session, _ = session
+    await ask(hub_session, Call.SYMBOL_INFO_TICK, symbol=SYMBOL)
     end = int(time.time()) - 30 * DAY_S
     week = asyncio.create_task(
         synced(

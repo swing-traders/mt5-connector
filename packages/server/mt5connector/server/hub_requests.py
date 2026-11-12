@@ -2,10 +2,10 @@
 
 State: each pending request under the hub's own id — the consumer that asked it, none once that
 consumer left; the consumer's id for it; the call it asks; the EA; its deadline and the timer armed
-for it; how long a busy said its EA would wait; the next answer part expected, and the conversion
-its parts go through. A request leaves on its last part, on an error, on its deadline and when its
-EA leaves; whatever its EA sends for it after that is dropped with a warning. Nothing is
-persisted."""
+for it; how long a busy said its EA would wait; the next answer part expected, the conversion its
+parts go through, its source and whether it joined the symbol's first download. A request leaves
+on its last part, on an error, on its deadline and when its EA leaves; whatever its EA sends for
+it after that is dropped with a warning. Nothing is persisted."""
 
 import asyncio
 import logging
@@ -34,6 +34,8 @@ class Pending:
     timer: asyncio.TimerHandle | None = None
     busy_until: float | None = None
     next_part: int = 0
+    first_download: bool = False
+    source: calls.Source = calls.Source.SERVER_SYNCED
 
 
 class Requests:

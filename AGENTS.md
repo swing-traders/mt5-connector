@@ -24,6 +24,7 @@ Delivery:
 
 - PRs merge to `main`; CI runs `just lint` and `just test`, and builds the image and runs the image tier against it, on every PR and push to `main`.
 - `VERSION` is the one version both projects read. A release is a `vX.Y.Z+st` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, and the image, pushes the image once the image tier passes on it, then publishes the wheels as one GitHub release and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
+- The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The separate terminal image is built by its manual Action and tagged by terminal build; an already tagged build is never pushed again. A terminal upgrade changes that one image reference.
 - Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
 
 ---
@@ -317,6 +318,9 @@ The terminal substitutes nearest-available data, serves only what it has synced 
 
 The EA (`ticks.mq5`) and its startup script (`ticks_setup.mq5`) are the only code inside the terminal. The server README documents the hub protocol and what the EA does, and `ws_server.py` the hub. The rules:
 
+- **The hub serves many consumers at once, each operation keyed by what it acts on.** Dozens of strategies, warmups and ingest jobs can share one account's hub. An operation keyed by a symbol, a chart, a consumer or a request runs independently of every other key's, and a batch fans out into the same one-key path a single request takes.
+  - No hub-wide slot, lock or queue exists unless MT5 imposes it; where MT5 does, the code states that limit and its evidence where it lives. A chart's EA is single-threaded, so the hub queues each chart's requests on that chart alone, never hub-wide.
+  - Each keyed operation's tests prove two keys progress independently, one key's slow or failed work delaying no other's, observing behaviour alone.
 - **One EA per role and symbol, each on its own chart; nothing is elected.** A chart's template sets its EA's `Role`: the spawner serves the account, a publisher its symbol's streams, reads and commands, a history EA its symbol's history. A chart is its role and symbol, never its symbol alone: the spawner's symbol has a publisher's chart too.
   - Every EA receives the account's whole transaction stream, so each publisher publishes only its own symbol's — a request transaction's by its request's symbol — and the spawner those that name none. Nothing downstream deduplicates.
   - A role and symbol's first EA serves it, the spawner's role alone; a later one is answered `duplicate`.

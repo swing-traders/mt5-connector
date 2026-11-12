@@ -28,7 +28,7 @@ _VARIABLES = {
     "ea_queue_bound": _Variable("MT5_HUB_EA_QUEUE_BOUND", "10000"),
     "pending_bound": _Variable("MT5_HUB_PENDING_BOUND", "1000"),
     "resync_hour": _Variable("MT5_RESYNC_HOUR", "1"),
-    "resync_idle_seconds": _Variable("MT5_RESYNC_IDLE_SECONDS", "600"),
+    "resync_reopen_seconds": _Variable("MT5_RESYNC_REOPEN_SECONDS", "600"),
     "history_store": _Variable(
         "MT5_HISTORY_STORE", "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
     ),
@@ -42,7 +42,7 @@ _POSITIVE = (
     "consumer_queue_bound",
     "ea_queue_bound",
     "pending_bound",
-    "resync_idle_seconds",
+    "resync_reopen_seconds",
 )
 
 
@@ -64,7 +64,7 @@ class HubSettings:
     ea_queue_bound: int
     pending_bound: int
     resync_hour: int
-    resync_idle_seconds: float
+    resync_reopen_seconds: float
     history_store: Path
 
     def __post_init__(self) -> None:

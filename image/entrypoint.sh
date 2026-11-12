@@ -19,6 +19,8 @@ readonly close_wait_seconds=60
 readonly stop_wait_seconds=10
 readonly call_seconds=10
 readonly gui_seconds=40
+readonly step_attempts=3
+readonly step_retry_seconds=5
 readonly restore_seconds=40
 readonly kill_after_seconds=5
 readonly -a driver=(wine "$MT5_PYTHON_DIR\\python.exe" 'Z:\opt\mt5\terminal_gui.py')
@@ -27,6 +29,7 @@ export DISPLAY=:0
 declare -A process_names=()
 terminal_pid=
 tail_pid=
+await_error=
 
 step() {
     echo "mt5: $*"
@@ -61,26 +64,71 @@ gui() {
     timeout --kill-after="$kill_after_seconds" "$gui_seconds" "${driver[@]}" "$@"
 }
 
-# Runs a driver action; when it fails, its own line names what it could not find.
-act() {
-    local what=$1
-    shift
-    run_bounded "$what" "$gui_seconds" "${driver[@]}" "$@"
+retried() {
+    local what=$1 own_dialog=$2 ini=$3
+    shift 3
+    local attempt status output detail message
+    for ((attempt = 1; attempt <= step_attempts; attempt++)); do
+        start_terminal "$(config_argument "$ini")"
+        if [[ "$ini" == "$startup_ini" ]]; then
+            process_names[$terminal_pid]=terminal
+            if [[ -z "$tail_pid" ]]; then
+                start_log_tail
+            fi
+        fi
+        if await_terminal_window; then
+            gui dismiss-dialogs "$own_dialog" \
+                || step "the dialog dismissal for $what failed with status $?"
+            status=0
+            output=$(gui "$@" 2>&1) || status=$?
+            end_with_stopped
+            if ((status == 0)); then
+                [[ -z "$output" ]] || printf '%s\n' "$output"
+                return
+            fi
+            case $status in
+                124 | 137) detail="$what did not finish within ${gui_seconds}s" ;;
+                *)
+                    [[ -z "$output" ]] || printf '%s\n' "$output"
+                    detail="${output##*$'\n'}"
+                    detail="${detail#mt5: }"
+                    ;;
+            esac
+        else
+            detail="$await_error"
+        fi
+        message="$what failed (attempt $attempt of $step_attempts): $detail"
+        step "$message"
+        discard_terminal
+        if ((attempt == step_attempts)); then
+            return 1
+        fi
+        sleep "$step_retry_seconds"
+    done
 }
 
-# Polls a command once a second until it succeeds, failing the start once `seconds` have passed on
-# the clock, however long each poll took.
+# A slow poll consumes the window's deadline rather than extending it.
 await() {
     local what=$1 seconds=$2
     shift 2
-    local deadline=$((SECONDS + seconds))
-    until "$@" >/dev/null 2>&1; do
+    local deadline=$((SECONDS + seconds)) poll_log status
+    # Wine services can inherit the poll's output; a file cannot hold its caller waiting for EOF.
+    poll_log=$(mktemp)
+    await_error=
+    until "$@" >"$poll_log" 2>&1; do
+        status=$?
         end_with_stopped
         if ((SECONDS >= deadline)); then
-            fail "no $what within ${seconds}s"
+            await_error="no $what within ${seconds}s; last poll exited $status"
+            if [[ -s "$poll_log" ]]; then
+                await_error+=": $(<"$poll_log")"
+            fi
+            rm -f "$poll_log"
+            return 1
         fi
         sleep 1
     done
+    rm -f "$poll_log"
 }
 
 require_settings() {
@@ -102,7 +150,7 @@ start_display() {
     rm -f "$socket" "/tmp/.X${DISPLAY#:}-lock"
     Xvfb "$DISPLAY" -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
     process_names[$!]=Xvfb
-    await "display" 30 test -S "$socket"
+    await "display" 30 test -S "$socket" || fail "$await_error"
     if command -v x11vnc >/dev/null; then
         x11vnc -display "$DISPLAY" -localhost -forever -shared -nopw -quiet >/dev/null 2>&1 &
         step "x11vnc on 127.0.0.1:5900"
@@ -151,14 +199,23 @@ close_terminal() {
     terminal_pid=
 }
 
+discard_terminal() {
+    unset "process_names[$terminal_pid]"
+    if ! request_terminal_close; then
+        step "killing the terminal, still running after ${close_wait_seconds}s"
+        bounded wineserver -k >/dev/null 2>&1 || :
+        kill -KILL "$terminal_pid" 2>/dev/null || :
+    fi
+    wait "$terminal_pid" || :
+    terminal_pid=
+}
+
 # The terminal logs in only to a trade server its server list holds: searching the server's name in
 # the account dialog adds its broker's servers, which the terminal keeps when it closes. A terminal
 # started with no account opens that dialog on its own, so this session starts with one.
 acquire_server_list() {
     step "fetching the trade server's broker into the server list"
-    start_terminal "$(config_argument "$search_ini")"
-    await_terminal_window
-    act "the server search" search-server
+    retried "the server search" "Open an Account" "$search_ini" search-server
     close_terminal
 }
 
@@ -197,7 +254,7 @@ config_argument() {
 # Puts 127.0.0.1 on the Options dialog's WebRequest list, which no ini key sets.
 allow_webrequest() {
     step "adding 127.0.0.1 to the WebRequest allowlist"
-    act "the WebRequest allowlist" allow-webrequest 127.0.0.1
+    retried "the WebRequest allowlist" Options "$startup_ini" allow-webrequest 127.0.0.1
 }
 
 # Streams the terminal's journal and experts log into the container's log. Its exit ends nothing: a
@@ -337,10 +394,6 @@ restore_baked_terminal
 write_inis
 acquire_server_list
 step "launching the terminal"
-start_terminal "$(config_argument "$startup_ini")"
-process_names[$terminal_pid]=terminal
-start_log_tail
-await_terminal_window
 allow_webrequest
 start_hub
 supervise

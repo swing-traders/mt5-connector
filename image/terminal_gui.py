@@ -19,6 +19,7 @@ class Action(StrEnum):
     MAIN_WINDOW = "main-window"
     SEARCH_SERVER = "search-server"
     ALLOW_WEBREQUEST = "allow-webrequest"
+    DISMISS_DIALOGS = "dismiss-dialogs"
 
 
 class WindowClass(StrEnum):
@@ -32,6 +33,7 @@ class WindowClass(StrEnum):
 
 
 class Message(IntEnum):
+    WM_CLOSE = 0x0010
     WM_SETTEXT = 0x000C
     WM_GETTEXT = 0x000D
     WM_GETTEXTLENGTH = 0x000E
@@ -136,6 +138,7 @@ WEBREQUEST_LIST_ID = 10191
 
 # File > Open an Account: a wizard whose first page searches the companies' trade servers.
 ACCOUNT_MENU_PATH = ("File", "Open an Account")
+ACCOUNT_CAPTION = "Open an Account"
 SERVER_SEARCH_BOX_ID = 10814  # the account dialog's first page: the search Edit
 SERVER_SEARCH_BUTTON_ID = 10815  # the account dialog's first page: "Find your company"
 
@@ -463,11 +466,16 @@ def _main_window() -> int:
 def _enabled_main_window() -> int:
     """The terminal's main window once no modal dialog disables it."""
     window = _main_window()
-    return _wait_for(
-        lambda: window if user32.IsWindowEnabled(window) else None,
-        MAIN_WINDOW_SECONDS,
-        f"the terminal's main window stayed disabled for {MAIN_WINDOW_SECONDS}s",
-    )
+    try:
+        return _wait_for(
+            lambda: window if user32.IsWindowEnabled(window) else None,
+            MAIN_WINDOW_SECONDS,
+            f"the terminal's main window stayed disabled for {MAIN_WINDOW_SECONDS}s",
+        )
+    except DialogError:
+        for dialog in _owned_dialogs(window):
+            print(f"mt5: owned dialog: {_caption(dialog)} ({_class_name(dialog)})", flush=True)
+        raise
 
 
 def _owned_dialogs(owner: int) -> set[int]:
@@ -478,6 +486,27 @@ def _owned_dialogs(owner: int) -> set[int]:
         and _class_name(window) == WindowClass.DIALOG
         and user32.GetWindow(window, WindowRelation.OWNER) == owner
     }
+
+
+def is_update_offer(caption: str) -> bool:
+    return "update" in caption.casefold()
+
+
+def dismiss_dialogs(own_caption: str) -> None:
+    """Closes an update offer and cancels only the named step's dialog."""
+    for dialog in _owned_dialogs(_main_window()):
+        caption = _caption(dialog)
+        print(f"mt5: owned dialog: {caption} ({_class_name(dialog)})", flush=True)
+        if is_update_offer(caption):
+            _post(dialog, Message.WM_CLOSE)
+            _wait_for(
+                lambda closing=dialog: None if user32.IsWindow(closing) else True,
+                DIALOG_SECONDS,
+                "the terminal's update offer did not close",
+            )
+            print(f"mt5: dismissed the terminal's update offer: {caption}", flush=True)
+        elif own_caption and caption == own_caption:
+            _close_dialog(dialog, Command.CANCEL, caption)
 
 
 def _menus() -> list[tuple[MenuEntry, ...]]:
@@ -661,6 +690,12 @@ def allow_webrequest(url: str) -> None:
     if _send(checkbox, Message.BM_GETCHECK) != CheckState.CHECKED:
         raise DialogError("the Options dialog's WebRequest checkbox did not tick")
     rows = _send(url_list, Message.LVM_GETITEMCOUNT)
+    if rows == 2:
+        _close_dialog(dialog, Command.OK, "the Options dialog")
+        print("mt5: the WebRequest allowlist already holds one URL", flush=True)
+        return
+    if rows > 2:
+        raise DialogError(f"the WebRequest list holds {rows - 1} URLs, not one")
     editor = _open_row_editor(url_list, rows - 1)
     _set_text(editor, url, "the WebRequest list's editor")
     _post(editor, Message.WM_KEYDOWN, VirtualKey.RETURN, Keystroke.REPEATED_ONCE)
@@ -708,6 +743,8 @@ def main() -> None:
         Action.ALLOW_WEBREQUEST, help="Allow WebRequest for one URL, on a list holding none."
     )
     webrequest.add_argument("url")
+    dismiss = actions.add_parser(Action.DISMISS_DIALOGS, help="Dismiss recognised owned dialogs.")
+    dismiss.add_argument("own_caption", nargs="?", default="")
     args = parser.parse_args()
     action = Action(args.action)
     try:
@@ -716,6 +753,8 @@ def main() -> None:
             print("mt5: the terminal's main window is up", flush=True)
         elif action == Action.SEARCH_SERVER:
             search_server(os.environ["MT5_SERVER"])
+        elif action == Action.DISMISS_DIALOGS:
+            dismiss_dialogs(args.own_caption)
         else:
             allow_webrequest(args.url)
     except DialogError as error:

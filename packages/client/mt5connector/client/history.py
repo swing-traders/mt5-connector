@@ -3,6 +3,7 @@ window of closes keeps."""
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from mt5connector.wire import calls
@@ -21,17 +22,39 @@ if TYPE_CHECKING:
     from mt5connector.client.hub import HubSession
 
 
+class OnSyncing(StrEnum):
+    WAIT = "wait"
+    RAISE = "raise"
+
+
+def _source_arguments(source: calls.Source) -> dict:
+    if not isinstance(source, calls.Source):
+        raise ValueError("source is not a Source member")
+    if source is calls.Source.TERMINAL:
+        return {"source": source}
+    return {}
+
+
 async def bars(
-    session: HubSession, symbol: str, series: Series, first_open_s: int, last_open_s: int
+    session: HubSession,
+    symbol: str,
+    series: Series,
+    first_open_s: int,
+    last_open_s: int,
+    *,
+    on_syncing: OnSyncing = OnSyncing.WAIT,
+    source: calls.Source = calls.Source.SERVER_SYNCED,
 ) -> np.ndarray:
     """The bars of `series` opened in [first_open_s, last_open_s], true-UTC epoch seconds, each with
     its open and its close."""
     answered = await session.deferring(
         calls.Call.COPY_RATES_RANGE,
+        on_syncing=on_syncing,
         symbol=symbol,
         timeframe=BAR_TIMEFRAME[series],
         date_from=first_open_s,
         date_to=last_open_s,
+        **_source_arguments(source),
     )
     return answered.result
 
@@ -55,20 +78,33 @@ async def ticks(
     start_s: int,
     end_s: int,
     flags: TickFlags = TickFlags.INFO,
+    *,
+    on_syncing: OnSyncing = OnSyncing.WAIT,
+    source: calls.Source = calls.Source.SERVER_SYNCED,
 ) -> np.ndarray:
     """The ticks from the start of second `start_s` through the end of second `end_s`, true-UTC
     epoch seconds."""
     answered = await session.deferring(
         calls.Call.COPY_TICKS_RANGE,
+        on_syncing=on_syncing,
         symbol=symbol,
         date_from=start_s,
         date_to=end_s,
         flags=TICK_FLAGS[flags],
+        **_source_arguments(source),
     )
     return answered.result
 
 
-async def ranges(session: HubSession, symbol: str) -> calls.Ranges:
+async def ranges(
+    session: HubSession,
+    symbol: str,
+    *,
+    on_syncing: OnSyncing = OnSyncing.WAIT,
+    source: calls.Source = calls.Source.SERVER_SYNCED,
+) -> calls.Ranges:
     """The terminal's MaxBars and the floors the hub holds for the symbol."""
-    answered = await session.deferring(calls.Call.RANGES, symbol=symbol)
+    answered = await session.deferring(
+        calls.Call.RANGES, on_syncing=on_syncing, symbol=symbol, **_source_arguments(source)
+    )
     return answered.result

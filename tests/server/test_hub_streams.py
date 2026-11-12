@@ -1004,6 +1004,33 @@ async def test_an_ea_leaving_while_its_close_is_pending_is_not_closed_again(cloc
     await _closed(tasks.values(), spawner)
 
 
+async def test_a_subscription_arriving_while_its_publishers_close_is_pending(clock):
+    hub = Hub(CLOCK, settings())
+    spawner, usdjpy, consumer = Peer(), Peer(), Peer()
+    tasks = await _spawning(hub, (spawner, SPAWNER, "EURUSD"), (usdjpy, PUBLISHER, "USDJPY"))
+    try:
+        clock[0] = 1_000.0 + IDLE_S
+        hub.close_idle_charts()
+        await settle()
+        assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+        tasks.append(asyncio.create_task(hub.handler(consumer)))
+        consumer.put_frame(binary.AdapterHello())
+        consumer.put_frame(binary.Subscribe(1, ticks_of("USDJPY")))
+        await settle()
+        await usdjpy.close()
+        await settle()
+        for step in (1, 31, 61):
+            clock[0] = 1_000.0 + IDLE_S + step
+            hub.close_idle_charts()
+        await settle()
+        assert sent_to_ea(spawner) == [
+            binary.CloseChart(PUBLISHER, "USDJPY"),
+            binary.OpenChart(PUBLISHER, "USDJPY"),
+        ]
+    finally:
+        await _closed(tasks, spawner, usdjpy, consumer)
+
+
 # ── The broker's repeated and skipped hours ───────────────────────────────────
 
 # Broker 08:30 on 2025-11-02 and on 2024-11-03 is New York's repeated 01:30.

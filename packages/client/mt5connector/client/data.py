@@ -46,7 +46,7 @@ from mt5connector.client.parsing import (
     venue_bar,
     venue_series,
 )
-from mt5connector.wire import binary
+from mt5connector.wire import binary, calls
 from mt5connector.wire.history_wire import BAR_CLOSE
 from mt5connector.wire.push_wire import Stream, Subscription
 
@@ -288,7 +288,9 @@ class MT5DataClient(LiveMarketDataClient):
         symbol = bar_type.instrument_id.symbol.value
         first_open, last_open = history.opens_closing(series, first_close, last_close)
         try:
-            rows = await history.bars(self._hub, symbol, series, first_open, last_open)
+            rows = await history.bars(
+                self._hub, symbol, series, first_open, last_open, source=calls.Source.TERMINAL
+            )
         except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: {bar_type} bars closing {_iso(first_close)}..{_iso(last_close)} "
@@ -394,7 +396,7 @@ class MT5DataClient(LiveMarketDataClient):
         start = _epoch_s(request.start)
         end = self._end_s(request.end)
         try:
-            rows = await history.ticks(self._hub, symbol, start, end)
+            rows = await history.ticks(self._hub, symbol, start, end, source=calls.Source.TERMINAL)
         except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: {exc}"
@@ -418,7 +420,9 @@ class MT5DataClient(LiveMarketDataClient):
         last_close = self._end_s(request.end)
         first_open, last_open = history.opens_closing(series, first_close, last_close)
         try:
-            rows = await history.bars(self._hub, symbol, series, first_open, last_open)
+            rows = await history.bars(
+                self._hub, symbol, series, first_open, last_open, source=calls.Source.TERMINAL
+            )
         except (HubAnswerError, ServerUnreachable) as exc:
             self._log.error(
                 f"MT5DataClient: {request.bar_type} bars closing "

@@ -7,10 +7,11 @@ wanted frame last told each publisher; the spawner; the chart requests held for 
 EA serves, and those the spawner was sent; the MQL5 error the spawner met on each chart it failed to
 open, and when, standing for the failure hold or until that chart opens or its EA says hello; when
 each chart was last in use, and when the spawner was last told to close each chart whose close is
-pending, which outlives the chart's EA; the true-UTC open of the last bar fanned out of each series;
-the latest commission schedule and trading sessions relayed for each symbol; the floors learned
-from ranges answers; the pending requests and the clock gate. The history re-sync record alone is
-persisted on the history volume. Nothing is replayed to a consumer that reconnects."""
+pending, which outlives the chart's EA; the closes the re-sync owns; the UTC open of the last bar
+fanned out of each series; the latest commission schedule and trading sessions relayed for each
+symbol; the floors learned from ranges answers; the pending requests and the clock gate. The history
+re-sync record alone is persisted on the history volume. Nothing is replayed to a consumer that
+reconnects."""
 
 import asyncio
 import dataclasses
@@ -93,6 +94,11 @@ class _Consumer:
     subscriptions: set[Subscription] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class _PassRead:
+    symbol: str
+
+
 @dataclass
 class _Ea:
     chart_role: ChartRole
@@ -133,6 +139,9 @@ class Hub:
         self._failed: dict[ChartKey, tuple[int, float]] = {}
         self._used: dict[ChartKey, float] = {}
         self._close_sent: dict[ChartKey, float] = {}
+        self._resync_closing: set[ChartKey] = set()
+        self._closed_at: dict[ChartKey, float] = {}
+        self._started_at = time.monotonic()
         self._bar_opens: dict[Subscription, int] = {}
         self._commissions = CommissionStore()
         self._sessions = SessionStore()
@@ -144,26 +153,50 @@ class Hub:
             clock,
             settings,
             ready=lambda: self._gate.verification is not None and self._spawner is not None,
-            idle=self._resync_idle,
+            release=self._resync_release,
+            closed_at=lambda symbol: self._closed_at.get(
+                (ChartRole.HISTORY, symbol), self._started_at
+            ),
+            monotonic=lambda: time.monotonic(),
             request=self._resync_request,
         )
 
-    def _resync_idle(self, symbol: str) -> bool:
+    def _resync_release(self, symbol: str) -> bool:
         key = (ChartRole.HISTORY, symbol)
-        margin = self._settings.chart_idle_seconds + self._settings.resync_idle_seconds
-        return (
-            key not in self._served
-            and key not in self._requested
-            and not self._in_use(key, time.monotonic())
-            and time.monotonic() - self._used.get(key, -math.inf) >= margin
-        )
+        now = time.monotonic()
+        ea = self._served.get(key)
+        if ea is not None:
+            if not self._requests.of_ea(ea) and (
+                key not in self._close_sent or now - self._close_sent[key] >= _CLOSE_BOUND_S
+            ):
+                self._resync_closing.add(key)
+                self._close_chart(key, now)
+            return False
+        if key in self._failed:
+            self._requested.discard(key)
+        if key in self._requested:
+            return False
+        return True
 
     def _resync_request(self, call: calls.Call, arguments: dict) -> bool:
         """Sends the pass's read once its history EA serves the requested chart."""
         key = (ChartRole.HISTORY, arguments["symbol"])
+        if self._failure_stands(key, time.monotonic()):
+            return False
+        if key in self._close_sent:
+            if key in self._served:
+                return False
+            self._close_sent.pop(key, None)
+            self._resync_closing.discard(key)
         state = self.use_chart(key)
         if key in self._served or state is ChartState.FAILED:
-            self._send(None, -1, calls.CALLS[call], arguments, arguments["symbol"])
+            self._send(
+                _PassRead(arguments["symbol"]),
+                -1,
+                calls.CALLS[call],
+                arguments,
+                arguments["symbol"],
+            )
             return True
         return False
 
@@ -223,10 +256,15 @@ class Hub:
         whose open is outstanding — out of use for the idle period, withdrawing an open nobody waits
         for, and settles each close pending for the bound: sent again while an EA serves the chart
         out of use, else ended. The spawner's own chart never closes."""
+        self._finish_resync_closes()
         now = time.monotonic()
         # The spawner is read per key: a close that overflows its queue drops it mid-sweep.
         for key, sent in list(self._close_sent.items()):
-            if self._spawner is not None and now - sent >= _CLOSE_BOUND_S:
+            if (
+                self._spawner is not None
+                and key not in self._resync_closing
+                and now - sent >= _CLOSE_BOUND_S
+            ):
                 if key not in self._served or self._in_use(key, now):
                     del self._close_sent[key]
                 else:
@@ -290,6 +328,7 @@ class Hub:
                 self._on_consumer_frame(ws, self._consumers[ws], frame)
 
     def _hello(self, ws, hello: binary.AdapterHello | binary.EaHello) -> None:
+        self._finish_resync_closes()
         if isinstance(hello, binary.EaHello):
             ea = _Ea(hello.chart_role, hello.symbol, self._outbound(ws))
             self._eas[ws] = ea
@@ -318,7 +357,9 @@ class Hub:
             if ea.chart_role is ChartRole.SPAWNER:
                 self._spawner = ws
                 self._sent.clear()
-                self._close_sent.clear()
+                for key in list(self._close_sent):
+                    if key not in self._resync_closing:
+                        del self._close_sent[key]
                 for key in sorted(self._requested):
                     self._request_chart(key)
             else:
@@ -329,6 +370,10 @@ class Hub:
                 # says hello again in between: that hello is no use.
                 if ea.key not in self._close_sent:
                     self._used[ea.key] = time.monotonic()
+                    if ea.chart_role is ChartRole.HISTORY:
+                        self._resync.hello(ea.symbol, int(time.time()))
+                elif ea.chart_role is ChartRole.HISTORY:
+                    self._resync.closing_hello(ea.symbol)
             if ea.chart_role is ChartRole.PUBLISHER:
                 self._told[ea.symbol] = self._wanted(ea.symbol)
                 self._to_ea(ws, self._told[ea.symbol])
@@ -506,6 +551,11 @@ class Hub:
             )
             self._failed[key] = (frame.error, time.monotonic())
             self._sent.discard(key)
+            if frame.chart_role is ChartRole.HISTORY:
+                for pending in self._requests.all():
+                    if isinstance(pending.consumer, _PassRead) and pending.symbol == frame.symbol:
+                        self._requests.remove(pending)
+                self._resync.chart_failed(frame.symbol, frame.error, int(time.time()))
         else:
             logger.info(
                 "the spawner keeps the %s chart of %s open: %d positions, %d pending orders",
@@ -516,6 +566,7 @@ class Hub:
             )
             self._used[key] = time.monotonic()
             self._close_sent.pop(key, None)
+            self._resync_closing.discard(key)
 
     def _close_chart(self, key: ChartKey, now: float) -> None:
         # Recorded first: a send that overflows the spawner's queue drops it, clearing every close.
@@ -549,9 +600,14 @@ class Hub:
         hold_s = _FAILED_HOLD_RETRIES * self._settings.retry_after_s
         return failed is not None and now - failed[1] < hold_s
 
-    def _in_use(self, key: ChartKey, now: float) -> bool:
-        """Whether a consumer subscribes to the symbol of a publisher chart, a request waits on the
-        chart's EA, or the chart was used within the idle period."""
+    def _finish_resync_closes(self) -> None:
+        for key in list(self._resync_closing):
+            if not self._resync.running(key[1]):
+                self._close_sent.pop(key, None)
+                self._resync_closing.remove(key)
+
+    def _in_use(self, key: ChartKey, now: float, *, include_resync: bool = True) -> bool:
+        """Whether subscriptions, requests, downloads, re-syncs or the idle grace hold a chart."""
         chart_role, symbol = key
         subscribed = chart_role is ChartRole.PUBLISHER and any(
             item.symbol == symbol
@@ -560,8 +616,14 @@ class Hub:
         )
         ea = self._served.get(key)
         waited_on = ea is not None and len(self._requests.of_ea(ea)) > 0
+        downloading = chart_role is ChartRole.HISTORY and self._resync.first_download_running(
+            symbol
+        )
+        resyncing = (
+            include_resync and chart_role is ChartRole.HISTORY and self._resync.running(symbol)
+        )
         recent = now - self._used.get(key, -math.inf) < self._settings.chart_idle_seconds
-        return subscribed or waited_on or recent
+        return subscribed or waited_on or downloading or resyncing or recent
 
     def _mark_used(self, subscriptions: Iterable[Subscription]) -> None:
         now = time.monotonic()
@@ -581,6 +643,8 @@ class Hub:
             raise ValueError(f"request {frame.request_id}: unknown call {frame.call}") from None
         row = calls.CALLS[call]
         arguments = calls.decode_arguments(row, frame)
+        symbol = calls.routed_symbol(row, arguments)
+        source = arguments.pop("source", calls.Source.SERVER_SYNCED)
         if row.shape is calls.Shape.RATES:
             bar_series(arguments["timeframe"])
         if self._gate.verification is None:
@@ -589,30 +653,46 @@ class Hub:
         elif self._requests.asked_by(ws) >= self._settings.pending_bound:
             message = f"{self._settings.pending_bound} requests pending"
             self._error(ws, frame.request_id, 0, ErrorKind.OVERFLOW, message)
+        elif row.role is ChartRole.HISTORY and (
+            reason := self._resync.unsettled(
+                symbol, int(time.time()), source, first_tick=self._first_ticks.get(symbol, 0)
+            )
+        ):
+            self._deferred(ws, frame.request_id, ErrorKind.SYNCING, reason)
         elif call is calls.Call.COMMISSION_SCHEDULE:
             self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._commissions)
         elif call is calls.Call.TRADING_SESSIONS:
             self._relay_read(ws, frame.request_id, row, arguments["symbol"], self._sessions)
         elif call in WINDOWS:
-            self._window_read(ws, frame.request_id, row, arguments)
+            self._window_read(ws, frame.request_id, row, arguments, source)
         else:
-            symbol = calls.routed_symbol(row, arguments)
-            self._send(ws, frame.request_id, row, arguments, symbol)
+            self._send(ws, frame.request_id, row, arguments, symbol, source)
 
     def _window_read(
-        self, ws, client_id: int, row: calls.Row, arguments: dict[str, object]
+        self,
+        ws,
+        client_id: int,
+        row: calls.Row,
+        arguments: dict[str, object],
+        source: calls.Source = calls.Source.SERVER_SYNCED,
     ) -> None:
         """Sends a range read to its EA, or answers it invalid_window when its true-UTC window
         starts after it ends or after the terminal's time."""
         refusal = window_refusal(arguments, self._gate.terminal_time())
         if refusal is None:
             symbol = calls.routed_symbol(row, arguments)
-            self._send(ws, client_id, row, arguments, symbol)
+            self._send(ws, client_id, row, arguments, symbol, source)
         else:
             self._error(ws, client_id, 0, ErrorKind.INVALID_WINDOW, refusal)
 
     def _send(
-        self, ws, client_id: int, row: calls.Row, arguments: dict[str, object], symbol: str | None
+        self,
+        ws,
+        client_id: int,
+        row: calls.Row,
+        arguments: dict[str, object],
+        symbol: str | None,
+        source: calls.Source = calls.Source.SERVER_SYNCED,
     ) -> None:
         """Sends a request to the EA serving its role and symbol; with none, has the spawner open
         its chart and defers it, or refuses it once that chart failed to open."""
@@ -626,6 +706,9 @@ class Hub:
         if ea is not None and self._eas[ea].outbound.queue.qsize() < self._settings.ea_queue_bound:
             results = Results(row, arguments, self._clock, self._repeated_hours)
             pending = self._requests.add(ws, client_id, row, symbol, ea, results)
+            if row.role is ChartRole.HISTORY and not isinstance(ws, _PassRead):
+                pending.first_download = self._resync.join_first_download(symbol)
+            pending.source = source
             count, body = calls.encode_arguments(row, broker_arguments(row, arguments, self._clock))
             self._to_ea(ea, binary.Request(pending.hub_id, row.call, count, body))
         elif ea is not None:
@@ -679,6 +762,10 @@ class Hub:
                 ea.symbol,
             )
         elif answer.error is not None:
+            if pending.first_download:
+                self._resync.end_first_download(
+                    pending.symbol, syncing=answer.error.kind is ErrorKind.SYNCING
+                )
             self._requests.remove(pending)
             passed = dataclasses.replace(
                 answer, request_id=pending.client_id, part=pending.next_part
@@ -693,6 +780,14 @@ class Hub:
             # Composed before the request leaves: a part the hub cannot pass on refuses its EA, and
             # the request, still pending on it, is answered ea_gone.
             value = calls.read_ea_result(pending.served, answer)
+            if pending.first_download:
+                self._resync.first_download(
+                    pending.symbol,
+                    int(time.time()),
+                    has_ticks=pending.served.shape is not calls.Shape.RANGES
+                    or value.first_tick != 0,
+                )
+                pending.first_download = False
             if pending.served.shape is calls.Shape.RANGES:
                 passed = self._measured(pending, answer, value)
             else:
@@ -721,6 +816,8 @@ class Hub:
             self._to_consumer(pending.consumer, binary.Busy(pending.client_id, busy.bound_s))
 
     def _expired(self, pending: Pending) -> None:
+        if pending.first_download:
+            self._resync.end_first_download(pending.symbol)
         ea = self._eas[pending.ea]
         logger.error(
             "request %d, %s, to the %s EA for %s went past its deadline unanswered",
@@ -743,6 +840,18 @@ class Hub:
         self._first_ticks[pending.symbol] = Conversion(self._clock, self._repeated_hours).utc(
             mirror.EpochUnit.SECONDS, measured.first_tick, pending.symbol, "first_tick"
         )
+        if not isinstance(pending.consumer, _PassRead) and self._first_ticks[pending.symbol] != 0:
+            reason = self._resync.unsettled(
+                pending.symbol,
+                int(time.time()),
+                pending.source,
+                first_tick=self._first_ticks[pending.symbol],
+            )
+            if reason:
+                error = binary.AnswerError(
+                    ErrorKind.SYNCING, reason, int(self._settings.retry_after_s * 1000)
+                )
+                return binary.Answer(pending.client_id, 0, True, 0, error=error)
         ranges = self._ranges(pending.symbol, measured.maxbars)
         count, result = calls.write_result(pending.served, ranges)
         return binary.Answer(pending.client_id, 0, True, answer.last_error, count, result)
@@ -793,8 +902,8 @@ class Hub:
 
     def _to_consumer(self, ws, frame: binary.Frame) -> None:
         """Queues a frame for a consumer still connected."""
-        if ws is None and isinstance(frame, binary.Answer) and frame.request_id == -1:
-            self._resync.answer(frame, int(time.time()))
+        if isinstance(ws, _PassRead) and isinstance(frame, binary.Answer):
+            self._resync.answer(ws.symbol, frame, int(time.time()))
             return
         consumer = self._consumers.get(ws)
         if consumer is not None:
@@ -882,8 +991,9 @@ class Hub:
     def _drop(self, ws) -> None:
         """Forgets a connection. A consumer's subscriptions leave the wanted frames with it and its
         pending requests are answered to no one; an EA that served its role and symbol leaves them
-        unserved, each of its pending requests answered ea_gone, a close pending on its chart still
+        unserved, each of its pending requests answered ea_gone, a re-sync's history close still
         pending, a chart still in use requested again, and one out of use closed."""
+        self._finish_resync_closes()
         consumer = self._consumers.pop(ws, None)
         ea = self._eas.pop(ws, None)
         if consumer is not None:
@@ -898,25 +1008,36 @@ class Hub:
                     "%s EA for %s disconnected: %s", ea.chart_role, ea.symbol, ws.remote_address
                 )
                 del self._served[ea.key]
+                if ea.chart_role is ChartRole.HISTORY and ea.key in self._close_sent:
+                    self._closed_at[ea.key] = time.monotonic()
                 message = f"the {ea.chart_role} EA for {ea.symbol} left"
+                if ea.chart_role is ChartRole.HISTORY and ea.key not in self._close_sent:
+                    self._resync.ea_gone(ea.symbol, int(time.time()))
                 for pending in self._requests.of_ea(ws):
+                    if pending.first_download:
+                        self._resync.end_first_download(pending.symbol)
                     self._requests.remove(pending)
-                    self._error(
-                        pending.consumer,
-                        pending.client_id,
-                        pending.next_part,
-                        ErrorKind.EA_GONE,
-                        message,
-                    )
+                    if not isinstance(pending.consumer, _PassRead):
+                        self._error(
+                            pending.consumer,
+                            pending.client_id,
+                            pending.next_part,
+                            ErrorKind.EA_GONE,
+                            message,
+                        )
                 if ea.chart_role is ChartRole.SPAWNER:
                     self._spawner = None
                     self._sent.clear()
-                    self._close_sent.clear()
+                    for key in list(self._close_sent):
+                        if key not in self._resync_closing:
+                            del self._close_sent[key]
                 else:
                     if ea.chart_role is ChartRole.PUBLISHER:
                         del self._told[ea.symbol]
                     now = time.monotonic()
-                    if self._in_use(ea.key, now):
+                    if ea.key in self._resync_closing:
+                        pass
+                    elif self._in_use(ea.key, now, include_resync=ea.key not in self._close_sent):
                         self._request_chart(ea.key)
                     elif self._spawner is not None and ea.key not in self._close_sent:
                         logger.info(
@@ -944,11 +1065,15 @@ async def _serve(settings: HubSettings) -> None:
     clock = BrokerClock(settings.broker_tz, timedelta(hours=settings.broker_offset_hours))
     hub = Hub(clock, settings)
     hub.start()
-    async with serve_hub(hub, "0.0.0.0", settings.hub_port):
-        while True:
-            await asyncio.sleep(_IDLE_SWEEP_S)
-            hub.close_idle_charts()
-            hub._resync.sweep(int(time.time()))
+    try:
+        async with serve_hub(hub, "0.0.0.0", settings.hub_port):
+            while True:
+                await asyncio.sleep(_IDLE_SWEEP_S)
+                # Let an expired download hand its chart to the due pass before idle cleanup.
+                await hub._resync.sweep(int(time.time()))
+                hub.close_idle_charts()
+    finally:
+        await hub._resync.close()
 
 
 def main() -> None:

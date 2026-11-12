@@ -4,6 +4,8 @@
 # downloaded artifact is versioned by its row in image/artifacts.txt.
 ARG VERSION_WINE=11.19~trixie-1
 
+FROM ghcr.io/swing-traders/mt5-terminal:6316@sha256:b8f9f9ed04d63d90ebdbe84b10faa5e41f32d88dedd3ae66bbca830295ca8f1d AS terminal
+
 FROM docker.io/library/debian:trixie-slim AS fetch
 
 RUN apt-get update \
@@ -14,11 +16,12 @@ WORKDIR /artifacts
 COPY image/artifacts.txt ./
 RUN set -e; \
     while read -r name url sha256; do \
+        if [ "$name" = mt5setup.exe ]; then continue; fi; \
         curl -fsSL --retry 3 -o "$name" "$url"; \
         printf '%s  %s\n' "$sha256" "$name" >> SHA256SUMS; \
     done < artifacts.txt; \
     sha256sum -c SHA256SUMS
-COPY image/first-start.sh ./
+COPY image/copied-terminal-start.sh ./
 
 
 FROM docker.io/mambaorg/micromamba:2.8-debian13-slim
@@ -26,7 +29,8 @@ ARG VERSION_WINE
 
 # The registry links a package to its repository by this label; the base image's own value names
 # micromamba's repository.
-LABEL org.opencontainers.image.source=https://github.com/swing-traders/mt5-connector
+LABEL org.opencontainers.image.source=https://github.com/swing-traders/mt5-connector \
+    io.github.swing-traders.mt5-connector.terminal-build=6316
 
 USER root
 COPY --from=fetch /artifacts/winehq.key /etc/apt/keyrings/winehq-archive.key
@@ -91,21 +95,11 @@ RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
             PrependPath=1 Include_test=0 Include_launcher=0 "TargetDir=$MT5_PYTHON_DIR"; \
         wineserver -w'
 
-# The web installer fetches whatever terminal is current. It exits 1 after a successful install, so
-# the first start is the success check. When it cannot finish, offline or with a terminal that
-# cannot start, it hangs and ignores SIGTERM, so the bound kills it. The history store ships empty,
-# so the volume mounted on it starts with nothing from the image.
+COPY --from=terminal --chown=mt5:mt5 ["/terminal/", "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/"]
+COPY --from=terminal --chown=mt5:mt5 /metaquotes/ /home/mt5/.wine/drive_c/users/mt5/AppData/Roaming/MetaQuotes/
+COPY --from=terminal --chown=mt5:mt5 /terminal-build /home/mt5/.terminal-build
 RUN --mount=type=bind,from=fetch,source=/artifacts,target=/artifacts \
-    xvfb-run -a sh -c ' \
-        timeout -s KILL 600 wine /artifacts/mt5setup.exe /auto; \
-        if [ $? -eq 137 ]; then \
-            wineserver -k; \
-            echo "mt5setup.exe: no exit within 600s" >&2; \
-            exit 1; \
-        fi; \
-        wineserver -w' \
-    && xvfb-run -a sh /artifacts/first-start.sh \
-    && rm -rf "$WINEPREFIX/drive_c/users/mt5/AppData/Roaming/MetaQuotes/WebInstall" \
+    tini -- xvfb-run -a sh /artifacts/copied-terminal-start.sh \
     && find "$WINEPREFIX/drive_c/Program Files/MetaTrader 5/Bases" -mindepth 1 -delete
 
 # The image's environment, Python and pip alone, is the base environment, root-owned and read-only.

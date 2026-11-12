@@ -2647,7 +2647,8 @@ void CheckTickEra(const HistoryRequest *r, HistoryRun &run, const long lo, const
 {
     if (g_firstTick == 0)
         return;
-    const long from = Latest(lo, g_firstTick - g_firstTick % MINUTE_SECONDS);
+    const long from = Latest(lo, Latest(g_firstTick - g_firstTick % MINUTE_SECONDS,
+                                        g_floors[FloorIndex((int)PERIOD_M1)].value));
     const long through = Earliest(hi, Present(r));
     MqlRates bars[];
     if (from <= through && ReadM1(r, run, from, through, bars))

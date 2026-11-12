@@ -442,6 +442,21 @@ def recorded():
     loop.close()
 
 
+async def test_warmup_reads_take_anything_the_terminal_holds(recorded):
+    c0, c1 = 1_752_570_060, 1_752_570_300
+    request = minute_bars_request(c0, c1)
+    with (
+        patch("mt5connector.client.history.bars", return_value=rate_rows()) as bars,
+        patch("mt5connector.client.history.ticks", return_value=tick_rows()) as ticks,
+    ):
+        await recorded._missed_bars(request.bar_type, c0, c1)
+        await recorded._request_bars(request)
+        await recorded._request_quote_ticks(ticks_request(c0, c1))
+    assert len(bars.await_args_list) == 2
+    assert all(call.kwargs["source"] is calls.Source.TERMINAL for call in bars.await_args_list)
+    assert ticks.await_args.kwargs["source"] is calls.Source.TERMINAL
+
+
 class TestRequestQuoteTicks:
 
     @pytest.mark.asyncio
@@ -450,7 +465,9 @@ class TestRequestQuoteTicks:
         with patch("mt5connector.client.history.ticks", return_value=rows) as ticks:
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
-        ticks.assert_awaited_once_with(recorded._hub, "EURUSDm", 1_752_570_000, 1_752_573_600)
+        ticks.assert_awaited_once_with(
+            recorded._hub, "EURUSDm", 1_752_570_000, 1_752_573_600, source=calls.Source.TERMINAL
+        )
         delivered = recorded._handle_quote_ticks.call_args[0][1]
         assert [tick.ts_event for tick in delivered] == [
             ((1_752_570_000 + i) * 1000 + 250) * 1_000_000 for i in range(10)
@@ -514,7 +531,9 @@ class TestRequestBars:
             await recorded._request_bars(minute_bars_request(c0, c1))
 
         # Every bar closing in the request opened from two periods before its first close on.
-        bars.assert_awaited_once_with(recorded._hub, "EURUSDm", Series.M1, c0 - 120, c1 - 1)
+        bars.assert_awaited_once_with(
+            recorded._hub, "EURUSDm", Series.M1, c0 - 120, c1 - 1, source=calls.Source.TERMINAL
+        )
         delivered = recorded._handle_bars.call_args[0][1]
         assert [bar.ts_event for bar in delivered] == [
             close * 1_000_000_000 for close in range(c0, c1 + 1, 60)
@@ -548,7 +567,7 @@ class TestRequestBars:
         reading = asyncio.Event()
         cancelled = []
 
-        async def syncing(*args):
+        async def syncing(*args, source=None):
             reading.set()
             try:
                 await asyncio.Event().wait()
@@ -593,7 +612,7 @@ class TestRequestBars:
     async def test_a_request_answers_the_bars_whose_real_closes_it_names(
         self, recorded, first_close, last_close, closes
     ):
-        def served(session, symbol, series, start, end):
+        def served(session, symbol, series, start, end, *, source=None):
             return closed_rows(*((t, c) for t, c in AUTUMN_WEEKS if start <= t <= end))
 
         with patch("mt5connector.client.history.bars", side_effect=served):

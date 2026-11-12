@@ -40,7 +40,7 @@ def settings(**overrides) -> HubSettings:
         "ea_queue_bound": 10_000,
         "pending_bound": 1_000,
         "resync_hour": 1,
-        "resync_idle_seconds": 600,
+        "resync_reopen_seconds": 600,
         "history_store": read_hub_settings(
             {"MT5_HISTORY_STORE": os.environ["MT5_HISTORY_STORE"]}
         ).history_store,
