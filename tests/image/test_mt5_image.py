@@ -151,6 +151,46 @@ def test_two_tabs_of_one_name_fail_naming_it(gui) -> None:
         gui.tab_index(["Experts", "Charts", "Experts"], "Experts")
 
 
+def test_the_update_offer_pattern_matches_what_the_driver_dismisses(gui):
+    # Replace this provisional caption when a terminal first shows its update offer.
+    assert gui.is_update_offer("Live Update")
+    assert not gui.is_update_offer("Open an Account")
+    assert not gui.is_update_offer("Options")
+
+
+def test_dismiss_dialogs_names_an_unknown_dialog_and_leaves_it(gui, monkeypatch, capsys):
+    closed = []
+    monkeypatch.setattr(gui, "_main_window", lambda: 1)
+    monkeypatch.setattr(gui, "_owned_dialogs", lambda owner: {2})
+    monkeypatch.setattr(gui, "_caption", lambda window: "Open an Account")
+    monkeypatch.setattr(gui, "_class_name", lambda window: gui.WindowClass.DIALOG)
+    monkeypatch.setattr(gui, "_post", lambda *args: closed.append(args))
+    gui.dismiss_dialogs("")
+    assert "Open an Account" in capsys.readouterr().out
+    assert closed == []
+
+
+def test_the_allowlist_driver_run_again_leaves_one_url(gui, monkeypatch, capsys):
+    monkeypatch.setattr(gui, "_enabled_main_window", lambda: 1)
+    monkeypatch.setattr(gui, "_open_dialog", lambda *args: 2)
+    monkeypatch.setattr(gui, "_caption", lambda window: "Options")
+    monkeypatch.setattr(gui, "_control", lambda parent, control, *args: control)
+    monkeypatch.setattr(gui, "_select_tab", lambda *args: 3)
+    closed = []
+    monkeypatch.setattr(gui, "_close_dialog", lambda *args: closed.append(args))
+
+    def send(window, message, *args):
+        if message is gui.Message.LVM_GETITEMCOUNT:
+            return 2
+        assert message is gui.Message.BM_GETCHECK
+        return gui.CheckState.CHECKED
+
+    monkeypatch.setattr(gui, "_send", send)
+    gui.allow_webrequest("127.0.0.1")
+    assert "already holds one URL" in capsys.readouterr().out
+    assert closed == [(2, gui.Command.OK, "the Options dialog")]
+
+
 _TAIL = _IMAGE_FILES / "tail_logs.py"
 
 
@@ -488,7 +528,9 @@ def test_a_max_bars_that_is_no_positive_integer_fails_the_start_naming_it(max_ba
     assert "mt5: MT5_MAX_BARS is not a positive integer" in result.stdout + result.stderr
 
 
-def _start_with(tmp_path, stub_at: str, stub: str, *, timeout: int) -> subprocess.CompletedProcess:
+def _start_with(
+    tmp_path, stub_at: str, stub: str, *, timeout: int, extra_mounts=()
+) -> subprocess.CompletedProcess:
     """Start the image on the unknown account, an executable ``stub`` mounted over ``stub_at``; the
     container is removed however the start ends."""
     runtime = _runtime()
@@ -506,6 +548,7 @@ def _start_with(tmp_path, stub_at: str, stub: str, *, timeout: int) -> subproces
                 name,
                 "-v",
                 f"{script}:{stub_at}:ro,z",
+                *(part for mount in extra_mounts for part in ("-v", mount)),
                 *_account_env(),
                 _IMAGE,
             ],
@@ -551,10 +594,196 @@ def test_a_restore_that_never_returns_fails_the_start_naming_its_step(tmp_path) 
 def test_a_driver_action_that_never_returns_fails_the_start_naming_its_step(tmp_path) -> None:
     stub = "import sys\nimport time\n\nif sys.argv[1] != 'main-window':\n    time.sleep(3600)\n"
 
-    result = _start_with(tmp_path, "/opt/mt5/terminal_gui.py", stub, timeout=300)
+    result = _start_with(tmp_path, "/opt/mt5/terminal_gui.py", stub, timeout=420)
 
     assert result.returncode != 0
-    assert "mt5: the server search did not finish within 40s" in result.stdout + result.stderr
+    assert (
+        "mt5: the server search failed (attempt 3 of 3): "
+        "the server search did not finish within 40s"
+    ) in result.stdout + result.stderr
+
+
+def _retry_driver(action, failures):
+    return f"""
+import pathlib
+import runpy
+import sys
+action = sys.argv[1]
+if action == "dismiss-dialogs":
+    print("dismiss-dialogs", flush=True)
+elif action == {action!r}:
+    path = pathlib.Path("/tmp/step-attempts")
+    attempt = int(path.read_text()) + 1 if path.exists() else 1
+    path.write_text(str(attempt))
+    if attempt <= {failures}:
+        print("mt5: the step did not finish", flush=True)
+        sys.exit(1)
+if action != "dismiss-dialogs":
+    runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
+"""
+
+
+@_needs_image
+@pytest.mark.parametrize("action", ["allow-webrequest", "search-server"])
+def test_a_step_that_fails_once_is_retried_and_the_boot_goes_on(tmp_path, action):
+    hub = tmp_path / "hub"
+    hub.write_text("#!/bin/sh\nexit 42\n")
+    hub.chmod(0o755)
+    result = _start_with(
+        tmp_path,
+        "/opt/mt5/terminal_gui.py",
+        _retry_driver(action, 1),
+        extra_mounts=(
+            f"{hub}:/opt/conda/bin/mt5-connector-hub:ro,z",
+            f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",
+        ),
+        timeout=420,
+    )
+    what = "the WebRequest allowlist" if action == "allow-webrequest" else "the server search"
+    output = result.stdout + result.stderr
+    assert f"{what} failed (attempt 1 of 3)" in output
+    assert "mt5: starting the hub" in output
+    assert result.returncode == 42
+
+
+@_needs_image
+@pytest.mark.parametrize("ini", ["search.ini", "setup.ini"], ids=["server-search", "webrequest"])
+def test_a_window_wait_that_fails_once_restarts_its_terminal_and_retries(tmp_path, ini):
+    hub = tmp_path / "hub"
+    hub.write_text("#!/bin/sh\nexit 42\n")
+    hub.chmod(0o755)
+    stub = f"""
+import pathlib
+import runpy
+import sys
+
+if sys.argv[1] == "main-window":
+    for process in pathlib.Path("Z:/proc").iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            command = (process / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if b"terminal64.exe" in command and {ini.encode()!r} in command:
+            failed = pathlib.Path("Z:/tmp/failed-window-terminal")
+            if not failed.exists():
+                failed.write_text(process.name)
+            previous = failed.read_text()
+            if previous == process.name:
+                print("mt5: forced first terminal window poll failure", flush=True)
+                sys.exit(1)
+            if pathlib.Path("Z:/proc", previous).exists():
+                print("mt5: the previous terminal is still running", flush=True)
+                sys.exit(1)
+            break
+runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
+"""
+    result = _start_with(
+        tmp_path,
+        "/opt/mt5/terminal_gui.py",
+        stub,
+        extra_mounts=(
+            f"{hub}:/opt/conda/bin/mt5-connector-hub:ro,z",
+            f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",
+        ),
+        timeout=420,
+    )
+    output = result.stdout + result.stderr
+    what = "the server search" if ini == "search.ini" else "the WebRequest allowlist"
+    assert f"{what} failed (attempt 1 of 3)" in output
+    assert "forced first terminal window poll failure" in output
+    assert "mt5: starting the hub" in output
+    assert result.returncode == 42
+
+
+@_needs_image
+def test_a_terminal_ignoring_close_is_killed_and_reaped_before_the_next_attempt(tmp_path):
+    hub = tmp_path / "hub"
+    hub.write_text("#!/bin/sh\nexit 42\n")
+    hub.chmod(0o755)
+    original_timeout = tmp_path / "timeout-real"
+    copied = subprocess.run(
+        [_runtime(), "run", "--rm", "--entrypoint", "cat", _IMAGE, "/usr/bin/timeout"],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    original_timeout.write_bytes(copied.stdout)
+    original_timeout.chmod(0o755)
+    timeout = tmp_path / "timeout"
+    timeout.write_text("""#!/bin/sh
+if [ "$3" = wine ] && [ "$4" = taskkill ] && [ ! -e /tmp/ignored-close ]; then
+    touch /tmp/ignored-close
+    exit 0
+fi
+exec /opt/mt5/timeout-real "$@"
+""")
+    timeout.chmod(0o755)
+    stub = """
+import pathlib
+import runpy
+import sys
+
+if sys.argv[1] == "search-server":
+    failed = pathlib.Path("Z:/tmp/failed-terminal-pids")
+    if not failed.exists():
+        pids = []
+        for process in pathlib.Path("Z:/proc").iterdir():
+            if not process.name.isdecimal():
+                continue
+            try:
+                command = (process / "cmdline").read_bytes()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if b"terminal64.exe" in command and b"search.ini" in command:
+                pids.append(process.name)
+        if not pids:
+            raise RuntimeError("no terminal process serves the first attempt")
+        failed.write_text(" ".join(pids))
+        print("mt5: forced server search failure", flush=True)
+        sys.exit(1)
+    remaining = [pid for pid in failed.read_text().split() if pathlib.Path("Z:/proc", pid).exists()]
+    if remaining:
+        print("mt5: the failed terminal is still running or unreaped", flush=True)
+        sys.exit(1)
+    print("mt5: the failed terminal was killed and reaped", flush=True)
+runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
+"""
+    result = _start_with(
+        tmp_path,
+        "/opt/mt5/terminal_gui.py",
+        stub,
+        extra_mounts=(
+            f"{hub}:/opt/conda/bin/mt5-connector-hub:ro,z",
+            f"{timeout}:/usr/bin/timeout:ro,z",
+            f"{original_timeout}:/opt/mt5/timeout-real:ro,z",
+            f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",
+        ),
+        timeout=420,
+    )
+    output = result.stdout + result.stderr
+    assert "the server search failed (attempt 1 of 3): forced server search failure" in output
+    assert "mt5: killing the terminal, still running after 60s" in output
+    assert "mt5: the failed terminal was killed and reaped" in output
+    assert "mt5: starting the hub" in output
+    assert result.returncode == 42
+
+
+@_needs_image
+def test_a_webrequest_step_that_fails_three_times_fails_the_start_naming_it(tmp_path):
+    result = _start_with(
+        tmp_path,
+        "/opt/mt5/terminal_gui.py",
+        _retry_driver("allow-webrequest", 3),
+        extra_mounts=(f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",),
+        timeout=420,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "the WebRequest allowlist failed (attempt 3 of 3)" in output
+    # Three for the allowlist; one before the preceding search step.
+    assert output.count("\ndismiss-dialogs\n") == 4
 
 
 @_needs_image
