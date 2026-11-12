@@ -30,6 +30,7 @@ from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 from mt5connector.client.config import MT5Config
 from mt5connector.client.hub import HubSession
 from mt5connector.server import hub_gate, ws_server
+from mt5connector.server.hub_resync import Resync
 from mt5connector.server.wire import binary, calls, mirror
 from mt5connector.server.wire.binary import ErrorKind
 from mt5connector.server.wire.history_wire import TICK_TIMEFRAME, Series
@@ -770,9 +771,9 @@ def ranges_store(tmp_path):
             {
                 "EURUSD": {
                     "months": {},
-                    "outcome": "failed",
-                    "month": "202507",
-                    "reason": "the measurement did not restore the month",
+                    "outcome": "downloaded",
+                    "month": "",
+                    "reason": "",
                 }
             }
         )
@@ -784,7 +785,33 @@ def assert_ranges_facts(ranges):
     assert ranges.first_tick == UTC_EPOCH + 30
     # The first tick is July 15 09:00:30 UTC; no month in that era has been verified.
     assert ranges.claimable_through == 1_752_537_600
-    assert ranges.resync_failure == "202507: the measurement did not restore the month"
+    assert ranges.resync_failure == ""
+
+
+def test_the_ranges_answer_names_the_records_latest_failure(ranges_store):
+    path = ranges_store / ".mt5-connector" / "resync.json"
+    path.write_text(
+        json.dumps(
+            {
+                "EURUSD": {
+                    "months": {},
+                    "outcome": "failed",
+                    "month": "202507",
+                    "reason": "the measurement did not restore the month",
+                }
+            }
+        )
+    )
+    resync = Resync(
+        CLOCK,
+        settings(history_store=ranges_store),
+        ready=lambda: False,
+        release=lambda symbol: True,
+        closed_at=lambda symbol: 0,
+        monotonic=lambda: 0,
+        request=lambda call, arguments: False,
+    )
+    assert resync.failure("EURUSD") == "202507: the measurement did not restore the month"
 
 
 async def test_a_ranges_answer_is_stored_and_reaches_the_consumer_in_true_utc_by_generation(

@@ -12,7 +12,7 @@ def test_resync_settings_read_the_defaults_and_an_existing_store(tmp_path):
     settings = read_hub_settings({"MT5_HISTORY_STORE": str(tmp_path)})
 
     assert settings.resync_hour == 1
-    assert settings.resync_idle_seconds == 600
+    assert settings.resync_reopen_seconds == 600
     assert settings.history_store == tmp_path
 
 
