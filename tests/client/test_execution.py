@@ -462,30 +462,42 @@ async def test_a_command_the_hub_cannot_serve_is_rejected_unsent_after_one_ask(h
     assert calls_after_order_send(h) == []
 
 
-async def test_a_command_waits_out_its_symbols_chart_opening_then_is_sent(h):
-    h.venue.order_send.side_effect = [no_publisher(), no_publisher(), trade_result()]
-    await submit(h, h.limit())
-    assert h.names() == ["OrderSubmitted"]
-    assert len(h.venue.order_send.call_args_list) == 3
-    await h.verdict(order=5001)
-    assert h.names() == ["OrderSubmitted", "OrderAccepted", "AccountState"]
+@pytest.mark.parametrize(
+    "failure",
+    [
+        errors.NotSent("hub session: order_send: not sent: the connection is reconnecting"),
+        errors.NoPublisher("order_send: no publisher", 0, 60.0),
+    ],
+    ids=["not-sent", "no-publisher"],
+)
+async def test_a_known_unsent_command_never_waits_or_reasks(h, failure):
+    h.venue.order_send.side_effect = failure
+    await asyncio.wait_for(submit(h, h.market()), 0.2)
+    assert h.names() == ["OrderSubmitted", "OrderRejected"]
+    assert h.events[1].reason == f"not sent: {failure}"
+    assert len(h.venue.order_send.call_args_list) == 1
+    assert calls_after_order_send(h) == []
 
 
-async def test_a_chart_that_does_not_open_within_the_bound_rejects_the_command_unsent(
-    h, monkeypatch
-):
-    monkeypatch.setattr(execution, "_NO_PUBLISHER_BOUND_S", 0.05)
-    h.venue.order_send.side_effect = no_publisher()
+async def test_a_command_for_a_closed_publisher_is_rejected_unsent_after_one_ask(h):
+    refusal = errors.NotServed("order_send: no publisher for EURUSD; chart requested", 0)
+    h.venue.order_send.side_effect = [refusal, refusal, trade_result()]
     await submit(h, h.limit())
     assert h.names() == ["OrderSubmitted", "OrderRejected"]
-    assert h.events[1].reason == f"not sent: {no_publisher()}"
-    assert 1 < len(h.venue.order_send.call_args_list) <= 6
+    assert h.events[1].reason == f"not sent: {refusal}"
+    assert len(h.venue.order_send.call_args_list) == 1
 
 
-async def test_a_command_whose_next_ask_would_fall_past_the_bound_is_rejected_unsent(
-    h, monkeypatch
-):
-    monkeypatch.setattr(execution, "_NO_PUBLISHER_BOUND_S", 0.05)
+async def test_a_command_refusal_never_waits_for_its_chart(h):
+    refusal = errors.NotServed("order_send: no publisher for EURUSD; chart requested", 0)
+    h.venue.order_send.side_effect = refusal
+    await submit(h, h.limit())
+    assert h.names() == ["OrderSubmitted", "OrderRejected"]
+    assert h.events[1].reason == f"not sent: {refusal}"
+    assert len(h.venue.order_send.call_args_list) == 1
+
+
+async def test_a_command_never_waits_out_a_no_publisher_deferral(h):
     late = errors.NoPublisher("order_send: no EA serves the publisher of EURUSD", 0, 0.06)
     h.venue.order_send.side_effect = [late, trade_result()]
     await submit(h, h.limit())
@@ -494,10 +506,7 @@ async def test_a_command_whose_next_ask_would_fall_past_the_bound_is_rejected_un
     assert len(h.venue.order_send.call_args_list) == 1
 
 
-async def test_a_command_waking_past_the_bound_is_rejected_unsent_without_asking_again(
-    h, monkeypatch
-):
-    monkeypatch.setattr(execution, "_NO_PUBLISHER_BOUND_S", 0.05)
+async def test_a_command_refusal_does_not_schedule_another_ask_when_the_loop_stalls(h):
     deferred = no_publisher()
     asked = []
 
@@ -605,27 +614,37 @@ async def test_a_verdict_held_for_a_command_whose_answer_was_lost_goes_to_the_co
     assert len(h.logged(LogLevel.WARNING)) == 1
 
 
-async def test_a_held_verdict_no_command_claims_is_released_once_past_the_bound(h, monkeypatch):
-    monkeypatch.setattr(execution, "_UNCLAIMED_S", 0.01)
-    monkeypatch.setattr(execution, "_NO_PUBLISHER_BOUND_S", 1.0)
+async def test_a_verdict_no_unanswered_command_claims_is_linked_at_once(h, monkeypatch):
     waiting = h.limit()
     lost = h.limit(price="1.07000")
     h.place(lost, status=OrderStatus.SUBMITTED)
     h.venue.orders_get.side_effect = resting(
         ours_order(ticket=5004, comment=execution.order_comment(lost.client_order_id))
     )
-    h.venue.order_send.side_effect = no_publisher()
+    held = asyncio.Event()
+    released = asyncio.Event()
+    request = h.push.request
+
+    async def unanswered(call, **arguments):
+        if call is calls.Call.ORDER_SEND:
+            held.set()
+            await released.wait()
+        return await request(call, **arguments)
+
+    monkeypatch.setattr(h.push, "request", unanswered)
     command = asyncio.get_running_loop().create_task(submit(h, waiting))
-    await asyncio.sleep(0.02)
-    held = request_done(5004, execution.order_comment(lost.client_order_id), MAGIC, request_id=77)
-    await h.delivered(held)
-    assert h.names() == ["OrderSubmitted"]
-    await asyncio.sleep(0.02)
-    await h.delivered(request_done(5005, "manual", MAGIC, request_id=78))
-    linked = [event for event in h.events if event.client_order_id == lost.client_order_id]
-    assert [type(event).__name__ for event in linked] == ["OrderAccepted"]
-    command.cancel()
-    await asyncio.gather(command, return_exceptions=True)
+    await held.wait()
+    try:
+        await h.delivered(
+            request_done(5004, execution.order_comment(lost.client_order_id), MAGIC, request_id=77)
+        )
+        assert h.names() == ["OrderSubmitted", "OrderAccepted"]
+        linked = [event for event in h.events if event.client_order_id == lost.client_order_id]
+        assert [type(event).__name__ for event in linked] == ["OrderAccepted"]
+        assert not command.done()
+    finally:
+        released.set()
+        await command
     await h.drained()
 
 
@@ -846,13 +865,50 @@ async def test_a_cancel_the_venue_refuses_is_rejected_with_the_retcode(h):
     assert h.events[0].reason == "TRADE_RETCODE_REJECT_CANCEL: Rejected"
 
 
-async def test_a_cancel_whose_venue_read_fails_is_rejected_unsent(h):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        errors.ServerUnreachable("orders_get: refused"),
+        errors.NotReady("orders_get: clock unverified", 0, 60.0),
+    ],
+    ids=["connection", "deferred"],
+)
+async def test_a_cancel_whose_venue_read_fails_is_rejected_unsent(h, failure):
     order = h.place(h.limit(), ticket=5001)
-    h.venue.orders_get.side_effect = errors.ServerUnreachable("orders_get: refused")
-    await h.client._cancel_order(cancel_command(order))
+    h.venue.orders_get.side_effect = failure
+    await asyncio.wait_for(h.client._cancel_order(cancel_command(order)), 0.2)
     assert h.names() == ["OrderCancelRejected"]
     assert h.events[0].reason.startswith("not sent")
     h.venue.order_send.assert_not_called()
+    assert h.venue.orders_get.call_count == 1
+
+
+async def test_a_modify_whose_venue_read_defers_is_rejected_unsent_after_one_ask(h):
+    order = h.place(h.limit(), ticket=5001)
+    h.venue.orders_get.side_effect = errors.NotReady("orders_get: clock unverified", 0, 60.0)
+    await asyncio.wait_for(
+        h.client._modify_order(modify_command(order, price=Price.from_str("1.07000"))), 0.2
+    )
+    assert h.names() == ["OrderModifyRejected"]
+    assert h.events[0].reason.startswith("not sent")
+    assert h.venue.orders_get.call_count == 1
+    h.venue.order_send.assert_not_called()
+
+
+async def test_a_remove_verdict_before_its_answer_is_claimed_by_its_order_ticket(h):
+    order = h.place(h.limit(), ticket=5001)
+    h.venue.orders_get.side_effect = resting(ours_order(ticket=5001))
+
+    def answered_after_verdict(request):
+        h.push.deliver(verdict_of(calls.trade_request(request), 41, mirror.TRADE_RETCODE_DONE))
+        return trade_result(request_id=41)
+
+    h.venue.order_send.side_effect = answered_after_verdict
+    await h.client._cancel_order(cancel_command(order))
+    await h.drained()
+    assert h.names() == ["OrderCanceled", "AccountState"]
+    assert h.events[0].venue_order_id == VenueOrderId("5001")
+    assert h.client._pending == {}
 
 
 async def test_a_cancel_whose_response_is_lost_emits_nothing_but_one_warning(h):
@@ -895,6 +951,28 @@ async def strategies(exec_venue):
         trade_order(ticket=5105, magic=MAGIC + 1),
     )
     return h
+
+
+@pytest.mark.parametrize(
+    ("side", "refused"),
+    [
+        (OrderSide.NO_ORDER_SIDE, {"5101", "5102"}),
+        (OrderSide.BUY, {"5101"}),
+        (OrderSide.SELL, {"5102"}),
+    ],
+)
+async def test_a_deferred_cancel_all_listing_rejects_each_commanded_cancel_once(
+    strategies, side, refused
+):
+    strategies.venue.orders_get.side_effect = errors.NotReady(
+        "orders_get: clock unverified", 0, 60.0
+    )
+    await asyncio.wait_for(strategies.client._cancel_all_orders(cancel_all_command(side)), 0.2)
+    assert strategies.names() == ["OrderCancelRejected"] * len(refused)
+    assert {event.venue_order_id.value for event in strategies.events} == refused
+    assert all(event.reason.startswith("not sent") for event in strategies.events)
+    assert strategies.venue.orders_get.call_count == 1
+    strategies.venue.order_send.assert_not_called()
 
 
 @pytest.mark.parametrize(

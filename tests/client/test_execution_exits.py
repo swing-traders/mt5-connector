@@ -2,7 +2,6 @@
 closing deals, and the fills and reports those answer for."""
 
 import asyncio
-import time
 from decimal import Decimal
 
 import pytest
@@ -34,8 +33,8 @@ from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from session_double import verdict_of
 from venue_doubles import trade_result
 
-from mt5connector.client import execution
-from mt5connector.wire import mirror
+from mt5connector.client import errors, execution
+from mt5connector.wire import calls, mirror
 
 POSITION = 8133477
 
@@ -49,6 +48,32 @@ async def connected(exec_venue, **settings):
     h = build_client(exec_venue, **settings)
     await h.connect()
     return h
+
+
+async def test_a_bracket_whose_position_read_defers_is_rejected_unsent_after_one_ask(exec_venue):
+    h = await connected(exec_venue)
+    h.venue.positions_get.side_effect = errors.NotReady("positions_get: clock unverified", 0, 60.0)
+    await asyncio.wait_for(submit(h, stop(h)), 0.2)
+    assert h.names() == ["OrderSubmitted", "OrderRejected"]
+    assert h.events[1].reason.startswith("not sent")
+    assert h.venue.positions_get.call_count == 1
+    h.venue.order_send.assert_not_called()
+
+
+async def test_a_bracket_verdict_before_its_answer_is_claimed_by_its_position(exec_venue):
+    h = await connected(exec_venue)
+    h.venue.positions_get.side_effect = holding(long_position())
+
+    def answered_after_verdict(request):
+        h.push.deliver(verdict_of(calls.trade_request(request), 41, mirror.TRADE_RETCODE_DONE))
+        return trade_result(request_id=41)
+
+    h.venue.order_send.side_effect = answered_after_verdict
+    await submit(h, stop(h))
+    await h.drained()
+    assert h.names() == ["OrderSubmitted", "OrderAccepted", "AccountState"]
+    assert h.events[1].venue_order_id == VenueOrderId(f"{POSITION}-SL-1")
+    assert h.client._pending == {}
 
 
 async def connect_with_events(h):
@@ -463,7 +488,7 @@ async def test_a_restarted_client_derives_the_generation_from_what_nt_kept(exec_
     assert restarted.events[1].venue_order_id == VenueOrderId(f"{POSITION}-SL-3")
 
 
-async def test_a_target_sent_behind_a_stop_in_flight_waits_for_its_verdict_and_carries_it(
+async def test_a_target_sent_behind_a_stop_in_flight_is_sent_at_once_and_carries_it(
     exec_venue,
 ):
     h = await connected(exec_venue)
@@ -472,9 +497,10 @@ async def test_a_target_sent_behind_a_stop_in_flight_waits_for_its_verdict_and_c
     target_order = target(h, price="1.10000")
     _, waiting = await in_flight(h, submit_command(h, stop_order), submit_command(h, target_order))
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0)
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.1),
     ]
-    assert not waiting.done()
+    assert waiting.done()
 
     await h.verdict(request_id=1)
     await waiting
@@ -491,7 +517,7 @@ async def test_a_target_sent_behind_a_stop_in_flight_waits_for_its_verdict_and_c
     ]
 
 
-async def test_a_target_behind_a_stop_the_venue_refuses_carries_no_stop_and_is_accepted(
+async def test_a_target_behind_a_stop_the_venue_refuses_keeps_the_level_it_already_sent(
     exec_venue,
 ):
     h = await connected(exec_venue)
@@ -506,7 +532,7 @@ async def test_a_target_behind_a_stop_the_venue_refuses_carries_no_stop_and_is_a
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.09, 0.0),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.09, 1.1),
     ]
     assert [
         (type(event).__name__, event.client_order_id)
@@ -518,7 +544,7 @@ async def test_a_target_behind_a_stop_the_venue_refuses_carries_no_stop_and_is_a
     ]
 
 
-async def test_a_target_whose_read_outlasts_the_refusal_of_the_stop_before_it_carries_no_stop(
+async def test_a_target_carries_nts_stop_until_nt_applies_its_rejection(
     exec_venue,
 ):
     h = await connected(exec_venue)
@@ -545,7 +571,7 @@ async def test_a_target_whose_read_outlasts_the_refusal_of_the_stop_before_it_ca
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.09, 0.0),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.09, 1.1),
     ]
     assert stop_order.status == OrderStatus.SUBMITTED
 
@@ -577,7 +603,7 @@ async def test_a_target_whose_read_outlasts_the_placed_stop_closing_carries_no_s
     ]
 
 
-async def test_a_stop_refused_at_its_answer_lends_no_level_to_the_target_behind_it(exec_venue):
+async def test_a_stop_answer_refusal_keeps_the_targets_already_sent_level(exec_venue):
     h = await connected(exec_venue)
     h.venue.positions_get.side_effect = holding(long_position(sl=0.0, tp=0.0))
     h.venue.order_send.side_effect = [
@@ -591,19 +617,19 @@ async def test_a_stop_refused_at_its_answer_lends_no_level_to_the_target_behind_
     await asyncio.gather(*tasks)
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.1),
     ]
 
 
 @pytest.mark.parametrize(
     ("retcode", "stop_level", "stop_event"),
     [
-        (mirror.TRADE_RETCODE_DONE, 1.083, "OrderUpdated"),
+        (mirror.TRADE_RETCODE_DONE, 1.08, "OrderUpdated"),
         (mirror.TRADE_RETCODE_INVALID_STOPS, 1.08, "OrderModifyRejected"),
     ],
     ids=["amended", "refused"],
 )
-async def test_a_target_amended_behind_a_stops_amend_waits_and_carries_the_stop_its_verdict_leaves(
+async def test_a_target_amended_during_a_stops_amend_carries_nts_stop_without_waiting(
     exec_venue, retcode, stop_level, stop_event
 ):
     h, stop_order, target_order = await occupied(exec_venue)
@@ -613,9 +639,10 @@ async def test_a_target_amended_behind_a_stops_amend_waits_and_carries_the_stop_
         modify_command(target_order, price=Price.from_str("1.10500")),
     )
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1)
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
     ]
-    assert not waiting.done()
+    assert waiting.done()
 
     await h.verdict(retcode, request_id=1)
     await waiting
@@ -634,19 +661,20 @@ async def test_a_target_amended_behind_a_stops_amend_waits_and_carries_the_stop_
 
 @pytest.mark.parametrize(
     ("retcode", "stop_level"),
-    [(mirror.TRADE_RETCODE_DONE, 0.0), (mirror.TRADE_RETCODE_INVALID_STOPS, 1.08)],
+    [(mirror.TRADE_RETCODE_DONE, 1.08), (mirror.TRADE_RETCODE_INVALID_STOPS, 1.08)],
     ids=["cleared", "refused"],
 )
-async def test_a_target_placed_behind_a_clear_of_the_stop_waits_and_carries_what_its_verdict_leaves(
+async def test_a_target_placed_during_a_stop_clear_carries_nts_stop_without_waiting(
     exec_venue, retcode, stop_level
 ):
     h, stop_order, _ = await occupied(exec_venue)
     moved = target(h, price="1.10500")
     _, waiting = await in_flight(h, cancel_command(stop_order), submit_command(h, moved))
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1)
+        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
     ]
-    assert not waiting.done()
+    assert waiting.done()
 
     await h.verdict(retcode, request_id=1)
     await waiting
@@ -662,51 +690,29 @@ async def test_a_target_placed_behind_a_clear_of_the_stop_waits_and_carries_what
     ]
 
 
-async def test_a_target_behind_a_stop_whose_verdict_never_comes_is_sent_past_the_bound_with_it(
-    exec_venue, monkeypatch
-):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.05)
+async def test_a_target_is_sent_at_once_with_nts_stop_while_its_verdict_is_unanswered(exec_venue):
     h = await connected(exec_venue)
     h.venue.positions_get.side_effect = holding(long_position(sl=0.0, tp=0.0))
     stop_order = stop(h, trigger="1.08000")
-    started = asyncio.get_running_loop().time()
     _, waiting = await in_flight(
         h, submit_command(h, stop_order), submit_command(h, target(h, price="1.10000"))
     )
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0)
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.1),
     ]
+    assert waiting.done()
 
     await asyncio.wait_for(waiting, timeout=1.0)
 
-    assert asyncio.get_running_loop().time() - started >= 0.05
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0),
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.1),
     ]
-    (warning,) = h.logged(LogLevel.WARNING)
-    assert f"{stop_order.client_order_id!r} {execution.Command.BRACKET}" in warning
+    assert h.logged(LogLevel.WARNING) == []
 
 
-def refused_once_the_loop_stalls_past_the_bound(h, request_id):
-    """Stalls the loop past the bound of the command waiting now, then delivers the venue's refusal
-    of the command sent under `request_id`: after the bound's timeout, before the waiting command
-    runs again."""
-    refusal = verdict_of(
-        h.push.sent[request_id],
-        request_id,
-        mirror.TRADE_RETCODE_INVALID_STOPS,
-        comment="Invalid stops",
-    )
-    loop = asyncio.get_running_loop()
-    loop.call_soon(time.sleep, 0.4)
-    loop.call_at(loop.time() + 0.25, h.push.deliver, refusal)
-
-
-async def test_a_stop_refused_as_the_bound_passes_lends_no_level_to_the_target_waiting_on_it(
-    exec_venue, monkeypatch
-):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.2)
+async def test_a_later_stop_refusal_does_not_change_the_targets_sent_levels(exec_venue):
     h = await connected(exec_venue)
     h.venue.positions_get.side_effect = holding(long_position(sl=0.0, tp=0.0))
     _, waiting = await in_flight(
@@ -714,26 +720,25 @@ async def test_a_stop_refused_as_the_bound_passes_lends_no_level_to_the_target_w
         submit_command(h, stop(h, trigger="1.09000")),
         submit_command(h, target(h, price="1.10000")),
     )
-    refused_once_the_loop_stalls_past_the_bound(h, request_id=1)
+    assert waiting.done()
+    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1, comment="Invalid stops")
 
     await asyncio.wait_for(waiting, timeout=2.0)
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.09, 0.0),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.09, 1.1),
     ]
     assert h.logged(LogLevel.WARNING) == []
 
 
-async def test_a_clear_refused_as_the_bound_passes_leaves_the_stop_on_the_target_waiting_on_it(
-    exec_venue, monkeypatch
-):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.2)
+async def test_a_later_clear_refusal_does_not_change_the_targets_sent_levels(exec_venue):
     h, stop_order, _ = await occupied(exec_venue)
     _, waiting = await in_flight(
         h, cancel_command(stop_order), submit_command(h, target(h, price="1.10500"))
     )
-    refused_once_the_loop_stalls_past_the_bound(h, request_id=1)
+    assert waiting.done()
+    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1, comment="Invalid stops")
 
     await asyncio.wait_for(waiting, timeout=2.0)
 
@@ -744,33 +749,9 @@ async def test_a_clear_refused_as_the_bound_passes_leaves_the_stop_on_the_target
     assert h.logged(LogLevel.WARNING) == []
 
 
-def refused_once_the_waiting_command_resumes(h, *request_ids):
-    """Stalls the loop past the bound of the command waiting now, then delivers the venue's refusal
-    of each command sent under `request_ids` right after the waiting command next runs."""
-    refusals = [
-        verdict_of(
-            h.push.sent[request_id],
-            request_id,
-            mirror.TRADE_RETCODE_INVALID_STOPS,
-            comment="Invalid stops",
-        )
-        for request_id in request_ids
-    ]
-
-    def deliver():
-        for refusal in refusals:
-            h.push.deliver(refusal)
-
-    loop = asyncio.get_running_loop()
-    loop.call_soon(time.sleep, 0.4)
-    # Due with the bound's timer, it queues the refusals behind the waiting command's resumption.
-    loop.call_at(loop.time() + 0.25, loop.call_soon, deliver)
-
-
-async def test_a_target_behind_two_amends_of_the_stop_judges_both_at_once_past_the_bound(
-    exec_venue, monkeypatch
+async def test_a_target_during_two_stop_amends_carries_nts_unchanged_stop_without_waiting(
+    exec_venue,
 ):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.2)
     h, stop_order, target_order = await occupied(exec_venue)
     *_, waiting = await in_flight(
         h,
@@ -778,109 +759,102 @@ async def test_a_target_behind_two_amends_of_the_stop_judges_both_at_once_past_t
         modify_command(stop_order, trigger_price=Price.from_str("1.08600")),
         modify_command(target_order, price=Price.from_str("1.10500")),
     )
-    refused_once_the_waiting_command_resumes(h, 1, 2)
+    assert waiting.done()
+    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1)
+    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=2)
 
     await asyncio.wait_for(waiting, timeout=2.0)
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.086, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.086, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
     ]
-    assert len(h.logged(LogLevel.WARNING)) == 2
+    assert h.logged(LogLevel.WARNING) == []
 
 
-async def test_a_target_judges_the_amends_of_a_closed_and_a_standing_stop_at_once_past_the_bound(
-    exec_venue, monkeypatch
+async def test_a_target_uses_nts_standing_stop_while_its_amend_and_a_closed_stops_are_unanswered(
+    exec_venue,
 ):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.2)
     h, older_stop, target_order = await occupied(exec_venue)
     await modify(h, older_stop, trigger_price=Price.from_str("1.08300"))
     newer_stop = h.place(stop(h, trigger="1.09000"), ticket=f"{POSITION}-SL-2", position=POSITION)
     await modify(h, newer_stop, trigger_price=Price.from_str("1.09300"))
     canceled(h, newer_stop)
     (waiting,) = await in_flight(h, modify_command(target_order, price=Price.from_str("1.10500")))
-    refused_once_the_waiting_command_resumes(h, 1, 2)
+    assert waiting.done()
+    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1)
+    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=2)
 
     await asyncio.wait_for(waiting, timeout=2.0)
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.093, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
     ]
-    warnings = h.logged(LogLevel.WARNING)
-    for stop_order in (older_stop, newer_stop):
-        named = f"{stop_order.client_order_id!r} {execution.Command.AMEND} within"
-        assert len([warning for warning in warnings if named in warning]) == 1
+    assert h.logged(LogLevel.WARNING) == []
 
 
 @pytest.mark.parametrize(
-    ("retcode", "outcome"),
+    ("retcode", "stop_event"),
     [
-        (mirror.TRADE_RETCODE_DONE, execution.SendOutcome.DONE),
-        (mirror.TRADE_RETCODE_INVALID_STOPS, execution.SendOutcome.REFUSED),
+        (mirror.TRADE_RETCODE_DONE, "OrderAccepted"),
+        (mirror.TRADE_RETCODE_INVALID_STOPS, "OrderRejected"),
     ],
     ids=["done", "refused"],
 )
-async def test_a_stop_a_target_stopped_waiting_for_settles_on_its_late_verdict(
-    exec_venue, monkeypatch, retcode, outcome
+async def test_a_stop_and_its_already_sent_target_settle_on_their_own_verdicts(
+    exec_venue, retcode, stop_event
 ):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.05)
     h = await connected(exec_venue)
     h.venue.positions_get.side_effect = holding(long_position(sl=0.0, tp=0.0))
     _, waiting = await in_flight(h, submit_command(h, stop(h)), submit_command(h, target(h)))
-    awaited = h.client._pending[1]
 
     await asyncio.wait_for(waiting, timeout=1.0)
 
-    assert not awaited.outcome.done()
+    assert set(h.client._pending) == {1, 2}
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 0.0),
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.1),
     ]
-    (warning,) = h.logged(LogLevel.WARNING)
+    assert h.logged(LogLevel.WARNING) == []
 
     await h.verdict(retcode, request_id=1)
     await h.verdict(request_id=2)
 
-    assert awaited.outcome.result() == outcome
+    assert [type(event).__name__ for event in h.events] == [stop_event, "OrderAccepted"]
     assert (h.client._pending, h.client._unanswered) == ({}, [])
-    assert h.logged(LogLevel.WARNING) == [warning]
+    assert h.logged(LogLevel.WARNING) == []
 
 
-@pytest.mark.parametrize("past_the_bound", [False, True], ids=["while-waiting", "past-the-bound"])
-async def test_a_target_cancelled_while_it_waits_ends_alone_leaving_the_stop_to_its_verdict(
-    exec_venue, monkeypatch, past_the_bound
+@pytest.mark.parametrize(
+    "after_stop_verdict", [False, True], ids=["before-verdict", "after-verdict"]
+)
+async def test_cancelling_a_finished_task_withdraws_neither_bracket_command(
+    exec_venue, after_stop_verdict
 ):
-    monkeypatch.setattr(execution, "_VERDICT_BOUND_S", 0.2)
     h = await connected(exec_venue)
     h.venue.positions_get.side_effect = holding(long_position(sl=0.0, tp=0.0))
     _, waiting = await in_flight(h, submit_command(h, stop(h)), submit_command(h, target(h)))
-    awaited = h.client._pending[1]
-    (cancelled,) = h.client._unanswered
+    assert waiting.done()
+    if after_stop_verdict:
+        await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1)
+    assert waiting.cancel() is False
+    await waiting
 
-    if past_the_bound:
-        loop = asyncio.get_running_loop()
-        # The bound's timer and the cancel both run before the waiting command resumes.
-        loop.call_soon(time.sleep, 0.4)
-        loop.call_at(loop.time() + 0.25, waiting.cancel)
-    else:
-        waiting.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiting
-
-    assert cancelled.outcome.result() == execution.SendOutcome.NOT_SENT
     assert h.client._unanswered == []
-    assert not awaited.outcome.done()
-    assert len(sent_requests(h)) == 1
+    assert 2 in h.client._pending
+    assert len(sent_requests(h)) == 2
     assert h.logged(LogLevel.WARNING) == []
 
-    await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1)
+    if not after_stop_verdict:
+        await h.verdict(mirror.TRADE_RETCODE_INVALID_STOPS, request_id=1)
+    assert set(h.client._pending) == {2}
+    await h.verdict(request_id=2)
 
-    assert awaited.outcome.result() == execution.SendOutcome.REFUSED
     assert h.client._pending == {}
-    assert h.names() == ["OrderRejected", "AccountState"]
+    assert h.names() == ["OrderRejected", "AccountState", "OrderAccepted", "AccountState"]
 
 
 async def test_a_stop_the_venue_refuses_as_invalid_is_rejected_with_its_retcode_and_comment(

@@ -1,6 +1,7 @@
 """The execution client's reports for NT's reconciliation: each one magic-filtered, its quantities
 and prices in the instrument's precisions, its times the venue's own, read over a bounded window."""
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -99,6 +100,23 @@ def by_ticket(*venue_orders):
             return venue_orders
 
     return orders_get
+
+
+@pytest.mark.parametrize(
+    ("read", "reports"),
+    [
+        ("history_orders_get", order_reports),
+        ("history_deals_get", fill_reports),
+        ("positions_get", position_reports),
+    ],
+)
+async def test_a_report_read_that_defers_raises_after_one_ask(h, read, reports):
+    failure = errors.NotReady(f"{read}: clock unverified", 0, 60.0)
+    getattr(h.venue, read).side_effect = failure
+    with pytest.raises(errors.Deferred) as caught:
+        await asyncio.wait_for(reports(h), 0.2)
+    assert caught.value is failure
+    assert getattr(h.venue, read).call_count == 1
 
 
 # ── One order ────────────────────────────────────────────────────────────────
