@@ -87,6 +87,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.objects import AccountBalance, MarginBalance, Money, Price, Quantity
 
+from mt5connector.client.concurrency import _fan_out
 from mt5connector.client.connection import AccountSnapshot, MarginMode
 from mt5connector.client.currencies import register_venue_currency, venue_currency
 from mt5connector.client.errors import (
@@ -1674,9 +1675,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             historical = await self._read(
                 calls.Call.HISTORY_ORDERS_GET, date_from=date_from, date_to=date_to
             )
-            ownership = await asyncio.gather(
-                *(self._is_ours(order, self._read) for order in historical)
-            )
+            ownership = await _fan_out(*(self._is_ours(order, self._read) for order in historical))
             for order, ours in zip(historical, ownership, strict=True):
                 if ours and _in_scope(order.symbol, command.instrument_id):
                     venue_orders.setdefault(order.ticket, order)
@@ -1702,7 +1701,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             for client_order_id, exit_order in executed.items()
             if client_order_id not in exit_reports
         ]
-        completed = await asyncio.gather(*(self._executed_exit_report(order) for order in missing))
+        completed = await _fan_out(*(self._executed_exit_report(order) for order in missing))
         exit_reports.update(
             (order.client_order_id, report)
             for order, report in zip(missing, completed, strict=True)
@@ -1744,7 +1743,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     return await self._fill_report(deal, owner)
             return None
 
-        reports = await asyncio.gather(
+        reports = await _fan_out(
             *(report(deal) for deal in sorted(deals, key=attrgetter("ticket")))
         )
         return [report for report in reports if report is not None]
@@ -1844,7 +1843,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     )
                     continue
                 reads.append(self._bracket_reports(identifier, slot, orders, position))
-            for bracket in await asyncio.gather(*reads):
+            for bracket in await _fan_out(*reads):
                 reports += bracket
         return reports
 

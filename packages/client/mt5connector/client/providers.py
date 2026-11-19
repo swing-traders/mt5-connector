@@ -7,7 +7,6 @@ replaces whole. A failed load changes neither."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import deque
 from decimal import Decimal
@@ -23,6 +22,7 @@ from mt5connector.client.commissions import (
     parse_schedule,
     taker_fee,
 )
+from mt5connector.client.concurrency import _fan_out
 from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.errors import (
     EaError,
@@ -136,7 +136,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         definitions = dict(
             zip(
                 symbols,
-                await asyncio.gather(*(_definition(session, symbol) for symbol in symbols)),
+                await _fan_out(*(_definition(session, symbol) for symbol in symbols)),
                 strict=True,
             )
         )
@@ -145,7 +145,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         pairs, quoting = await _quote_conversions(
             session, definitions, _listed_pairs(listing), loaded | set(symbols), account.currency
         )
-        instruments = await asyncio.gather(
+        instruments = await _fan_out(
             *(
                 self._load_definition(session, info, rule, account, pairs, ts)
                 for info, rule in (definitions | quoting).values()
@@ -165,7 +165,7 @@ class MT5InstrumentProvider(InstrumentProvider):
         """Builds the instrument a symbol's definition describes, its fee from its commission rule
         and its trading sessions as relayed."""
         try:
-            sessions, fee_result, margin_rates = await asyncio.gather(
+            sessions, fee_result, margin_rates = await _fan_out(
                 _asked(session, calls.Call.TRADING_SESSIONS, symbol=info.name),
                 _fee(session, info, rule, pairs),
                 _asked(session, calls.Call.SYMBOL_MARGIN_RATE, symbol=info.name),
@@ -304,7 +304,7 @@ async def _quote_conversions(
         pairs |= found
         pending = []
         symbols = sorted(set(found.values()) - definitions.keys())
-        pending = await asyncio.gather(*(_definition(session, symbol) for symbol in symbols))
+        pending = await _fan_out(*(_definition(session, symbol) for symbol in symbols))
         quoting.update(zip(symbols, pending, strict=True))
     return pairs, quoting
 
@@ -316,7 +316,7 @@ async def _select_quoted_pairs(
     else the first that quotes, each in alphabetical order; a pair none quotes is left out."""
     pairs = {}
     ordered = sorted(needed)
-    symbols = await asyncio.gather(
+    symbols = await _fan_out(
         *(_select_quoting_symbol(session, listed[pair], traded) for pair in ordered)
     )
     for pair, symbol in zip(ordered, symbols, strict=True):
