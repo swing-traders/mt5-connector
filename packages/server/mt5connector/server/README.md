@@ -697,9 +697,11 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
 
 #### Concurrency certification
 
-`tests/live/test_hub_certification.py` adds the account-load and pending-role checks, command refusal, restart, chart cleanup and chart-ceiling cases. It is live-only: ordinary unit runs leave `MT5_LIVE_HUB_SYMBOL` unset. The health/load and publisher-role cases use the ordinary demo hub. The terminal-control cases require an explicitly named throwaway container; they do not operate on the ordinary functional-workflow server.
+`tests/live/test_hub_certification.py` adds the account-load and pending-role checks, command refusal, restart, chart cleanup and chart-ceiling cases. It is live-only: ordinary unit runs leave `MT5_LIVE_HUB_SYMBOL` unset. The publisher-role and closed-publisher command checks can use the ordinary demo hub. The load case and terminal-control cases require an explicitly named throwaway container; they do not operate on the ordinary functional-workflow server.
 
 The throwaway uses the built image, its own history volume and a dedicated container network. Keep the image's normal hub port and EA templates: every EA connects directly to the hub on loopback 9000. Publish that hub as the test's `MT5_LIVE_HUB_URL`. Set a short `MT5_CHART_IDLE_SECONDS`; the tests drop subscriptions together and observe the hub's idle-close requests and the terminal's own close/open log entries.
+
+The load case runs only on that throwaway. It holds the known publisher with a tick subscription and chooses a fresh symbol from the terminal probe's unused symbols. Its five-second measurement starts at the fresh subscription and ends at the owned hub's logged chart-open acknowledgement or publisher hello for that symbol. It does not time a deferred read.
 
 Each close-backlog case captures the log immediately before requesting its fresh subscriptions. The ceiling run counts the closes logged between that request boundary and each logged open, and requires no more than the number still waiting at the request. The fifteen-close case permits at most one queued publisher close between the request and the new open. A drained backlog fails the fixture precondition. The stray case requires its chart-specific unallocated close after the request boundary and before the remaining queued publisher closes, which distinguishes open preparation from the cursor's later cleanup. These are close-count and ordering assertions; they impose no timer-pass or elapsed-time substitute for the close guarantee.
 

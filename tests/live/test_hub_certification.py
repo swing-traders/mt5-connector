@@ -34,7 +34,7 @@ from test_hub_live import (
     verdict_of,
 )
 
-from mt5connector.client.errors import NoPublisher, NotSent, NotServed, ResponseLost
+from mt5connector.client.errors import NotSent, NotServed, ResponseLost
 from mt5connector.client.execution import SymbolFilling
 from mt5connector.server.ws_server import _CLOSE_BOUND_S, _IDLE_SWEEP_S
 from mt5connector.wire import binary, calls, mirror
@@ -94,10 +94,6 @@ async def unsubscribe(session, symbols):
     )
 
 
-async def chart_opened(session, symbol, seconds):
-    await asyncio.wait_for(ask(session, Call.SYMBOL_INFO_TICK, symbol=symbol), seconds)
-
-
 def closed_lines(log, symbols):
     return [
         line
@@ -142,10 +138,10 @@ async def no_hidden_removal(control, since, before):
     assert not any(row.event is ProbeEvent.WATCH_GONE and not row.visible for row in rows[before:])
 
 
-async def test_account_load_keeps_health_and_two_publishers_responsive(live):
+async def test_account_load_keeps_health_and_two_publishers_responsive(live, throwaway):
     observer, _ = live
-    await ask(observer, Call.SYMBOL_INFO_TICK, symbol=SYMBOL)
-    candidates = await symbols_for(observer, 5)
+    await subscribe(observer, [SYMBOL])
+    candidates = await symbols_for(observer, 1, throwaway)
     fresh = None
     owners = [Owner() for _ in range(10)]
     sessions = await asyncio.gather(*(connected(owner) for owner in owners))
@@ -178,16 +174,20 @@ async def test_account_load_keeps_health_and_two_publishers_responsive(live):
         await asyncio.wait_for(
             observer.request(Call.SYMBOL_INFO_TICK, symbol=SYMBOL), calls.READ_DEADLINE_S
         )
+        fresh = candidates[0]
+        since = time.time()
         beginning = time.monotonic()
-        for symbol in candidates:
-            try:
-                await observer.request(Call.SYMBOL_INFO_TICK, symbol=symbol)
-            except NoPublisher:
-                fresh = symbol
-                break
-        assert fresh is not None, "the load case needs a genuinely fresh publisher"
         await observer.subscribe(Subscription(Stream.TICKS, fresh))
-        await chart_opened(observer, fresh, 5)
+        await until(
+            lambda: throwaway.logs(since),
+            lambda log: any(
+                line.endswith(f"the spawner opened the publisher chart of {fresh}")
+                or f"publisher EA for {fresh} connected:" in line
+                for line in log.splitlines()
+            ),
+            5,
+            "the fresh publisher's chart-open acknowledgement or hello",
+        )
         assert time.monotonic() - beginning <= 5
         answers = await reads
         assert len(answers) == 10 and all(len(pair) == 2 for pair in answers)
