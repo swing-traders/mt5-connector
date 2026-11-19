@@ -297,6 +297,7 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
         ]
         assert opened >= requested
         assert len([index for index in queued_closes if index < opened]) <= 1
+        assert any(index > opened for index in queued_closes), "the close backlog already drained"
         if stray:
             stray_closed = next(
                 index
@@ -596,6 +597,18 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
             "the ceiling run's ten publisher opens",
         )
         lines = log.splitlines()
+        first_opened = next(
+            index
+            for index, line in enumerate(lines)
+            if any(f"opened the publisher chart of '{symbol}'" in line for symbol in fresh)
+        )
+        assert any(
+            index > first_opened
+            and any(
+                f"closed the {role.value} chart of '{symbol}'" in line for role, symbol in waiting
+            )
+            for index, line in enumerate(lines)
+        ), "the ceiling backlog drained before the first fresh open"
         for symbol in fresh:
             opened = next(
                 index
