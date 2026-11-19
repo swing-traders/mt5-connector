@@ -14,7 +14,7 @@ An owned hard fork of [aulekator/mt5-connector](https://github.com/aulekator/mt5
 
 It ships two distributions and the image that runs the server, never a deployment. The distributions share one `mt5connector` namespace package (no `__init__.py` at `mt5connector/`), each its own hatchling project:
 
-- **`mt5-connector-client`** (`packages/client/`) — `mt5connector.client`: NT data and execution clients, the instrument provider, the factories, the history client and the downloader.
+- **`mt5-connector-client`** (`packages/client/`) — `mt5connector.client`: NT data and execution clients, the instrument provider, the factories and the history client.
 - **Wire vocabulary** (`packages/client/mt5connector/wire/`: `mirror.py`, `broker_clock.py`, `history_wire.py`, `push_wire.py`, `binary.py`, `calls.py`) — the inventory of the pinned `MetaTrader5` package, the broker-clock conversion, the history protocol's names, and the hub protocol's names, binary frames and call registry. It lives once, in the client's tree, and ships in both wheels.
 - **`mt5-connector-server`** (`packages/server/`) — `mt5connector.server`: the hub (`mt5-connector-hub`), the EA and its startup script with their vendored MQL5 libraries as package data (`mql5/`), and its README — the hub protocol and the contract the image that runs it builds to.
 

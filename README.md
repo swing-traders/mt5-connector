@@ -43,7 +43,7 @@ The repository ships two distributions, versioned together: one release builds b
 
 | Distribution | Import packages | Installs into | Carries |
 |---|---|---|---|
-| `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the history client and the downloader, and the wire vocabulary |
+| `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the history client, and the wire vocabulary |
 | `mt5-connector-server` | `mt5connector.server` | the Linux Python that runs the hub beside the terminal | the hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
 
 `mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
@@ -61,7 +61,6 @@ The repository ships two distributions, versioned together: one release builds b
   - [Quick start](#quick-start)
   - [Configuration](#configuration)
     - [Symbol naming](#symbol-naming)
-  - [Downloading history](#downloading-history)
   - [Running in a node](#running-in-a-node)
     - [Bar types](#bar-types)
   - [The MT5 server](#the-mt5-server)
@@ -282,72 +281,6 @@ Its loads — NautilusTrader's `load_all_async` and `load_ids_async`, and `load_
 
 ---
 
-## Downloading history
-
-`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the hub's [history calls](packages/server/mt5connector/server/README.md#history) on its connection's hub session; `download_ticks`, `download_bars` and `download_all` are coroutines.
-
-The downloader walks back from `end`, one request per window, until `start` or the floor the hub's `ranges` holds for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
-
-- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at the close the hub answers for it — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
-- ticks one UTC day at a time, both sizes of each the instrument's largest order.
-
-A window the hub answers with an error, or whose answer is lost, is recorded among the result's errors and the walk goes on, and so is a `ranges` read the hub answers with an error; any other error reading it raises.
-
-```python
-import asyncio
-from datetime import datetime, timezone
-
-from mt5connector.client.config import MT5Config
-from mt5connector.client.connection import MT5Connection
-from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.client.downloader import MT5DataDownloader
-from nautilus_trader.common.component import LiveClock
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-
-async def main() -> None:
-    config = MT5Config(account=12345678, server="Exness-MT5Trial9", ws_url="ws://127.0.0.1:9000")
-
-    conn     = MT5Connection(config)
-    await conn.connect()
-
-    provider = MT5InstrumentProvider(conn, venue=config.venue, clock=LiveClock())
-    catalog  = ParquetDataCatalog("./catalog")
-
-    # Write the instrument definition first (required by the backtest engine)
-    instrument = await provider.load_symbol("EURUSDm")
-    catalog.write_data([instrument])
-
-    # Download bars
-    downloader = MT5DataDownloader(conn, provider, catalog)
-    result = await downloader.download_bars(
-        symbol    = "EURUSDm",
-        start     = datetime(2024, 1,  1, tzinfo=timezone.utc),
-        end       = datetime(2024, 12, 31, tzinfo=timezone.utc),
-        timeframe = 16385,  # MT5 timeframe constant: 16385 = H1
-    )
-    print(result)
-    await conn.disconnect()
-
-
-asyncio.run(main())
-```
-
-**MT5 timeframe constants:**
-
-| Timeframe | Constant |
-|-----------|----------|
-| M1  | 1 |
-| M5  | 5 |
-| M15 | 15 |
-| M30 | 30 |
-| H1  | 16385 |
-| H4  | 16388 |
-| D1  | 16408 |
-| W1  | 32769 |
-
----
-
 ## Running in a node
 
 The data and execution clients run in NautilusTrader's `TradingNode`, and the node's instrument set is NT's own: each client loads what its `instrument_provider` config names, as NT's adapters do.
@@ -441,7 +374,7 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 
 - `bars(session, symbol, series, first_open_s, last_open_s)` answers the bars of a `Series` opened in that window as a numpy array of `MqlRates`' fields and each bar's `time_close`; `ticks(session, symbol, start_s, end_s, flags=TickFlags.INFO)` the ticks of those seconds as the package's array; and `ranges(session, symbol)` the hub's `Ranges`: the terminal's `maxbars`, each series' `SeriesRange` floor, the first real tick's `first_tick`, the exclusive UTC-day edge `claimable_through` certified by the hub's re-sync record, and its latest `resync_failure`, empty after success.
 - Each takes keyword-only `source=Source.SERVER_SYNCED`, with `Source` in `wire.calls`. `syncing`, `not_ready` and `no_publisher` are retried after their delays, with no deadline of their own. Any other error is the hub's `HubAnswerError` raised — `InvalidWindow` for a window starting after the terminal's time — and an answer lost to the session's deadline or a reconnect raises `ResponseLost`.
-- The server-synced default sends no extra wire argument and waits for any due re-sync. `source=Source.TERMINAL` accepts the terminal's live recording and waits only from a re-sync's deletion until measurement restores the months. This changes the gate, not the returned rows or ranges fields. The data client uses `TERMINAL` in its three history paths; the downloader and catalog providers use the default.
+- The server-synced default sends no extra wire argument and waits for any due re-sync. `source=Source.TERMINAL` accepts the terminal's live recording and waits only from a re-sync's deletion until measurement restores the months. This changes the gate, not the returned rows or ranges fields. The data client uses `TERMINAL` in its three history paths; catalog providers use the default.
 - `opens_closing(series, first_close, last_close)` gives the opens a window of closes is read by, and `closing(rows, first_close, last_close)` keeps the bars closing in it.
 - A caller awaits one on its connection's session, on the loop the connection was connected on: `await history.bars(conn.session, "EURUSDm", Series.H1, first_open_s, last_open_s)`.
 
@@ -466,7 +399,7 @@ just test
 All tests but the image tier's and the live hub tier's mock the MT5 terminal — no live connection required to run them.
 
 ```
-tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the history client and the downloader
+tests/client/              — the adapter: connection, data and execution clients, instruments, factories and the history client
 tests/server/              — the WS hub: its streams, requests, clock gate, epoch conversion and settings, the EA's half of the protocol, and the MQL5 generator
 tests/image/               — the server image, started on a made-up account; its GUI driver and log tail
 tests/live/                — the hub and its EAs in two running images, through the client's hub session
@@ -504,7 +437,6 @@ mt5-connector/
 │   │       │   ├── constants.py     # venue, account-loop and reconnect defaults
 │   │       │   ├── currencies.py    # the precision ladder a venue currency code is built by
 │   │       │   ├── data.py          # MT5DataClient — pushed ticks, marks and venue bars, and history requests
-│   │       │   ├── downloader.py    # MT5DataDownloader — historical bar download
 │   │       │   ├── errors.py        # custom exceptions
 │   │       │   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
 │   │       │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
