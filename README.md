@@ -385,6 +385,21 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 
 ## Releases
 
+### 0.21.0+st
+
+- The client requires `nautilus_trader==1.231.0+st.39`.
+- A request that cannot be written immediately raises `NotSent`. A command the hub cannot serve immediately raises `NotServed`; it is rejected unsent without waiting or retrying. An unknown command outcome stays with NT's reconciliation.
+- A bracket command no longer waits for a sibling's verdict.
+- Reads on command paths and in reports are asked once.
+- The server runs a dedicated account EA. Symbol-named position, order and margin-rate reads use that symbol's publisher; account-wide reads use the account EA. Health requires both the spawner and account EA and a fresh verified clock, which any serving EA can relay.
+- Symbol-named account reads defer until the symbol's publisher opens.
+- Chart opens progress ahead of unrelated closes. Each spawner pass permits one chart close and one Market Watch deselection, preserving hidden conversion symbols.
+- Instrument loads, cancel batches and report reads fan out by key. Historical quote and bar construction yields between batches; pushed tick frames carry a structured NumPy array in `Ticks.ticks`.
+- The history API no longer accepts `on_syncing`, and `OnSyncing` is removed. Remove that argument and its import; history reads continue waiting out the hub's deferrals.
+- `MT5DataDownloader` is removed. Read `history.bars`, `history.ticks` or `history.ranges` on the connection's session instead.
+
+### Publishing
+
 - `VERSION` holds the one version both distributions carry.
 - The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The manual `terminal-image.yml` Action builds the terminal-only image and skips publishing a build already tagged. A terminal upgrade changes that one image reference in a PR, checked by the image tier.
 - A `vX.Y.Z+st` tag builds both wheels, each `py3-none-any` with a sha256 sidecar, and the server image. The image is pushed to `ghcr.io/swing-traders/mt5-connector-server:vX.Y.Z-st` once the image tier passes on it; only then are all four wheel files attached to one GitHub release and the PEP 503 index rebuilt on this repository's GitHub Pages, one page per project: `/simple/mt5-connector-client/` and `/simple/mt5-connector-server/`.
