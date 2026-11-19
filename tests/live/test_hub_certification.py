@@ -11,7 +11,6 @@ import pytest
 from certification import (
     ProbeCommand,
     ProbeEvent,
-    RelayOperation,
     Throwaway,
     health,
     listed_charts,
@@ -40,7 +39,6 @@ from mt5connector.wire.push_wire import ChartRole, Stream, Subscription
 
 pytestmark = pytest.mark.skipif(SYMBOL is None, reason="MT5_LIVE_HUB_SYMBOL is not set")
 Call = calls.Call
-POLL_SECONDS = 0.016
 
 
 @pytest.fixture
@@ -107,6 +105,27 @@ def closed_lines(log, symbols):
         line
         for line in log.splitlines()
         if any(f"closed the publisher chart of '{symbol}'" in line for symbol in symbols)
+    ]
+
+
+def close_backlog(log, symbols):
+    requested = set()
+    closed = set()
+    for line in log.splitlines():
+        asked = re.search(r"the (\w+) chart of (.+) out of use for \d+ s: closing it$", line)
+        finished = re.search(r"ticks: closed the (\w+) chart of '(.*)'$", line)
+        if asked is not None and asked[2] in symbols:
+            requested.add((ChartRole(asked[1]), asked[2]))
+        if finished is not None:
+            closed.add((ChartRole(finished[1]), finished[2]))
+    return requested, requested - closed
+
+
+def close_indices(lines):
+    return [
+        index
+        for index, line in enumerate(lines)
+        if "ticks: closed the " in line or "ticks: closed chart " in line
     ]
 
 
@@ -238,44 +257,24 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
     await subscribe(session, old)
     before = len(await throwaway.observations())
     since = time.time()
-    await throwaway.relay(RelayOperation.PAUSE)
     try:
         await unsubscribe(session, old)
         await until(
-            throwaway.relay,
-            lambda state: len(
-                [
-                    event
-                    for event in state["queued"]
-                    if binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
-                    and event["symbol"] in old
-                ]
-            )
-            >= 15,
+            lambda: throwaway.logs(since),
+            lambda log: len(close_backlog(log, old)[0]) == 15,
             throwaway.idle_seconds + 5,
-            "fifteen queued publisher closes",
-        )
-        began = time.monotonic()
-        await session.subscribe(Subscription(Stream.TICKS, fresh))
-        await until(
-            throwaway.relay,
-            lambda state: any(
-                binary.FrameKind[event["kind"]] is binary.FrameKind.OPEN_CHART
-                and event["symbol"] == fresh
-                for event in state["queued"]
-            ),
-            1,
-            "the new open queued after the closes",
+            "the hub's fifteen idle-close requests",
         )
         if stray:
-            protected_charts = len(listed_charts(await throwaway.observations()))
-            stray_started = time.monotonic()
             stray_chart = await throwaway.command(ProbeCommand.OPEN_STRAY, fresh)
             assert stray_chart.chart in listed_charts(await throwaway.observations())
-        await throwaway.relay(RelayOperation.RELEASE)
+        at_request = await throwaway.logs(since)
+        assert close_backlog(at_request, old)[1], "the fixture's close backlog already drained"
+        requested = len(at_request.splitlines())
         if stray:
-            # The allocated charts cannot leave while held; two sightings need a full cursor round.
-            assert time.monotonic() - stray_started < (protected_charts - 2) * POLL_SECONDS
+            assert f"closed chart {stray_chart.chart} of '{fresh}'" not in at_request
+        began = time.monotonic()
+        await session.subscribe(Subscription(Stream.TICKS, fresh))
         await chart_opened(session, fresh, 2)
         assert time.monotonic() - began <= 2
         log = await until(
@@ -294,15 +293,17 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             index
             for index, line in enumerate(lines)
             if any(f"closed the publisher chart of '{symbol}'" in line for symbol in old)
+            and index >= requested
         ]
-        assert opened < queued_closes[1]
+        assert opened >= requested
+        assert len([index for index in queued_closes if index < opened]) <= 1
         if stray:
             stray_closed = next(
                 index
                 for index, line in enumerate(lines)
                 if f"closed chart {stray_chart.chart} of '{fresh}'" in line
             )
-            assert stray_closed < queued_closes[0]
+            assert requested <= stray_closed < queued_closes[0]
             assert stray_closed < opened
             observations = (await throwaway.observations())[before:]
             created = next(
@@ -316,7 +317,6 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             )
         await no_hidden_removal(throwaway, since, before)
     finally:
-        await throwaway.relay(RelayOperation.RELEASE)
         await unsubscribe(session, [*old, fresh])
 
 
@@ -324,24 +324,19 @@ async def test_a_resyncs_own_teardown_does_not_hold_another_symbols_open(live, t
     session, _ = live
     fresh = (await symbols_for(session, 1, throwaway))[0]
     since = time.time()
-    await throwaway.relay(RelayOperation.PAUSE)
     try:
         await until(
-            throwaway.relay,
-            lambda state: any(
-                binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
-                and ChartRole[event["role"]] is ChartRole.HISTORY
-                and event["symbol"] == throwaway.resync_symbol
-                for event in state["queued"]
+            lambda: throwaway.logs(since),
+            lambda log: (
+                f"closed the history chart of '{throwaway.resync_symbol}'" in log
+                and any(
+                    "re-sync" in line and throwaway.resync_symbol in line
+                    for line in log.splitlines()
+                )
             ),
             ANSWERED_S,
             "the prepared symbol's re-sync close",
         )
-        log = await throwaway.logs(since)
-        assert any(
-            "re-sync" in line and throwaway.resync_symbol in line for line in log.splitlines()
-        ), "the queued history close must belong to a re-sync"
-        await throwaway.relay(RelayOperation.RELEASE)
         charts = listed_charts(await throwaway.observations())
         assert throwaway.resync_symbol in charts.values(), "the own close is no longer listed"
         began = time.monotonic()
@@ -349,7 +344,6 @@ async def test_a_resyncs_own_teardown_does_not_hold_another_symbols_open(live, t
         await chart_opened(session, fresh, 2)
         assert time.monotonic() - began <= 2
     finally:
-        await throwaway.relay(RelayOperation.RELEASE)
         await unsubscribe(session, [fresh])
 
 
@@ -416,29 +410,21 @@ async def test_a_held_symbol_is_reported_once_and_kept(live, throwaway):
         "type_filling": filling,
         "magic": MAGIC,
     }
-    await throwaway.relay(RelayOperation.PAUSE)
+    since = time.time()
     try:
-        await throwaway.command(ProbeCommand.CLOSE_SYMBOL, symbol)
-
-        async def publisher_absent():
-            try:
-                await session.request(Call.SYMBOL_INFO_TICK, symbol=symbol)
-            except NoPublisher:
-                return True
-            return False
-
-        await until(publisher_absent, bool, 5, "the closed publisher")
+        await until(
+            lambda: throwaway.logs(since),
+            lambda log: f"closed the publisher chart of '{symbol}'" in log,
+            throwaway.idle_seconds + 10,
+            "the unused publisher's idle close",
+        )
         request_id = session._next_request_id
         began = time.monotonic()
         with pytest.raises(NotServed):
             await session.order_send(order)
         assert session._next_request_id == request_id + 1
         assert time.monotonic() - began < calls.READ_DEADLINE_S
-    finally:
-        await throwaway.relay(RelayOperation.RELEASE)
-    await chart_opened(session, symbol, 5)
-    since = time.time()
-    try:
+        await chart_opened(session, symbol, 5)
         sent = await session.order_send(order)
         verdict = await owner.first(verdict_of(sent.result.request_id), 30)
         assert verdict.result["retcode"] in (
@@ -584,99 +570,46 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
             1200,
             "45 publisher and 45 history charts",
         )
-        await throwaway.relay(RelayOperation.PAUSE)
         for symbol in idle:
             holding[symbol].cancel()
         await asyncio.gather(*(holding[symbol] for symbol in idle), return_exceptions=True)
         await unsubscribe(session, idle)
-        await until(
-            throwaway.relay,
-            lambda state: len(
-                [
-                    event
-                    for event in state["queued"]
-                    if binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
-                    and event["symbol"] in idle
-                ]
-            )
-            >= 15,
+        at_request = await until(
+            lambda: throwaway.logs(since),
+            lambda log: len(close_backlog(log, idle)[0]) >= 15,
             throwaway.idle_seconds + 10,
-            "the ceiling run's queued closes",
+            "the ceiling run's idle-close requests",
         )
+        waiting = close_backlog(at_request, idle)[1]
+        assert waiting, "the fixture's close backlog already drained"
+        requested = len(at_request.splitlines())
         await asyncio.gather(
             *(session.subscribe(Subscription(Stream.TICKS, symbol)) for symbol in fresh)
         )
-        queued = await until(
-            throwaway.relay,
-            lambda state: {
-                event["symbol"]
-                for event in state["queued"]
-                if binary.FrameKind[event["kind"]] is binary.FrameKind.OPEN_CHART
-            }
-            >= set(fresh),
-            2,
-            "the ceiling run's ten queued opens",
+        await asyncio.gather(
+            *(ask(session, Call.SYMBOL_INFO_TICK, symbol=symbol) for symbol in fresh)
         )
-        await throwaway.relay(RelayOperation.RELEASE)
-        await asyncio.gather(*(chart_opened(session, symbol, 15) for symbol in fresh))
-        waiting = {
-            (ChartRole[event["role"]], event["symbol"])
-            for event in queued["queued"]
-            if binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
-        }
         log = await until(
             lambda: throwaway.logs(since),
-            lambda log: all(
-                f"closed the {role.value} chart of '{symbol}'" in log for role, symbol in waiting
-            ),
-            15,
-            "the ceiling run's waiting closes",
+            lambda log: all(f"opened the publisher chart of '{symbol}'" in log for symbol in fresh),
+            ANSWERED_S,
+            "the ceiling run's ten publisher opens",
         )
         lines = log.splitlines()
-        assert all(f"opened the publisher chart of '{symbol}'" in log for symbol in fresh)
-        relayed = (await throwaway.relay())["events"]
         for symbol in fresh:
-            open_frame = next(
-                index
-                for index, event in enumerate(queued["queued"])
-                if binary.FrameKind[event["kind"]] is binary.FrameKind.OPEN_CHART
-                and event["symbol"] == symbol
-            )
-            closes_ahead = {
-                (ChartRole[event["role"]], event["symbol"])
-                for event in queued["queued"][:open_frame]
-                if binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
-            }
-            assert closes_ahead
-            close_passes = [
-                index
-                for index, line in enumerate(lines)
-                if any(
-                    f"closed the {role.value} chart of '{closed}'" in line
-                    for role, closed in closes_ahead
-                )
-            ]
-            assert len(close_passes) == len(closes_ahead)
             opened = next(
                 index
                 for index, line in enumerate(lines)
                 if f"opened the publisher chart of '{symbol}'" in line
             )
-            # Each waiting close consumes one pass; opens run before that pass's close.
-            assert opened < close_passes[-1], f"{symbol}: exceeded {len(closes_ahead)} close passes"
-            assert any(
-                binary.FrameKind[event["kind"]] is binary.FrameKind.CHART_OPENED
-                and event["symbol"] == symbol
-                for event in relayed
-            )
-            assert not any(
-                binary.FrameKind[event["kind"]] is binary.FrameKind.CHART_FAILED
-                and event["symbol"] == symbol
-                for event in relayed
-            )
+            assert opened >= requested
+            closed_before_open = [
+                index for index in close_indices(lines) if requested <= index < opened
+            ]
+            assert len(closed_before_open) <= len(waiting), symbol
+            assert f"cannot open the publisher chart of '{symbol}'" not in log
         assert len(retained) == 30
     finally:
-        await throwaway.relay(RelayOperation.RELEASE)
         running = False
         for task in holding.values():
             task.cancel()

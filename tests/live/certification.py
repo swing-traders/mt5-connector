@@ -83,12 +83,6 @@ class ProbeCommand(IntEnum):
     SELECT_SYMBOL = 3
 
 
-class RelayOperation(StrEnum):
-    PAUSE = "pause"
-    RELEASE = "release"
-    STATUS = "status"
-
-
 @dataclass(frozen=True)
 class Observation:
     microseconds: int
@@ -114,7 +108,6 @@ class Throwaway:
         )
         self.idle_seconds = float(os.environ["MT5_CERT_IDLE_SECONDS"])
         self.resync_symbol = os.environ["MT5_CERT_RESYNC_SYMBOL"]
-        self.relay_script = os.environ["MT5_CERT_RELAY_SCRIPT"]
         self.runtime = shutil.which("docker") or shutil.which("podman")
         if self.runtime is None:
             raise RuntimeError("certification needs docker or podman")
@@ -190,20 +183,6 @@ class Throwaway:
         )
         return next(row for row in rows if row.event is ProbeEvent.ACK and row.token == token)
 
-    async def relay(self, operation=RelayOperation.STATUS):
-        answer = await self.run(
-            "exec",
-            self.container,
-            "python3",
-            "-c",
-            "import json,sys,urllib.request; "
-            "r=urllib.request.Request('http://127.0.0.1:9002/control',"
-            "data=json.dumps({'operation':sys.argv[1]}).encode()); "
-            "print(urllib.request.urlopen(r,timeout=5).read().decode())",
-            operation.value,
-        )
-        return json.loads(answer)
-
     async def cut_network(self):
         await self.run("network", "disconnect", self.network, self.container)
         self.network_attached = False
@@ -215,7 +194,6 @@ class Throwaway:
 
     async def start(self):
         await self.run("start", self.container)
-        await self.run("exec", "-d", self.container, "python3", self.relay_script)
 
 
 def listed_charts(rows):
