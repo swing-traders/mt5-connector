@@ -1,0 +1,186 @@
+#property script_show_inputs
+#property strict
+
+input string OutputFile = "connector-chart-probe.tsv";
+input string CommandsFile = "connector-chart-probe.commands.tsv";
+input uint SampleMilliseconds = 10;
+
+enum ProbeEvent
+{
+    START, CHART_ADDED, CHART_GONE, WATCH_SELECTED, WATCH_GONE, WATCH_HELD,
+    CONNECTED, DISCONNECTED, ACK, FAILED
+};
+enum ProbeCommand { OPEN_STRAY = 1, CLOSE_SYMBOL = 2, SELECT_SYMBOL = 3 };
+struct ChartState { long id; string symbol; };
+struct WatchState { string symbol; bool visible; int positions; int orders; };
+
+int output = INVALID_HANDLE;
+bool failed = false;
+ChartState previousCharts[];
+WatchState previousWatch[];
+
+void Record(const ProbeEvent event, const string symbol = "", const long chart = 0,
+            const bool selected = false, const bool visible = false,
+            const int positions = 0, const int orders = 0, const string token = "")
+{
+    if (FileWrite(output, GetMicrosecondCount(), EnumToString(event), symbol, chart,
+                  (int)selected, (int)visible, positions, orders, token) == 0)
+    {
+        PrintFormat("chart probe: FileWrite failed: %d", GetLastError());
+        failed = true;
+    }
+}
+
+int ChartAt(const ChartState &rows[], const long id)
+{
+    for (int i = 0; i < ArraySize(rows); i++)
+        if (rows[i].id == id) return i;
+    return -1;
+}
+
+int WatchAt(const WatchState &rows[], const string symbol)
+{
+    for (int i = 0; i < ArraySize(rows); i++)
+        if (rows[i].symbol == symbol) return i;
+    return -1;
+}
+
+void Charts()
+{
+    ChartState current[];
+    for (long chart = ChartFirst(); chart != -1; chart = ChartNext(chart))
+    {
+        const int index = ArraySize(current);
+        ArrayResize(current, index + 1);
+        current[index].id = chart;
+        current[index].symbol = ChartSymbol(chart);
+        if (ChartAt(previousCharts, chart) == -1)
+            Record(CHART_ADDED, current[index].symbol, chart);
+    }
+    for (int i = 0; i < ArraySize(previousCharts); i++)
+        if (ChartAt(current, previousCharts[i].id) == -1)
+            Record(CHART_GONE, previousCharts[i].symbol, previousCharts[i].id);
+    ArraySwap(current, previousCharts);
+}
+
+void MarketWatch()
+{
+    WatchState current[];
+    for (int i = 0; i < SymbolsTotal(true); i++)
+    {
+        const string symbol = SymbolName(i, true);
+        const int index = ArraySize(current);
+        ArrayResize(current, index + 1);
+        current[index].symbol = symbol;
+        current[index].visible = (bool)SymbolInfoInteger(symbol, SYMBOL_VISIBLE);
+        current[index].positions = 0;
+        current[index].orders = 0;
+        for (int p = 0; p < PositionsTotal(); p++)
+            if (PositionGetSymbol(p) == symbol) current[index].positions++;
+        for (int o = 0; o < OrdersTotal(); o++)
+        {
+            const ulong ticket = OrderGetTicket(o);
+            if (ticket != 0 && OrderGetString(ORDER_SYMBOL) == symbol) current[index].orders++;
+        }
+        const int prior = WatchAt(previousWatch, symbol);
+        if (prior == -1 || previousWatch[prior].visible != current[index].visible)
+            Record(WATCH_SELECTED, symbol, 0, true, current[index].visible,
+                   current[index].positions, current[index].orders);
+        else if (previousWatch[prior].positions != current[index].positions
+                 || previousWatch[prior].orders != current[index].orders)
+            Record(WATCH_HELD, symbol, 0, true, current[index].visible,
+                   current[index].positions, current[index].orders);
+    }
+    for (int i = 0; i < ArraySize(previousWatch); i++)
+        if (WatchAt(current, previousWatch[i].symbol) == -1)
+            Record(WATCH_GONE, previousWatch[i].symbol, 0, false, previousWatch[i].visible,
+                   previousWatch[i].positions, previousWatch[i].orders);
+    ArraySwap(current, previousWatch);
+}
+
+void Commands()
+{
+    if (!FileIsExist(CommandsFile, FILE_COMMON)) return;
+    const int handle = FileOpen(CommandsFile, FILE_COMMON | FILE_READ | FILE_CSV | FILE_ANSI,
+                               '\t', CP_UTF8);
+    if (handle == INVALID_HANDLE)
+    {
+        Record(FAILED);
+        failed = true;
+        return;
+    }
+    const string token = FileReadString(handle);
+    const int operation = (int)StringToInteger(FileReadString(handle));
+    const string symbol = FileReadString(handle);
+    FileClose(handle);
+    if (!FileDelete(CommandsFile, FILE_COMMON))
+    {
+        Record(FAILED, symbol, 0, false, false, 0, 0, token);
+        failed = true;
+        return;
+    }
+    bool ok = true;
+    long opened = 0;
+    if (operation == OPEN_STRAY)
+    {
+        opened = ChartOpen(symbol, PERIOD_M1);
+        ok = opened != 0;
+    }
+    else if (operation == CLOSE_SYMBOL)
+    {
+        for (long chart = ChartFirst(); chart != -1;)
+        {
+            const long next = ChartNext(chart);
+            if (chart != ChartID() && ChartSymbol(chart) == symbol)
+                ok = ChartClose(chart) && ok;
+            chart = next;
+        }
+    }
+    else if (operation == SELECT_SYMBOL)
+        ok = SymbolSelect(symbol, true);
+    else
+        ok = false;
+    if (ok) Record(ACK, symbol, opened, false, false, 0, 0, token);
+    else
+    {
+        Record(FAILED, symbol, 0, false, false, 0, 0, token);
+        failed = true;
+    }
+}
+
+void OnStart()
+{
+    if (SampleMilliseconds == 0)
+    {
+        Print("chart probe: SampleMilliseconds must be positive");
+        return;
+    }
+    output = FileOpen(OutputFile, FILE_COMMON | FILE_WRITE | FILE_CSV | FILE_SHARE_READ
+                      | FILE_ANSI, '\t', CP_UTF8);
+    if (output == INVALID_HANDLE)
+    {
+        PrintFormat("chart probe: FileOpen failed: %d", GetLastError());
+        return;
+    }
+    FileWrite(output, "microseconds", "event", "symbol", "chart", "selected", "visible",
+              "positions", "orders", "token");
+    Record(START);
+    bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+    Record(connected ? CONNECTED : DISCONNECTED);
+    while (!IsStopped() && !failed)
+    {
+        Commands();
+        Charts();
+        MarketWatch();
+        const bool nowConnected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+        if (nowConnected != connected)
+        {
+            connected = nowConnected;
+            Record(connected ? CONNECTED : DISCONNECTED);
+        }
+        FileFlush(output);
+        Sleep(SampleMilliseconds);
+    }
+    FileFlush(output);
+    FileClose(output);
+}

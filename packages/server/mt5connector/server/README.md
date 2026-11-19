@@ -695,6 +695,28 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
 
 `docker` takes the same commands.
 
+#### Concurrency certification
+
+`tests/live/test_hub_certification.py` adds the account-load and pending-role checks, command refusal, restart, chart cleanup and chart-ceiling cases. It is live-only: ordinary unit runs leave `MT5_LIVE_HUB_SYMBOL` unset. The health/load and publisher-role cases use the ordinary demo hub. The terminal-control cases require an explicitly named throwaway container; they do not operate on the ordinary functional-workflow server.
+
+The throwaway uses the built image, its own history volume and a dedicated container network. Set its `MT5_HUB_PORT=9001` and publish that backend as the test's `MT5_LIVE_HUB_URL`; the baked EA templates still connect to port 9000. Mount `tests/live/` read-only at `/opt/mt5-cert`, and start `python3 /opt/mt5-cert/chart_relay.py` inside it. This test-only relay listens on loopback 9000 and forwards EAs to the hub on loopback 9001. Its loopback 9002 control endpoint holds chart-control frames alone, never requests, answers or keepalives. It lets the chart cases establish fifteen queued closes before releasing the new open beside them, including an unallocated stray of that same symbol.
+
+Compile `tests/live/chart_probe.mq5` with the image's `MetaEditor64.exe`, from a path without spaces, requiring `0 errors, 0 warnings`, and copy the `.ex5` into the terminal's `MQL5/Scripts`. Run it from Navigator on the existing spawner chart with its default output and commands filenames, leaving the EA attached. It opens no chart of its own. It records chart disappearance, Market Watch selection/visibility and holdings on its monotonic microsecond clock. The named throwaway's local commands can open a stray, close a symbol's charts or visibly re-select a symbol. Its TSV remains a private certification artifact; it is not checked in.
+
+| Variable | Required throwaway control |
+|---|---|
+| `MT5_CERT_CONTAINER` | the disposable container to restart and disconnect |
+| `MT5_CERT_NETWORK` | its dedicated network, disconnected for the twenty-second broker outage |
+| `MT5_CERT_PROBE_FILE` | the probe TSV's absolute Linux path inside the container, in the Wine prefix's terminal Common Files directory |
+| `MT5_CERT_RELAY_SCRIPT` | `/opt/mt5-cert/chart_relay.py`, started again after the restart case |
+| `MT5_CERT_IDLE_SECONDS` | the throwaway's actual `MT5_CHART_IDLE_SECONDS`, positive and at most ten seconds |
+| `MT5_CERT_RESYNC_SYMBOL` | a synced symbol prepared for a due re-sync while its history chart is listed |
+| `MT5_CERT_CEILING` | `1` selects the once-per-certification ceiling case |
+
+The re-sync case needs its prepared symbol to enter a due re-sync during the observation window; keep its history store and history chart ready and schedule its re-sync accordingly. It fails if it cannot observe the own close while the chart is still listed. The 45-publisher plus 45-history ceiling case runs once on the read-only account, with at least 55 unused fully tradable symbols. The held-symbol case uses the demo half's one market entry, first proving its unsent refusal while the publisher is closed, then waiting for the publisher and its venue verdict; its cleanup closes that position. It is skipped on the read-only account.
+
+Run certification only after the ordinary live-tier prerequisites hold. Save the container log, probe TSV, relay observations and pytest output beside the certification evidence. The restart case runs last in its module and kills then starts only the named throwaway; its probe must be started again before a subsequent chart-certification run.
+
 ### The tick generator's historical lane
 
 `tests/live/test_tickgen_history.py` measures the generator of a candidate image against two weeks the strategy tester exported in its "Every tick" mode. A native capture checks real ticks field for field and a later tickless minute's rejection inside the tick era. The file runs on its own, never with the order-placement cases of the live tier, and reads only: it places no order and runs no tester. Its synthesis expectations come from `tests/live/tickgen_oracle.py`, the fitted rules written from their formulas alone, whose worked examples `tests/live/test_tickgen_oracle.py` pins in every test run.
