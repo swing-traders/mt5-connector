@@ -124,6 +124,7 @@ async def test_before_a_verifying_sample_every_request_is_answered_not_ready_and
     assert body["ok"] is False
     assert body["result"] | {"sample_age_s": None} == {
         "spawner": False,
+        "account": False,
         "clock": None,
         "sample_age_s": None,
         "bootstrap_missed": False,
@@ -137,10 +138,11 @@ async def test_before_a_verifying_sample_every_request_is_answered_not_ready_and
 async def test_after_a_verifying_sample_a_request_reaches_its_ea_and_health_is_200_with_the_load():
     hub, server, port = await run_hub()
     async with verified(port) as spawner:
+        account = await FakeEa.connect(port, ChartRole.ACCOUNT, "EURUSD")
         consumer = await Consumer.connect(port)
 
         await consumer.ask(7, Call.ACCOUNT_INFO)
-        request = await spawner.request()
+        request = await account.request()
         status, body = await health_of(port)
 
         assert arguments_of(request) == (Call.ACCOUNT_INFO, {})
@@ -151,12 +153,14 @@ async def test_after_a_verifying_sample_a_request_reaches_its_ea_and_health_is_2
             1,
             False,
         )
-        assert result["pending"] == [{"role": "spawner", "symbol": "EURUSD", "requests": 1}]
+        assert result["account"] is True
+        assert result["pending"] == [{"role": "account", "symbol": "EURUSD", "requests": 1}]
         assert 0 <= result["sample_age_s"] < MAX_AGE_S
         assert result["clock"]["symbol"] == "EURUSD"
         assert abs(result["clock"]["skew_s"]) <= 1
         assert result["clock"]["offset_s"] == CLOCK.offset_at(int(time.time())).total_seconds()
         await consumer.close()
+        await account.close()
         await spawner.close()
     server.close()
 
@@ -615,6 +619,7 @@ async def _end(peers, tasks) -> None:
 async def test_the_consumers_request_past_its_pending_bound_is_answered_overflow_at_once():
     hub, server, port = await run_hub(pending_bound=2)
     async with verified(port) as spawner:
+        account = await FakeEa.connect(port, ChartRole.ACCOUNT, "EURUSD")
         consumer = await Consumer.connect(port)
 
         for request_id in (1, 2, 3):
@@ -623,6 +628,7 @@ async def test_the_consumers_request_past_its_pending_bound_is_answered_overflow
 
         assert (refused.request_id, error_of(refused)) == (3, (ErrorKind.OVERFLOW, None))
         await consumer.close()
+        await account.close()
         await spawner.close()
     server.close()
 
@@ -630,9 +636,11 @@ async def test_the_consumers_request_past_its_pending_bound_is_answered_overflow
 async def test_a_request_its_eas_queue_has_no_room_for_is_answered_overflow():
     hub = ws_server.Hub(CLOCK, settings(ea_queue_bound=1))
     spawner = Peer(stuck=True)
+    account = Peer(stuck=True)
     consumer = Peer()
-    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (spawner, consumer)]
+    tasks = [asyncio.create_task(hub.handler(peer)) for peer in (spawner, account, consumer)]
     spawner.put_ea(binary.EaHello(ChartRole.SPAWNER, "EURUSD"))
+    account.put_ea(binary.EaHello(ChartRole.ACCOUNT, "EURUSD"))
     consumer.put_frame(binary.AdapterHello())
     for _ in range(8):
         spawner.put_ea(sample("EURUSD"))
@@ -646,9 +654,7 @@ async def test_a_request_its_eas_queue_has_no_room_for_is_answered_overflow():
     await settle()
 
     assert _answers(consumer) == [(3, ErrorKind.OVERFLOW)]
-    await consumer.close()
-    await asyncio.wait_for(tasks[1], timeout=1)
-    tasks[0].cancel()
+    await _end((spawner, account, consumer), tasks)
 
 
 # ── Answers ───────────────────────────────────────────────────────────────────
@@ -1307,15 +1313,17 @@ async def test_a_last_part_the_hub_cannot_convert_still_ends_its_request_with_ea
 async def test_while_the_gate_is_shut_a_request_at_the_pending_bound_is_answered_not_ready():
     hub, server, port = await run_hub(pending_bound=1)
     async with verified(port) as spawner:
+        account = await FakeEa.connect(port, ChartRole.ACCOUNT, "EURUSD")
         consumer = await Consumer.connect(port)
         await consumer.ask(1, Call.ACCOUNT_INFO)
-        await spawner.request()
+        await account.request()
     await asyncio.sleep(MAX_AGE_S * 1.5)
 
     await consumer.ask(2, Call.ACCOUNT_INFO)
 
     assert error_of(await consumer.received()) == deferred(ErrorKind.NOT_READY)
     await consumer.close()
+    await account.close()
     await spawner.close()
     server.close()
 

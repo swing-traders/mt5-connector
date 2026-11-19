@@ -444,6 +444,43 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
 
 
 @_needs_image
+def test_the_chart_templates_install_each_role_in_both_terminal_locations():
+    script = """
+from pathlib import Path
+terminal = Path('/home/mt5/.wine/drive_c/Program Files/MetaTrader 5')
+for directory in (terminal / 'MQL5/Profiles/Templates', terminal / 'Profiles/Templates'):
+    for name, role in (
+        ('ticks_spawner.tpl', 0), ('ticks.tpl', 1),
+        ('ticks_history.tpl', 2), ('ticks_account.tpl', 3),
+    ):
+        data = (directory / name).read_bytes()
+        assert data.startswith(bytes((255, 254))), name
+        assert bytes((13, 0, 10, 0)) in data, name
+        text = data.decode('utf-16')
+        assert f'Role={role}' in text.splitlines(), name
+        assert 'AccountTemplate=ticks_account.tpl' in text, name
+"""
+    result = subprocess.run(
+        [
+            _runtime(),
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "python",
+            _IMAGE,
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@_needs_image
 def test_the_booted_terminal_logs_the_pinned_build_and_pays_no_recompile():
     runtime = _runtime()
     expected = _image_build(runtime)
@@ -1347,6 +1384,7 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
         answered_at = datetime.now(UTC)
         status, body = answered
         assert status == 503
+        assert body["result"]["account"] is False
         assert (body["ok"], body["result"]["spawner"], body["result"]["clock"]) == (
             False,
             False,

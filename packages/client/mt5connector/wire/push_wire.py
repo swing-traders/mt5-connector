@@ -27,12 +27,12 @@ class Role(StrEnum):
 
 
 class ChartRole(StrEnum):
-    """What an EA serves, as its chart's template sets it: the spawner the account and the charts, a
-    publisher its symbol but its history, which a history EA serves."""
+    """What an EA serves: chart control, account reads, a symbol's live data, or its history."""
 
     SPAWNER = "spawner"
     PUBLISHER = "publisher"
     HISTORY = "history"
+    ACCOUNT = "account"
 
 
 class ChartState(StrEnum):

@@ -22,11 +22,12 @@ The hub (`mt5connector.server.ws_server`, port `MT5_HUB_PORT`) is the one endpoi
 
 | Role | What its EA serves |
 |---|---|
-| `spawner` | the account: its reads (account, open positions and orders, deal and order history, the symbol list, terminal facts), the charts the hub requests and the transactions that name no symbol |
+| `spawner` | the charts the hub requests and the transactions that name no symbol |
+| `account` | account-wide reads: account and terminal facts, the symbol list, open positions and orders without a named symbol, deal and order history |
 | `publisher` | one symbol: its ticks, closed bars and transactions, its reads, its trade commands and their outcomes, and its commission schedule and trading sessions |
 | `history` | one symbol's history: its floors, bars and ticks |
 
-- The hub addresses an EA by its role and symbol, the spawner by its role alone. The first EA to say hello for a role and symbol serves it; the hub answers a later one `duplicate`, closes it, and logs a warning. A refused duplicate's frames are dropped silently.
+- The hub addresses an EA by its role and symbol, the spawner and account EA by their roles alone. The first EA to say hello for a role and symbol serves it; the hub answers a later one `duplicate`, closes it, and logs a warning. A refused duplicate's frames are dropped silently.
 - The hub keeps no event store and replays nothing: a consumer that reconnects subscribes again and receives what is published from then on.
 - A frame the hub cannot handle — text, another version, out of its kind's layout, of a kind its sender's role does not send — is answered with an `error` frame and the connection closed with code 1002, logged as a warning; a frame of an unknown kind is logged and skipped.
 
@@ -67,7 +68,7 @@ Inside a payload a `str` is a u16 byte count, then that many bytes of UTF-8; a S
 | `bar` | 14 | publisher → hub | `symbol`, `timeframe` (int32 `ENUM_TIMEFRAMES`), one `MqlRates` record, once the bar has closed |
 | `bar` | 14 | hub → consumers of the series | `symbol`, `series` (`M1` to `W1`), one `MqlRates` record followed by its close, `time_close` (int64): 68 bytes |
 | `trade_transaction` | 15 | publisher, spawner → hub → consumers of `trade_transactions` | the `MqlTradeTransaction`, `MqlTradeRequest` and `MqlTradeResult` records one `OnTradeTransaction` call receives |
-| `server_time` | 16 | spawner → hub | `symbol`, the spawner's; `trade_server`, `current`, `gmt` (int64); `connected` (u8) |
+| `server_time` | 16 | every EA → hub | `symbol`, the EA's own; `trade_server`, `current`, `gmt` (int64); `connected` (u8) |
 | `commissions` | 17 | publisher → hub | `symbol`; `ret` and `last_error` (int32) of its `SymbolInfoCommissions` call; a u16 rule count, each rule its `currency`, its five enum fields by their `EnumToString` names and a u16 tier count, each tier its `mode` and `volume_type` by name, `value`, `min_value`, `max_value`, `range_from`, `range_to` (float64) and `currency` |
 | `sessions` | 18 | publisher → hub | `symbol`; then `quote` and `trade`, seven days each, Sunday first, each a u16 session count and each session its `from` and `to` (int32 seconds from the broker day's 00:00); then `last_error` (int32) |
 | `request` | 19 | consumer → hub → EA | `call` (u16), then `count` arguments, each its index in the call's arguments (u8, ascending) and its value; hub-only arguments follow the EA's and are never forwarded |
@@ -80,15 +81,15 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 
 | Call | Code | Served by | Arguments | Answer | Deadline |
 |---|---|---|---|---|---|
-| `account_info` | 1 | spawner | — | `AccountInfo` | read |
-| `terminal_info` | 2 | spawner | — | `TerminalInfo` | read |
-| `symbols_get` | 3 | spawner | `group` | `SymbolListing` rows | read |
+| `account_info` | 1 | account | — | `AccountInfo` | read |
+| `terminal_info` | 2 | account | — | `TerminalInfo` | read |
+| `symbols_get` | 3 | account | `group` | `SymbolListing` rows | read |
 | `symbol_info` | 6 | publisher | `symbol` | `SymbolInfo` | read |
 | `symbol_info_tick` | 7 | publisher | `symbol` | one `MqlTick` | read |
-| `positions_get` | 8 | spawner | `symbol`, `group`, `ticket` | `TradePosition` rows | read |
-| `orders_get` | 9 | spawner | `symbol`, `group`, `ticket` | `TradeOrder` rows | read |
-| `history_orders_get` | 10 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeOrder` rows | read |
-| `history_deals_get` | 11 | spawner | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeDeal` rows | read |
+| `positions_get` | 8 | publisher when `symbol` is named, account otherwise | `symbol`, `group`, `ticket` | `TradePosition` rows | read |
+| `orders_get` | 9 | publisher when `symbol` is named, account otherwise | `symbol`, `group`, `ticket` | `TradeOrder` rows | read |
+| `history_orders_get` | 10 | account | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeOrder` rows | read |
+| `history_deals_get` | 11 | account | `date_from`, `date_to`, `group`, `ticket`, `position` | `TradeDeal` rows | read |
 | `order_send` | 12 | publisher of the request's `symbol` | `request` | `MqlTradeResult` | command |
 | `copy_rates_range` | 13 | history | `symbol`, `timeframe`, `date_from`, `date_to`; hub-only `source` | bars | history |
 | `copy_ticks_range` | 15 | history | `symbol`, `date_from`, `date_to`, `flags`; hub-only `source` | `MqlTick` rows; `ea_error` for a tick-era minute holding a positive-volume bar and no tick | history |
@@ -96,7 +97,7 @@ Each call is a row of the registry in `wire/calls.py`, served by the EA of its r
 | `outcomes` | 18 | publisher | `symbol`, `request_ids` | per request id its outcome log holds, the `MqlTradeTransaction`, `MqlTradeRequest` and `MqlTradeResult` of its `REQUEST` transaction, back to back | read |
 | `commission_schedule` | 19 | the hub | `symbol` | the schedule, laid out as a `commissions` frame's after its symbol | read |
 | `trading_sessions` | 20 | the hub | `symbol` | the sessions, laid out as a `sessions` frame's after its symbol | read |
-| `symbol_margin_rate` | 21 | spawner | `symbol` | sixteen doubles: initial and maintenance rate for `BUY`, `SELL`, `BUY_LIMIT`, `SELL_LIMIT`, `BUY_STOP`, `SELL_STOP`, `BUY_STOP_LIMIT`, `SELL_STOP_LIMIT`, in that order | read |
+| `symbol_margin_rate` | 21 | publisher | `symbol` | sixteen doubles: initial and maintenance rate for `BUY`, `SELL`, `BUY_LIMIT`, `SELL_LIMIT`, `BUY_STOP`, `SELL_STOP`, `BUY_STOP_LIMIT`, `SELL_STOP_LIMIT`, in that order | read |
 
 - Arguments travel by the inventory's parameter kinds: integers as int64, strings as `str`, a time as int64 epoch seconds, `request` as an `MqlTradeRequest` record, `request_ids` as a u32 count and each id as a u32. A required argument missing, an argument out of the call's order or of the wrong type, or a history query in none of its call forms is a frame the hub cannot handle; a session refuses it before sending. A bar read of a timeframe no series serves is refused too.
 - `last_error` is the MQL5 `GetLastError()` the EA read after the call, folded into every answer; the hub's own answers carry 0, but for a chart the spawner failed to open, which carry the error its `chart_failed` named.
@@ -181,7 +182,9 @@ A running re-sync owns its months until it ends; months becoming due meanwhile s
 - The hub verifies the broker clock against `server_time` samples from every serving EA, at any hour, market open or closed: a sample fresh for `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, from a terminal connected without a break for that long, its trade server within 120 s of the hub's clock, measured again every `MT5_CLOCK_CHECK_SECONDS`.
 - The terminal extrapolates the trade server's time from the clock it shares with the hub, so the comparison checks the offset the terminal learned from the trade server against the broker clock's schedule, whatever the host's clock reads.
 - Until a sample verifies it the hub answers reads `not_ready` and commands `not_served`. No verification by `MT5_CLOCK_BOOTSTRAP_SECONDS` after start, and a sample the clock contradicts, are logged as critical and leave the gate shut; the hub keeps serving, and a later verifying sample opens it.
-- `GET /health` on the hub's port answers HTTP 200 while the spawner is connected, the latest sample is fresh and the clock verified, and HTTP 503 otherwise naming why. Its body carries, either way: `spawner`, whether one is connected; `clock`, the verification's `symbol`, `trade_server`, `current`, `gmt`, `skew_s` and `offset_s`, or null; `sample_age_s`; `bootstrap_missed`; `in_flight`, the requests pending; and `pending`, each EA's `role`, `symbol` and `requests` pending. Another method answers 405.
+- `GET /health` on the hub's port answers HTTP 200 while the spawner and account EA are connected, the latest sample is fresh and the clock verified. Otherwise it answers HTTP 503 naming why; without the account EA it names "no account EA is connected". Another method answers 405.
+- Its body carries `spawner` and `account`, whether each is connected; `clock`, the verification's `symbol`, `trade_server`, `current`, `gmt`, `skew_s` and `offset_s`, or null; `sample_age_s`; `bootstrap_missed`; `in_flight`, the requests pending; and `pending`, each EA's `role`, `symbol` and `requests` pending.
+- The spawner's hello requests the account chart on its own symbol. That chart stays open and is requested again if its EA leaves; account reads defer until its EA says hello.
 
 ### Streams, charts and relays
 
@@ -201,7 +204,7 @@ A running re-sync owns its months until it ends; months becoming due meanwhile s
 
 ### The EA
 
-The EA, `ticks.mq5`, is one program in three roles, the `Role` its chart's template sets, and every frame it sends and reads is binary. A history EA reads its symbol's history itself, in its own thread.
+The EA, `ticks.mq5`, is one program in four roles, the `Role` its chart's template sets, and every frame it sends and reads is binary. A history EA reads its symbol's history itself, in its own thread.
 
 - Its half of the protocol is `Include/hub_wire.mqh`, which the image's build writes from the installed wheel's wire inventory with `python -m mt5connector.server.mql5gen <path>`: the header's constants, the frame, error and call codes, the chart roles, the calls each role serves with their arguments, the history's busy bound, the retry delay, the span margin, the bar series with the table of their timeframes and the timeframe the ticks' floor travels under, and a writer of every struct an EA sends — and a reader of the trade request — each member read by the MQL5 property `mirror.py` names for it, in the inventory's order.
 - A writer reads each property by the overload that answers whether the read succeeded; `AccountInfo*` and `TerminalInfo*` have none, so the error a read of theirs leaves decides. A read that fails writes nothing and the writer reads on, collecting every property that failed, the first `HUB_PROPERTY_FAILURES_MAX` (128) by name, and then fails.
@@ -213,7 +216,7 @@ What it does inside the terminal:
 - **Requests** are answered once each, under their correlation id: a result's records in parts as [Calls](#calls) lays them out, each part carrying the `GetLastError()` the call left; or `ea_error` with the error the call met. Every call but a history request waits on nothing beyond a local read and is answered at once, in the order the requests arrive; a history request is answered once the symbol is measured and its reads settle, as below.
   - A call its role does not serve, and a `group` filter, are answered `ea_error` with `ERR_FUNCTION_NOT_ALLOWED` (4014); arguments out of the call's layout with `ERR_INVALID_PARAMETER` (4003).
   - A property of a record that cannot be read fails the call: `ea_error` naming the record — the symbol, or the position, order or deal by its ticket — and every property of it that failed, each with its MQL5 error, the first one's error the answer's `last_error`. `symbols_get` fails whole on one symbol whose definition it cannot read.
-  - The spawner serves `account_info`, `terminal_info` and `symbols_get`, the definition of every symbol the terminal knows, in Market Watch or not; `positions_get` and `orders_get` by `symbol`, by `ticket`, by both, or every one with neither; and `history_orders_get` and `history_deals_get` by `ticket`, else by `position`, else by window. A `ticket` names the order or the deal itself; one the history does not hold answers no record, the selection's error its `last_error`.
+  - The account EA serves `account_info`, `terminal_info`, `symbols_get` and deal and order history. A publisher serves `positions_get`, `orders_get` and `symbol_margin_rate` when their arguments name its symbol; position and order reads without a symbol use the account EA. A `ticket` names the order or the deal itself; one the history does not hold answers no record, the selection's error its `last_error`.
   - A publisher serves `symbol_info`, `symbol_info_tick`, `order_send` and `outcomes` of its own symbol; a history EA `ranges`, `copy_rates_range` and `copy_ticks_range` of its own, and nothing else. A `symbol_info` of a symbol `SymbolExist` denies is answered `ea_error` with `ERR_MARKET_UNKNOWN_SYMBOL` (4301).
 - **History.** A history EA serves its symbol's history in its own thread, and its reads wait; no read of a publisher's waits on a download:
   - The requests run from the EA's timer, oldest first, one at a time, an earlier one's answer sent before the next runs. Each hears `busy` for `HISTORY_BUSY_S` (900 s) on its arrival, before anything waits, and again every 300 s while it is pending, the hub's keepalive and deadlines following that bound. A request makes no call once 900 s have passed since its run began, and answers `syncing` then, whatever a call that returned past that bound read.
@@ -404,7 +407,7 @@ On each terminal start `ticks_setup` opens an M1 chart of the symbol it runs on 
 
 #### The chart template
 
-Three templates attach the EA, one per role: `ticks_spawner.tpl` with `Role=0`, `ticks.tpl` with `Role=1` for a publisher, and `ticks_history.tpl` with `Role=2` for a history EA — an enum input takes its value, which the build reads from `ENUM_CHART_ROLE` in the generated `hub_wire.mqh`. Each goes in `MQL5\Profiles\Templates\` and in `Profiles\Templates\`, the two places a template applied by bare name is looked for, and must be in the form the terminal saves templates in:
+Four templates attach the EA: `ticks_spawner.tpl` with `Role=0`, `ticks.tpl` with `Role=1` for a publisher, `ticks_history.tpl` with `Role=2`, and `ticks_account.tpl` with `Role=3`. An enum input takes its value, which the build reads from `ENUM_CHART_ROLE` in the generated `hub_wire.mqh`. Each goes in `MQL5\Profiles\Templates\` and `Profiles\Templates\`, and must be in the form the terminal saves templates in:
 
 - UTF-16LE with a byte-order mark (`FF FE`), and CRLF line ends;
 - a root `<chart>` section — its symbol and period are ignored, the chart keeps its own;
@@ -430,13 +433,14 @@ HubPingTimeoutSec=50
 
 | EA input | Meaning |
 |---|---|
-| `Role` | the EA's role: `0` the spawner, which opens and closes the charts the hub asks for, `1` a publisher, `2` a history EA |
+| `Role` | the EA's role: `0` the spawner, `1` a publisher, `2` a history EA, `3` the account EA |
 | `Server` | the hub's URL, `ws://127.0.0.1:<MT5_HUB_PORT>` |
 | `ReconnectIntervalSec` | the fewest seconds between two attempts to reach the hub while the EA is not connected |
 | `RelaySeconds` | the interval between each EA's server-time frames, and a publisher's commission schedules and trading sessions, and how often the spawner sweeps the terminal's charts and Market Watch. It must stay below `MT5_CLOCK_SAMPLE_MAX_AGE_SECONDS`, or the clock never verifies |
 | `PollMilliseconds` | the EA's timer: the interval between reads of the hub, of the symbol's ticks and closed bars, and of the connection, and so the longest a request waits for its read; the terminal fires it no faster than every 10–16 ms, which `16` matches |
 | `ChartTemplate` | the template the spawner applies to a chart it opens for a publisher, `ticks.tpl` |
 | `HistoryTemplate` | the template the spawner applies to a chart it opens for a history EA, `ticks_history.tpl` |
+| `AccountTemplate` | the template the spawner applies to the account chart, `ticks_account.tpl` |
 | `HubPingTimeoutSec` | how long after its first refusal the spawner, answered `duplicate`, says hello again before it closes its chart: the longest the hub takes to drop a dead connection while its writes to it drain, `50` s — its 10 s ping interval, its 30 s ping timeout and the 10 s close timeout of its WebSocket server |
 
 <details>
@@ -548,7 +552,7 @@ fixed_height=-1
 
 </details>
 
-The image's build writes the three templates from `image/ticks.tpl.in`, filling in the hub's port and `Role`.
+The image's build writes the four templates from `image/ticks.tpl.in`, filling in the hub's port and `Role`.
 
 #### The allowlist
 
@@ -579,7 +583,7 @@ podman build --format=docker --build-arg DEBUG=1 -t mt5-connector-server-debug .
 
 The build also:
 
-- **Compiles the EA** and **writes its three templates**, as [The EA and the startup script](#the-ea-and-the-startup-script) and [The chart template](#the-chart-template) state.
+- **Compiles the EA** and **writes its four templates**, as [The EA and the startup script](#the-ea-and-the-startup-script) and [The chart template](#the-chart-template) state.
 - **Empties the history store** (`Bases`) after the terminal's first start, so a fresh volume mounted on it starts with nothing from the image.
 - **Bakes the terminal's start state** into `/opt/mt5-baked`, owned by root, which every boot restores:
   - `terminal/`, the terminal directory once the EA is installed, with the chart profile `default` emptied in whichever of `Profiles\Charts\` and `MQL5\Profiles\Charts\` exists — the build log names each it empties — its `logs\` and `MQL5\logs\` empty, and without `Bases`;

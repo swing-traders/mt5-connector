@@ -331,8 +331,8 @@ def _chart_role_named() -> str:
 def _serves() -> str:
     cases = []
     for role in ChartRole:
-        served = [f"call == HUB_CALL_{row.call.name}" for row in _ea_rows() if row.role is role]
-        condition = "\n                 || ".join(served)
+        served = [f"call == HUB_CALL_{row.call.name}" for row in _ea_rows() if role in row.roles]
+        condition = "\n                 || ".join(served) if served else "false"
         cases.append(f"    case ROLE_{role.name}:\n        serves = {condition};\n        break;")
     return (
         "// Whether an EA of the role serves the call.\n"

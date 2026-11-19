@@ -98,6 +98,7 @@ async def verified(port: int, symbol="EURUSD"):
     """A spawner relaying a live sample every SAMPLE_EVERY_S, held until the hub's clock is
     verified; yields the spawner."""
     spawner = await FakeEa.connect(port, ChartRole.SPAWNER, symbol)
+    assert await spawner.received() == binary.OpenChart(ChartRole.ACCOUNT, symbol)
 
     async def relay():
         with contextlib.suppress(websockets.ConnectionClosed):
@@ -107,7 +108,9 @@ async def verified(port: int, symbol="EURUSD"):
 
     task = asyncio.create_task(relay())
     try:
-        await eventually(lambda: health(port)[0] == 200, timeout=MAX_AGE_S * 10)
+        await eventually(
+            lambda: health(port)[1]["result"]["clock"] is not None, timeout=MAX_AGE_S * 10
+        )
         yield spawner
     finally:
         task.cancel()

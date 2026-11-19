@@ -70,6 +70,9 @@ class ArgType(StrEnum):
     REQUEST_IDS = "request_ids"
 
 
+_SYMBOL_ACCOUNT_CALLS = frozenset({Call.POSITIONS_GET, Call.ORDERS_GET, Call.SYMBOL_MARGIN_RATE})
+
+
 class Source(IntEnum):
     SERVER_SYNCED = 0
     TERMINAL = 1
@@ -114,8 +117,7 @@ class Argument:
 
 @dataclass(frozen=True)
 class Row:
-    """A call, its arguments and their forms, its answer's shape and layout, the role of the EA that
-    serves it, and the deadline it waits under."""
+    """A call's wire contract, routing role and the EA roles that can serve it."""
 
     call: Call
     arguments: tuple[Argument, ...]
@@ -126,6 +128,11 @@ class Row:
     # The argument sets of which a call carries at least one in full.
     forms: tuple[tuple[str, ...], ...] = ()
     hub_arguments: tuple[Argument, ...] = ()
+    roles: frozenset[ChartRole] = frozenset()
+
+    def __post_init__(self):
+        if self.role is not None:
+            object.__setattr__(self, "roles", self.roles | {self.role})
 
 
 @dataclass(frozen=True)
@@ -202,17 +209,18 @@ def _package(call: Call, name: mirror.FunctionName, role: ChartRole, wait: Wait)
         struct_layout,
         function.forms,
         (_SOURCE,) if role is ChartRole.HISTORY else (),
+        roles=frozenset({ChartRole.PUBLISHER}) if call in _SYMBOL_ACCOUNT_CALLS else frozenset(),
     )
 
 
 CALLS: dict[Call, Row] = {
     row.call: row
     for row in (
-        _package(Call.ACCOUNT_INFO, mirror.FunctionName.ACCOUNT_INFO, ChartRole.SPAWNER, Wait.READ),
+        _package(Call.ACCOUNT_INFO, mirror.FunctionName.ACCOUNT_INFO, ChartRole.ACCOUNT, Wait.READ),
         _package(
-            Call.TERMINAL_INFO, mirror.FunctionName.TERMINAL_INFO, ChartRole.SPAWNER, Wait.READ
+            Call.TERMINAL_INFO, mirror.FunctionName.TERMINAL_INFO, ChartRole.ACCOUNT, Wait.READ
         ),
-        _package(Call.SYMBOLS_GET, mirror.FunctionName.SYMBOLS_GET, ChartRole.SPAWNER, Wait.READ),
+        _package(Call.SYMBOLS_GET, mirror.FunctionName.SYMBOLS_GET, ChartRole.ACCOUNT, Wait.READ),
         _package(Call.SYMBOL_INFO, mirror.FunctionName.SYMBOL_INFO, ChartRole.PUBLISHER, Wait.READ),
         _package(
             Call.SYMBOL_INFO_TICK,
@@ -221,19 +229,19 @@ CALLS: dict[Call, Row] = {
             Wait.READ,
         ),
         _package(
-            Call.POSITIONS_GET, mirror.FunctionName.POSITIONS_GET, ChartRole.SPAWNER, Wait.READ
+            Call.POSITIONS_GET, mirror.FunctionName.POSITIONS_GET, ChartRole.ACCOUNT, Wait.READ
         ),
-        _package(Call.ORDERS_GET, mirror.FunctionName.ORDERS_GET, ChartRole.SPAWNER, Wait.READ),
+        _package(Call.ORDERS_GET, mirror.FunctionName.ORDERS_GET, ChartRole.ACCOUNT, Wait.READ),
         _package(
             Call.HISTORY_ORDERS_GET,
             mirror.FunctionName.HISTORY_ORDERS_GET,
-            ChartRole.SPAWNER,
+            ChartRole.ACCOUNT,
             Wait.READ,
         ),
         _package(
             Call.HISTORY_DEALS_GET,
             mirror.FunctionName.HISTORY_DEALS_GET,
-            ChartRole.SPAWNER,
+            ChartRole.ACCOUNT,
             Wait.READ,
         ),
         _package(
@@ -273,7 +281,7 @@ CALLS: dict[Call, Row] = {
         _package(
             Call.SYMBOL_MARGIN_RATE,
             mirror.FunctionName.SYMBOL_MARGIN_RATE,
-            ChartRole.SPAWNER,
+            ChartRole.ACCOUNT,
             Wait.READ,
         ),
     )
@@ -290,8 +298,10 @@ SymbolMarginRate = STRUCT_TYPES[mirror.StructName.SYMBOL_MARGIN_RATE]
 
 
 def routed_symbol(row: Row, arguments: dict[str, object]) -> str | None:
-    """The symbol whose EA serves a request, or whose relays answer it; None for the spawner's."""
-    if row.role is ChartRole.SPAWNER:
+    """The symbol whose EA serves a request, or whose relays answer it; None for account reads."""
+    if row.call in _SYMBOL_ACCOUNT_CALLS:
+        return arguments.get("symbol")
+    elif row.role is ChartRole.ACCOUNT:
         return None
     elif row.call is Call.ORDER_SEND:
         return arguments["request"]["symbol"]

@@ -1,8 +1,5 @@
-// The EA inside the terminal, in the role its chart's template sets: the spawner serves the
-// account, relays the trade server's time and opens and closes the charts the hub asks for; a
-// publisher serves its symbol's ticks, closed bars, transactions, reads and trade commands; a
-// history EA serves its symbol's history, read in its own thread once it has measured the symbol.
-// Every frame it sends and reads is the hub protocol's binary one.
+// The chart's template assigns this EA its role: chart control, account-wide reads, a symbol's live
+// streams, or its measured history. Every frame it sends and reads is binary.
 #property script_show_inputs
 
 #include <MQL5Book/ws/wsclient.mqh>
@@ -13,9 +10,10 @@ input string Server = "ws://127.0.0.1:9000/";
 input int ReconnectIntervalSec = 3;
 input int RelaySeconds = 5;
 input int PollMilliseconds = 16;
-// The templates the spawner applies to a chart it opens for a publisher and for a history EA.
+// The templates the spawner applies to the charts it opens.
 input string ChartTemplate = "ticks.tpl";
 input string HistoryTemplate = "ticks_history.tpl";
+input string AccountTemplate = "ticks_account.tpl";
 // The whole time from a dead connection's last pong to the hub dropping it, while the hub's writes
 // to it drain: the hub's ping interval, ping timeout and close timeout together.
 input int HubPingTimeoutSec = 50;
@@ -874,6 +872,11 @@ void ServeSymbol(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &
     case HUB_CALL_OUTCOMES:
         AnswerOutcomes(arguments, answer);
         break;
+    case HUB_CALL_POSITIONS_GET:
+    case HUB_CALL_ORDERS_GET:
+    case HUB_CALL_SYMBOL_MARGIN_RATE:
+        ServeAccount(call, arguments, answer);
+        break;
     default:
         answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
         break;
@@ -887,7 +890,7 @@ void Serve(const ulong requestId, const ENUM_HUB_CALL call, RequestArguments &ar
     ResetLastError();
     switch (Role)
     {
-    case ROLE_SPAWNER:
+    case ROLE_ACCOUNT:
         ServeAccount(call, arguments, answer);
         break;
     case ROLE_PUBLISHER:
@@ -3506,7 +3509,9 @@ void Sweep()
 // The template that attaches the EA in the role.
 string TemplateOf(const ENUM_CHART_ROLE role)
 {
-    if (role == ROLE_HISTORY)
+    if (role == ROLE_ACCOUNT)
+        return AccountTemplate;
+    else if (role == ROLE_HISTORY)
         return HistoryTemplate;
     else
         return ChartTemplate;
