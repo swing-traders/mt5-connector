@@ -40,6 +40,7 @@ from mt5connector.wire.push_wire import ChartRole, Stream, Subscription
 
 pytestmark = pytest.mark.skipif(SYMBOL is None, reason="MT5_LIVE_HUB_SYMBOL is not set")
 Call = calls.Call
+POLL_SECONDS = 0.016
 
 
 @pytest.fixture
@@ -254,8 +255,6 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             throwaway.idle_seconds + 5,
             "fifteen queued publisher closes",
         )
-        if stray:
-            stray_chart = await throwaway.command(ProbeCommand.OPEN_STRAY, fresh)
         began = time.monotonic()
         await session.subscribe(Subscription(Stream.TICKS, fresh))
         await until(
@@ -269,8 +268,14 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             "the new open queued after the closes",
         )
         if stray:
+            protected_charts = len(listed_charts(await throwaway.observations()))
+            stray_started = time.monotonic()
+            stray_chart = await throwaway.command(ProbeCommand.OPEN_STRAY, fresh)
             assert stray_chart.chart in listed_charts(await throwaway.observations())
         await throwaway.relay(RelayOperation.RELEASE)
+        if stray:
+            # The allocated charts cannot leave while held; two sightings need a full cursor round.
+            assert time.monotonic() - stray_started < (protected_charts - 2) * POLL_SECONDS
         await chart_opened(session, fresh, 2)
         assert time.monotonic() - began <= 2
         log = await until(
@@ -285,13 +290,20 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             for index, line in enumerate(lines)
             if f"opened the publisher chart of '{fresh}'" in line
         )
-        second_close = [
+        queued_closes = [
             index
             for index, line in enumerate(lines)
             if any(f"closed the publisher chart of '{symbol}'" in line for symbol in old)
-        ][1]
-        assert opened < second_close
+        ]
+        assert opened < queued_closes[1]
         if stray:
+            stray_closed = next(
+                index
+                for index, line in enumerate(lines)
+                if f"closed chart {stray_chart.chart} of '{fresh}'" in line
+            )
+            assert stray_closed < queued_closes[0]
+            assert stray_closed < opened
             observations = (await throwaway.observations())[before:]
             created = next(
                 row
@@ -594,7 +606,7 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
         await asyncio.gather(
             *(session.subscribe(Subscription(Stream.TICKS, symbol)) for symbol in fresh)
         )
-        await until(
+        queued = await until(
             throwaway.relay,
             lambda state: {
                 event["symbol"]
@@ -607,10 +619,51 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
         )
         await throwaway.relay(RelayOperation.RELEASE)
         await asyncio.gather(*(chart_opened(session, symbol, 15) for symbol in fresh))
-        log = await throwaway.logs(since)
+        waiting = {
+            (ChartRole[event["role"]], event["symbol"])
+            for event in queued["queued"]
+            if binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
+        }
+        log = await until(
+            lambda: throwaway.logs(since),
+            lambda log: all(
+                f"closed the {role.value} chart of '{symbol}'" in log for role, symbol in waiting
+            ),
+            15,
+            "the ceiling run's waiting closes",
+        )
+        lines = log.splitlines()
         assert all(f"opened the publisher chart of '{symbol}'" in log for symbol in fresh)
         relayed = (await throwaway.relay())["events"]
         for symbol in fresh:
+            open_frame = next(
+                index
+                for index, event in enumerate(queued["queued"])
+                if binary.FrameKind[event["kind"]] is binary.FrameKind.OPEN_CHART
+                and event["symbol"] == symbol
+            )
+            closes_ahead = {
+                (ChartRole[event["role"]], event["symbol"])
+                for event in queued["queued"][:open_frame]
+                if binary.FrameKind[event["kind"]] is binary.FrameKind.CLOSE_CHART
+            }
+            assert closes_ahead
+            close_passes = [
+                index
+                for index, line in enumerate(lines)
+                if any(
+                    f"closed the {role.value} chart of '{closed}'" in line
+                    for role, closed in closes_ahead
+                )
+            ]
+            assert len(close_passes) == len(closes_ahead)
+            opened = next(
+                index
+                for index, line in enumerate(lines)
+                if f"opened the publisher chart of '{symbol}'" in line
+            )
+            # Each waiting close consumes one pass; opens run before that pass's close.
+            assert opened < close_passes[-1], f"{symbol}: exceeded {len(closes_ahead)} close passes"
             assert any(
                 binary.FrameKind[event["kind"]] is binary.FrameKind.CHART_OPENED
                 and event["symbol"] == symbol

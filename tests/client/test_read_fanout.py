@@ -13,9 +13,10 @@ from mt5connector.client.concurrency import _fan_out
 from mt5connector.wire import calls
 
 
-async def test_simultaneous_failures_raise_the_original_error_first_in_input_order():
+async def test_cancellation_cleanup_cannot_replace_the_original_read_failure():
     started = asyncio.Event()
     first = None
+    original_failure = ValueError("second input")
 
     async def first_read():
         nonlocal first
@@ -28,11 +29,13 @@ async def test_simultaneous_failures_raise_the_original_error_first_in_input_ord
 
     async def second_read():
         await started.wait()
-        raise ValueError("second input")
+        raise original_failure
 
     try:
-        with pytest.raises(errors.MT5InstrumentError, match="first input"):
+        with pytest.raises(ValueError, match="second input") as refused:
             await _fan_out(first_read(), second_read())
+        assert refused.value is original_failure
+        assert isinstance(first.exception(), errors.MT5InstrumentError)
     finally:
         if first is not None and not first.done():
             first.cancel()
@@ -67,11 +70,8 @@ async def test_a_refused_definition_cancels_a_siblings_unbounded_deferrals():
     try:
         with pytest.raises(errors.MT5InstrumentError, match="definition refused"):
             await asyncio.wait_for(provider._load(["EURUSD", "GBPUSD"]), 1)
-        before = asks
-        await asyncio.sleep(0.025)
-        assert asks == before
-        assert sibling.done()
         assert sibling.cancelled()
+        assert asks == 2
     finally:
         if sibling is not None and not sibling.done():
             sibling.cancel()
@@ -111,12 +111,9 @@ async def test_a_failed_fill_report_cancels_other_reports_before_their_next_read
     try:
         with pytest.raises(errors.MT5InstrumentError, match="fill refused"):
             await asyncio.wait_for(fill_reports(h), 1)
-        before = h.venue.orders_get.call_count
-        release.set()
-        await asyncio.sleep(0.025)
-        assert h.venue.orders_get.call_count == before
-        h.venue.history_orders_get.assert_not_called()
         assert sibling.cancelled()
+        h.venue.orders_get.assert_not_called()
+        h.venue.history_orders_get.assert_not_called()
     finally:
         release.set()
         if sibling is not None and not sibling.done():
