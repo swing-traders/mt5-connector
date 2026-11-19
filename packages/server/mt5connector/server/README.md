@@ -703,7 +703,7 @@ The throwaway uses the built image, its own history volume and a dedicated conta
 
 Each close-backlog case captures the log immediately before requesting its fresh subscriptions. The ceiling run counts the closes logged between that request boundary and each logged open, and requires no more than the number still waiting at the request. The fifteen-close case permits at most one queued publisher close between the request and the new open. A drained backlog fails the fixture precondition. The stray case requires its chart-specific unallocated close after the request boundary and before the remaining queued publisher closes, which distinguishes open preparation from the cursor's later cleanup. These are close-count and ordering assertions; they impose no timer-pass or elapsed-time substitute for the close guarantee.
 
-Compile `tests/live/chart_probe.mq5` with the image's `MetaEditor64.exe`, from a path without spaces, requiring `0 errors, 0 warnings`, and copy the `.ex5` into the terminal's `MQL5/Scripts`. Run it from Navigator on the existing spawner chart with its default output and commands filenames, leaving the EA attached. It opens no chart of its own. It records chart disappearance, Market Watch selection/visibility and holdings on its monotonic microsecond clock. The named throwaway's local commands can open a stray, close a symbol's charts or visibly re-select a symbol. Its TSV remains a private certification artifact; it is not checked in.
+Compile `tests/live/chart_probe.mq5` with the image's `MetaEditor64.exe`, from a path without spaces, requiring `0 errors, 0 warnings`, and copy the `.ex5` into the terminal's `MQL5/Scripts`. Run it from Navigator on the existing spawner chart with its default output and commands filenames, leaving the EA attached. It opens no chart of its own. It records chart disappearance, Market Watch selection/visibility and holdings on its monotonic microsecond clock. The named throwaway's local commands can open a stray, close a symbol's charts, visibly re-select a symbol or identify its current publisher by the EA's role marker. Its TSV remains a private certification artifact; it is not checked in.
 
 | Variable | Required throwaway control |
 |---|---|
@@ -711,10 +711,20 @@ Compile `tests/live/chart_probe.mq5` with the image's `MetaEditor64.exe`, from a
 | `MT5_CERT_NETWORK` | its dedicated network, disconnected for the twenty-second broker outage |
 | `MT5_CERT_PROBE_FILE` | the probe TSV's absolute Linux path inside the container, in the Wine prefix's terminal Common Files directory |
 | `MT5_CERT_IDLE_SECONDS` | the throwaway's actual `MT5_CHART_IDLE_SECONDS`, positive and at most ten seconds |
-| `MT5_CERT_RESYNC_SYMBOL` | a synced symbol prepared for a due re-sync while its history chart is listed |
+| `MT5_CERT_RESYNC_SYMBOL` | an actively quoted symbol with no tick store or re-sync record on this throwaway |
 | `MT5_CERT_CEILING` | `1` selects the once-per-certification ceiling case |
 
-The re-sync case needs its prepared symbol to enter a due re-sync during the observation window; keep its history store and history chart ready and schedule its re-sync accordingly. It reads the history close from the terminal log and fails if the chart is no longer listed when it requests the other symbol. The 45-publisher plus 45-history ceiling case runs once on the read-only account, with at least 55 unused fully tradable symbols. The held-symbol case uses the demo half's one market entry: it waits for the unused publisher's idle close, proves the first command is refused unsent, then waits for its replacement publisher and the re-sent order's venue verdict. Its cleanup closes that position, including if a guard assertion fails. It is skipped on the read-only account.
+The re-sync case completes the watched symbol's first terminal-source history download. The hub keeps its ended months and makes the live month due for re-sync. The case reads the resulting history close from the terminal log and fails if the chart is no longer listed when it requests the other symbol.
+
+The 45-publisher plus 45-history ceiling case runs once on the read-only account, with at least 55 unused fully tradable symbols.
+
+The held-symbol case uses the demo half's one market entry. A tick subscription holds its publisher while the metadata and quote are prepared, including across deferral sleeps. The case identifies the current publisher's chart, drops the subscription and waits for that exact chart's disappearance, allowing the hub's retained close bound, idle period and next sweep. It confirms no replacement publisher is listed before proving the first command is refused unsent, then waits for its replacement publisher and the re-sent order's venue verdict.
+
+Its cleanup closes that position; an unexpectedly sent guard command is allowed to reach its verdict before cleanup. The case is skipped on the read-only account.
+
+Publisher preparation honours the hub's advertised deferrals without an overall chart-open timeout: a chart request remains held until its EA says hello or the spawner reports failure. The throwaway's short chart-latency checks observe the hub's existing hello or chart-open acknowledgement directly, independently of a deferred read's retry sleep.
+
+If restart preparation fails, the case prints the complete existing container log and terminal-probe observations, preserving earlier chart work. Those logs contain opens, failures and hellos; they do not record every outgoing open frame, spawner receipt or `PrepareOpen` decision.
 
 Run certification only after the ordinary live-tier prerequisites hold. Save the container log, the terminal probe's timestamped chart/Market Watch observations and pytest output beside the certification evidence. The restart case runs last in its module and kills then starts only the named throwaway; its probe must be started again before a subsequent chart-certification run.
 

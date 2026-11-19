@@ -10,7 +10,7 @@ enum ProbeEvent
     START, CHART_ADDED, CHART_GONE, WATCH_SELECTED, WATCH_GONE, WATCH_HELD,
     CONNECTED, DISCONNECTED, ACK, FAILED
 };
-enum ProbeCommand { OPEN_STRAY = 1, CLOSE_SYMBOL = 2, SELECT_SYMBOL = 3 };
+enum ProbeCommand { OPEN_STRAY = 1, CLOSE_SYMBOL = 2, SELECT_SYMBOL = 3, FIND_PUBLISHER = 4 };
 struct ChartState { long id; string symbol; };
 struct WatchState { string symbol; bool visible; int positions; int orders; };
 
@@ -138,6 +138,22 @@ void Commands()
     }
     else if (operation == SELECT_SYMBOL)
         ok = SymbolSelect(symbol, true);
+    else if (operation == FIND_PUBLISHER)
+    {
+        int count = 0;
+        for (long chart = ChartFirst(); chart != -1; chart = ChartNext(chart))
+        {
+            string expert;
+            if (ChartSymbol(chart) == symbol
+                && ChartGetString(chart, CHART_EXPERT_NAME, expert) && expert != ""
+                && ChartGetString(chart, CHART_COMMENT) == expert + " publisher")
+            {
+                opened = chart;
+                count++;
+            }
+        }
+        ok = count <= 1;
+    }
     else
         ok = false;
     if (ok) Record(ACK, symbol, opened, false, false, 0, 0, token);

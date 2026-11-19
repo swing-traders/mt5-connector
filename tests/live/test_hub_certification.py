@@ -1,6 +1,7 @@
 """Certification on demo hubs and explicitly selected throwaway servers; never a unit-tier run."""
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -15,6 +16,7 @@ from certification import (
     health,
     listed_charts,
     observed_pending,
+    publisher_ready,
     selected_symbols,
     until,
 )
@@ -34,6 +36,7 @@ from test_hub_live import (
 
 from mt5connector.client.errors import NoPublisher, NotSent, NotServed, ResponseLost
 from mt5connector.client.execution import SymbolFilling
+from mt5connector.server.ws_server import _CLOSE_BOUND_S, _IDLE_SWEEP_S
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.push_wire import ChartRole, Stream, Subscription
 
@@ -82,12 +85,7 @@ async def subscribe(session, symbols):
     await asyncio.gather(
         *(session.subscribe(Subscription(Stream.TICKS, symbol)) for symbol in symbols)
     )
-    await asyncio.gather(
-        *(
-            asyncio.wait_for(ask(session, Call.SYMBOL_INFO_TICK, symbol=symbol), 5)
-            for symbol in symbols
-        )
-    )
+    await asyncio.gather(*(publisher_ready(session, symbol) for symbol in symbols))
 
 
 async def unsubscribe(session, symbols):
@@ -241,10 +239,14 @@ async def test_a_closed_publishers_command_is_refused_in_one_round_trip(live):
             await session.order_send(request)
         except NotServed:
             assert time.monotonic() - started < calls.READ_DEADLINE_S
-            await chart_opened(session, symbol, 5)
-            answered = await session.order_send(request)
-            assert answered.result.retcode > 0
-            await assert_flat(session)
+            await session.subscribe(Subscription(Stream.TICKS, symbol))
+            try:
+                await publisher_ready(session, symbol)
+                answered = await session.order_send(request)
+                assert answered.result.retcode > 0
+                await assert_flat(session)
+            finally:
+                await unsubscribe(session, [symbol])
             return
     pytest.fail("no candidate had a closed publisher")
 
@@ -275,7 +277,12 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             assert f"closed chart {stray_chart.chart} of '{fresh}'" not in at_request
         began = time.monotonic()
         await session.subscribe(Subscription(Stream.TICKS, fresh))
-        await chart_opened(session, fresh, 2)
+        await until(
+            lambda: throwaway.logs(since),
+            lambda log: f"publisher EA for {fresh} connected:" in log,
+            2,
+            "the fresh publisher's hello",
+        )
         assert time.monotonic() - began <= 2
         log = await until(
             lambda: throwaway.logs(since),
@@ -326,6 +333,27 @@ async def test_a_resyncs_own_teardown_does_not_hold_another_symbols_open(live, t
     fresh = (await symbols_for(session, 1, throwaway))[0]
     since = time.time()
     try:
+        unused = await throwaway.run(
+            "exec",
+            throwaway.container,
+            "python3",
+            "-c",
+            "import json,os,sys; "
+            "from mt5connector.server.settings import read_hub_settings; "
+            "root=read_hub_settings(os.environ).history_store; "
+            "record=root/'.mt5-connector/resync.json'; "
+            "print(json.dumps({'files':list(map(str,root.glob('*/ticks/'+sys.argv[1]+'/*.tkc'))),"
+            "'recorded':record.exists() and sys.argv[1] in json.loads(record.read_text())}))",
+            throwaway.resync_symbol,
+        )
+        prepared = json.loads(unused)
+        assert (
+            not prepared["files"] and not prepared["recorded"]
+        ), "the re-sync setup requires a symbol with no tick store or first-download record"
+        ranges = await session.deferring(
+            Call.RANGES, symbol=throwaway.resync_symbol, source=calls.Source.TERMINAL
+        )
+        assert ranges.result.first_tick > 0, "the prepared history needs real ticks"
         await until(
             lambda: throwaway.logs(since),
             lambda log: (
@@ -342,7 +370,12 @@ async def test_a_resyncs_own_teardown_does_not_hold_another_symbols_open(live, t
         assert throwaway.resync_symbol in charts.values(), "the own close is no longer listed"
         began = time.monotonic()
         await session.subscribe(Subscription(Stream.TICKS, fresh))
-        await chart_opened(session, fresh, 2)
+        await until(
+            lambda: throwaway.logs(since),
+            lambda log: f"the spawner opened the publisher chart of {fresh}" in log,
+            2,
+            "the unrelated publisher's chart-open acknowledgement",
+        )
         assert time.monotonic() - began <= 2
     finally:
         await unsubscribe(session, [fresh])
@@ -394,6 +427,7 @@ async def test_a_held_symbol_is_reported_once_and_kept(live, throwaway):
     if not account.trade_allowed:
         pytest.skip("the held-position certification case requires the demo half")
     symbol = (await symbols_for(session, 1, throwaway))[0]
+    await subscribe(session, [symbol])
     info = (await ask(session, Call.SYMBOL_INFO, symbol=symbol)).result
     tick = (await ask(session, Call.SYMBOL_INFO_TICK, symbol=symbol)).result
     await session.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
@@ -413,19 +447,36 @@ async def test_a_held_symbol_is_reported_once_and_kept(live, throwaway):
     }
     since = time.time()
     try:
+        current = await throwaway.command(ProbeCommand.FIND_PUBLISHER, symbol)
+        assert current.chart > 0, "the prepared publisher is not listed"
+        await unsubscribe(session, [symbol])
+        # Retained close bookkeeping + the current idle period + the next idle sweep.
+        idle_close_s = _CLOSE_BOUND_S + throwaway.idle_seconds + _IDLE_SWEEP_S
         await until(
-            lambda: throwaway.logs(since),
-            lambda log: f"closed the publisher chart of '{symbol}'" in log,
-            throwaway.idle_seconds + 10,
-            "the unused publisher's idle close",
+            throwaway.observations,
+            lambda rows: any(
+                row.event is ProbeEvent.CHART_GONE
+                and row.chart == current.chart
+                and row.microseconds >= current.microseconds
+                for row in rows
+            ),
+            idle_close_s,
+            "the current publisher's idle close",
         )
+        absent = await throwaway.command(ProbeCommand.FIND_PUBLISHER, symbol)
+        assert absent.chart == 0, "a replacement publisher is already serving"
         request_id = session._next_request_id
         began = time.monotonic()
         with pytest.raises(NotServed):
-            await session.order_send(order)
+            unexpected = await session.order_send(order)
+            await owner.first(verdict_of(unexpected.result.request_id), 30)
         assert session._next_request_id == request_id + 1
         assert time.monotonic() - began < calls.READ_DEADLINE_S
-        await chart_opened(session, symbol, 5)
+        await session.subscribe(Subscription(Stream.TICKS, symbol))
+        try:
+            await publisher_ready(session, symbol)
+        finally:
+            await unsubscribe(session, [symbol])
         sent = await session.order_send(order)
         verdict = await owner.first(verdict_of(sent.result.request_id), 30)
         assert verdict.result["retcode"] in (
@@ -497,7 +548,7 @@ async def test_reconnect_readd_is_removed_in_one_cursor_round(live, throwaway):
         await throwaway.restore_network()
     await until(
         lambda: throwaway.logs(since),
-        lambda log: "Broker synchronized" in log,
+        lambda log: re.search(r"\bterminal synchronized with\b", log) is not None,
         240,
         "the terminal's broker synchronization",
     )
@@ -634,9 +685,15 @@ async def test_restart_loses_an_inflight_read_refuses_outage_and_replays_subscri
     live, throwaway
 ):
     session, owner = live
-    await session.subscribe(Subscription(Stream.TICKS, SYMBOL))
-    await chart_opened(session, SYMBOL, 5)
-    await ask(session, Call.RANGES, symbol=SYMBOL, source=calls.Source.TERMINAL)
+    try:
+        await session.subscribe(Subscription(Stream.TICKS, SYMBOL))
+        await publisher_ready(session, SYMBOL)
+        await ask(session, Call.RANGES, symbol=SYMBOL, source=calls.Source.TERMINAL)
+    except BaseException:
+        print(f"restart preparation failed for {SYMBOL!r} at monotonic {time.monotonic()}")
+        print(await throwaway.run("logs", "--timestamps", throwaway.container, combine_output=True))
+        print(await throwaway.observations())
+        raise
     now = int(time.time())
     read = asyncio.create_task(
         session.request(

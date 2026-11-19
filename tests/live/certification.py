@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
+from mt5connector.wire import calls
 from mt5connector.wire.push_wire import ChartRole
 
 
@@ -64,6 +65,11 @@ async def observed_pending(url, coroutines):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def publisher_ready(session, symbol):
+    # Each attempt = READ_DEADLINE_S + advertised retry_after_s; cold opens have no total deadline.
+    return await session.deferring(calls.Call.SYMBOL_INFO_TICK, symbol=symbol)
+
+
 class ProbeEvent(StrEnum):
     START = "START"
     CHART_ADDED = "CHART_ADDED"
@@ -81,6 +87,7 @@ class ProbeCommand(IntEnum):
     OPEN_STRAY = 1
     CLOSE_SYMBOL = 2
     SELECT_SYMBOL = 3
+    FIND_PUBLISHER = 4
 
 
 @dataclass(frozen=True)
@@ -115,23 +122,25 @@ class Throwaway:
             raise ValueError("MT5_CERT_IDLE_SECONDS must be in (0, 10]")
         self.network_attached = True
 
-    async def run(self, *arguments, input_text=None):
+    async def run(self, *arguments, input_text=None, combine_output=False):
         process = await asyncio.create_subprocess_exec(
             self.runtime,
             *arguments,
             stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT if combine_output else asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(
             process.communicate(None if input_text is None else input_text.encode()), 240
         )
         if process.returncode:
-            raise AssertionError(f"container control failed: {stderr.decode()}")
+            raise AssertionError(f"container control failed: {(stderr or stdout).decode()}")
         return stdout.decode()
 
     async def logs(self, since):
-        return await self.run("logs", "--timestamps", "--since", str(since), self.container)
+        return await self.run(
+            "logs", "--timestamps", "--since", str(since), self.container, combine_output=True
+        )
 
     async def observations(self):
         contents = await self.run(
