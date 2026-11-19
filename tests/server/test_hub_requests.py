@@ -226,7 +226,7 @@ async def test_the_command_guard_refuses_a_closed_publisher_and_requests_its_cha
         await consumer.ask(1, Call.ORDER_SEND, request=calls.trade_request({"symbol": "GUARD"}))
         refused = await consumer.received(timeout=0.2)
 
-        assert refused.error.kind.value == 9
+        assert refused.error.kind is ErrorKind.NOT_SERVED
         assert refused.error.retry_after_ms is None
         assert refused.error.message == "no publisher for GUARD; chart requested"
         assert await spawner.received() == binary.OpenChart(ChartRole.PUBLISHER, "GUARD")
@@ -257,7 +257,7 @@ async def test_the_command_guard_refuses_an_unverified_clock_while_a_read_still_
     await consumer.ask(2, Call.SYMBOL_INFO_TICK, symbol="GUARD")
     command, read = await consumer.received(), await consumer.received()
 
-    assert command.error.kind.value == 9
+    assert command.error.kind is ErrorKind.NOT_SERVED
     assert command.error.retry_after_ms is None
     assert command.error.message == "the broker clock is not verified"
     assert error_of(read) == deferred(ErrorKind.NOT_READY)

@@ -302,7 +302,6 @@ async def _quote_conversions(
         found = await _select_quoted_pairs(session, listed, needed - asked, traded)
         asked |= needed
         pairs |= found
-        pending = []
         symbols = sorted(set(found.values()) - definitions.keys())
         pending = await _fan_out(*(_definition(session, symbol) for symbol in symbols))
         quoting.update(zip(symbols, pending, strict=True))
