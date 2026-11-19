@@ -36,6 +36,7 @@ from mt5connector.client.errors import (
     NoPublisher,
     NotReady,
     NotSent,
+    NotServed,
     Overflow,
     ProtocolError,
     ResponseLost,
@@ -491,6 +492,8 @@ def _raised(call: calls.Call, error: binary.AnswerError, last_error: int) -> Hub
         return NotReady(message, last_error, error.retry_after_ms / 1000)
     elif error.kind is ErrorKind.NO_PUBLISHER:
         return NoPublisher(message, last_error, error.retry_after_ms / 1000)
+    elif error.kind is ErrorKind.NOT_SERVED:
+        return NotServed(message, last_error)
     elif error.kind is ErrorKind.INVALID_WINDOW:
         return InvalidWindow(message, last_error)
     elif error.kind is ErrorKind.OVERFLOW:

@@ -48,6 +48,10 @@ class Deferred(HubAnswerError):
         self.retry_after_s = retry_after_s
 
 
+class NotServed(HubAnswerError):
+    """Raised when the hub cannot execute a command now and refuses it unsent."""
+
+
 class Syncing(Deferred):
     """Raised for a history window the terminal's answers do not prove yet."""
 

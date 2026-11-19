@@ -97,6 +97,7 @@ from mt5connector.client.errors import (
     MT5OrderError,
     NoPublisher,
     NotReady,
+    NotServed,
     Overflow,
     ProtocolError,
     ResponseLost,
@@ -364,7 +365,7 @@ _BRACKET_COMMANDS = frozenset({Command.BRACKET, Command.AMEND, Command.CLEAR})
 # The answers to an order_send whose request went out, and those to one that never reached the
 # venue.
 _LOST_ANSWERS = (ResponseLost, ProtocolError, HubTimeout, EaGone)
-_UNSENT_ANSWERS = (EaError, Overflow, NotReady, Syncing)
+_UNSENT_ANSWERS = (EaError, Overflow, NotReady, Syncing, NotServed)
 # A command whose symbol no publisher serves yet is asked again while the spawner opens its chart,
 # up to this long; the spawner answers a chart it cannot open as an EA error.
 _NO_PUBLISHER_BOUND_S = 15.0

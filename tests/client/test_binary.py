@@ -373,6 +373,28 @@ def test_a_frame_the_hub_sends_a_consumer_round_trips(frame):
     assert binary.decode(binary.encode(frame), Sender.HUB) == frame
 
 
+def test_a_not_served_answer_is_a_refusal_without_a_delay_and_no_ea_may_send_it():
+    message = b"no publisher for X; chart requested"
+    payload = b"\x00" * 8 + b"\x09" + struct.pack("<H", len(message)) + message
+    raw = header(FrameKind.ANSWER, payload, flags=2, correlation=17)
+
+    answer = binary.decode(raw, Sender.HUB)
+
+    assert answer.request_id == 17
+    assert answer.error.kind.value == 9
+    assert answer.error.message == message.decode()
+    assert answer.error.retry_after_ms is None
+    assert binary.encode(answer) == raw
+    with pytest.raises(CodecError, match="an EA answering not_served"):
+        binary.decode(raw, Sender.EA)
+    with pytest.raises(CodecError, match="a retry delay on a not_served answer"):
+        binary.encode(
+            binary.Answer(
+                17, 0, True, 0, error=binary.AnswerError(answer.error.kind, message.decode(), 50)
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "frame",
     [

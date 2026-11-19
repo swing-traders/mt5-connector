@@ -450,6 +450,18 @@ def no_publisher() -> errors.NoPublisher:
     return errors.NoPublisher("order_send: no EA serves the publisher of EURUSD", 0, 0.01)
 
 
+async def test_a_command_the_hub_cannot_serve_is_rejected_unsent_after_one_ask(h):
+    refusal = errors.NotServed("order_send: no publisher for EURUSD; chart requested", 0)
+    h.venue.order_send.side_effect = refusal
+
+    await submit(h, h.market())
+
+    assert h.names() == ["OrderSubmitted", "OrderRejected"]
+    assert h.events[1].reason == f"not sent: {refusal}"
+    assert len(h.venue.order_send.call_args_list) == 1
+    assert calls_after_order_send(h) == []
+
+
 async def test_a_command_waits_out_its_symbols_chart_opening_then_is_sent(h):
     h.venue.order_send.side_effect = [no_publisher(), no_publisher(), trade_result()]
     await submit(h, h.limit())

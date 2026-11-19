@@ -91,6 +91,7 @@ class ErrorKind(IntEnum):
     EA_GONE = 6
     TIMEOUT = 7
     EA_ERROR = 8
+    NOT_SERVED = 9
 
 
 # The kinds that defer a request: each carries the delay before asking again.

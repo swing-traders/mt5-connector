@@ -343,6 +343,21 @@ async def test_a_refused_request_write_fails_not_sent_with_no_flight(hub, reconn
         await hub_session.disconnect()
 
 
+async def test_a_command_refused_not_served_raises_the_hubs_reason_without_reasking(hub):
+    hub_session = session(hub, Owner())
+    await hub_session.connect()
+    hub.answers[Call.ORDER_SEND] = [
+        binary.AnswerError(ErrorKind.NOT_SERVED, "no publisher for X; chart requested")
+    ]
+    try:
+        with pytest.raises(errors.HubAnswerError, match="order_send: no publisher for X") as caught:
+            await asyncio.wait_for(hub_session.order_send({"symbol": "X"}), 0.2)
+        assert type(caught.value) is errors.NotServed
+        assert len(hub.asked(Call.ORDER_SEND)) == 1
+    finally:
+        await hub_session.disconnect()
+
+
 async def test_a_refusal_and_an_undecodable_frame_are_logged_and_the_stream_goes_on(hub):
     owner = Owner()
     hub_session = session(hub, owner)

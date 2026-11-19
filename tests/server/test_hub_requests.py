@@ -215,6 +215,70 @@ async def test_health_answers_get_alone():
 # ── Routing ───────────────────────────────────────────────────────────────────
 
 
+async def test_the_command_guard_refuses_a_closed_publisher_and_requests_its_chart():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        consumer = await Consumer.connect(port)
+        await consumer.ask(1, Call.ORDER_SEND, request=calls.trade_request({"symbol": "GUARD"}))
+        refused = await consumer.received(timeout=0.2)
+
+        assert refused.error.kind.value == 9
+        assert refused.error.retry_after_ms is None
+        assert refused.error.message == "no publisher for GUARD; chart requested"
+        assert await spawner.received() == binary.OpenChart(ChartRole.PUBLISHER, "GUARD")
+
+        ea = await publisher(port, "GUARD")
+        await consumer.ask(2, Call.ORDER_SEND, request=calls.trade_request({"symbol": "GUARD"}))
+        request = await ea.request()
+        assert arguments_of(request)[0] is Call.ORDER_SEND
+        sent = zeroed(
+            calls.CALLS[Call.ORDER_SEND].layout,
+            retcode=mirror.TRADE_RETCODE_PLACED,
+            request_id=41,
+        )
+        await ea.send(answer(request.request_id, Call.ORDER_SEND, sent))
+        reply = await consumer.received()
+        assert reply.error is None
+        assert calls.read_hub_result(calls.CALLS[Call.ORDER_SEND], reply) == sent
+        await ea.close()
+        await consumer.close()
+        await spawner.close()
+    server.close()
+
+
+async def test_the_command_guard_refuses_an_unverified_clock_while_a_read_still_defers():
+    hub, server, port = await run_hub()
+    consumer = await Consumer.connect(port)
+    await consumer.ask(1, Call.ORDER_SEND, request=calls.trade_request({"symbol": "GUARD"}))
+    await consumer.ask(2, Call.SYMBOL_INFO_TICK, symbol="GUARD")
+    command, read = await consumer.received(), await consumer.received()
+
+    assert command.error.kind.value == 9
+    assert command.error.retry_after_ms is None
+    assert command.error.message == "the broker clock is not verified"
+    assert error_of(read) == deferred(ErrorKind.NOT_READY)
+    await consumer.close()
+    server.close()
+
+
+async def test_an_ea_answering_not_served_is_refused_as_a_broken_frame():
+    hub, server, port = await run_hub()
+    ea = await publisher(port, "GUARD")
+    payload = b"\x00" * 8 + b"\x09\x00\x00"
+    raw = (
+        binary.HEADER.pack(binary.VERSION, binary.FrameKind.ANSWER, 2, 42, 0, len(payload))
+        + payload
+    )
+    await ea.ws.send(raw)
+
+    refusal = await ea.received()
+
+    assert isinstance(refusal, binary.Refusal)
+    assert "an EA answering not_served" in refusal.message
+    await ea.close()
+    server.close()
+
+
 async def test_a_request_no_ea_of_its_role_serves_is_deferred_at_once_and_its_chart_asked_once():
     hub, server, port = await run_hub()
     loop = asyncio.get_running_loop()

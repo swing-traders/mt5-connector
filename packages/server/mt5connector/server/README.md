@@ -112,8 +112,9 @@ Every request is answered once, by a result or an error, and nothing comes after
 | Error | Answered by | `retry_after_ms` | When |
 |---|---|---|---|
 | `syncing` | EA, hub | yes | a history request its EA has not settled; a server-synced history request whose symbol's re-sync is due and not done; any history request while its symbol's months are deleted for re-sync; or a commission schedule or trading sessions not yet relayed |
-| `not_ready` | hub | yes | the broker clock is not verified |
-| `no_publisher` | hub | yes | no EA serves the call's role and symbol: its chart is requested from the spawner — once per spawner connection — and the request answered at once |
+| `not_ready` | hub | yes | a read while the broker clock is not verified |
+| `no_publisher` | hub | yes | a read no EA serves by role and symbol: its chart is requested from the spawner — once per spawner connection — and the request answered at once |
+| `not_served` | hub | no | a command the hub cannot execute now: the broker clock is not verified, or no publisher serves its symbol; the symbol's chart is still requested |
 | `invalid_window` | hub, EA | no | a history window starting after it ends or after the terminal's time: the hub judges the true-UTC window asked, the EA the broker bounds it is sent |
 | `overflow` | hub | no | the consumer has `MT5_HUB_PENDING_BOUND` requests pending, or the EA's outbound queue is full |
 | `ea_gone` | hub | no | the EA left — a close, or its pong overdue — with the request pending |
@@ -121,6 +122,7 @@ Every request is answered once, by a result or an error, and nothing comes after
 | `ea_error` | EA, hub | no | the EA could not perform the call, its MQL5 error the answer's `last_error`; or the spawner failed to open the chart the call needs, or the last relay a hub-answered call reads was refused |
 
 - The deferring kinds carry `MT5_HISTORY_RETRY_SECONDS` as `retry_after_ms` when the hub answers them; a session's `deferring` asks again after that delay until it is answered otherwise or its caller cancels.
+- A command is served now or refused now, never deferred. `not_served` guards a state normal trading does not reach: a strategy's price subscriptions open its publisher before it can trigger an order. A command deliberately issued without that chart is refused unsent at once; opening the chart never replays that command.
 - A call's deadline is its row's `Deadline`, a protocol constant of `calls.py` that binds the hub and the session alike, counted from the moment the request is sent:
 
   | Deadline | Constant | Calls |

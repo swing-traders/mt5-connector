@@ -649,7 +649,10 @@ class Hub:
             bar_series(arguments["timeframe"])
         if self._gate.verification is None:
             message = "the broker clock is not verified"
-            self._deferred(ws, frame.request_id, ErrorKind.NOT_READY, message)
+            if row.wait is calls.Wait.COMMAND:
+                self._error(ws, frame.request_id, 0, ErrorKind.NOT_SERVED, message)
+            else:
+                self._deferred(ws, frame.request_id, ErrorKind.NOT_READY, message)
         elif self._requests.asked_by(ws) >= self._settings.pending_bound:
             message = f"{self._settings.pending_bound} requests pending"
             self._error(ws, frame.request_id, 0, ErrorKind.OVERFLOW, message)
@@ -695,7 +698,8 @@ class Hub:
         source: calls.Source = calls.Source.SERVER_SYNCED,
     ) -> None:
         """Sends a request to the EA serving its role and symbol; with none, has the spawner open
-        its chart and defers it, or refuses it once that chart failed to open."""
+        its chart and defers a read or refuses a command. Orders normally follow a publisher's
+        price subscription; refusing a command with no publisher guards an unavailable chart."""
         if row.role is ChartRole.SPAWNER:
             key = (ChartRole.SPAWNER, None)
             state = None
@@ -718,6 +722,9 @@ class Hub:
             self._chart_failed(ws, client_id, key)
         elif row.role is ChartRole.SPAWNER:
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no spawner is connected")
+        elif row.wait is calls.Wait.COMMAND:
+            message = f"no publisher for {symbol}; chart requested"
+            self._error(ws, client_id, 0, ErrorKind.NOT_SERVED, message)
         else:
             message = f"no {row.role} EA for {symbol}; chart requested"
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
