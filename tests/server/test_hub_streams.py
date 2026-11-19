@@ -10,8 +10,21 @@ from types import SimpleNamespace
 
 import pytest
 import websockets
-from ea_wire import FakeEa, encode_ea, frame, tick_rows, zeroed
-from hub_doubles import Consumer, Peer, run_hub, sample, settings, settle, verified
+from ea_wire import FakeEa, answer, encode_ea, frame, tick_rows, zeroed
+from hub_doubles import (
+    MAX_AGE_S,
+    Consumer,
+    Peer,
+    eventually,
+    health,
+    health_of,
+    run_hub,
+    sample,
+    settings,
+    settle,
+    verified,
+    verified_by,
+)
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.server import ws_server
@@ -1244,6 +1257,7 @@ async def _refused(port, hello: bytes | None, sent: bytes | str) -> binary.Refus
 
 EA_HELLO = encode_ea(binary.EaHello(PUBLISHER, "EURUSD"))
 ADAPTER_HELLO = binary.encode(binary.AdapterHello())
+PUBLISHER_SERVER_TIME = encode_ea(sample("EURUSD"))
 
 
 @pytest.mark.parametrize(
@@ -1254,7 +1268,6 @@ ADAPTER_HELLO = binary.encode(binary.AdapterHello())
         (None, binary.encode(binary.Subscribe(1, ticks_of("EURUSD")))),
         (ADAPTER_HELLO, ADAPTER_HELLO),
         (EA_HELLO, EA_HELLO),
-        (EA_HELLO, encode_ea(sample("EURUSD"))),
         (EA_HELLO, binary.encode(binary.Subscribe(1, ticks_of("EURUSD")))),
         (ADAPTER_HELLO, encode_ea(binary.Ticks("EURUSD", tick_rows(tick())))),
         (EA_HELLO, encode_ea(binary.RatesBar("EURUSD", mirror.TIMEFRAME_MN1, rates()))),
@@ -1266,7 +1279,6 @@ ADAPTER_HELLO = binary.encode(binary.AdapterHello())
         "op-before-hello",
         "second-adapter-hello",
         "second-ea-hello",
-        "server-time-from-a-publisher",
         "op-from-an-ea",
         "tick-from-a-consumer",
         "bar-of-no-series",
@@ -1317,21 +1329,79 @@ async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on():
 # ── Relays ────────────────────────────────────────────────────────────────────
 
 
-async def test_the_spawners_server_time_is_never_fanned_out_and_one_for_another_symbol_dropped(
+async def test_a_publishers_server_time_sample_reaches_the_clock_gate():
+    hub, server, port = await run_hub()
+    ea = await publisher(port)
+    try:
+        await ea.ws.send(PUBLISHER_SERVER_TIME)
+        await eventually(lambda: health(port)[1]["result"]["sample_age_s"] is not None)
+        assert (await health_of(port))[1]["result"]["clock"] is None
+    finally:
+        await close_all(server, ea)
+
+
+async def test_a_publisher_keeps_the_gate_open_while_the_connected_spawner_is_silent():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        ea = await publisher(port, "GBPUSD")
+    consumer = await Consumer.connect(port)
+    try:
+        async with verified_by(ea):
+            await asyncio.sleep(MAX_AGE_S * 3)
+            status, body = await health_of(port)
+            assert status == 200
+            assert body["result"]["sample_age_s"] < MAX_AGE_S
+
+            await consumer.ask(1, calls.Call.SYMBOL_INFO_TICK, symbol="GBPUSD")
+            requested = await ea.request()
+            assert requested.call == calls.Call.SYMBOL_INFO_TICK
+            assert calls.decode_arguments(calls.CALLS[requested.call], requested) == {
+                "symbol": "GBPUSD"
+            }
+            await ea.send(answer(requested.request_id, calls.Call.SYMBOL_INFO_TICK, tick()))
+            received = await consumer.received()
+            assert received.error is None
+            assert (
+                calls.read_hub_result(calls.CALLS[calls.Call.SYMBOL_INFO_TICK], received)["bid"]
+                == 1.085
+            )
+    finally:
+        await close_all(server, consumer, ea, spawner)
+
+
+async def test_a_history_eas_server_time_for_another_symbol_is_dropped_with_a_warning(caplog):
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
+    hub, server, port = await run_hub()
+    ea = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+    try:
+        await ea.send(sample("GBPUSD"))
+        await nothing(ea.ws, timeout=0.05)
+        assert warnings(caplog) == [
+            "dropping a server-time sample for 'GBPUSD' from the history for EURUSD"
+        ]
+    finally:
+        await close_all(server, ea)
+
+
+async def test_server_time_is_never_fanned_out_and_only_its_serving_eas_symbol_is_taken(
     caplog,
 ):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD.a")
+    ea = await publisher(port, "GBPUSD")
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD.a"))
-    measured = binary.ServerTime("EURUSD.a", 1_752_580_800, 1_752_580_798, 1_752_570_000, True)
+    try:
+        measured = binary.ServerTime("EURUSD.a", 1_752_580_800, 1_752_580_798, 1_752_570_000, True)
+        await spawner.send(measured)
+        await spawner.send(binary.ServerTime("GBPUSD", 1, 1, 1, True))
+        async with verified_by(ea):
+            assert (await health_of(port))[1]["result"]["clock"]["symbol"] == "GBPUSD"
+            await nothing(consumer.ws)
 
-    await spawner.send(measured)
-    await spawner.send(binary.ServerTime("GBPUSD", 1, 1, 1, True))
-    await nothing(consumer.ws)
-
-    assert warnings(caplog) == [
-        "dropping a server-time sample for 'GBPUSD' from the spawner for EURUSD.a"
-    ]
-    await close_all(server, consumer, spawner)
+        assert warnings(caplog) == [
+            "dropping a server-time sample for 'GBPUSD' from the spawner for EURUSD.a"
+        ]
+    finally:
+        await close_all(server, consumer, spawner, ea)

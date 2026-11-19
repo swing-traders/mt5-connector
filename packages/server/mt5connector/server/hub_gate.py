@@ -1,5 +1,5 @@
-"""The hub's clock gate: the broker clock verified against the trade-server time the spawner
-relays, and re-verified on its interval.
+"""The hub's clock gate: the broker clock verified against the trade-server time its EAs relay,
+and re-verified on its interval.
 
 State: the latest sample, the monotonic time it arrived and when its unbroken connected run began;
 the sample last measured; the latest verification, held while the latest sample is verifiable and

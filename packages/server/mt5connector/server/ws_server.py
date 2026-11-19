@@ -397,7 +397,7 @@ class Hub:
             self._publish(ea, frame)
         elif isinstance(frame, binary.TradeTransaction) and (publisher or spawner):
             self._publish(ea, frame)
-        elif isinstance(frame, binary.ServerTime) and spawner:
+        elif isinstance(frame, binary.ServerTime):
             self._server_time(ea, frame)
         elif isinstance(frame, binary.Commissions) and publisher:
             self._relayed_commissions(ea, frame)
@@ -513,13 +513,14 @@ class Hub:
     # ── Relays ────────────────────────────────────────────────────────────────
 
     def _server_time(self, ea: _Ea, frame: binary.ServerTime) -> None:
-        """Takes the spawner's server-time sample naming its own symbol into the gate."""
+        """Takes a serving EA's server-time sample naming its own symbol into the gate."""
         if frame.symbol == ea.symbol:
             self._gate.write(frame)
         else:
             logger.warning(
-                "dropping a server-time sample for %r from the spawner for %s",
+                "dropping a server-time sample for %r from the %s for %s",
                 frame.symbol,
+                ea.chart_role,
                 ea.symbol,
             )
 

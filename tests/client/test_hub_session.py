@@ -441,7 +441,8 @@ async def test_two_calls_answered_in_reverse_order_resolve_each_with_its_own_ans
 
     account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
-    first, second = await asked(hub, 2)
+    requests = {request.call: request for request in await asked(hub, 2)}
+    first, second = requests[Call.ACCOUNT_INFO], requests[Call.SYMBOL_INFO_TICK]
     await hub.answer(second, tick())
     await hub.answer(first, account(1_234))
 
@@ -1029,7 +1030,8 @@ async def test_an_answer_whose_payload_runs_short_fails_its_request_at_once_and_
     loop = asyncio.get_running_loop()
     account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
-    first, second = await asked(hub, 2)
+    requests = {request.call: request for request in await asked(hub, 2)}
+    first, second = requests[Call.ACCOUNT_INFO], requests[Call.SYMBOL_INFO_TICK]
 
     started = loop.time()
     # An answer's payload opens with its part and last_error, eight bytes; this one carries three.

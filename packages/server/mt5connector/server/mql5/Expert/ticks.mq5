@@ -274,19 +274,14 @@ void SendSessions()
     Send(frame);
 }
 
-// The relay cadence, by role
 void Relay()
 {
     g_lastRelay = GetTickCount64();
-    switch (Role)
+    SendServerTime();
+    if (Role == ROLE_PUBLISHER)
     {
-    case ROLE_SPAWNER:
-        SendServerTime();
-        break;
-    case ROLE_PUBLISHER:
         SendCommissions();
         SendSessions();
-        break;
     }
 }
 
