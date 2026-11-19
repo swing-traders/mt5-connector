@@ -58,7 +58,8 @@ def controller(tmp_path_factory):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["opens", "budgets", "symbols", "teardown", "capacity", "sightings", "rollback"]
+    "scenario",
+    ["opens", "stray", "budgets", "symbols", "teardown", "capacity", "sightings", "rollback"],
 )
 def test_chart_pass(controller, scenario):
     result = subprocess.run([str(controller), scenario], capture_output=True, text=True, timeout=30)

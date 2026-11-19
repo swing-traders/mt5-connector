@@ -3839,7 +3839,7 @@ bool PrepareOpen(const string symbol)
     {
         if (!IsClosing(chart) && !Swept(chart) && ChartSymbol(chart) == symbol && !Allocated(chart))
         {
-            if (!g_chartCloseUsed && !WaitingClose())
+            if (!g_chartCloseUsed)
                 CloseUnallocated(chart, symbol);
             return false;
         }

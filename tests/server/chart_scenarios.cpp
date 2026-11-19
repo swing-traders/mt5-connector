@@ -36,6 +36,26 @@ int main(int argc, char** argv) {
             require(std::count_if(events.begin(), events.end(), [](const string& e) {
                 return e.rfind("close:", 0) == 0;
             }) == 15, "queued closes did not drain in fifteen passes");
+        } else if (scenario == "stray") {
+            for (int i = 0; i < 15; ++i) {
+                string symbol = "OLD" + std::to_string(i);
+                add(i + 2, symbol);
+                QueueChartFrame(HUB_FRAME_CLOSE_CHART, ROLE_PUBLISHER, symbol);
+            }
+            add(17, "NEW", false);
+            QueueChartFrame(HUB_FRAME_OPEN_CHART, ROLE_PUBLISHER, "NEW");
+            pass();
+            require(close_calls == 1 && has("close:NEW"), "the stray waited behind queued closes");
+            require(!has("open:NEW"), "the open ignored its stray's teardown");
+            require(!has("close:OLD0"), "a queued close overtook the stray");
+            disappear();
+            pass();
+            require(has("open:NEW"), "the open waited behind the remaining close queue");
+            require(close_calls == 1 && has("close:OLD0"), "the queued close did not resume");
+            for (int i = 0; i < 14; ++i) { disappear(); pass(); }
+            require(std::count_if(events.begin(), events.end(), [](const string& e) {
+                return e.rfind("close:OLD", 0) == 0;
+            }) == 15, "queued closes did not drain after the stray's one pass");
         } else if (scenario == "budgets") {
             add(2, "A"); add(3, "B"); add(4, "C");
             QueueChartFrame(HUB_FRAME_CLOSE_CHART, ROLE_PUBLISHER, "A");
