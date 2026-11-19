@@ -41,6 +41,8 @@ _ACCOUNT = {
 }
 # The stop timeout the image's contract asks for, over the entrypoint's own stop bounds together.
 _STOP_TIMEOUT_SECONDS = 190
+# Entrypoint: display + restore + two retry loops (final window poll included) + search close.
+_BOOT_SECONDS = 30 + (40 + 5) + 2 * (3 * (120 + 3 * (40 + 5) + 60 + 10 + 5) + 2 * 5) + 60
 _HUB_PORT = 9000
 _IMAGE_FILES = Path(__file__).resolve().parents[2] / "image"
 _BASES = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
@@ -1128,10 +1130,34 @@ def _booted(runtime: str, tmp_path, name: str):
             check=True,
             timeout=60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=_BOOT_SECONDS)
         yield name
+    except BaseException:
+        print(_logs(runtime, name), flush=True)
+        raise
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
+
+
+def test_a_failed_boot_prints_its_log_before_removing_the_container(monkeypatch, tmp_path, capsys):
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="retained boot log", stderr="")
+
+    def failed_boot(*args, **kwargs):
+        raise AssertionError("boot failed")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sys.modules[__name__], "_await_log", failed_boot)
+    with pytest.raises(AssertionError, match="boot failed"):
+        with _booted("runtime", tmp_path, "owned-image-test"):
+            pytest.fail("a failed boot must not enter the body")
+    assert "retained boot log" in capsys.readouterr().out
+    assert commands.index(["runtime", "logs", "owned-image-test"]) < commands.index(
+        ["runtime", "rm", "-f", "-v", "owned-image-test"]
+    )
 
 
 def _windows_python(runtime: str, name: str) -> str:
@@ -1252,9 +1278,10 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
         subprocess.run(
             [runtime, "restart", "-t", str(_STOP_TIMEOUT_SECONDS), name],
             capture_output=True,
+            check=True,
             timeout=_STOP_TIMEOUT_SECONDS + 60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=_BOOT_SECONDS)
         after = _allowlist(runtime, name)
         kept = subprocess.run(
             [runtime, "exec", name, "ls", _CONFIG, _COMMON_FILES, _BASES],
@@ -1268,12 +1295,14 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
         ).returncode
         printed = _logs(runtime, name)
 
-    assert before == after == {"checked": 1, "urls": 1}
-    assert restored == 0
-    assert printed.count("mt5: restored the terminal's baked state, its history store aside") == 2
-    assert "written-by-a-run" not in kept
-    assert "synced" in kept
-    assert queried.returncode != 0
+        assert before == after == {"checked": 1, "urls": 1}
+        assert restored == 0
+        assert (
+            printed.count("mt5: restored the terminal's baked state, its history store aside") == 2
+        )
+        assert "written-by-a-run" not in kept
+        assert "synced" in kept
+        assert queried.returncode != 0
 
 
 # Writes each argument as a line of a journal dated past any real day, as the terminal writes one.
