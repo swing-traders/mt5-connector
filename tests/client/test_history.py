@@ -10,7 +10,7 @@ from hub_double import eventually
 
 from mt5connector.client import history
 from mt5connector.client.config import MT5Config
-from mt5connector.client.errors import InvalidWindow, Syncing
+from mt5connector.client.errors import InvalidWindow
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import ErrorKind
@@ -119,36 +119,58 @@ async def test_ranges_are_the_hubs_ranges_of_the_symbol(hub, session):
 
 
 @pytest.mark.parametrize("kind", ["bars", "ticks", "ranges"])
-async def test_a_read_surfacing_syncing_raises_it_with_its_delay_after_one_answer(
-    hub, session, kind
+async def test_a_read_waits_out_syncing_and_returns_its_rows_after_the_delay(
+    hub, session, kind, monkeypatch
 ):
     call = {
         "bars": Call.COPY_RATES_RANGE,
         "ticks": Call.COPY_TICKS_RANGE,
         "ranges": Call.RANGES,
     }[kind]
-    hub.answers[call] = [binary.AnswerError(ErrorKind.SYNCING, "X is measuring", 75)]
-    with pytest.raises(Syncing, match="X is measuring") as caught:
-        if kind == "bars":
-            await history.bars(
-                session, "X", Series.M1, NINE, NINE, on_syncing=history.OnSyncing.RAISE
-            )
-        elif kind == "ticks":
-            await history.ticks(session, "X", NINE, NINE, on_syncing=history.OnSyncing.RAISE)
-        else:
-            await history.ranges(session, "X", on_syncing=history.OnSyncing.RAISE)
-    assert caught.value.retry_after_s == 0.075
-    assert len(hub.asked(call)) == 1
+    answers = {
+        "bars": rows(1),
+        "ticks": np.zeros(1, dtype=_TICKS),
+        "ranges": calls.Ranges(100_000, {}),
+    }
+    hub.answers[call] = [
+        binary.AnswerError(ErrorKind.SYNCING, "X is measuring", 75),
+        answers[kind],
+    ]
+    asked_at = []
+    answered_at = []
+    answer = hub._answered
+
+    async def timed_answer(ws, request):
+        asked_at.append(asyncio.get_running_loop().time())
+        await answer(ws, request)
+        answered_at.append(asyncio.get_running_loop().time())
+
+    monkeypatch.setattr(hub, "_answered", timed_answer)
+    if kind == "bars":
+        read = await asyncio.wait_for(history.bars(session, "X", Series.M1, NINE, NINE), 2)
+    elif kind == "ticks":
+        read = await asyncio.wait_for(history.ticks(session, "X", NINE, NINE), 2)
+    else:
+        read = await asyncio.wait_for(history.ranges(session, "X"), 2)
+
+    if kind == "ranges":
+        assert read == answers[kind]
+    else:
+        assert read.tolist() == answers[kind].tolist()
+    assert len(hub.asked(call)) == 2
+    assert asked_at[1] - answered_at[0] >= 0.075
 
 
-async def test_a_read_surfacing_syncing_still_asks_again_after_no_publisher(hub, session):
+async def test_a_read_waits_out_no_publisher_then_syncing_before_its_answer(hub, session):
+    ranges = calls.Ranges(100_000, {})
     hub.answers[Call.RANGES] = [
         binary.AnswerError(ErrorKind.NO_PUBLISHER, "chart requested", 1),
         binary.AnswerError(ErrorKind.SYNCING, "measuring", 50),
+        ranges,
     ]
-    with pytest.raises(Syncing, match="measuring"):
-        await history.ranges(session, "X", on_syncing=history.OnSyncing.RAISE)
-    assert len(hub.asked(Call.RANGES)) == 2
+    read = await asyncio.wait_for(history.ranges(session, "X"), 2)
+    assert read == ranges
+    assert len(hub.asked(Call.RANGES)) == 3
 
 
 async def test_a_read_states_its_source_only_when_it_is_the_terminals(hub, session):
