@@ -11,6 +11,7 @@ import pytest
 from hub_double import HubDouble, asked, eventually, zeroed
 from websockets.asyncio.server import serve
 
+from mt5connector.client import errors
 from mt5connector.client import hub as hub_module
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import (
@@ -259,6 +260,89 @@ async def test_after_a_reconnect_a_subscribe_waits_for_the_hello_and_rides_the_r
     assert socket.sent[-1] == binary.Subscribe(2, Subscription(Stream.TICKS, "USDJPY"))
 
 
+async def test_a_request_before_its_first_hello_is_not_sent():
+    owner = Owner()
+    hub_session = HubSession(config(1), asyncio.get_running_loop(), owner.on_frame, None, owner.log)
+    socket = HeldSocket(lambda frame: isinstance(frame, binary.AdapterHello))
+    hub_session._ws = socket
+    resend = asyncio.create_task(hub_session._send_wanted())
+    await socket.holding.wait()
+    try:
+        with pytest.raises(
+            ServerUnreachable, match="account_info: not sent:.*awaiting its hello"
+        ) as caught:
+            await asyncio.wait_for(hub_session.account_info(), 0.2)
+        assert type(caught.value) is errors.NotSent
+        assert socket.sent == [HELLO]
+        assert hub_session._in_flight == {}
+    finally:
+        socket.released.set()
+        await resend
+
+
+async def test_a_request_during_sixty_subscription_replay_is_sent_after_the_hello():
+    owner = Owner()
+    hub_session = HubSession(config(1), asyncio.get_running_loop(), owner.on_frame, None, owner.log)
+    wanted = [Subscription(Stream.TICKS, f"S{index:02}") for index in range(60)]
+    for subscription in wanted:
+        await hub_session.subscribe(subscription)
+    socket = HeldSocket(lambda frame: isinstance(frame, binary.Subscribe))
+    hub_session._ws = socket
+    hub_session._on_reconnected()
+    await socket.holding.wait()
+    read = asyncio.create_task(hub_session.account_info())
+    try:
+        await asyncio.wait_for(
+            eventually(lambda: any(isinstance(frame, binary.Request) for frame in socket.sent)),
+            0.2,
+        )
+        request = next(frame for frame in socket.sent if isinstance(frame, binary.Request))
+        assert len([frame for frame in socket.sent if isinstance(frame, binary.Subscribe)]) == 1
+        count, body = calls.write_result(calls.CALLS[Call.ACCOUNT_INFO], account(42))
+        hub_session._on_message(
+            binary.encode(binary.Answer(request.request_id, 0, True, 0, count, body))
+        )
+        assert (await asyncio.wait_for(read, 0.2)).result.login == 42
+    finally:
+        socket.released.set()
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+        await asyncio.gather(*hub_session._tasks)
+    assert socket.sent[0] == HELLO
+    assert [
+        frame.subscription for frame in socket.sent if isinstance(frame, binary.Subscribe)
+    ] == wanted
+
+
+@pytest.mark.parametrize("reconnect", [False, True])
+async def test_a_refused_request_write_fails_not_sent_with_no_flight(hub, reconnect):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    connected_socket = hub_session._ws
+
+    class RefusingSocket(HeldSocket):
+        async def send(self, raw):
+            if raw[1] == binary.FrameKind.HELLO:
+                return
+            if reconnect:
+                hub_session._on_reconnected()
+            raise hub_module.WebSocketClientError("write refused")
+
+    socket = RefusingSocket(lambda frame: False)
+    hub_session._ws = socket
+    try:
+        with pytest.raises(ServerUnreachable, match="account_info: not sent:.*write") as caught:
+            await asyncio.wait_for(hub_session.account_info(), 0.2)
+        assert type(caught.value) is errors.NotSent
+        assert socket.sent == []
+        assert hub_session._in_flight == {}
+    finally:
+        hub_session._ws = connected_socket
+        await hub_session.disconnect()
+
+
 async def test_a_refusal_and_an_undecodable_frame_are_logged_and_the_stream_goes_on(hub):
     owner = Owner()
     hub_session = session(hub, owner)
@@ -494,8 +578,9 @@ async def cancelled_once_sent(hub, hub_session, monkeypatch, call) -> binary.Req
     send = hub_session._send
 
     async def sending(raw):
-        await send(raw)
+        sent = await send(raw)
         sent_once.set()
+        return sent
 
     monkeypatch.setattr(hub_session, "_send", sending)
     task = asyncio.create_task(call)
@@ -877,11 +962,14 @@ async def test_a_resend_a_reconnect_overtakes_does_not_open_the_next_connection_
     hub_session._on_reconnected()
     await socket.holding.wait()
     hub_session._reconnects += 1
-    hub_session._greeting.clear()
     socket.released.set()
     await asyncio.gather(*hub_session._tasks)
 
-    assert not hub_session._greeting.is_set()
+    with pytest.raises(ServerUnreachable, match="account_info: not sent:.*reconnecting") as caught:
+        await asyncio.wait_for(hub_session.account_info(), 0.2)
+    assert type(caught.value) is errors.NotSent
+    assert not any(isinstance(frame, binary.Request) for frame in socket.sent)
+    assert hub_session._in_flight == {}
 
 
 async def test_an_answer_of_one_record_in_two_parts_fails_its_call():

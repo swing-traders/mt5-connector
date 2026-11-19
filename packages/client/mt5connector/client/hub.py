@@ -5,11 +5,11 @@ hub keeps nothing for a consumer that left.
 State: the subscriptions wanted, in the order they were first wanted; the next op id and request id;
 each request in flight with its call, its answer's parts so far, its deadline and the future its
 caller awaits; each command sent and not yet settled, by its MQL5 request id, with its symbol, kept
-across a disconnect; the reconnects NT's client has made, and the one the last hello greeted. An op
-or a request waits for its connection's hello, which the hub needs before any other frame. A change
-of the wanted set and the resend hold one lock across their sends, so the hub receives them in the
-order the set changed. A request in flight when NT's client reconnects fails at once: the hub
-answers nothing asked on a connection that left."""
+across a disconnect; the reconnects NT's client has made, and the one the last hello greeted.
+Requests are sent immediately or fail unsent before their connection's hello. The wanted set is
+the session's desired state: its changes and replay hold one lock across their sends, in the order
+the set changed. A request in flight when NT's client reconnects fails at once: the hub answers
+nothing asked on a connection that left."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from mt5connector.client.errors import (
     InvalidWindow,
     NoPublisher,
     NotReady,
+    NotSent,
     Overflow,
     ProtocolError,
     ResponseLost,
@@ -140,7 +141,6 @@ class HubSession:
         self._ws: WebSocketClient | None = None
         self._wanted: list[Subscription] = []
         self._wanting = asyncio.Lock()
-        self._greeting = asyncio.Event()
         self._next_op_id = 1
         self._next_request_id = 1
         self._in_flight: dict[int, _InFlight] = {}
@@ -194,7 +194,6 @@ class HubSession:
         await self._ws.disconnect()
         self._ws = None
         self._greeted = None
-        self._greeting.clear()
 
     async def subscribe(self, subscription: Subscription) -> None:
         """Wants a stream, and subscribes it once the connection it rides has had its hello; the
@@ -216,10 +215,10 @@ class HubSession:
 
     async def request(self, call: calls.Call, **arguments: object) -> Answered:
         """The answer to a call, its parts assembled; raises the HubAnswerError of the answer's
-        error kind, ResponseLost when no answer comes within the session's deadline or across a
-        reconnect, and ValueError for arguments the call does not take, a bar read's timeframe among
-        them. An order_send's request names the MqlTradeRequest fields it sets; every other member
-        is zero."""
+        error kind, NotSent when its connection cannot send it now, ResponseLost when no answer
+        comes within the session's deadline or across a reconnect, and ValueError for arguments the
+        call does not take. An order_send's request names the MqlTradeRequest fields it sets; every
+        other member is zero."""
         if self._ws is None:
             raise RuntimeError("hub session: not connected")
         row = calls.CALLS[call]
@@ -228,7 +227,13 @@ class HubSession:
         count, body = calls.encode_arguments(row, arguments)
         if row.shape is calls.Shape.RATES:
             bar_series(arguments["timeframe"])
-        await self._greeting.wait()
+        if not self._is_greeted():
+            if self._reconnects or not self._ws.is_active():
+                raise NotSent(
+                    f"hub session: {call.name.lower()}: not sent: the connection is reconnecting"
+                )
+            else:
+                raise NotSent(f"hub session: {call.name.lower()}: not sent: awaiting its hello")
         request_id = self._next_request_id
         self._next_request_id += 1
         timer = self._loop.call_later(
@@ -239,7 +244,15 @@ class HubSession:
             flight.symbol = arguments["request"]["symbol"]
         self._in_flight[request_id] = flight
         try:
-            await self._send(binary.encode(binary.Request(request_id, call, count, body)))
+            sent = await self._send(binary.encode(binary.Request(request_id, call, count, body)))
+            if not sent:
+                if request_id in self._in_flight:
+                    self._end(request_id)
+                if flight.future.done():
+                    flight.future.exception()
+                else:
+                    flight.future.cancel()
+                raise NotSent(f"hub session: {call.name.lower()}: not sent: the write was refused")
         except asyncio.CancelledError:
             # A flight whose request may not have gone out is withdrawn; one whose request went out
             # is the session's to finish, its answer taken as any other once its caller has gone.
@@ -271,15 +284,12 @@ class HubSession:
     async def _send_wanted(self) -> None:
         async with self._wanting:
             reconnects = self._reconnects
-            await self._send(binary.encode(binary.AdapterHello()))
-            for subscription in self._wanted:
-                await self._send(binary.encode(binary.Subscribe(self._op_id(), subscription)))
-            self._greeted = reconnects
-            # A reconnect while this resend ran leaves the next connection to its own hello.
-            if reconnects == self._reconnects:
-                self._greeting.set()
+            if await self._send(binary.encode(binary.AdapterHello())):
+                self._greeted = reconnects
+                for subscription in self._wanted:
+                    await self._send(binary.encode(binary.Subscribe(self._op_id(), subscription)))
 
-    async def _send(self, raw: bytes) -> None:
+    async def _send(self, raw: bytes) -> bool:
         """Sends a frame; one the connection drops is lost with it, and the reconnect resends the
         wanted set and fails every request in flight. NT's client turns a reconnected socket active
         before it calls back, and sends a frame it held through the outage at once, so that frame
@@ -289,6 +299,9 @@ class HubSession:
             await self._ws.send(raw)
         except (WebSocketClientError, RuntimeError) as exc:
             self._log.info(f"hub session: a frame not sent, the reconnect starts over: {exc}")
+            return False
+        else:
+            return True
 
     def _on_message(self, raw: bytes) -> None:
         """Takes a frame from the hub: an answer to its request, a stream frame to the owner; logs a
@@ -405,11 +418,9 @@ class HubSession:
         self._loop.call_soon_threadsafe(self._on_reconnected)
 
     def _on_reconnected(self) -> None:
-        """Holds back every op and request until the new connection's hello, fails the requests in
-        flight, tells the owner, then sends the hello and the whole wanted set again and asks the
-        outcomes of the commands not yet settled."""
+        """Fails the requests in flight, tells the owner, then reasserts the session's desired
+        subscriptions after a new hello and asks the outcomes of unsettled commands."""
         self._reconnects += 1
-        self._greeting.clear()
         self._fail_in_flight(ResponseLost, "unanswered: the hub connection was lost")
         self._log.info("hub session: reconnected, subscribing again what is wanted")
         if self._on_reconnect is not None:
