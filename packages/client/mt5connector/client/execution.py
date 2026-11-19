@@ -1357,15 +1357,18 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     self._cancel_rejected(order, order.venue_order_id, f"not sent: {exc}")
         else:
             ours = [venue_order for venue_order in venue_orders if venue_order.magic == self._magic]
+            removes = []
             for venue_order in ours:
                 order = self._order_behind(venue_order)
                 if order is not None and _commanded(order, command):
-                    await self._remove(order, venue_order.ticket)
+                    removes.append(self._remove(order, venue_order.ticket))
+            await asyncio.gather(*removes)
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         """Removes each pending order the batch names, as a cancel of each would."""
-        for cancel in command.cancels:
-            await self._cancel(self._cache.order(cancel.client_order_id))
+        await asyncio.gather(
+            *(self._cancel(self._cache.order(cancel.client_order_id)) for cancel in command.cancels)
+        )
 
     async def _cancel(self, order: Order) -> None:
         exit_id = _exit_id_of(order)
@@ -1635,14 +1638,15 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             historical = await self._read(
                 calls.Call.HISTORY_ORDERS_GET, date_from=date_from, date_to=date_to
             )
-            for order in historical:
-                if await self._is_ours(order, self._read) and _in_scope(
-                    order.symbol, command.instrument_id
-                ):
+            ownership = await asyncio.gather(
+                *(self._is_ours(order, self._read) for order in historical)
+            )
+            for order, ours in zip(historical, ownership, strict=True):
+                if ours and _in_scope(order.symbol, command.instrument_id):
                     venue_orders.setdefault(order.ticket, order)
         reports = []
         executed = {}
-        for venue_order in venue_orders.values():
+        for venue_order in sorted(venue_orders.values(), key=attrgetter("ticket")):
             if self._provider.get_instrument(venue_order.symbol) is None:
                 self._log.debug(
                     f"Skipping order status report for instrument not loaded: {venue_order.symbol}"
@@ -1657,13 +1661,28 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             report.client_order_id: report
             for report in await self._exit_reports(command.instrument_id)
         }
-        for client_order_id, exit_order in executed.items():
-            if client_order_id not in exit_reports:
-                exit_reports[client_order_id] = await self._executed_exit_report(exit_order)
+        missing = [
+            exit_order
+            for client_order_id, exit_order in executed.items()
+            if client_order_id not in exit_reports
+        ]
+        completed = await asyncio.gather(*(self._executed_exit_report(order) for order in missing))
+        exit_reports.update(
+            (order.client_order_id, report)
+            for order, report in zip(missing, completed, strict=True)
+        )
         for report in exit_reports.values():
             if report.is_open or not command.open_only:
                 reports.append(report)
-        return reports
+
+        def report_key(report):
+            exit_id = _exit_id(report.venue_order_id)
+            if exit_id is None:
+                return int(report.venue_order_id.value), "", 0
+            else:
+                return exit_id.identifier, exit_id.slot.value, exit_id.generation
+
+        return sorted(reports, key=report_key)
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
         """The fills of this trader's deals in the venue's history over the command's window, each
@@ -1673,8 +1692,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._conn.ensure_connected()
         date_from, date_to = self._window(command)
         deals = await self._read(calls.Call.HISTORY_DEALS_GET, date_from=date_from, date_to=date_to)
-        reports = []
-        for deal in deals:
+
+        async def report(deal):
             owner = self._bracket_owner(deal)
             if (
                 (owner is not None or await self._is_fill(deal, self._read))
@@ -1685,9 +1704,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     self._log.debug(
                         f"Skipping fill report for instrument not loaded: {deal.symbol}"
                     )
-                    continue
-                reports.append(await self._fill_report(deal, owner))
-        return reports
+                else:
+                    return await self._fill_report(deal, owner)
+            return None
+
+        reports = await asyncio.gather(
+            *(report(deal) for deal in sorted(deals, key=attrgetter("ticket")))
+        )
+        return [report for report in reports if report is not None]
 
     async def generate_position_status_reports(
         self,
@@ -1775,6 +1799,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 position.identifier: position
                 for position in await self._venue_positions(instrument_id)
             }
+            reads = []
             for identifier, slot in sorted(brackets):
                 position = positions.get(identifier)
                 if position is not None and self._provider.get_instrument(position.symbol) is None:
@@ -1782,7 +1807,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                         f"Skipping bracket report for instrument not loaded: {position.symbol}"
                     )
                     continue
-                reports += await self._bracket_reports(identifier, slot, orders, position)
+                reads.append(self._bracket_reports(identifier, slot, orders, position))
+            for bracket in await asyncio.gather(*reads):
+                reports += bracket
         return reports
 
     async def _bracket_reports(
