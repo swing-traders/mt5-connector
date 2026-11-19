@@ -60,6 +60,9 @@ New code fails loud:
 - A CLI validates every flag before the job starts — its value, the flags it is combined with, and whatever it names (a symbol, a path, a server) — never at the point of use.
 - Parsers and providers crash on bad input from the terminal or the server, not silently emit a default or a NaN.
 - Lifecycle methods crash if the state transition is wrong — a connect on an already-connected client, a disconnect on one never connected.
+- At the client boundary, connection failures fail at once and are never waited out. A command is served now or refused now; no retry or admission wait is added ahead of it.
+- API-contract deferrals are honoured where the call's contract says to wait, never treated as failures: history and provider reads, and the event path's fill-completion reads. A command or reconciliation report does not inherit those waits.
+- NT-owned startup and reconciliation, session-owned subscription reconciliation, chart setup and keyed venue-verdict or outcome retrieval keep their named lifetimes. None becomes a barrier that holds a consumer's command.
 
 Don't add `if x is None: return` to bury a real problem. Find the real cause; either fix it or crash with a useful message.
 
@@ -310,7 +313,7 @@ The terminal substitutes nearest-available data, serves only what it has synced 
 - **Floors are measured, never assumed, once per series**: a bar series' floor is the first of its first two rows one period apart, found by walking the series forward from the store's first row, which each frame is built to reach, or a capped frame's first readable row, and a daily or weekly series' its first row; a series holding no such pair is empty history. The tick series' floor is the quote floor, the earlier of the first real tick and the first M1 bar recording a spread. A floor stands for the history EA's life; a capped series' is measured at every request.
 - **Every bar is held to its timeframe's grid, and ticks to time order**; a row that breaks either fails the answer.
 - **Every bar leaves the hub with its close**, `time_close`, beside the open MT5 stamps, pushed and answered alike, computed in `encoding` alone — `bar_close`, and `bar_closes` for an array of bars —: a frame on the broker day's grid (H2 to W1) closes at the next grid open on the broker's clock, a finer one a period of real time after its open. The client stamps NT's bar at that close, asks in open-time bounds, and keeps the bars whose close a range names.
-- **A consumer retries only what the hub tells it to**: a session's `deferring` asks again after each deferring answer's delay until it is answered otherwise or its caller cancels; it has no deadline of its own.
+- **A consumer whose API contract waits retries only what the hub tells it to**: a session's `deferring` asks again after each deferring answer's delay until it is answered otherwise or its caller cancels; it has no deadline of its own. Connection failures and command refusals are not deferrals.
 
 ---
 

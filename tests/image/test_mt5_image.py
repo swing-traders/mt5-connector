@@ -20,9 +20,14 @@ import types
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 
 import pytest
+from websockets.sync.client import connect
+
+from mt5connector.server.wire import binary
+from mt5connector.server.wire.push_wire import ChartRole
 
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
@@ -1383,7 +1388,7 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
         assert answered is not None, "the hub never answered /health"
         answered_at = datetime.now(UTC)
         status, body = answered
-        assert status == 503
+        assert status == HTTPStatus.SERVICE_UNAVAILABLE
         assert body["result"]["account"] is False
         assert (body["ok"], body["result"]["spawner"], body["result"]["clock"]) == (
             False,
@@ -1401,5 +1406,26 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
         latest = probes[-1]
         assert latest["ExitCode"] == 1, latest
         assert "503" in latest["Output"] and "not found" not in latest["Output"], latest
+
+        spec = importlib.util.spec_from_file_location(
+            "image_ea_wire", Path(__file__).resolve().parents[1] / "server" / "ea_wire.py"
+        )
+        ea_wire = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = ea_wire
+        spec.loader.exec_module(ea_wire)
+        with connect(f"ws://127.0.0.1:{hub}") as spawner:
+            spawner.send(ea_wire.encode_ea(binary.EaHello(ChartRole.SPAWNER, "EURUSD")))
+            deadline = time.monotonic() + 5
+            while True:
+                after_spawner = _health(hub)
+                if after_spawner is not None and after_spawner[1]["result"]["spawner"]:
+                    break
+                assert time.monotonic() < deadline, "the fake spawner's hello was not accepted"
+                time.sleep(0.01)
+            status, body = after_spawner
+            assert status == HTTPStatus.SERVICE_UNAVAILABLE
+            assert body["error"] == "no account EA is connected"
+            assert body["result"]["spawner"] is True
+            assert body["result"]["account"] is False
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
