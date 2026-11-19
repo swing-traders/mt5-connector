@@ -622,15 +622,15 @@ async def test_a_stop_answer_refusal_keeps_the_targets_already_sent_level(exec_v
 
 
 @pytest.mark.parametrize(
-    ("retcode", "stop_level", "stop_event"),
+    ("retcode", "stop_event"),
     [
-        (mirror.TRADE_RETCODE_DONE, 1.08, "OrderUpdated"),
-        (mirror.TRADE_RETCODE_INVALID_STOPS, 1.08, "OrderModifyRejected"),
+        (mirror.TRADE_RETCODE_DONE, "OrderUpdated"),
+        (mirror.TRADE_RETCODE_INVALID_STOPS, "OrderModifyRejected"),
     ],
     ids=["amended", "refused"],
 )
-async def test_a_target_amended_during_a_stops_amend_carries_nts_stop_without_waiting(
-    exec_venue, retcode, stop_level, stop_event
+async def test_a_target_amended_during_a_stops_amend_carries_the_amends_level_without_waiting(
+    exec_venue, retcode, stop_event
 ):
     h, stop_order, target_order = await occupied(exec_venue)
     _, waiting = await in_flight(
@@ -639,8 +639,8 @@ async def test_a_target_amended_during_a_stops_amend_carries_nts_stop_without_wa
         modify_command(target_order, price=Price.from_str("1.10500")),
     )
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
     ]
     assert waiting.done()
 
@@ -649,8 +649,8 @@ async def test_a_target_amended_during_a_stops_amend_carries_nts_stop_without_wa
     await h.verdict(request_id=2)
 
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, stop_level, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
     ]
     assert h.names() == [stop_event, "AccountState", "OrderUpdated", "AccountState"]
     assert (h.events[1].client_order_id, h.events[1].price) == (
@@ -660,19 +660,19 @@ async def test_a_target_amended_during_a_stops_amend_carries_nts_stop_without_wa
 
 
 @pytest.mark.parametrize(
-    ("retcode", "stop_level"),
-    [(mirror.TRADE_RETCODE_DONE, 1.08), (mirror.TRADE_RETCODE_INVALID_STOPS, 1.08)],
+    "retcode",
+    [mirror.TRADE_RETCODE_DONE, mirror.TRADE_RETCODE_INVALID_STOPS],
     ids=["cleared", "refused"],
 )
-async def test_a_target_placed_during_a_stop_clear_carries_nts_stop_without_waiting(
-    exec_venue, retcode, stop_level
+async def test_a_target_placed_during_a_stop_clear_carries_no_stop_without_waiting(
+    exec_venue, retcode
 ):
     h, stop_order, _ = await occupied(exec_venue)
     moved = target(h, price="1.10500")
     _, waiting = await in_flight(h, cancel_command(stop_order), submit_command(h, moved))
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.105),
     ]
     assert waiting.done()
 
@@ -682,7 +682,7 @@ async def test_a_target_placed_during_a_stop_clear_carries_nts_stop_without_wait
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, stop_level, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.105),
     ]
     accepted = [event for event in h.events if type(event).__name__ == "OrderAccepted"]
     assert [(event.client_order_id, event.venue_order_id) for event in accepted] == [
@@ -744,12 +744,12 @@ async def test_a_later_clear_refusal_does_not_change_the_targets_sent_levels(exe
 
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 0.0, 1.105),
     ]
     assert h.logged(LogLevel.WARNING) == []
 
 
-async def test_a_target_during_two_stop_amends_carries_nts_unchanged_stop_without_waiting(
+async def test_a_target_during_two_stop_amends_carries_the_latest_started_level_without_waiting(
     exec_venue,
 ):
     h, stop_order, target_order = await occupied(exec_venue)
@@ -766,14 +766,14 @@ async def test_a_target_during_two_stop_amends_carries_nts_unchanged_stop_withou
     await asyncio.wait_for(waiting, timeout=2.0)
 
     assert [sltp(request) for request in sent_requests(h)] == [
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.086, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.086, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.086, 1.105),
     ]
     assert h.logged(LogLevel.WARNING) == []
 
 
-async def test_a_target_uses_nts_standing_stop_while_its_amend_and_a_closed_stops_are_unanswered(
+async def test_a_target_uses_the_standing_stops_amend_and_ignores_a_closed_stops_amend(
     exec_venue,
 ):
     h, older_stop, target_order = await occupied(exec_venue)
@@ -791,7 +791,7 @@ async def test_a_target_uses_nts_standing_stop_while_its_amend_and_a_closed_stop
     assert [sltp(request) for request in sent_requests(h)] == [
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.1),
         (mirror.TRADE_ACTION_SLTP, POSITION, 1.093, 1.1),
-        (mirror.TRADE_ACTION_SLTP, POSITION, 1.08, 1.105),
+        (mirror.TRADE_ACTION_SLTP, POSITION, 1.083, 1.105),
     ]
     assert h.logged(LogLevel.WARNING) == []
 

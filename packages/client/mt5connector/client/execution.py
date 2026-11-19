@@ -13,6 +13,8 @@ venue:
 - the commands in flight: those whose immediate answer is outstanding, in the order they started,
   and those the terminal sent, by request id, until their verdict — kept across a disconnect, since
   the session settles them at its next connect;
+- the start sequence of each command and the last proven level per position and bracket slot,
+  cleared on disconnect; a lost outcome forgets that slot's proof;
 - the verdicts of this trader's requests no command awaited when they came, held only for an
   unanswered command naming their order comment, order ticket or bracket position;
 - the handling of each pushed transaction still reading the venue;
@@ -278,6 +280,7 @@ class _Pending:
 
     command: Command
     order: Order
+    sequence: int
     slot: Slot | None = None
     identifier: int | None = None
     level: Price | None = None
@@ -458,6 +461,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._unresolved: set[int] = set()
         self._unanswered: list[_Pending] = []
         self._pending: dict[int, _Pending] = {}
+        self._command_sequence = 0
+        self._proven: dict[tuple[int, Slot], Price | None] = {}
         self._held: dict[int, _Held] = {}
         self._handlers: set[asyncio.Task] = set()
         self._account_owed = False
@@ -542,6 +547,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if self._hub.connected:
             await self._hub.disconnect()
         self._held.clear()
+        self._proven.clear()
         self._client_order_ids.clear()
         self._tickets.clear()
         self._seen_deals.clear()
@@ -1086,14 +1092,28 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             await self._command(pending, request)
 
     def _other_level(self, pending: _Pending, identifier: int) -> Price | None:
-        """The level NT holds for the latest standing exit in a position's other slot."""
-        for exit_order in reversed(self._exits(identifier, _other_slot(pending.slot))):
+        """The other slot's latest intended level, else its proven level or NT's standing level."""
+        slot = _other_slot(pending.slot)
+        key = (identifier, slot)
+        for exit_order in reversed(self._exits(identifier, slot)):
             placing = self._placing(exit_order)
             if not exit_order.is_closed and (
                 exit_order.status != OrderStatus.INITIALIZED
                 or (placing is not None and placing.position_ticket is not None)
+                or key in self._proven
             ):
-                return _exit_level(exit_order)
+                changing = [
+                    command
+                    for command in (*self._unanswered, *self._pending.values())
+                    if command.command in (Command.AMEND, Command.CLEAR)
+                    and command.order.client_order_id == exit_order.client_order_id
+                ]
+                if changing:
+                    return max(changing, key=attrgetter("sequence")).level
+                elif key in self._proven:
+                    return self._proven[key]
+                else:
+                    return _exit_level(exit_order)
         return None
 
     async def _modify_exit(self, order: Order, exit_id: _ExitId, command: ModifyOrder) -> None:
@@ -1118,7 +1138,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 await self._refresh_account()
         else:
             pending = self._started(
-                Command.AMEND, order, slot=exit_id.slot, quantity=command.quantity, level=level
+                Command.AMEND,
+                order,
+                slot=exit_id.slot,
+                identifier=exit_id.identifier,
+                quantity=command.quantity,
+                level=level,
             )
             await self._bracket_command(pending, exit_id.identifier, level)
 
@@ -1146,7 +1171,9 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             await self._clear_bracket(order, exit_id)
 
     async def _clear_bracket(self, order: Order, exit_id: _ExitId) -> None:
-        pending = self._started(Command.CLEAR, order, slot=exit_id.slot)
+        pending = self._started(
+            Command.CLEAR, order, slot=exit_id.slot, identifier=exit_id.identifier
+        )
         try:
             self._conn.ensure_connected()
             position = await self._position(exit_id.identifier, order.instrument_id.symbol.value)
@@ -1428,7 +1455,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     def _started(self, command: Command, order: Order, **fields) -> _Pending:
         """A command started, unanswered until the terminal answers its request."""
-        pending = _Pending(command, order, **fields)
+        self._command_sequence += 1
+        pending = _Pending(command, order, self._command_sequence, **fields)
         self._unanswered.append(pending)
         return pending
 
@@ -1475,6 +1503,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         elif sent.outcome == SendOutcome.NOT_SENT:
             self._rejected(pending, sent.reason)
         else:
+            if pending.command in _BRACKET_COMMANDS:
+                self._proven.pop((pending.identifier, pending.slot), None)
             self._log.warning(
                 f"{pending.order.client_order_id!r} {pending.command}: {sent.reason}; {_LOST}"
             )
@@ -1487,6 +1517,8 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         if outcome == SendOutcome.DONE:
             self._done(pending, result["order"])
         elif outcome == SendOutcome.LOST:
+            if pending.command in _BRACKET_COMMANDS:
+                self._proven.pop((pending.identifier, pending.slot), None)
             self._log.warning(
                 f"{pending.order.client_order_id!r} {pending.command}: {reason}; {_LOST}"
             )
@@ -1498,6 +1530,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         """Emits what a command the venue completed did; `ticket` is the order a placement
         placed."""
         ts_event = self._clock.timestamp_ns()
+        if pending.command == Command.BRACKET:
+            self._proven[(pending.identifier, pending.slot)] = _exit_level(pending.order)
+        elif pending.command in (Command.AMEND, Command.CLEAR):
+            self._proven[(pending.identifier, pending.slot)] = pending.level
         if pending.command == Command.PLACE:
             self._index(ticket, pending.order.client_order_id)
             self._accepted(pending.order, VenueOrderId(str(ticket)), ts_event)
