@@ -4,11 +4,11 @@ definition is typed by its calc mode and filled from the venue's own facts alone
 from __future__ import annotations
 
 import calendar
-import time
 from decimal import Decimal, localcontext
 from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
+import numpy as np
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, MarkPriceUpdate, QuoteTick
 from nautilus_trader.model.enums import AssetClass, BarAggregation, PriceType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
@@ -22,8 +22,6 @@ from mt5connector.wire.calls import SymbolMarginRate
 from mt5connector.wire.history_wire import BAR_CLOSE, Series, bar_series
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from mt5connector.client.connection import AccountSnapshot
     from mt5connector.client.sessions import TradingSessions
 
@@ -433,18 +431,30 @@ def _decimals(value: float) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def parse_quote_tick(row, instrument: InstrumentAny) -> QuoteTick:
-    """A history tick row as a QuoteTick stamped at its time_msc: bid and ask as the venue quotes
-    them, and both sizes the instrument's largest order, since the venue publishes no depth."""
-    return QuoteTick(
-        instrument_id=instrument.id,
-        bid_price=instrument.make_price(row["bid"]),
-        ask_price=instrument.make_price(row["ask"]),
-        bid_size=instrument.max_quantity,
-        ask_size=instrument.max_quantity,
-        ts_event=int(row["time_msc"]) * 1_000_000,
-        ts_init=time.time_ns(),
+def quote_ticks_from_rows(
+    rows: np.ndarray, instrument: InstrumentAny, ts_init: int
+) -> list[QuoteTick]:
+    """Quote rows as NT ticks, both sizes the instrument's largest order: the venue has no depth."""
+    precision = max(0, -instrument.price_increment.as_decimal().normalize().as_tuple().exponent)
+    # NT's batch API takes double arrays even in its high-precision build.
+    sizes = np.full(len(rows), instrument.max_quantity.as_double(), dtype=np.float64)
+    return QuoteTick.from_raw_arrays_to_list(
+        instrument.id,
+        instrument.price_precision,
+        instrument.size_precision,
+        np.round(rows["bid"], precision),
+        np.round(rows["ask"], precision),
+        sizes,
+        sizes,
+        _nanosecond_times(rows["time_msc"], 1_000_000),
+        np.full(len(rows), ts_init, dtype=np.uint64),
     )
+
+
+def _nanosecond_times(values: np.ndarray, scale: int) -> np.ndarray:
+    if np.any(values < 0) or np.any(values > np.iinfo(np.uint64).max // scale):
+        raise OverflowError("timestamp is outside the nanosecond range")
+    return values.astype(np.uint64) * np.uint64(scale)
 
 
 # Map MT5 timeframe integers to NautilusTrader BarAggregation + step
@@ -480,20 +490,6 @@ _VENUE_SERIES: dict[tuple[int, BarAggregation], Series] = {
 }
 
 
-def quote_tick_from_frame(frame: np.void, instrument: InstrumentAny, ts_init: int) -> QuoteTick:
-    """A pushed tick as a QuoteTick stamped at its time_msc: bid and ask as the venue quotes them,
-    and both sizes the instrument's largest order, since the venue publishes no depth."""
-    return QuoteTick(
-        instrument_id=instrument.id,
-        bid_price=instrument.make_price(frame["bid"]),
-        ask_price=instrument.make_price(frame["ask"]),
-        bid_size=instrument.max_quantity,
-        ask_size=instrument.max_quantity,
-        ts_event=frame["time_msc"] * 1_000_000,
-        ts_init=ts_init,
-    )
-
-
 def mark_at_mid(quote: QuoteTick) -> MarkPriceUpdate:
     """The mark at a quote's mid, one decimal finer than the quote so every mid is exact."""
     mid = (quote.bid_price.as_decimal() + quote.ask_price.as_decimal()) / 2
@@ -518,6 +514,24 @@ def venue_bar(rates, bar_type: BarType, instrument: InstrumentAny) -> Bar:
         volume=Quantity(int(rates["tick_volume"]), 0),
         ts_event=ts_event,
         ts_init=ts_event,
+    )
+
+
+def venue_bars(rows: np.ndarray, bar_type: BarType, instrument: InstrumentAny) -> list[Bar]:
+    """Venue bars stamped at their closes, with the venue's tick volume."""
+    precision = max(0, -instrument.price_increment.as_decimal().normalize().as_tuple().exponent)
+    timestamps = _nanosecond_times(rows[BAR_CLOSE], 1_000_000_000)
+    return Bar.from_raw_arrays_to_list(
+        bar_type,
+        instrument.price_precision,
+        0,
+        np.round(rows["open"], precision),
+        np.round(rows["high"], precision),
+        np.round(rows["low"], precision),
+        np.round(rows["close"], precision),
+        rows["tick_volume"].astype(np.float64),
+        timestamps,
+        timestamps,
     )
 
 

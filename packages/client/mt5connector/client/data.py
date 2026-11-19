@@ -9,6 +9,7 @@ the config times."""
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -41,9 +42,9 @@ from mt5connector.client.hub import HubSession
 from mt5connector.client.parsing import (
     InstrumentAny,
     mark_at_mid,
-    parse_quote_tick,
-    quote_tick_from_frame,
+    quote_ticks_from_rows,
     venue_bar,
+    venue_bars,
     venue_series,
 )
 from mt5connector.wire import binary, calls
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
     from mt5connector.client.config import MT5Config
     from mt5connector.client.connection import MT5Connection
     from mt5connector.client.providers import MT5InstrumentProvider
+
+_CONSTRUCTION_BATCH = 10_000
 
 
 @dataclass(eq=False)
@@ -212,8 +215,7 @@ class MT5DataClient(LiveMarketDataClient):
         venue bar of every bar type subscribed to its series."""
         if isinstance(frame, binary.Ticks):
             instrument = self._instrument(frame.symbol)
-            for tick in frame.ticks:
-                quote = quote_tick_from_frame(tick, instrument, self._clock.timestamp_ns())
+            for quote in quote_ticks_from_rows(frame.ticks, instrument, self._clock.timestamp_ns()):
                 self._handle_data(quote)
                 self._handle_data(mark_at_mid(quote))
         elif isinstance(frame, binary.Bar):
@@ -402,7 +404,15 @@ class MT5DataClient(LiveMarketDataClient):
                 f"MT5DataClient: ticks for {symbol} {_iso(start)}..{_iso(end)} failed: {exc}"
             )
         else:
-            ticks = [parse_quote_tick(row, instrument) for row in rows]
+            ticks = []
+            for start in range(0, len(rows), _CONSTRUCTION_BATCH):
+                if start:
+                    await asyncio.sleep(0)
+                ticks.extend(
+                    quote_ticks_from_rows(
+                        rows[start : start + _CONSTRUCTION_BATCH], instrument, time.time_ns()
+                    )
+                )
             self._handle_quote_ticks(
                 instrument.id, ticks, request.id, request.start, request.end, request.params
             )
@@ -429,10 +439,16 @@ class MT5DataClient(LiveMarketDataClient):
                 f"{_iso(first_close)}..{_iso(last_close)} failed: {exc}"
             )
         else:
-            bars = [
-                venue_bar(row, request.bar_type, instrument)
-                for row in history.closing(rows, first_close, last_close)
-            ]
+            rows = history.closing(rows, first_close, last_close)
+            bars = []
+            for start in range(0, len(rows), _CONSTRUCTION_BATCH):
+                if start:
+                    await asyncio.sleep(0)
+                bars.extend(
+                    venue_bars(
+                        rows[start : start + _CONSTRUCTION_BATCH], request.bar_type, instrument
+                    )
+                )
             self._handle_bars(
                 request.bar_type, bars, request.id, request.start, request.end, request.params
             )

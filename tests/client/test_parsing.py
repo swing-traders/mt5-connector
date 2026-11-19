@@ -16,8 +16,8 @@ from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.parsing import (
     _MT5_TIMEFRAME_MAP,
-    parse_quote_tick,
     parse_symbol_info,
+    quote_ticks_from_rows,
     venue_bar,
     venue_bar_type,
 )
@@ -52,6 +52,10 @@ TICKS = np.dtype(list(mirror.TICKS.dtype))
 def make_tick_row(bid=1.08500, ask=1.08502, time_msc=1700000000123):
     """A history tick row as the shim decodes it."""
     return np.array([(time_msc // 1000, bid, ask, 0.0, 0, time_msc, 6, 0.0)], dtype=TICKS)[0]
+
+
+def parse_quote_tick(row, instrument):
+    return quote_ticks_from_rows(np.array([row], dtype=TICKS), instrument, 0)[0]
 
 
 def make_rate(
