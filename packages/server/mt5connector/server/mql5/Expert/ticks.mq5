@@ -78,9 +78,7 @@ long g_openedCharts[];
 ENUM_CHART_ROLE g_openedRoles[];
 string g_openedSymbols[];
 
-// The open_chart and close_chart frames the spawner has not served, in arrival order. It serves one
-// per timer pass: the terminal tears a chart down, and loads a template's EA, after the call
-// returns.
+// Chart teardown and template loading finish after the call returns.
 ENUM_HUB_FRAME g_chartFrameKinds[];
 ENUM_CHART_ROLE g_chartFrameRoles[];
 string g_chartFrameSymbols[];
@@ -93,8 +91,7 @@ long g_closingCharts[];
 string g_closingSymbols[];
 ulong g_closingSince[];
 
-// The charts the last periodic sweep found that the connector has not allocated; one found again
-// is closed.
+// Charts unallocated on the preceding cleanup round; a second sighting permits their close.
 long g_unallocatedSeen[];
 // The charts the sweep closed that the terminal still lists; a chart is closed by the sweep once.
 long g_sweptCharts[];
@@ -102,6 +99,27 @@ long g_sweptCharts[];
 // or whose deselect the terminal refused; a symbol is reported once per spell.
 string g_heldReported[];
 string g_refusedReported[];
+string g_heldThisRound[];
+string g_refusedThisRound[];
+string g_goneSymbols[];
+long g_templateFailedCharts[];
+string g_templateFailedSymbols[];
+bool g_chartCloseUsed = false;
+bool g_deselectUsed = false;
+enum ENUM_CLEANUP_PHASE
+{
+    CLEANUP_CHARTS,
+    CLEANUP_SYMBOLS
+};
+ENUM_CLEANUP_PHASE g_cleanupPhase = CLEANUP_CHARTS;
+bool g_cleanupStarted = false;
+long g_cleanupChart = -1;
+int g_cleanupSymbol = -1;
+long g_listedThisRound[];
+long g_unallocatedThisRound[];
+// Last observed chart symbols, updated by opens and completed teardowns between cursor rounds.
+long g_knownCharts[];
+string g_knownSymbols[];
 
 // The publisher's outcome log, a ring: g_outcomeNext is the slot the next transaction takes.
 Outcome g_outcomes[OUTCOME_RING];
@@ -3236,8 +3254,37 @@ int OpenedIndex(const ENUM_CHART_ROLE role, const string symbol)
     return -1;
 }
 
+void RememberKnownChart(const long chart, const string symbol)
+{
+    for (int i = 0; i < ArraySize(g_knownCharts); i++)
+    {
+        if (g_knownCharts[i] == chart)
+        {
+            g_knownSymbols[i] = symbol;
+            return;
+        }
+    }
+    Push(g_knownCharts, chart);
+    Push(g_knownSymbols, symbol);
+}
+
+void ForgetKnownChart(const long chart)
+{
+    for (int i = ArraySize(g_knownCharts) - 1; i >= 0; i--)
+    {
+        if (g_knownCharts[i] == chart)
+        {
+            ArrayRemove(g_knownCharts, i, 1);
+            ArrayRemove(g_knownSymbols, i, 1);
+        }
+    }
+}
+
 void RememberOpened(const long chart, const ENUM_CHART_ROLE role, const string symbol)
 {
+    RememberKnownChart(chart, symbol);
+    if (g_cleanupPhase == CLEANUP_CHARTS)
+        Push(g_listedThisRound, chart);
     const int n = ArraySize(g_openedCharts);
     ArrayResize(g_openedCharts, n + 1);
     ArrayResize(g_openedRoles, n + 1);
@@ -3330,6 +3377,9 @@ void ForgetGoneClosing()
     {
         if (!Listed(g_closingCharts[i]))
         {
+            ForgetKnownChart(g_closingCharts[i]);
+            if (!Holds(g_goneSymbols, g_closingSymbols[i]))
+                Push(g_goneSymbols, g_closingSymbols[i]);
             ForgetClosing(i);
         }
         else if (now - g_closingSince[i] >= (ulong)CHART_CLOSE_GONE_SECONDS * 1000)
@@ -3399,10 +3449,19 @@ void KeepListed(const long &listed[])
         if (!found)
             ArrayRemove(g_sweptCharts, i, 1);
     }
+    for (int i = ArraySize(g_knownCharts) - 1; i >= 0; i--)
+    {
+        bool found = false;
+        for (int j = 0; j < ArraySize(listed) && !found; j++)
+            found = listed[j] == g_knownCharts[i];
+        if (!found)
+            ForgetKnownChart(g_knownCharts[i]);
+    }
 }
 
 void CloseUnallocated(const long chart, const string symbol)
 {
+    g_chartCloseUsed = true;
     Push(g_sweptCharts, chart);
     // Read ahead of the close: a synchronous chart call on a chart being torn down blocks the EA.
     string expert;
@@ -3421,89 +3480,130 @@ void CloseUnallocated(const long chart, const string symbol)
     }
 }
 
-// Closes every listed chart the connector has not allocated, each once and only when an earlier
-// sighting pass found it so; a sighting pass also records what it found unallocated. Leaves the
-// symbols of the allocated charts in allocated[]. A chart being torn down, or closed by the sweep
-// and still listed, is passed over before any read of it.
-void SweepCharts(string &allocated[], const bool sighting)
+bool WaitingOpen(const string symbol)
 {
-    ForgetClosedCharts();
-    long listed[];
-    long unallocated[];
-    long chart = ChartFirst();
-    while (chart != -1)
-    {
-        Push(listed, chart);
-        if (!IsClosing(chart) && !Swept(chart))
-        {
-            const string symbol = ChartSymbol(chart);
-            if (symbol == "")
-            {
-                // A chart that no longer exists answers an empty symbol.
-            }
-            else if (Allocated(chart))
-            {
-                Push(allocated, symbol);
-            }
-            else
-            {
-                Push(unallocated, chart);
-                if (Seen(chart))
-                    CloseUnallocated(chart, symbol);
-            }
-        }
-        chart = ChartNext(chart);
-    }
-    if (sighting)
-        ArraySwap(g_unallocatedSeen, unallocated);
-    KeepListed(listed);
+    for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
+        if (g_chartFrameKinds[i] == HUB_FRAME_OPEN_CHART && g_chartFrameSymbols[i] == symbol)
+            return true;
+    return false;
 }
 
-// Takes out of Market Watch every visible symbol no allocated chart has, when the terminal lets it:
-// a symbol with open positions or pending orders, and one whose chart is still being torn down,
-// stay and are reported once per spell.
-void SweepMarketWatch(const string &allocated[])
+bool WaitingClose()
 {
-    string held[];
-    string refused[];
-    for (int i = SymbolsTotal(true) - 1; i >= 0; i--)
+    for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
+        if (g_chartFrameKinds[i] == HUB_FRAME_CLOSE_CHART)
+            return true;
+    return ArraySize(g_templateFailedCharts) > 0;
+}
+
+void ForgetReported(string &values[], const string symbol)
+{
+    for (int i = ArraySize(values) - 1; i >= 0; i--)
+        if (values[i] == symbol)
+            ArrayRemove(values, i, 1);
+}
+
+void CleanupSymbol(const string symbol)
+{
+    if (SymbolInfoInteger(symbol, SYMBOL_VISIBLE) == 0)
+        return;
+    if (HasClosingChart(symbol) || WaitingOpen(symbol) || Holds(g_knownSymbols, symbol))
+        return;
+    int positions = 0;
+    int orders = 0;
+    CountHoldings(symbol, positions, orders);
+    if (positions > 0 || orders > 0)
     {
-        const string symbol = SymbolName(i, true);
-        if (Holds(allocated, symbol) || HasClosingChart(symbol)
-            || SymbolInfoInteger(symbol, SYMBOL_VISIBLE) == 0)
-            continue;
-        int positions = 0;
-        int orders = 0;
-        CountHoldings(symbol, positions, orders);
-        if (positions > 0 || orders > 0)
+        Push(g_heldThisRound, symbol);
+        if (!Holds(g_heldReported, symbol))
         {
-            Push(held, symbol);
-            if (!Holds(g_heldReported, symbol))
-                PrintFormat("ticks: '%s' stays in Market Watch: %d open positions, %d pending "
-                            "orders", symbol, positions, orders);
+            Push(g_heldReported, symbol);
+            PrintFormat("ticks: '%s' stays in Market Watch: %d open positions, %d pending "
+                        "orders", symbol, positions, orders);
         }
-        else if (SymbolSelect(symbol, false))
+    }
+    else if (!g_deselectUsed)
+    {
+        g_deselectUsed = true;
+        ForgetReported(g_heldReported, symbol);
+        if (SymbolSelect(symbol, false))
         {
+            ForgetReported(g_refusedReported, symbol);
             PrintFormat("ticks: took '%s' out of Market Watch", symbol);
         }
         else
         {
-            Push(refused, symbol);
+            Push(g_refusedThisRound, symbol);
             if (!Holds(g_refusedReported, symbol))
+            {
+                Push(g_refusedReported, symbol);
                 PrintFormat("ticks: '%s' stays in Market Watch: SymbolSelect refused it: %d",
                             symbol, GetLastError());
+            }
         }
     }
-    ArraySwap(g_heldReported, held);
-    ArraySwap(g_refusedReported, refused);
 }
 
-// Charts first: the terminal refuses to take a symbol out of Market Watch while its chart is open.
+// One terminal item per pass; a close and a deselect have independent budgets.
 void Sweep()
 {
-    string allocated[];
-    SweepCharts(allocated, true);
-    SweepMarketWatch(allocated);
+    if (ArraySize(g_goneSymbols) > 0)
+    {
+        const string symbol = g_goneSymbols[0];
+        ArrayRemove(g_goneSymbols, 0, 1);
+        CleanupSymbol(symbol);
+    }
+    if (g_cleanupPhase == CLEANUP_CHARTS)
+    {
+        if (!g_cleanupStarted)
+        {
+            g_cleanupChart = ChartFirst();
+            g_cleanupStarted = true;
+        }
+        if (g_cleanupChart == -1)
+        {
+            ArraySwap(g_unallocatedSeen, g_unallocatedThisRound);
+            ArrayResize(g_unallocatedThisRound, 0);
+            KeepListed(g_listedThisRound);
+            ArrayResize(g_listedThisRound, 0);
+            g_cleanupPhase = CLEANUP_SYMBOLS;
+            g_cleanupSymbol = SymbolsTotal(true) - 1;
+            ArrayResize(g_heldThisRound, 0);
+            ArrayResize(g_refusedThisRound, 0);
+        }
+        else
+        {
+            const long chart = g_cleanupChart;
+            g_cleanupChart = ChartNext(chart);
+            Push(g_listedThisRound, chart);
+            if (!IsClosing(chart) && !Swept(chart))
+            {
+                const string symbol = ChartSymbol(chart);
+                if (symbol != "")
+                    RememberKnownChart(chart, symbol);
+                if (symbol != "" && !Allocated(chart))
+                {
+                    Push(g_unallocatedThisRound, chart);
+                    if (Seen(chart) && !g_chartCloseUsed)
+                        CloseUnallocated(chart, symbol);
+                }
+            }
+        }
+    }
+    else if (g_cleanupSymbol >= 0)
+    {
+        const string symbol = SymbolName(g_cleanupSymbol, true);
+        g_cleanupSymbol--;
+        if (symbol != "")
+            CleanupSymbol(symbol);
+    }
+    else
+    {
+        ArraySwap(g_heldReported, g_heldThisRound);
+        ArraySwap(g_refusedReported, g_refusedThisRound);
+        g_cleanupPhase = CLEANUP_CHARTS;
+        g_cleanupStarted = false;
+    }
 }
 
 // The template that attaches the EA in the role.
@@ -3517,10 +3617,8 @@ string TemplateOf(const ENUM_CHART_ROLE role)
         return ChartTemplate;
 }
 
-// Have a chart of the role and symbol open, and tell the hub whether one is: a chart whose EA is
-// gone takes its template again, and a chart the spawner opened is loading its EA, so the open is
-// idempotent
-void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
+// Open the role's chart and answer it; return false only while a queued close can free its slot.
+bool OpenChart(const ENUM_CHART_ROLE role, const string symbol)
 {
     ForgetClosedCharts();
     const long marked = MarkedChart(role, symbol);
@@ -3569,6 +3667,8 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             const long chart = ChartOpen(symbol, PERIOD_M1);
             if (chart == 0)
             {
+                if (WaitingClose())
+                    return false;
                 failing = "ChartOpen";
                 error = GetLastError();
             }
@@ -3576,11 +3676,8 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             {
                 failing = "ChartApplyTemplate";
                 error = GetLastError();
-                if (ChartClose(chart))
-                    RememberClosing(chart, symbol);
-                else
-                    PrintFormat("ticks: ChartClose of the %s chart of '%s' failed: %d",
-                                ChartRoleName(role), symbol, GetLastError());
+                Push(g_templateFailedCharts, chart);
+                Push(g_templateFailedSymbols, symbol);
             }
             else
             {
@@ -3599,6 +3696,7 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
                     ChartRoleName(role), symbol, failing, error);
         SendChartFailed(role, symbol, error);
     }
+    return true;
 }
 
 // Close the chart of the role and symbol; while the account holds positions or pending orders on
@@ -3606,6 +3704,7 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
 // releases the chart: the hub no longer wants it.
 void CloseChart(const ENUM_CHART_ROLE role, const string symbol)
 {
+    g_chartCloseUsed = true;
     ForgetClosedCharts();
     int positions = 0;
     int orders = 0;
@@ -3724,34 +3823,79 @@ void QueueChartFrame(const ENUM_HUB_FRAME kind, const ENUM_CHART_ROLE role, cons
     g_chartFrameSymbols[n] = symbol;
 }
 
-// Serve the oldest chart frame while the hub takes this EA's frames, so its answer reaches the
-// hub, unless a chart of its symbol the spawner closed is still listed; then it waits, and every
-// frame behind it
+void ForgetChartFrame(const int i)
+{
+    ArrayRemove(g_chartFrameKinds, i, 1);
+    ArrayRemove(g_chartFrameRoles, i, 1);
+    ArrayRemove(g_chartFrameSymbols, i, 1);
+}
+
+// A fresh open waits only on its own symbol's teardown.
+bool PrepareOpen(const string symbol)
+{
+    if (HasClosingChart(symbol))
+        return false;
+    for (long chart = ChartFirst(); chart != -1; chart = ChartNext(chart))
+    {
+        if (!IsClosing(chart) && !Swept(chart) && ChartSymbol(chart) == symbol && !Allocated(chart))
+        {
+            if (!g_chartCloseUsed && !WaitingClose())
+                CloseUnallocated(chart, symbol);
+            return false;
+        }
+    }
+    return true;
+}
+
 void ServeChartFrame()
 {
+    if (Role != ROLE_SPAWNER || !wss.isConnected() || g_refused)
+        return;
+    g_chartCloseUsed = false;
+    g_deselectUsed = false;
     ForgetGoneClosing();
-    if (wss.isConnected() && !g_refused && ArraySize(g_chartFrameKinds) > 0
-        && !HasClosingChart(g_chartFrameSymbols[0]))
+    for (int i = 0; i < ArraySize(g_chartFrameKinds);)
     {
-        if (g_chartFrameKinds[0] == HUB_FRAME_OPEN_CHART)
+        bool priorClose = false;
+        for (int j = 0; j < i && !priorClose; j++)
+            priorClose = g_chartFrameKinds[j] == HUB_FRAME_CLOSE_CHART
+                         && g_chartFrameSymbols[j] == g_chartFrameSymbols[i];
+        if (g_chartFrameKinds[i] == HUB_FRAME_OPEN_CHART && !priorClose
+            && PrepareOpen(g_chartFrameSymbols[i])
+            && OpenChart(g_chartFrameRoles[i], g_chartFrameSymbols[i]))
         {
-            // Charts the connector has not allocated go before a fresh one of the symbol opens.
-            string allocated[];
-            SweepCharts(allocated, false);
-            if (HasClosingChart(g_chartFrameSymbols[0]))
-                return;
+            ForgetChartFrame(i);
         }
-        const ENUM_HUB_FRAME kind = g_chartFrameKinds[0];
-        const ENUM_CHART_ROLE role = g_chartFrameRoles[0];
-        const string symbol = g_chartFrameSymbols[0];
-        ArrayRemove(g_chartFrameKinds, 0, 1);
-        ArrayRemove(g_chartFrameRoles, 0, 1);
-        ArrayRemove(g_chartFrameSymbols, 0, 1);
-        if (kind == HUB_FRAME_OPEN_CHART)
-            OpenChart(role, symbol);
         else
-            CloseChart(role, symbol);
+        {
+            i++;
+        }
     }
+    if (!g_chartCloseUsed)
+    {
+        for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
+        {
+            if (g_chartFrameKinds[i] == HUB_FRAME_CLOSE_CHART)
+            {
+                if (!HasClosingChart(g_chartFrameSymbols[i]))
+                {
+                    CloseChart(g_chartFrameRoles[i], g_chartFrameSymbols[i]);
+                    ForgetChartFrame(i);
+                }
+                break;
+            }
+        }
+        if (!g_chartCloseUsed && ArraySize(g_templateFailedCharts) > 0)
+        {
+            const long chart = g_templateFailedCharts[0];
+            const string symbol = g_templateFailedSymbols[0];
+            ArrayRemove(g_templateFailedCharts, 0, 1);
+            ArrayRemove(g_templateFailedSymbols, 0, 1);
+            if (Listed(chart) && !IsClosing(chart))
+                CloseUnallocated(chart, symbol);
+        }
+    }
+    Sweep();
 }
 
 void OnDuplicateFrame(BinaryReader &reader)
@@ -4030,8 +4174,6 @@ void OnTimer()
         if (GetTickCount64() - g_lastRelay >= (ulong)RelaySeconds * 1000)
         {
             Relay();
-            if (Role == ROLE_SPAWNER && !g_refused)
-                Sweep();
         }
     }
 }
