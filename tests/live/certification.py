@@ -146,7 +146,8 @@ class Throwaway:
             self.container,
             "python3",
             "-c",
-            "import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))",
+            "import pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); "
+            "sys.stdout.buffer.write(data[:data.rfind(b'\\n')+1])",
             self.probe_file,
         )
         rows = csv.DictReader(io.StringIO(contents), delimiter="\t")

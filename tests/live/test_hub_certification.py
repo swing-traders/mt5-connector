@@ -637,6 +637,7 @@ async def test_restart_loses_an_inflight_read_refuses_outage_and_replays_subscri
     session, owner = live
     await session.subscribe(Subscription(Stream.TICKS, SYMBOL))
     await chart_opened(session, SYMBOL, 5)
+    await ask(session, Call.RANGES, symbol=SYMBOL, source=calls.Source.TERMINAL)
     now = int(time.time())
     read = asyncio.create_task(
         session.request(
