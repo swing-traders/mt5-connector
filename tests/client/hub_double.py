@@ -2,10 +2,27 @@
 
 import asyncio
 
+import numpy as np
 from websockets.exceptions import ConnectionClosed
 
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import Sender
+
+
+def tick_rows(*records):
+    return np.array(
+        [tuple(record[name] for name in mirror.TICKS.names) for record in records],
+        dtype=np.dtype(list(mirror.TICKS.dtype)),
+    )
+
+
+def assert_frame_equal(actual, expected):
+    assert type(actual) is type(expected)
+    if isinstance(expected, binary.Ticks):
+        assert actual.symbol == expected.symbol
+        np.testing.assert_array_equal(actual.ticks, expected.ticks)
+    else:
+        assert actual == expected
 
 
 def zeroed(layout: binary.Layout, **values) -> dict:

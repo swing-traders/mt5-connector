@@ -1,17 +1,17 @@
 """The hub, the one endpoint the EAs and the consumers connect to: it fans the EAs' frames out in
 true UTC, routes or answers every request, and has the spawner open and close the charts in use.
 
-State: the connections that said hello — each consumer's subscriptions, each EA's chart role and
-symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
-wanted frame last told each publisher; the spawner; the chart requests held for a role and symbol no
-EA serves, and those the spawner was sent; the MQL5 error the spawner met on each chart it failed to
-open, and when, standing for the failure hold or until that chart opens or its EA says hello; when
-each chart was last in use, and when the spawner was last told to close each chart whose close is
-pending, which outlives the chart's EA; the closes the re-sync owns; the UTC open of the last bar
-fanned out of each series; the latest commission schedule and trading sessions relayed for each
-symbol; the floors learned from ranges answers; the pending requests and the clock gate. The history
-re-sync record alone is persisted on the history volume. Nothing is replayed to a consumer that
-reconnects."""
+State: the connections that said hello — each consumer's subscriptions, indexed by symbol and
+stream, and each EA's chart role and symbol — and each one's queue of frames not yet sent; the EA
+serving each role and symbol, and the wanted frame last told each publisher; the spawner; the chart
+requests held for a role and symbol no EA serves, and those the spawner was sent; the MQL5 error the
+spawner met on each chart it failed to open, and when, standing for the failure hold or until that
+chart opens or its EA says hello; when each chart was last in use, and when the spawner was last
+told to close each chart whose close is pending, which outlives the chart's EA; the closes the
+re-sync owns; the UTC open of the last bar fanned out of each series; the latest commission schedule
+and trading sessions relayed for each symbol; the floors learned from ranges answers; the pending
+requests and clock gate. The history re-sync record alone is persisted on the history volume.
+Nothing is replayed to a consumer that reconnects."""
 
 import asyncio
 import dataclasses
@@ -130,6 +130,7 @@ class Hub:
         )
         self._requests = Requests(expire=self._expired)
         self._consumers: dict[object, _Consumer] = {}
+        self._subscribers: dict[str | None, dict[Subscription, set[object]]] = {}
         self._eas: dict[object, _Ea] = {}
         self._served: dict[tuple[ChartRole, str | None], object] = {}
         self._told: dict[str, binary.Wanted] = {}
@@ -423,16 +424,28 @@ class Hub:
         change routes to it; a subscription to a symbol no publisher serves requests its chart."""
         if isinstance(frame, binary.Subscribe):
             consumer.subscriptions.add(frame.subscription)
-        else:
-            consumer.subscriptions.discard(frame.subscription)
+            streams = self._subscribers.setdefault(frame.subscription.symbol, {})
+            streams.setdefault(frame.subscription, set()).add(ws)
+        elif frame.subscription in consumer.subscriptions:
+            consumer.subscriptions.remove(frame.subscription)
+            self._forget_subscriber(ws, frame.subscription)
         self._mark_used([frame.subscription])
         if self._enqueue(ws, consumer, binary.encode(binary.Ack(frame.op_id))):
-            self._tell_publishers()
-            symbol = frame.subscription.symbol
-            if isinstance(frame, binary.Subscribe) and symbol is not None:
-                key = (ChartRole.PUBLISHER, symbol)
+            if frame.subscription.symbol is not None:
+                self._tell_publisher(frame.subscription.symbol)
+            if isinstance(frame, binary.Subscribe) and frame.subscription.symbol is not None:
+                key = (ChartRole.PUBLISHER, frame.subscription.symbol)
                 if key not in self._served:
                     self._request_chart(key)
+
+    def _forget_subscriber(self, ws, subscription: Subscription) -> None:
+        streams = self._subscribers[subscription.symbol]
+        subscribers = streams[subscription]
+        subscribers.remove(ws)
+        if not subscribers:
+            del streams[subscription]
+        if not streams:
+            del self._subscribers[subscription.symbol]
 
     # ── Streams ───────────────────────────────────────────────────────────────
 
@@ -469,33 +482,32 @@ class Hub:
             self._fan_out(subscription, binary.encode(bar))
 
     def _fan_out(self, subscription: Subscription, raw: bytes) -> None:
-        overflowed = False
-        for ws, consumer in list(self._consumers.items()):
-            if subscription in consumer.subscriptions:
-                overflowed |= not self._enqueue(ws, consumer, raw)
-        if overflowed:
-            self._tell_publishers()
+        subscribers = self._subscribers.get(subscription.symbol, {}).get(subscription, set())
+        for ws in list(subscribers):
+            # An overflow can drop another listener through its EA's pending requests.
+            consumer = self._consumers.get(ws)
+            if consumer is not None:
+                self._enqueue(ws, consumer, raw)
 
-    def _tell_publishers(self) -> None:
-        """Tells each publisher its symbol's wanted frame when it differs from the one last told."""
-        for (chart_role, symbol), ws in list(self._served.items()):
-            if chart_role is ChartRole.PUBLISHER:
-                wanted = self._wanted(symbol)
-                if wanted != self._told[symbol]:
-                    self._told[symbol] = wanted
-                    self._to_ea(ws, wanted)
+    def _tell_publisher(self, symbol: str) -> None:
+        """Tells a publisher its symbol's wanted frame when it differs from the one last told."""
+        ws = self._served.get((ChartRole.PUBLISHER, symbol))
+        if ws is not None:
+            wanted = self._wanted(symbol)
+            if wanted != self._told[symbol]:
+                self._told[symbol] = wanted
+                self._to_ea(ws, wanted)
 
     def _wanted(self, symbol: str) -> binary.Wanted:
         """Whether some consumer subscribes to the symbol's ticks, and the timeframes whose bars
         some consumer subscribes to."""
         ticks = False
         timeframes = set()
-        for consumer in self._consumers.values():
-            for item in consumer.subscriptions:
-                if item.symbol == symbol and item.stream == Stream.TICKS:
-                    ticks = True
-                elif item.symbol == symbol and item.stream == Stream.BARS:
-                    timeframes.add(BAR_TIMEFRAME[item.timeframe])
+        for item in self._subscribers.get(symbol, {}):
+            if item.stream is Stream.TICKS:
+                ticks = True
+            elif item.stream is Stream.BARS:
+                timeframes.add(BAR_TIMEFRAME[item.timeframe])
         return binary.Wanted(symbol, ticks, tuple(sorted(timeframes)))
 
     # ── Relays ────────────────────────────────────────────────────────────────
@@ -609,11 +621,7 @@ class Hub:
     def _in_use(self, key: ChartKey, now: float, *, include_resync: bool = True) -> bool:
         """Whether subscriptions, requests, downloads, re-syncs or the idle grace hold a chart."""
         chart_role, symbol = key
-        subscribed = chart_role is ChartRole.PUBLISHER and any(
-            item.symbol == symbol
-            for consumer in self._consumers.values()
-            for item in consumer.subscriptions
-        )
+        subscribed = chart_role is ChartRole.PUBLISHER and bool(self._subscribers.get(symbol))
         ea = self._served.get(key)
         waited_on = ea is not None and len(self._requests.of_ea(ea)) > 0
         downloading = chart_role is ChartRole.HISTORY and self._resync.first_download_running(
@@ -759,7 +767,8 @@ class Hub:
 
     def _answer(self, ws, ea: _Ea, answer: binary.Answer) -> None:
         """Passes an EA's answer part on to the consumer that asked, its results in true UTC; a part
-        for a request not pending on this EA is dropped with a warning."""
+        for a request not pending on this EA is dropped with a warning. Conversion stays on the hub
+        loop: each EA result part is bounded by calls.PART_BYTES."""
         pending = self._requests.get(ws, answer.request_id)
         if pending is None:
             logger.warning(
@@ -1006,8 +1015,13 @@ class Hub:
         if consumer is not None:
             consumer.outbound.sender.cancel()
             self._requests.consumer_left(ws)
+            for subscription in consumer.subscriptions:
+                self._forget_subscriber(ws, subscription)
             self._mark_used(consumer.subscriptions)
-            self._tell_publishers()
+            for symbol in {
+                item.symbol for item in consumer.subscriptions if item.symbol is not None
+            }:
+                self._tell_publisher(symbol)
         elif ea is not None:
             ea.outbound.sender.cancel()
             if self._served.get(ea.key) is ws:

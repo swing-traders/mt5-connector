@@ -7,6 +7,8 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag, StrEnum
 
+import numpy as np
+
 from . import mirror
 from .history_wire import BARS, Series
 from .push_wire import (
@@ -46,6 +48,7 @@ def _pod(array: mirror.Array) -> struct.Struct:
 
 
 TICK = _pod(mirror.TICKS)
+_TICKS = np.dtype(list(mirror.TICKS.dtype))
 RATES = _pod(mirror.RATES)
 # A bar as the hub sends it to a consumer: its MqlRates, then its close.
 BAR = _pod(BARS)
@@ -277,10 +280,10 @@ class Duplicate:
 
 @dataclass(frozen=True)
 class Ticks:
-    """A symbol's ticks, each its MqlTick's fields."""
+    """A symbol's ticks as a structured array of MqlTick records."""
 
     symbol: str
-    ticks: tuple[dict[str, object], ...]
+    ticks: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -759,8 +762,7 @@ def encode(frame: Frame) -> bytes:
         kind = FrameKind.TICK
         count = len(frame.ticks)
         writer.string(frame.symbol)
-        for tick in frame.ticks:
-            write_pod(writer, TICK, mirror.TICKS, tick)
+        writer.raw(frame.ticks.tobytes())
     elif isinstance(frame, Bar):
         kind = FrameKind.BAR
         writer.string(frame.symbol)
@@ -872,7 +874,9 @@ def _payload(
         frame = ChartKept(*_read_chart(reader), reader.i32("positions"), reader.i32("orders"))
     elif kind is FrameKind.TICK:
         symbol = _symbol(reader)
-        frame = Ticks(symbol, tuple(read_pod(reader, TICK, mirror.TICKS) for _ in range(count)))
+        frame = Ticks(
+            symbol, np.frombuffer(reader.raw(count * _TICKS.itemsize, mirror.TICKS.name), _TICKS)
+        )
     elif kind is FrameKind.BAR and sender is Sender.EA:
         symbol = _symbol(reader)
         timeframe = reader.i32("timeframe")

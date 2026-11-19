@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from hub_double import HubDouble, asked, eventually, zeroed
+from hub_double import HubDouble, asked, assert_frame_equal, eventually, tick_rows, zeroed
 from websockets.asyncio.server import serve
 
 from mt5connector.client import errors
@@ -116,7 +116,7 @@ async def test_connect_says_hello_and_subscribes_what_is_wanted_under_op_ids(hub
 @pytest.mark.parametrize(
     "frame",
     [
-        binary.Ticks("EURUSD", (tick(1), tick(2))),
+        binary.Ticks("EURUSD", tick_rows(tick(1), tick(2))),
         binary.Bar(
             "EURUSD",
             Series.M1,
@@ -149,7 +149,8 @@ async def test_a_pushed_stream_frame_is_handed_to_the_owner(hub, frame):
     await hub.push(frame)
 
     await eventually(lambda: owner.frames)
-    assert owner.frames == [frame]
+    assert len(owner.frames) == 1
+    assert_frame_equal(owner.frames[0], frame)
     await hub_session.disconnect()
 
 
@@ -363,14 +364,15 @@ async def test_a_refusal_and_an_undecodable_frame_are_logged_and_the_stream_goes
     hub_session = session(hub, owner)
     await hub_session.connect()
     await eventually(lambda: hub.connections)
-    frame = binary.Ticks("EURUSD", (tick(),))
+    frame = binary.Ticks("EURUSD", tick_rows(tick()))
 
     await hub.push(binary.Refusal("a text frame"))
     await hub.connections[-1].send('{"v": 1, "type": "tick"}')
     await hub.push(frame)
 
     await eventually(lambda: owner.frames)
-    assert owner.frames == [frame]
+    assert len(owner.frames) == 1
+    assert_frame_equal(owner.frames[0], frame)
     errors = [call.args[0] for call in owner.log.error.call_args_list]
     assert errors[0] == "hub session: the hub refused a frame: a text frame"
     assert errors[1].startswith("hub session: a frame it cannot decode: offset 0: version 123")
@@ -383,8 +385,8 @@ async def test_a_frame_the_owner_fails_on_is_logged_and_the_session_goes_on(hub)
     await hub_session.connect()
     await eventually(lambda: hub.connections)
 
-    await hub.push(binary.Ticks("EURUSD", (tick(),)))
-    await hub.push(binary.Ticks("EURUSD", (tick(),)))
+    await hub.push(binary.Ticks("EURUSD", tick_rows(tick())))
+    await hub.push(binary.Ticks("EURUSD", tick_rows(tick())))
 
     await eventually(lambda: len(owner.log.exception.call_args_list) == 2)
     message, failure = owner.log.exception.call_args.args

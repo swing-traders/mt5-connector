@@ -124,9 +124,8 @@ def published(
     raises ValueError for a bar of a timeframe no series serves."""
     conversion = Conversion(clock, repeated_hours)
     if isinstance(frame, binary.Ticks):
-        ticks = tuple(
-            conversion.record(mirror.TICKS.epochs, tick, binary.FrameKind.TICK.name.lower())
-            for tick in frame.ticks
+        ticks = conversion.rows(
+            mirror.TICKS.epochs, frame.ticks, binary.FrameKind.TICK.name.lower()
         )
         subscription = Subscription(Stream.TICKS, frame.symbol)
         passed = Published(subscription, frame.symbol, binary.Ticks(frame.symbol, ticks))

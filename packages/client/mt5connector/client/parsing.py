@@ -22,6 +22,8 @@ from mt5connector.wire.calls import SymbolMarginRate
 from mt5connector.wire.history_wire import BAR_CLOSE, Series, bar_series
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from mt5connector.client.connection import AccountSnapshot
     from mt5connector.client.sessions import TradingSessions
 
@@ -478,7 +480,7 @@ _VENUE_SERIES: dict[tuple[int, BarAggregation], Series] = {
 }
 
 
-def quote_tick_from_frame(frame: dict, instrument: InstrumentAny, ts_init: int) -> QuoteTick:
+def quote_tick_from_frame(frame: np.void, instrument: InstrumentAny, ts_init: int) -> QuoteTick:
     """A pushed tick as a QuoteTick stamped at its time_msc: bid and ask as the venue quotes them,
     and both sizes the instrument's largest order, since the venue publishes no depth."""
     return QuoteTick(

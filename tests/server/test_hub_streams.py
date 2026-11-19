@@ -10,12 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 import websockets
-from ea_wire import FakeEa, encode_ea, frame, zeroed
-from hub_doubles import Consumer, Peer, run_hub, sample, settings, settle
+from ea_wire import FakeEa, encode_ea, frame, tick_rows, zeroed
+from hub_doubles import Consumer, Peer, run_hub, sample, settings, settle, verified
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.server import ws_server
-from mt5connector.server.wire import binary, mirror
+from mt5connector.server.wire import binary, calls, mirror
 from mt5connector.server.wire.binary import FrameKind
 from mt5connector.server.wire.history_wire import Series
 from mt5connector.server.wire.push_wire import (
@@ -104,13 +104,69 @@ async def test_a_publishers_ticks_reach_the_consumers_of_its_symbol_alone_in_tru
     await first.subscribed(1, ticks_of("EURUSD"))
     await other.subscribed(1, ticks_of("XAUUSD"))
 
-    await eurusd.send(binary.Ticks("EURUSD", (tick(msc=1), tick(msc=2))))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(*(tick(msc=i) for i in range(1_000)))))
 
-    assert await first.received() == binary.Ticks(
-        "EURUSD", (tick(UTC_EPOCH, msc=1), tick(UTC_EPOCH, msc=2))
+    assert await asyncio.wait_for(first.ws.recv(), 1.0) == binary.encode(
+        binary.Ticks("EURUSD", tick_rows(*(tick(UTC_EPOCH, msc=i) for i in range(1_000))))
     )
     await nothing(other.ws)
     await close_all(server, first, other, eurusd)
+
+
+async def test_an_unsubscribe_among_forty_symbols_tells_only_its_publisher():
+    hub, server, port = await run_hub()
+    symbols = [f"S{index:02}" for index in range(40)]
+    publishers = [await publisher(port, symbol) for symbol in symbols]
+    consumers = [await Consumer.connect(port) for _ in symbols]
+    try:
+        for consumer, symbol in zip(consumers, symbols, strict=True):
+            await consumer.subscribed(1, ticks_of(symbol))
+        for ea, symbol in zip(publishers, symbols, strict=True):
+            assert await ea.received() == binary.Wanted(symbol, True, ())
+
+        await consumers[0].send(binary.Unsubscribe(2, ticks_of(symbols[0])))
+        assert await consumers[0].received() == binary.Ack(2)
+        assert await publishers[0].received() == binary.Wanted(symbols[0], False, ())
+        await asyncio.gather(*(nothing(ea.ws, timeout=0.05) for ea in publishers[1:]))
+    finally:
+        await asyncio.gather(*(peer.close() for peer in [*consumers, *publishers]))
+        server.close()
+
+
+async def test_a_consumer_overflow_cascading_through_its_ea_does_not_break_fan_out():
+    hub, server, port = await run_hub(consumer_queue_bound=2, ea_queue_bound=5)
+    async with verified(port) as spawner:
+        first, second, ea = Peer(stuck=True), Peer(stuck=True), Peer(stuck=True)
+        tasks = [asyncio.create_task(hub.handler(peer)) for peer in (first, second, ea)]
+        first.put_frame(binary.AdapterHello())
+        second.put_frame(binary.AdapterHello())
+        ea.put_ea(binary.EaHello(PUBLISHER, "EURUSD"))
+        await settle()
+        for peer, series in ((first, Series.M1), (second, Series.M5)):
+            peer.put_frame(binary.Subscribe(1, ticks_of("EURUSD")))
+            peer.put_frame(binary.Subscribe(2, Subscription(Stream.BARS, "EURUSD", series)))
+        await settle()
+        count, body = calls.encode_arguments(
+            calls.CALLS[calls.Call.SYMBOL_INFO_TICK], {"symbol": "EURUSD"}
+        )
+        for peer in (first, second):
+            peer.put_frame(binary.Request(1, calls.Call.SYMBOL_INFO_TICK, count, body))
+        await settle()
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
+        await settle()
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
+        await settle()
+        try:
+            assert first.closed == (ws_server.OVERFLOW, "queue overflow")
+            assert second.closed == (ws_server.OVERFLOW, "queue overflow")
+            assert ea.closed == (ws_server.OVERFLOW, "queue overflow")
+            await asyncio.wait_for(asyncio.gather(*tasks), 1.0)
+        finally:
+            for peer in (first, second, ea):
+                await peer.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await spawner.close()
+    server.close()
 
 
 async def test_ticks_in_two_frames_are_passed_on_in_the_order_published():
@@ -119,8 +175,8 @@ async def test_ticks_in_two_frames_are_passed_on_in_the_order_published():
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD"))
 
-    await eurusd.send(binary.Ticks("EURUSD", (tick(bid=1.08501),)))
-    await eurusd.send(binary.Ticks("EURUSD", (tick(bid=1.08502),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick(bid=1.08501))))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick(bid=1.08502))))
 
     received = [await consumer.received(), await consumer.received()]
     assert [frame_.ticks[0]["bid"] for frame_ in received] == [1.08501, 1.08502]
@@ -169,11 +225,11 @@ async def test_a_frame_a_publisher_sends_for_another_symbol_is_dropped_with_a_wa
     await consumer.subscribed(1, ticks_of("EURUSD"))
     await consumer.subscribed(2, Subscription(Stream.TRADE_TRANSACTIONS))
 
-    await gbpusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await gbpusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
     await gbpusd.send(transaction("EURUSD"))
     await gbpusd.send(transaction("", TransactionType.REQUEST, request_symbol="EURUSD"))
     await gbpusd.send(transaction(""))
-    await eurusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
 
     assert isinstance(await consumer.received(), binary.Ticks)
     await nothing(consumer.ws)
@@ -263,7 +319,7 @@ async def test_an_unsubscribe_is_acknowledged_and_ends_the_stream():
 
     await consumer.send(binary.Unsubscribe(2, ticks_of("EURUSD")))
     acked = await consumer.received()
-    await eurusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
 
     assert acked == binary.Ack(2)
     await nothing(consumer.ws)
@@ -289,7 +345,7 @@ async def test_a_second_ea_for_a_served_role_and_symbol_is_told_it_is_a_duplicat
 
     assert await second.received() == binary.Duplicate(PUBLISHER, "EURUSD")
     await asyncio.wait_for(second.ws.wait_closed(), 1)
-    await first.send(binary.Ticks("EURUSD", (tick(),)))
+    await first.send(binary.Ticks("EURUSD", tick_rows(tick())))
     assert isinstance(await consumer.received(), binary.Ticks)
     (warning,) = warnings(caplog)
     assert warning.startswith("refusing a second publisher EA for EURUSD from ")
@@ -309,7 +365,7 @@ async def test_a_refused_duplicates_frames_are_dropped_silently(caplog):
     await settle()
 
     second.put_ea(binary.EaHello(PUBLISHER, "EURUSD"))
-    second.put_ea(binary.Ticks("EURUSD", (tick(),)))
+    second.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     handled = asyncio.create_task(hub.handler(second))
     await settle()
 
@@ -350,7 +406,7 @@ async def test_a_subscription_to_a_symbol_no_publisher_serves_has_the_spawner_op
     await nothing(gbpusd.ws)
     usdjpy = await FakeEa.connect(port, PUBLISHER, "USDJPY")
     assert await usdjpy.received() == binary.Wanted("USDJPY", True, ())
-    await usdjpy.send(binary.Ticks("USDJPY", (tick(),)))
+    await usdjpy.send(binary.Ticks("USDJPY", tick_rows(tick())))
     assert (await consumer.received()).symbol == "USDJPY"
     await close_all(server, consumer, spawner, gbpusd, usdjpy)
 
@@ -1053,7 +1109,7 @@ async def test_two_repeated_broker_hours_alternating_are_each_warned_of_once(cap
     await settle()
 
     for epoch in (REPEATED, REPEATED_A_YEAR_BEFORE, REPEATED + 60, REPEATED_A_YEAR_BEFORE + 60):
-        ea.put_ea(binary.Ticks("EURUSD", (tick(epoch),)))
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick(epoch))))
     await settle()
 
     assert [raw[1] for raw in consumer.sent] == [FrameKind.ACK] + [FrameKind.TICK] * 4
@@ -1149,15 +1205,15 @@ async def test_a_consumer_whose_queue_overflows_is_closed_with_4008_and_the_rest
 
     # The stuck consumer's ack is in the send that never completes; three ticks fill its queue.
     for _ in range(3):
-        ea.put_ea(binary.Ticks("EURUSD", (tick(),)))
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     await settle()
     full = stuck.closed
-    ea.put_ea(binary.Ticks("EURUSD", (tick(),)))
+    ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     await settle()
 
     assert full is None
     assert stuck.closed == (ws_server.OVERFLOW, "queue overflow")
-    ea.put_ea(binary.Ticks("EURUSD", (tick(),)))
+    ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     await settle()
     assert len(reading.sent) == 1 + 5
     assert reading.closed is None
@@ -1200,7 +1256,7 @@ ADAPTER_HELLO = binary.encode(binary.AdapterHello())
         (EA_HELLO, EA_HELLO),
         (EA_HELLO, encode_ea(sample("EURUSD"))),
         (EA_HELLO, binary.encode(binary.Subscribe(1, ticks_of("EURUSD")))),
-        (ADAPTER_HELLO, encode_ea(binary.Ticks("EURUSD", (tick(),)))),
+        (ADAPTER_HELLO, encode_ea(binary.Ticks("EURUSD", tick_rows(tick())))),
         (EA_HELLO, encode_ea(binary.RatesBar("EURUSD", mirror.TIMEFRAME_MN1, rates()))),
         (ADAPTER_HELLO, frame(FrameKind.ACK, b"", flags=1)),
     ],
@@ -1252,7 +1308,7 @@ async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on():
 
     await broken.ws.send(b"\x02\x0d")
     await asyncio.wait_for(broken.ws.wait_closed(), 1)
-    await eurusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
 
     assert isinstance(await consumer.received(), binary.Ticks)
     await close_all(server, consumer, eurusd)

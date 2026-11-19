@@ -2,7 +2,7 @@
 the hub reads it, and each frame the hub sends an EA read back as the EA reads it."""
 
 import pytest
-from ea_wire import decode_to_ea, encode_ea, frame, zeroed
+from ea_wire import assert_frame_equal, decode_to_ea, encode_ea, frame, tick_rows, zeroed
 
 from mt5connector.server.wire import binary, mirror
 from mt5connector.server.wire.binary import CodecError, ErrorKind, FrameKind, Sender
@@ -70,7 +70,7 @@ WEEK = [[[64_800, 0]]] + [[[0, 61_140], [64_800, 0]]] * 4 + [[[0, 61_020]], []]
         binary.ChartOpened(ChartRole.PUBLISHER, "US500#"),
         binary.ChartFailed(ChartRole.PUBLISHER, "XYZ", 4301),
         binary.ChartKept(ChartRole.PUBLISHER, "USDJPY", 1, 2),
-        binary.Ticks("EURUSD", (TICK, TICK | {"bid": 1.08501})),
+        binary.Ticks("EURUSD", tick_rows(TICK, TICK | {"bid": 1.08501})),
         binary.RatesBar("EURUSD", mirror.TIMEFRAME_H1, RATES),
         binary.TradeTransaction(
             zeroed(binary.TRADE_TRANSACTION, symbol="EURUSD", type=10, deal=2**63 - 1),
@@ -107,7 +107,7 @@ WEEK = [[[64_800, 0]]] + [[[0, 61_140], [64_800, 0]]] * 4 + [[[0, 61_020]], []]
     ],
 )
 def test_each_frame_an_ea_sends_decodes_as_the_ea_packs_it(sent):
-    assert binary.decode(encode_ea(sent), Sender.EA) == sent
+    assert_frame_equal(binary.decode(encode_ea(sent), Sender.EA), sent)
 
 
 def test_an_eas_hello_is_read_as_its_first_frame():
