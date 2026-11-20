@@ -22,7 +22,7 @@ from test_hub_live import (
     verdict_of,
 )
 
-from mt5connector.client.errors import NoPublisher, NotServed
+from mt5connector.client.errors import EaError, NotServed
 from mt5connector.client.hub import HubSession
 from mt5connector.server.ws_server import _CLOSE_BOUND_S, _IDLE_SWEEP_S
 from mt5connector.wire import binary, calls, mirror
@@ -135,6 +135,16 @@ async def test_capacity_is_reported_without_losing_the_spawner(live, throwaway):
     async with loaded_charts(session, throwaway, 49) as (old, candidates, holders):
         fresh = candidates[0]
         since = time.time()
+        retry_s = float(
+            await throwaway.run(
+                "exec",
+                throwaway.container,
+                "python3",
+                "-c",
+                "import os; from mt5connector.server.settings import read_hub_settings; "
+                "print(read_hub_settings(os.environ).retry_after_s)",
+            )
+        )
         try:
             status, body = await health(HUB_URL)
             assert status is HTTPStatus.OK and body["result"]["chart_limit"], body
@@ -148,8 +158,9 @@ async def test_capacity_is_reported_without_losing_the_spawner(live, throwaway):
                 "the terminal's capacity refusal and the hub's warning",
             )
             assert "spawner" in log
-            with pytest.raises(NoPublisher) as deferred:
+            with pytest.raises(EaError) as refused:
                 await session.request(calls.Call.SYMBOL_INFO_TICK, symbol=fresh)
+            assert refused.value.last_error != 0
             with pytest.raises(NotServed):
                 await session.order_send(
                     {
@@ -177,8 +188,8 @@ async def test_capacity_is_reported_without_losing_the_spawner(live, throwaway):
                 session.deferring(calls.Call.SYMBOL_INFO_TICK, symbol=fresh)
             )
             try:
-                # A chart failure is held for two advertised retry intervals.
-                hold_s = 2 * deferred.value.retry_after_s
+                # A fresh explicit request may open again after the failed-chart hold.
+                hold_s = 2 * retry_s
                 await until(
                     lambda: throwaway.logs(freed_at),
                     lambda text: f"the spawner opened the publisher chart of {fresh}" in text
@@ -186,9 +197,7 @@ async def test_capacity_is_reported_without_losing_the_spawner(live, throwaway):
                     hold_s,
                     "the held publisher's open after capacity is released",
                 )
-                await asyncio.wait_for(
-                    recovery, deferred.value.retry_after_s + calls.READ_DEADLINE_S
-                )
+                await asyncio.wait_for(recovery, retry_s + calls.READ_DEADLINE_S)
             finally:
                 recovery.cancel()
                 await asyncio.gather(recovery, return_exceptions=True)

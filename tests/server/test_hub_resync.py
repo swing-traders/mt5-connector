@@ -1991,9 +1991,7 @@ async def test_failed_reopens_after_a_deferred_measurements_ea_leaves_end_the_re
         try:
             await consumer.ask(1, calls.Call.RANGES, symbol="EURUSD")
             response = await consumer.received()
-            assert response.error.kind is binary.ErrorKind.NO_PUBLISHER
-            assert response.error.retry_after_ms == 5000
-            assert response.last_error == 4102
+            assert response.error.kind is binary.ErrorKind.EA_ERROR
             assert "4102" in response.error.message
         finally:
             await consumer.close()

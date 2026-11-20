@@ -347,13 +347,13 @@ async def test_a_request_on_a_chart_that_failed_to_open_carries_the_spawners_err
         ] == [
             (
                 2,
-                deferred(ErrorKind.NO_PUBLISHER),
+                (ErrorKind.EA_ERROR, None),
                 4301,
                 "the publisher chart of NOSUCH failed to open: MQL5 error 4301",
             ),
             (
                 3,
-                deferred(ErrorKind.NO_PUBLISHER),
+                (ErrorKind.EA_ERROR, None),
                 4301,
                 "the publisher chart of NOSUCH failed to open: MQL5 error 4301",
             ),

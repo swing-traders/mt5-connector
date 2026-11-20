@@ -913,7 +913,7 @@ class Hub:
         self._to_consumer(ws, binary.Answer(client_id, part, True, 0, error=error))
 
     def _chart_failed(self, ws, client_id: int, key: ChartKey, wait: calls.Wait) -> None:
-        """Defers a read or refuses a command whose chart failed to open."""
+        """Refuses a request whose chart failed to open, carrying its MQL5 error."""
         chart_role, symbol = key
         mql5_error, _failed_at = self._failed[key]
         if chart_role is ChartRole.ACCOUNT:
@@ -923,9 +923,7 @@ class Hub:
         if wait is calls.Wait.COMMAND:
             error = binary.AnswerError(ErrorKind.NOT_SERVED, message)
         else:
-            error = binary.AnswerError(
-                ErrorKind.NO_PUBLISHER, message, int(self._settings.retry_after_s * 1000)
-            )
+            error = binary.AnswerError(ErrorKind.EA_ERROR, message)
         self._to_consumer(ws, binary.Answer(client_id, 0, True, mql5_error, error=error))
 
     # ── Sending ───────────────────────────────────────────────────────────────
