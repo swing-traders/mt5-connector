@@ -13,10 +13,13 @@ from certification import (
     ProbeCommand,
     ProbeEvent,
     Throwaway,
+    container_log_time,
     health,
+    journal_after,
     listed_charts,
     observed_pending,
     publisher_ready,
+    retained_publisher_closes,
     selected_symbols,
     until,
 )
@@ -72,13 +75,20 @@ async def symbols_for(session, count, control=None):
     if control is not None:
         rows = await control.observations()
         excluded |= set(selected_symbols(rows)) | set(listed_charts(rows).values())
+        now = time.time()
+        excluded |= retained_publisher_closes(
+            await control.logs(now - _CLOSE_BOUND_S), now, _CLOSE_BOUND_S
+        )
     symbols = [
         row.name
         for row in listing
         if row.name not in excluded and row.trade_mode == mirror.SYMBOL_TRADE_MODE_FULL
     ]
-    assert len(symbols) >= count, f"certification needs {count} unused fully tradable symbols"
-    return symbols[:count]
+    assert symbols, "certification needs unused fully tradable symbols"
+    if count is not None:
+        assert len(symbols) >= count, f"certification needs {count} unused fully tradable symbols"
+        return symbols[:count]
+    return symbols
 
 
 async def subscribe(session, symbols):
@@ -107,9 +117,15 @@ def close_backlog(log, symbols):
     closed = set()
     for line in log.splitlines():
         asked = re.search(r"the (\w+) chart of (.+) out of use for \d+ s: closing it$", line)
+        renewed = re.search(
+            r"the (\w+) chart of (.+) neither closed nor was kept within \d+ s: closing it again$",
+            line,
+        )
         finished = re.search(r"ticks: closed the (\w+) chart of '(.*)'$", line)
         if asked is not None and asked[2] in symbols:
             requested.add((ChartRole(asked[1]), asked[2]))
+        if renewed is not None and renewed[2] in symbols:
+            requested.add((ChartRole(renewed[1]), renewed[2]))
         if finished is not None:
             closed.add((ChartRole(finished[1]), finished[2]))
     return requested, requested - closed
@@ -136,6 +152,39 @@ async def no_hidden_removal(control, since, before):
     removed = set(re.findall(r"took '([^']+)' out of Market Watch", log))
     assert not hidden & removed
     assert not any(row.event is ProbeEvent.WATCH_GONE and not row.visible for row in rows[before:])
+
+
+async def retire_publisher(control, symbol, since, last_used):
+    # Retained close bookkeeping + idle grace + the next sweep.
+    deadline = time.monotonic() + _CLOSE_BOUND_S + control.idle_seconds + _IDLE_SWEEP_S
+    while time.monotonic() < deadline:
+        log = await control.logs(since)
+        for line in log.splitlines():
+            if (
+                f"publisher EA for {symbol} connected:" in line
+                or f"the spawner keeps the publisher chart of {symbol} open:" in line
+            ):
+                last_used = max(last_used, container_log_time(line))
+        grace = last_used + control.idle_seconds - time.time()
+        if grace > 0:
+            await asyncio.sleep(grace)
+        else:
+            current = await control.command(ProbeCommand.FIND_PUBLISHER, symbol)
+            if current.chart:
+                await control.command(ProbeCommand.CLOSE_SYMBOL, symbol)
+            await control.caught_up_log(since)
+            if symbol not in listed_charts(await control.observations()).values():
+                latest = await control.logs(since)
+                touched = [
+                    container_log_time(line)
+                    for line in latest.splitlines()
+                    if f"publisher EA for {symbol} connected:" in line
+                    or f"the spawner keeps the publisher chart of {symbol} open:" in line
+                ]
+                if not touched or max(touched) + control.idle_seconds <= time.time():
+                    return
+            await asyncio.sleep(0.02)
+    raise AssertionError("the held symbol's replacement publisher did not retire")
 
 
 async def test_account_load_keeps_health_and_two_publishers_responsive(live, throwaway):
@@ -264,7 +313,7 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
         await until(
             lambda: throwaway.logs(since),
             lambda log: len(close_backlog(log, old)[0]) == 15,
-            throwaway.idle_seconds + 5,
+            throwaway.idle_seconds + _IDLE_SWEEP_S,
             "the hub's fifteen idle-close requests",
         )
         if stray:
@@ -272,11 +321,11 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             assert stray_chart.chart in listed_charts(await throwaway.observations())
         at_request = await throwaway.logs(since)
         assert close_backlog(at_request, old)[1], "the fixture's close backlog already drained"
-        requested = len(at_request.splitlines())
         if stray:
             assert f"closed chart {stray_chart.chart} of '{fresh}'" not in at_request
         began = time.monotonic()
         await session.subscribe(Subscription(Stream.TICKS, fresh))
+        acknowledged_at = int(time.time() * 1000) / 1000
         await until(
             lambda: throwaway.logs(since),
             lambda log: f"publisher EA for {fresh} connected:" in log,
@@ -290,7 +339,8 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             throwaway.idle_seconds + 15,
             "all fifteen publisher closes",
         )
-        lines = log.splitlines()
+        log = await throwaway.caught_up_log(since)
+        lines = journal_after(log, acknowledged_at)
         opened = next(
             index
             for index, line in enumerate(lines)
@@ -300,9 +350,7 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
             index
             for index, line in enumerate(lines)
             if any(f"closed the publisher chart of '{symbol}'" in line for symbol in old)
-            and index >= requested
         ]
-        assert opened >= requested
         assert len([index for index in queued_closes if index < opened]) <= 1
         assert any(index > opened for index in queued_closes), "the close backlog already drained"
         if stray:
@@ -311,7 +359,7 @@ async def test_fifteen_closes_do_not_delay_a_fresh_open(live, throwaway, stray):
                 for index, line in enumerate(lines)
                 if f"closed chart {stray_chart.chart} of '{fresh}'" in line
             )
-            assert requested <= stray_closed < queued_closes[0]
+            assert stray_closed < queued_closes[0]
             assert stray_closed < opened
             observations = (await throwaway.observations())[before:]
             created = next(
@@ -354,6 +402,8 @@ async def test_a_resyncs_own_teardown_does_not_hold_another_symbols_open(live, t
             Call.RANGES, symbol=throwaway.resync_symbol, source=calls.Source.TERMINAL
         )
         assert ranges.result.first_tick > 0, "the prepared history needs real ticks"
+        snapshot = await throwaway.history_snapshot(throwaway.resync_symbol)
+        print(json.dumps({"after_first_download": snapshot}, sort_keys=True))
         await until(
             lambda: throwaway.logs(since),
             lambda log: (
@@ -403,7 +453,7 @@ async def test_market_watch_follows_chart_disappearance_within_100ms(live, throw
         row for row in rows[before:] if row.event is ProbeEvent.WATCH_GONE and row.symbol == symbol
     )
     assert 0 <= removed.microseconds - gone.microseconds <= 100_000
-    log = await throwaway.logs(since)
+    log = await throwaway.caught_up_log(since)
     assert f"took '{symbol}' out of Market Watch" in log
     await no_hidden_removal(throwaway, since, before)
 
@@ -426,7 +476,12 @@ async def test_a_held_symbol_is_reported_once_and_kept(live, throwaway):
     account = (await ask(session, Call.ACCOUNT_INFO)).result
     if not account.trade_allowed:
         pytest.skip("the held-position certification case requires the demo half")
-    symbol = (await symbols_for(session, 1, throwaway))[0]
+    for candidate in await symbols_for(session, None, throwaway):
+        if await throwaway.trade_session_open(candidate):
+            symbol = candidate
+            break
+    else:
+        pytest.fail("no unused fully tradable symbol has an open terminal trade session")
     await subscribe(session, [symbol])
     info = (await ask(session, Call.SYMBOL_INFO, symbol=symbol)).result
     tick = (await ask(session, Call.SYMBOL_INFO_TICK, symbol=symbol)).result
@@ -477,6 +532,7 @@ async def test_a_held_symbol_is_reported_once_and_kept(live, throwaway):
             await publisher_ready(session, symbol)
         finally:
             await unsubscribe(session, [symbol])
+        sent_at = time.time()
         sent = await session.order_send(order)
         verdict = await owner.first(verdict_of(sent.result.request_id), 30)
         assert verdict.result["retcode"] in (
@@ -484,14 +540,15 @@ async def test_a_held_symbol_is_reported_once_and_kept(live, throwaway):
             mirror.TRADE_RETCODE_DONE_PARTIAL,
         )
         await throwaway.command(ProbeCommand.CLOSE_SYMBOL, symbol)
+        await retire_publisher(throwaway, symbol, since, sent_at)
         await until(
             lambda: throwaway.logs(since),
             lambda log: f"'{symbol}' stays in Market Watch:" in log,
-            throwaway.idle_seconds + 10,
+            ANSWERED_S,
             "the held-symbol report",
         )
         await asyncio.sleep(3)
-        log = await throwaway.logs(since)
+        log = await throwaway.caught_up_log(since)
         assert log.count(f"'{symbol}' stays in Market Watch:") == 1
         assert f"took '{symbol}' out of Market Watch" not in log
         assert symbol in selected_symbols(await throwaway.observations())
@@ -599,15 +656,16 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
     idle, retained = old[:15], old[15:]
     running = True
     holding = {}
+    case_deadline = time.monotonic() + 1200
 
     async def hold_history(symbol):
         while running:
-            await ask(session, Call.RANGES, symbol=symbol, source=calls.Source.TERMINAL)
+            await session.deferring(Call.RANGES, symbol=symbol, source=calls.Source.TERMINAL)
             await asyncio.sleep(throwaway.idle_seconds / 3)
 
     since = time.time()
     try:
-        await subscribe(session, old)
+        await asyncio.wait_for(subscribe(session, old), max(0, case_deadline - time.monotonic()))
         holding = {symbol: asyncio.create_task(hold_history(symbol)) for symbol in old}
 
         def all_charts(rows):
@@ -619,7 +677,7 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
         await until(
             throwaway.observations,
             all_charts,
-            1200,
+            max(0, case_deadline - time.monotonic()),
             "45 publisher and 45 history charts",
         )
         for symbol in idle:
@@ -634,12 +692,15 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
         )
         waiting = close_backlog(at_request, idle)[1]
         assert waiting, "the fixture's close backlog already drained"
-        requested = len(at_request.splitlines())
-        await asyncio.gather(
-            *(session.subscribe(Subscription(Stream.TICKS, symbol)) for symbol in fresh)
-        )
-        await asyncio.gather(
-            *(ask(session, Call.SYMBOL_INFO_TICK, symbol=symbol) for symbol in fresh)
+
+        async def subscribe_fresh(symbol):
+            await session.subscribe(Subscription(Stream.TICKS, symbol))
+            return int(time.time() * 1000) / 1000
+
+        acknowledged_at = min(await asyncio.gather(*(subscribe_fresh(symbol) for symbol in fresh)))
+        await asyncio.wait_for(
+            asyncio.gather(*(publisher_ready(session, symbol) for symbol in fresh)),
+            max(0, case_deadline - time.monotonic()),
         )
         log = await until(
             lambda: throwaway.logs(since),
@@ -647,7 +708,8 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
             ANSWERED_S,
             "the ceiling run's ten publisher opens",
         )
-        lines = log.splitlines()
+        log = await throwaway.caught_up_log(since)
+        lines = journal_after(log, acknowledged_at)
         first_opened = next(
             index
             for index, line in enumerate(lines)
@@ -666,10 +728,7 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
                 for index, line in enumerate(lines)
                 if f"opened the publisher chart of '{symbol}'" in line
             )
-            assert opened >= requested
-            closed_before_open = [
-                index for index in close_indices(lines) if requested <= index < opened
-            ]
+            closed_before_open = [index for index in close_indices(lines) if index < opened]
             assert len(closed_before_open) <= len(waiting), symbol
             assert f"cannot open the publisher chart of '{symbol}'" not in log
         assert len(retained) == 30

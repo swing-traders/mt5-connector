@@ -63,6 +63,8 @@ async def observed():
 
 @asynccontextmanager
 async def loaded_charts(session, control, pairs, extra_publisher=False):
+    account = (await ask(session, calls.Call.ACCOUNT_INFO)).result
+    assert not account.trade_allowed, "chart-ceiling scheduling requires the read-only account"
     symbols = await symbols_for(session, pairs + 11, control)
     held = symbols[:pairs]
     publishers = held + (symbols[pairs : pairs + 1] if extra_publisher else [])
@@ -246,6 +248,8 @@ async def test_a_publishers_fifty_reads_do_not_defer_the_venue_verdict(
     live, observed, throwaway, cold_sibling, reads_ahead
 ):
     session, _ = live
+    if not (await ask(observed, calls.Call.ACCOUNT_INFO)).result.trade_allowed:
+        pytest.skip("venue-verdict scheduling requires the demo half")
     await subscribe(observed, [SYMBOL])
     info = (await ask(observed, calls.Call.SYMBOL_INFO, symbol=SYMBOL)).result
     cold = None

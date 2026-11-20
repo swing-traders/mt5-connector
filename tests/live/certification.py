@@ -5,9 +5,11 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import IntEnum, StrEnum
 from http import HTTPStatus
 from pathlib import PurePosixPath
@@ -70,6 +72,50 @@ async def publisher_ready(session, symbol):
     return await session.deferring(calls.Call.SYMBOL_INFO_TICK, symbol=symbol)
 
 
+def container_log_time(line):
+    value = datetime.fromisoformat(line.split(" ", 1)[0])
+    if value.tzinfo is None:
+        raise ValueError("container log timestamp has no timezone")
+    return value.timestamp()
+
+
+def journal_event_time(line):
+    match = re.search(r" (?:experts|terminal): [^\t]*\t[^\t]*\t(\d{2}:\d{2}:\d{2}\.\d{3})\t", line)
+    if match is None:
+        return None
+    delivered = datetime.fromtimestamp(container_log_time(line), UTC)
+    clock = datetime.strptime(match[1], "%H:%M:%S.%f").time()
+    event = delivered.replace(
+        hour=clock.hour, minute=clock.minute, second=clock.second, microsecond=clock.microsecond
+    )
+    if event > delivered:
+        event -= timedelta(days=1)
+    return event.timestamp()
+
+
+def journal_after(log, acknowledged_at):
+    lines = []
+    for line in log.splitlines():
+        event = journal_event_time(line)
+        if event is not None and event >= acknowledged_at:
+            lines.append(line)
+    return lines
+
+
+def retained_publisher_closes(log, now, seconds):
+    symbols = set()
+    for line in log.splitlines():
+        match = re.search(
+            r"the publisher chart of (.+?)(?: out of use| neither closed|, asked for)", line
+        )
+        left = re.search(r"publisher EA for (.+?) left its chart out of use: closing it", line)
+        if "closing it" in line and (match is not None or left is not None):
+            symbol = match[1] if match is not None else left[1]
+            if container_log_time(line) >= now - seconds:
+                symbols.add(symbol)
+    return symbols
+
+
 class ProbeEvent(StrEnum):
     START = "START"
     CHART_ADDED = "CHART_ADDED"
@@ -81,6 +127,8 @@ class ProbeEvent(StrEnum):
     DISCONNECTED = "DISCONNECTED"
     ACK = "ACK"
     FAILED = "FAILED"
+    TRADE_OPEN = "TRADE_OPEN"
+    TRADE_CLOSED = "TRADE_CLOSED"
 
 
 class ProbeCommand(IntEnum):
@@ -90,6 +138,8 @@ class ProbeCommand(IntEnum):
     FIND_PUBLISHER = 4
     CREATE_TICKS = 5
     BURST_TICKS = 6
+    TRADE_SESSION = 7
+    LOG_BOUNDARY = 8
 
 
 @dataclass(frozen=True)
@@ -193,6 +243,43 @@ class Throwaway:
             "terminal probe command acknowledgement",
         )
         return next(row for row in rows if row.event is ProbeEvent.ACK and row.token == token)
+
+    async def trade_session_open(self, symbol):
+        acknowledged = await self.command(ProbeCommand.TRADE_SESSION, symbol)
+        state = next(
+            row
+            for row in await self.observations()
+            if row.token == acknowledged.token
+            and row.event in (ProbeEvent.TRADE_OPEN, ProbeEvent.TRADE_CLOSED)
+        )
+        return state.event is ProbeEvent.TRADE_OPEN
+
+    async def caught_up_log(self, since):
+        boundary = await self.command(ProbeCommand.LOG_BOUNDARY, "")
+        return await until(
+            lambda: self.logs(since),
+            lambda log: f"chart probe: log boundary {boundary.token}" in log,
+            120,
+            "delivery of the terminal journal boundary",
+        )
+
+    async def history_snapshot(self, symbol):
+        return json.loads(
+            await self.run(
+                "exec",
+                self.container,
+                "python3",
+                "-c",
+                "import json,os,sys; "
+                "from mt5connector.server.settings import read_hub_settings; "
+                "root=read_hub_settings(os.environ).history_store; "
+                "record=root/'.mt5-connector/resync.json'; "
+                "print(json.dumps({'symbol':sys.argv[1],"
+                "'files':sorted(map(str,root.glob('*/ticks/'+sys.argv[1]+'/*.tkc'))),"
+                "'resync':json.loads(record.read_text()) if record.exists() else None}))",
+                symbol,
+            )
+        )
 
     async def cut_network(self):
         await self.run("network", "disconnect", self.network, self.container)

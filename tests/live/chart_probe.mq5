@@ -8,12 +8,12 @@ input uint SampleMilliseconds = 10;
 enum ProbeEvent
 {
     START, CHART_ADDED, CHART_GONE, WATCH_SELECTED, WATCH_GONE, WATCH_HELD,
-    CONNECTED, DISCONNECTED, ACK, FAILED
+    CONNECTED, DISCONNECTED, ACK, FAILED, TRADE_OPEN, TRADE_CLOSED
 };
 enum ProbeCommand
 {
     OPEN_STRAY = 1, CLOSE_SYMBOL = 2, SELECT_SYMBOL = 3, FIND_PUBLISHER = 4,
-    CREATE_TICKS = 5, BURST_TICKS = 6
+    CREATE_TICKS = 5, BURST_TICKS = 6, TRADE_SESSION = 7, LOG_BOUNDARY = 8
 };
 struct ChartState { long id; string symbol; };
 struct WatchState { string symbol; bool visible; int positions; int orders; };
@@ -100,6 +100,38 @@ void MarketWatch()
             Record(WATCH_GONE, previousWatch[i].symbol, 0, false, previousWatch[i].visible,
                    previousWatch[i].positions, previousWatch[i].orders);
     ArraySwap(current, previousWatch);
+}
+
+bool ReadTradeSession(const string symbol, bool &open)
+{
+    open = false;
+    MqlDateTime clock;
+    if (!TimeToStruct(TimeTradeServer(), clock))
+        return false;
+    const long seconds = clock.hour * 3600 + clock.min * 60 + clock.sec;
+    for (int previous = 0; previous <= 1; previous++)
+    {
+        const ENUM_DAY_OF_WEEK day = (ENUM_DAY_OF_WEEK)((clock.day_of_week + 7 - previous) % 7);
+        datetime from, to;
+        for (uint index = 0; SymbolInfoSessionTrade(symbol, day, index, from, to); index++)
+        {
+            const long start = (long)from % 86400;
+            const long end = (long)to % 86400;
+            if (previous == 0
+                && ((start == end) || (start < end && seconds >= start && seconds < end)
+                    || (start > end && seconds >= start)))
+            {
+                open = true;
+                return true;
+            }
+            if (previous == 1 && start > end && seconds < end)
+            {
+                open = true;
+                return true;
+            }
+        }
+    }
+    return true;
 }
 
 void Commands()
@@ -196,6 +228,19 @@ void Commands()
             ok = CustomTicksAdd(symbol, ticks) == ArraySize(ticks);
         }
     }
+    else if (operation == TRADE_SESSION)
+    {
+        bool custom = false;
+        ok = SymbolExist(symbol, custom) && (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+        bool open = false;
+        if (ok)
+            ok = ReadTradeSession(symbol, open);
+        if (ok)
+            Record(open ? TRADE_OPEN : TRADE_CLOSED,
+                   symbol, 0, false, false, 0, 0, token);
+    }
+    else if (operation == LOG_BOUNDARY)
+        PrintFormat("chart probe: log boundary %s", token);
     else
         ok = false;
     if (ok) Record(ACK, symbol, opened, false, false, 0, 0, token);
