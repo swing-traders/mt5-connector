@@ -73,6 +73,7 @@ RelaySeconds=5
 PollMilliseconds=16
 ChartTemplate=ticks.tpl
 HistoryTemplate=ticks_history.tpl
+AccountTemplate=ticks_account.tpl
 HubPingTimeoutSec=50
 </inputs>
 </expert>

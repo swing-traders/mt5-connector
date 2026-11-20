@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
-from ea_wire import zeroed
+from ea_wire import assert_frame_equal, tick_rows, zeroed
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.server.encoding import bar_close
@@ -61,10 +61,12 @@ def rates_rows(*epochs):
 
 
 def test_a_published_ticks_epochs_reach_its_subscribers_in_true_utc():
-    passed = published(binary.Ticks("EURUSD", (tick(BROKER_EPOCH),)), CLOCK, RepeatedHours())
+    passed = published(
+        binary.Ticks("EURUSD", tick_rows(tick(BROKER_EPOCH))), CLOCK, RepeatedHours()
+    )
 
     assert passed.subscription == Subscription(Stream.TICKS, "EURUSD")
-    assert passed.frame == binary.Ticks("EURUSD", (tick(UTC_EPOCH),))
+    assert_frame_equal(passed.frame, binary.Ticks("EURUSD", tick_rows(tick(UTC_EPOCH))))
 
 
 def test_a_published_bar_reaches_its_series_with_its_open_and_close_in_true_utc():
@@ -124,7 +126,9 @@ def test_an_epoch_in_the_brokers_repeated_hour_reads_as_its_first_occurrence_wit
     caplog,
 ):
     caplog.set_level(logging.WARNING)
-    frame = binary.Ticks("EURUSD", (tick(REPEATED_BROKER_EPOCH), tick(REPEATED_BROKER_EPOCH + 60)))
+    frame = binary.Ticks(
+        "EURUSD", tick_rows(tick(REPEATED_BROKER_EPOCH), tick(REPEATED_BROKER_EPOCH + 60))
+    )
 
     passed = published(frame, CLOCK, RepeatedHours())
 

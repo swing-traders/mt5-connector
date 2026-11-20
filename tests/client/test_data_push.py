@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from hub_double import tick_rows
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
@@ -191,7 +192,7 @@ def tick(bid, ask, time_msc=NINE * 1000 + 123, symbol="EURUSD"):
         "flags": 6,
         "volume_real": 0.0,
     }
-    return binary.Ticks(symbol, (fields,))
+    return binary.Ticks(symbol, tick_rows(fields))
 
 
 def bar(open_time, timeframe="M1", **fields):

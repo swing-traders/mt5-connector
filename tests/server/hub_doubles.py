@@ -1,5 +1,5 @@
 """Doubles of the hub's peers: its settings for a test, a consumer on a real connection, a
-connection double driving the handler directly, and a spawner relaying live server-time samples."""
+connection double driving the handler directly, and EAs relaying live server-time samples."""
 
 import asyncio
 import contextlib
@@ -20,7 +20,7 @@ from mt5connector.server.wire import binary, calls
 from mt5connector.server.wire.push_wire import ChartRole
 from mt5connector.server.ws_server import Hub, serve_hub
 
-# How long a sample stays fresh in a test, and how often the spawner relays one.
+# How long a sample stays fresh in a test, and how often an EA relays one.
 MAX_AGE_S = 0.2
 SAMPLE_EVERY_S = 0.04
 
@@ -98,6 +98,7 @@ async def verified(port: int, symbol="EURUSD"):
     """A spawner relaying a live sample every SAMPLE_EVERY_S, held until the hub's clock is
     verified; yields the spawner."""
     spawner = await FakeEa.connect(port, ChartRole.SPAWNER, symbol)
+    assert await spawner.received() == binary.OpenChart(ChartRole.ACCOUNT, symbol)
 
     async def relay():
         with contextlib.suppress(websockets.ConnectionClosed):
@@ -107,7 +108,9 @@ async def verified(port: int, symbol="EURUSD"):
 
     task = asyncio.create_task(relay())
     try:
-        await eventually(lambda: health(port)[0] == 200, timeout=MAX_AGE_S * 10)
+        await eventually(
+            lambda: health(port)[1]["result"]["clock"] is not None, timeout=MAX_AGE_S * 10
+        )
         yield spawner
     finally:
         task.cancel()
@@ -120,6 +123,28 @@ def health(port: int) -> tuple[int, dict]:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as refused:
         return refused.code, json.loads(refused.read())
+
+
+@contextlib.asynccontextmanager
+async def verified_by(ea: FakeEa):
+    """An EA relaying live samples until the hub's clock verifies; yields the EA."""
+    port = ea.ws.remote_address[1]
+
+    async def relay():
+        with contextlib.suppress(websockets.ConnectionClosed):
+            while True:
+                await ea.send(sample(ea.symbol))
+                await asyncio.sleep(SAMPLE_EVERY_S)
+
+    task = asyncio.create_task(relay())
+    try:
+        await eventually(
+            lambda: health(port)[1]["result"]["clock"] is not None, timeout=MAX_AGE_S * 10
+        )
+        yield ea
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def health_of(port: int) -> tuple[int, dict]:

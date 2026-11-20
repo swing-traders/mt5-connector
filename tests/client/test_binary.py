@@ -6,7 +6,9 @@ their offset."""
 import json
 import struct
 
+import numpy as np
 import pytest
+from hub_double import assert_frame_equal, tick_rows
 
 from mt5connector.wire import binary, mirror
 from mt5connector.wire.binary import CodecError, ErrorKind, FrameKind, Sender
@@ -210,7 +212,22 @@ def test_a_captured_sixty_byte_tick_decodes_to_the_values_the_probe_read():
     decoded = binary.decode(header(FrameKind.TICK, payload, count=1), Sender.HUB)
 
     assert len(captured) == 60
-    assert decoded == binary.Ticks("EURUSD", (PROBE_TICK,))
+    assert_frame_equal(decoded, binary.Ticks("EURUSD", tick_rows(PROBE_TICK)))
+
+
+def test_ticks_decode_as_a_structured_array_with_the_same_wire_bytes():
+    second = PROBE_TICK | {"bid": 1.086}
+    records = PROBE.pack(*PROBE_TICK.values()) + PROBE.pack(*second.values())
+    symbol = b"EURUSD"
+    payload = struct.pack("<H", len(symbol)) + symbol + records
+    raw = header(FrameKind.TICK, payload, count=2)
+
+    decoded = binary.decode(raw, Sender.HUB)
+
+    assert isinstance(decoded.ticks, np.ndarray)
+    assert decoded.ticks.dtype == np.dtype(list(mirror.TICKS.dtype))
+    assert decoded.ticks.tolist() == [tuple(PROBE_TICK.values()), tuple(second.values())]
+    assert binary.encode(decoded) == raw
 
 
 # ── The struct layouts ────────────────────────────────────────────────────────
@@ -344,8 +361,8 @@ TRANSACTION = binary.TradeTransaction(
         binary.Ack(7),
         binary.Refusal(""),
         binary.Refusal("ünïcødé € and 中文"),
-        binary.Ticks("EURUSD", ()),
-        binary.Ticks("EURUSD.a", (tick(1), tick(2))),
+        binary.Ticks("EURUSD", tick_rows()),
+        binary.Ticks("EURUSD.a", tick_rows(tick(1), tick(2))),
         binary.Bar("EURUSD", Series.M5, bar()),
         TRANSACTION,
         binary.Answer(2**63, 0, True, 0, 1, b"\x01" + b"\x00" * 7),
@@ -370,7 +387,29 @@ TRANSACTION = binary.TradeTransaction(
     ],
 )
 def test_a_frame_the_hub_sends_a_consumer_round_trips(frame):
-    assert binary.decode(binary.encode(frame), Sender.HUB) == frame
+    assert_frame_equal(binary.decode(binary.encode(frame), Sender.HUB), frame)
+
+
+def test_a_not_served_answer_is_a_refusal_without_a_delay_and_no_ea_may_send_it():
+    message = b"no publisher for X; chart requested"
+    payload = b"\x00" * 8 + b"\x09" + struct.pack("<H", len(message)) + message
+    raw = header(FrameKind.ANSWER, payload, flags=2, correlation=17)
+
+    answer = binary.decode(raw, Sender.HUB)
+
+    assert answer.request_id == 17
+    assert answer.error.kind.value == 9
+    assert answer.error.message == message.decode()
+    assert answer.error.retry_after_ms is None
+    assert binary.encode(answer) == raw
+    with pytest.raises(CodecError, match="an EA answering not_served"):
+        binary.decode(raw, Sender.EA)
+    with pytest.raises(CodecError, match="a retry delay on a not_served answer"):
+        binary.encode(
+            binary.Answer(
+                17, 0, True, 0, error=binary.AnswerError(answer.error.kind, message.decode(), 50)
+            )
+        )
 
 
 @pytest.mark.parametrize(

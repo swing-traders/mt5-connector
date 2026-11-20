@@ -8,20 +8,22 @@ import logging
 import os
 import time
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
 import tickgen_oracle as oracle
+from certification import health, observed_pending
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
 from mt5connector.client.config import MT5Config
-from mt5connector.client.errors import InvalidWindow, NoPublisher
+from mt5connector.client.errors import InvalidWindow, NotServed
 from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.broker_clock import BrokerClock
 from mt5connector.wire.history_wire import BAR_TIMEFRAME, Series
-from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
+from mt5connector.wire.push_wire import ChartRole, Stream, Subscription, TransactionType
 
 HUB_URL = os.environ.get("MT5_LIVE_HUB_URL", "ws://127.0.0.1:9000")
 CAPPED_HUB_URL = os.environ.get("MT5_LIVE_CAPPED_HUB_URL", "ws://127.0.0.1:9001")
@@ -287,15 +289,13 @@ def refused_order(info, price: float) -> dict:
     }
 
 
-async def deferred_command(
-    session: HubSession, candidates: list
-) -> tuple[dict, NoPublisher] | None:
+async def deferred_command(session: HubSession, candidates: list) -> tuple[dict, NotServed] | None:
     """The first candidate's refused order whose command no publisher serves yet, with its
-    deferral; None when a publisher already serves each."""
+    refusal; None when a publisher already serves each."""
     for symbol in candidates:
         order = refused_order(symbol, symbol.point)
         try:
-            with pytest.raises(NoPublisher) as deferred:
+            with pytest.raises(NotServed) as deferred:
                 await session.order_send(order)
         except pytest.fail.Exception:
             logger.info("%s: a publisher already serves it", symbol.name)
@@ -327,11 +327,13 @@ async def session():
     await hub_session.disconnect()
 
 
-async def test_every_spawner_read_answers_as_its_row_types_it(session):
+async def test_every_account_read_answers_as_its_row_types_it(session):
     hub_session, _ = session
     now = int(time.time())
 
     account = (await ask(hub_session, Call.ACCOUNT_INFO)).result
+    status, body = await health(HUB_URL)
+    assert status is HTTPStatus.OK and body["result"]["account"] is True
     terminal = (await ask(hub_session, Call.TERMINAL_INFO)).result
     symbols = (await ask(hub_session, Call.SYMBOLS_GET)).result
     positions = (await ask(hub_session, Call.POSITIONS_GET)).result
@@ -356,6 +358,15 @@ async def test_every_spawner_read_answers_as_its_row_types_it(session):
     assert all(is_struct(order, "TradeOrder") for order in history_orders)
     assert all(is_struct(deal, "TradeDeal") for deal in history_deals)
     assert all(now - DAY_S - HOUR_S <= deal.time <= now + HOUR_S for deal in history_deals)
+    _, roles = await observed_pending(
+        HUB_URL,
+        [
+            ask(hub_session, Call.HISTORY_DEALS_GET, date_from=now - 30 * DAY_S, date_to=now)
+            for _ in range(32)
+        ],
+    )
+    assert ChartRole.ACCOUNT in roles
+    assert ChartRole.SPAWNER not in roles
 
 
 async def test_every_publisher_read_of_the_symbol_answers_as_its_row_types_it(session):
@@ -779,8 +790,8 @@ async def test_a_command_for_a_symbol_no_publisher_serves_answers_once_its_chart
     try:
         first = await deferred_command(hub_session, candidates)
         if first is not None:
-            order, deferred = first
-            await asyncio.sleep(deferred.retry_after_s)
+            order, _ = first
+            await ask(hub_session, Call.SYMBOL_INFO_TICK, symbol=order["symbol"])
             answered = await ask(hub_session, Call.ORDER_SEND, request=order)
 
             assert is_struct(answered.result, "MqlTradeResult")

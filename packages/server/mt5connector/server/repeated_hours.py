@@ -1,20 +1,18 @@
 """Warnings, given once per broker hour across a process, of an epoch in an hour the broker's clock
 repeats or skips, and of a bar dropped for opening in the true-UTC period of the bar before it.
 
-State: the broker hours already warned of; nothing is persisted."""
+State: the broker hours already warned of, owned by the hub loop; nothing is persisted."""
 
 import logging
-import threading
 
 logger = logging.getLogger(__name__)
 
 
 class RepeatedHours:
-    """The broker hours a process has warned of, shared by its threads."""
+    """The broker hours a process has warned of."""
 
     def __init__(self) -> None:
         self._warned: set[int] = set()
-        self._lock = threading.Lock()
 
     def warn(self, where: str, field: str, epoch: int, hour: int) -> None:
         """Warns that the epoch of `field` in what `where` names lies in the repeated broker hour
@@ -53,7 +51,6 @@ class RepeatedHours:
 
     def _mark_warned(self, hour: int) -> bool:
         """Marks `hour` warned of; whether it was not already."""
-        with self._lock:
-            warned = hour in self._warned
-            self._warned.add(hour)
+        warned = hour in self._warned
+        self._warned.add(hour)
         return not warned

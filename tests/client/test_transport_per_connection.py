@@ -10,7 +10,6 @@ from hub_double import HubDouble
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from venue_doubles import (
     account_info,
     listing,
@@ -21,14 +20,14 @@ from venue_doubles import (
 )
 from websockets.asyncio.server import serve
 
+from mt5connector.client import history
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import ConnectionState, MT5Connection
-from mt5connector.client.downloader import MT5DataDownloader
 from mt5connector.client.errors import EaError
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.binary import ErrorKind
-from mt5connector.wire.history_wire import BARS
+from mt5connector.wire.history_wire import BARS, Series
 
 Call = calls.Call
 NOW_NS = 1_760_000_000_000_000_000
@@ -220,43 +219,19 @@ async def test_a_loaded_instrument_carries_the_fee_and_sessions_its_hub_relays(a
 
 
 async def test_history_reads_after_another_connection_connects_reach_their_own_hub(
-    alpha, beta, connected, tmp_path
+    alpha, beta, connected
 ):
     first = await connected(alpha)
     await connected(beta)
     forget(alpha, beta)
-    downloader = MT5DataDownloader(
-        first, provider_of(first, "MT5_ALPHA"), ParquetDataCatalog(str(tmp_path))
-    )
+    start = int(datetime(2025, 7, 14, tzinfo=UTC).timestamp())
+    end = int(datetime(2025, 7, 15, tzinfo=UTC).timestamp())
+    await history.ranges(first.session, "EURUSD")
+    await history.bars(first.session, "EURUSD", Series.H1, start, end)
+    await history.ticks(first.session, "EURUSD", start, end)
 
-    results = await downloader.download_all(
-        ["EURUSD"],
-        datetime(2025, 7, 14, tzinfo=UTC),
-        datetime(2025, 7, 15, tzinfo=UTC),
-    )
-
-    assert all(result.success for result in results["EURUSD"])
     assert {Call.RANGES, Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE} <= set(alpha.calls())
     assert beta.calls() == []
-
-
-async def test_a_history_failure_is_recorded_with_its_own_hubs_error(
-    alpha, beta, connected, tmp_path
-):
-    first = await connected(alpha)
-    await connected(beta)
-    alpha.hub.answers[Call.RANGES] = [binary.AnswerError(ErrorKind.EA_ERROR, "Terminal: Not found")]
-    downloader = MT5DataDownloader(
-        first, provider_of(first, "MT5_ALPHA"), ParquetDataCatalog(str(tmp_path))
-    )
-
-    result = await downloader.download_bars(
-        "EURUSD",
-        datetime(2025, 7, 14, tzinfo=UTC),
-        datetime(2025, 7, 15, tzinfo=UTC),
-    )
-
-    assert result.errors == ["Ranges failed: ranges: Terminal: Not found"]
 
 
 async def test_disconnecting_another_connection_leaves_this_ones_session_open_on_its_own(

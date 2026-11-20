@@ -1,6 +1,6 @@
 #!/bin/sh
 # Places the connector's EA and the startup script in the terminal, compiled with the EA's half of
-# the hub protocol generated from the installed server, and writes the three chart templates that
+# the hub protocol generated from the installed server, and writes the chart templates that
 # attach the EA in its roles. Runs once, at image build, under Xvfb.
 set -eu
 
@@ -67,6 +67,8 @@ write_template() {
 spawner=$(role_value ROLE_SPAWNER)
 publisher=$(role_value ROLE_PUBLISHER)
 history=$(role_value ROLE_HISTORY)
+account=$(role_value ROLE_ACCOUNT)
 write_template ticks_spawner.tpl "$spawner"
 write_template ticks.tpl "$publisher"
 write_template ticks_history.tpl "$history"
+write_template ticks_account.tpl "$account"

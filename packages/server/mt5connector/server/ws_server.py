@@ -1,17 +1,17 @@
 """The hub, the one endpoint the EAs and the consumers connect to: it fans the EAs' frames out in
 true UTC, routes or answers every request, and has the spawner open and close the charts in use.
 
-State: the connections that said hello — each consumer's subscriptions, each EA's chart role and
-symbol — and each one's queue of frames not yet sent; the EA serving each role and symbol, and the
-wanted frame last told each publisher; the spawner; the chart requests held for a role and symbol no
-EA serves, and those the spawner was sent; the MQL5 error the spawner met on each chart it failed to
-open, and when, standing for the failure hold or until that chart opens or its EA says hello; when
-each chart was last in use, and when the spawner was last told to close each chart whose close is
-pending, which outlives the chart's EA; the closes the re-sync owns; the UTC open of the last bar
-fanned out of each series; the latest commission schedule and trading sessions relayed for each
-symbol; the floors learned from ranges answers; the pending requests and the clock gate. The history
-re-sync record alone is persisted on the history volume. Nothing is replayed to a consumer that
-reconnects."""
+State: the connections that said hello — each consumer's subscriptions, indexed by symbol and
+stream, and each EA's chart role and symbol — and each one's queue of frames not yet sent; the EA
+serving each role and symbol, and the wanted frame last told each publisher; the spawner; the chart
+requests held for a role and symbol no EA serves, and those the spawner was sent; the MQL5 error the
+spawner met on each chart it failed to open, and when, standing for the failure hold or until that
+chart opens or its EA says hello; when each chart was last in use, and when the spawner was last
+told to close each chart whose close is pending, which outlives the chart's EA; the closes the
+re-sync owns; the UTC open of the last bar fanned out of each series; the latest commission schedule
+and trading sessions relayed for each symbol; the floors learned from ranges answers; the pending
+requests and clock gate. The history re-sync record alone is persisted on the history volume.
+Nothing is replayed to a consumer that reconnects."""
 
 import asyncio
 import dataclasses
@@ -77,7 +77,7 @@ _HOUR_S = 3_600
 
 logger = logging.getLogger(__name__)
 
-ChartKey = tuple[ChartRole, str]
+ChartKey = tuple[ChartRole, str | None]
 
 
 @dataclass
@@ -107,10 +107,9 @@ class _Ea:
 
     @property
     def key(self) -> tuple[ChartRole, str | None]:
-        """What the EA serves: its chart's role, and its symbol but for the spawner, which serves
-        the account."""
-        if self.chart_role is ChartRole.SPAWNER:
-            return ChartRole.SPAWNER, None
+        """The role and symbol served; chart control and account reads are terminal-wide."""
+        if self.chart_role in (ChartRole.SPAWNER, ChartRole.ACCOUNT):
+            return self.chart_role, None
         else:
             return self.chart_role, self.symbol
 
@@ -130,10 +129,12 @@ class Hub:
         )
         self._requests = Requests(expire=self._expired)
         self._consumers: dict[object, _Consumer] = {}
+        self._subscribers: dict[str | None, dict[Subscription, set[object]]] = {}
         self._eas: dict[object, _Ea] = {}
         self._served: dict[tuple[ChartRole, str | None], object] = {}
         self._told: dict[str, binary.Wanted] = {}
         self._spawner: object | None = None
+        self._chart_status: binary.ChartStatus | None = None
         self._requested: set[ChartKey] = set()
         self._sent: set[ChartKey] = set()
         self._failed: dict[ChartKey, tuple[int, float]] = {}
@@ -229,7 +230,12 @@ class Hub:
         if request.path == HEALTH_PATH and request.method == HTTPMethod.GET:
             labels = {ws: (ea.chart_role.value, ea.symbol) for ws, ea in self._eas.items()}
             status, body = health(
-                self._gate, self._spawner is not None, self._requests.all(), labels
+                self._gate,
+                self._spawner is not None,
+                (ChartRole.ACCOUNT, None) in self._served,
+                self._requests.all(),
+                labels,
+                self._chart_status,
             )
             return _json(connection, status, body)
         elif request.path == HEALTH_PATH:
@@ -252,10 +258,8 @@ class Hub:
             return ChartState.REQUESTED
 
     def close_idle_charts(self) -> None:
-        """Tells the spawner to close each chart the hub has allocated — one an EA serves, or one
-        whose open is outstanding — out of use for the idle period, withdrawing an open nobody waits
-        for, and settles each close pending for the bound: sent again while an EA serves the chart
-        out of use, else ended. The spawner's own chart never closes."""
+        """Closes idle symbol charts, withdraws their unused opens, and renews pending closes past
+        their bound; the spawner and account charts stay open."""
         self._finish_resync_closes()
         now = time.monotonic()
         # The spawner is read per key: a close that overflows its queue drops it mid-sweep.
@@ -281,7 +285,7 @@ class Hub:
             chart_role, symbol = key
             if (
                 self._spawner is not None
-                and chart_role is not ChartRole.SPAWNER
+                and chart_role not in (ChartRole.SPAWNER, ChartRole.ACCOUNT)
                 and key not in self._close_sent
                 and not self._in_use(key, now)
             ):
@@ -360,6 +364,8 @@ class Hub:
                 for key in list(self._close_sent):
                     if key not in self._resync_closing:
                         del self._close_sent[key]
+                if (ChartRole.ACCOUNT, None) not in self._served:
+                    self._requested.add((ChartRole.ACCOUNT, None))
                 for key in sorted(self._requested):
                     self._request_chart(key)
             else:
@@ -396,8 +402,10 @@ class Hub:
             self._publish(ea, frame)
         elif isinstance(frame, binary.TradeTransaction) and (publisher or spawner):
             self._publish(ea, frame)
-        elif isinstance(frame, binary.ServerTime) and spawner:
+        elif isinstance(frame, binary.ServerTime):
             self._server_time(ea, frame)
+        elif isinstance(frame, binary.ChartStatus) and spawner:
+            self._chart_status = frame
         elif isinstance(frame, binary.Commissions) and publisher:
             self._relayed_commissions(ea, frame)
         elif isinstance(frame, binary.Sessions) and publisher:
@@ -423,16 +431,28 @@ class Hub:
         change routes to it; a subscription to a symbol no publisher serves requests its chart."""
         if isinstance(frame, binary.Subscribe):
             consumer.subscriptions.add(frame.subscription)
-        else:
-            consumer.subscriptions.discard(frame.subscription)
+            streams = self._subscribers.setdefault(frame.subscription.symbol, {})
+            streams.setdefault(frame.subscription, set()).add(ws)
+        elif frame.subscription in consumer.subscriptions:
+            consumer.subscriptions.remove(frame.subscription)
+            self._forget_subscriber(ws, frame.subscription)
         self._mark_used([frame.subscription])
         if self._enqueue(ws, consumer, binary.encode(binary.Ack(frame.op_id))):
-            self._tell_publishers()
-            symbol = frame.subscription.symbol
-            if isinstance(frame, binary.Subscribe) and symbol is not None:
-                key = (ChartRole.PUBLISHER, symbol)
+            if frame.subscription.symbol is not None:
+                self._tell_publisher(frame.subscription.symbol)
+            if isinstance(frame, binary.Subscribe) and frame.subscription.symbol is not None:
+                key = (ChartRole.PUBLISHER, frame.subscription.symbol)
                 if key not in self._served:
                     self._request_chart(key)
+
+    def _forget_subscriber(self, ws, subscription: Subscription) -> None:
+        streams = self._subscribers[subscription.symbol]
+        subscribers = streams[subscription]
+        subscribers.remove(ws)
+        if not subscribers:
+            del streams[subscription]
+        if not streams:
+            del self._subscribers[subscription.symbol]
 
     # ── Streams ───────────────────────────────────────────────────────────────
 
@@ -469,45 +489,45 @@ class Hub:
             self._fan_out(subscription, binary.encode(bar))
 
     def _fan_out(self, subscription: Subscription, raw: bytes) -> None:
-        overflowed = False
-        for ws, consumer in list(self._consumers.items()):
-            if subscription in consumer.subscriptions:
-                overflowed |= not self._enqueue(ws, consumer, raw)
-        if overflowed:
-            self._tell_publishers()
+        subscribers = self._subscribers.get(subscription.symbol, {}).get(subscription, set())
+        for ws in list(subscribers):
+            # An overflow can drop another listener through its EA's pending requests.
+            consumer = self._consumers.get(ws)
+            if consumer is not None:
+                self._enqueue(ws, consumer, raw)
 
-    def _tell_publishers(self) -> None:
-        """Tells each publisher its symbol's wanted frame when it differs from the one last told."""
-        for (chart_role, symbol), ws in list(self._served.items()):
-            if chart_role is ChartRole.PUBLISHER:
-                wanted = self._wanted(symbol)
-                if wanted != self._told[symbol]:
-                    self._told[symbol] = wanted
-                    self._to_ea(ws, wanted)
+    def _tell_publisher(self, symbol: str) -> None:
+        """Tells a publisher its symbol's wanted frame when it differs from the one last told."""
+        ws = self._served.get((ChartRole.PUBLISHER, symbol))
+        if ws is not None:
+            wanted = self._wanted(symbol)
+            if wanted != self._told[symbol]:
+                self._told[symbol] = wanted
+                self._to_ea(ws, wanted)
 
     def _wanted(self, symbol: str) -> binary.Wanted:
         """Whether some consumer subscribes to the symbol's ticks, and the timeframes whose bars
         some consumer subscribes to."""
         ticks = False
         timeframes = set()
-        for consumer in self._consumers.values():
-            for item in consumer.subscriptions:
-                if item.symbol == symbol and item.stream == Stream.TICKS:
-                    ticks = True
-                elif item.symbol == symbol and item.stream == Stream.BARS:
-                    timeframes.add(BAR_TIMEFRAME[item.timeframe])
+        for item in self._subscribers.get(symbol, {}):
+            if item.stream is Stream.TICKS:
+                ticks = True
+            elif item.stream is Stream.BARS:
+                timeframes.add(BAR_TIMEFRAME[item.timeframe])
         return binary.Wanted(symbol, ticks, tuple(sorted(timeframes)))
 
     # ── Relays ────────────────────────────────────────────────────────────────
 
     def _server_time(self, ea: _Ea, frame: binary.ServerTime) -> None:
-        """Takes the spawner's server-time sample naming its own symbol into the gate."""
+        """Takes a serving EA's server-time sample naming its own symbol into the gate."""
         if frame.symbol == ea.symbol:
             self._gate.write(frame)
         else:
             logger.warning(
-                "dropping a server-time sample for %r from the spawner for %s",
+                "dropping a server-time sample for %r from the %s for %s",
                 frame.symbol,
+                ea.chart_role,
                 ea.symbol,
             )
 
@@ -538,16 +558,17 @@ class Hub:
     ) -> None:
         """Takes the spawner's answer to an open_chart or a close_chart: clears or records the
         failure to open a chart, or counts a chart it kept open in use for another idle period."""
-        key = (frame.chart_role, frame.symbol)
+        key = (frame.chart_role, None if frame.chart_role is ChartRole.ACCOUNT else frame.symbol)
         if isinstance(frame, binary.ChartOpened):
             logger.info("the spawner opened the %s chart of %s", frame.chart_role, frame.symbol)
             self._failed.pop(key, None)
         elif isinstance(frame, binary.ChartFailed):
             logger.warning(
-                "the spawner cannot open the %s chart of %s: MQL5 error %d",
+                "the spawner cannot open the %s chart of %s: MQL5 error %d (chart status %s)",
                 frame.chart_role,
                 frame.symbol,
                 frame.error,
+                self._chart_status,
             )
             self._failed[key] = (frame.error, time.monotonic())
             self._sent.discard(key)
@@ -592,7 +613,10 @@ class Hub:
             )
         if self._spawner is not None and key not in self._sent and key not in self._failed:
             self._sent.add(key)
-            self._to_ea(self._spawner, binary.OpenChart(*key))
+            chart_role, symbol = key
+            if chart_role is ChartRole.ACCOUNT:
+                symbol = self._eas[self._spawner].symbol
+            self._to_ea(self._spawner, binary.OpenChart(chart_role, symbol))
 
     def _failure_stands(self, key: ChartKey, now: float) -> bool:
         """Whether the spawner's failure to open the chart is within its hold."""
@@ -609,11 +633,7 @@ class Hub:
     def _in_use(self, key: ChartKey, now: float, *, include_resync: bool = True) -> bool:
         """Whether subscriptions, requests, downloads, re-syncs or the idle grace hold a chart."""
         chart_role, symbol = key
-        subscribed = chart_role is ChartRole.PUBLISHER and any(
-            item.symbol == symbol
-            for consumer in self._consumers.values()
-            for item in consumer.subscriptions
-        )
+        subscribed = chart_role is ChartRole.PUBLISHER and bool(self._subscribers.get(symbol))
         ea = self._served.get(key)
         waited_on = ea is not None and len(self._requests.of_ea(ea)) > 0
         downloading = chart_role is ChartRole.HISTORY and self._resync.first_download_running(
@@ -649,7 +669,10 @@ class Hub:
             bar_series(arguments["timeframe"])
         if self._gate.verification is None:
             message = "the broker clock is not verified"
-            self._deferred(ws, frame.request_id, ErrorKind.NOT_READY, message)
+            if row.wait is calls.Wait.COMMAND:
+                self._error(ws, frame.request_id, 0, ErrorKind.NOT_SERVED, message)
+            else:
+                self._deferred(ws, frame.request_id, ErrorKind.NOT_READY, message)
         elif self._requests.asked_by(ws) >= self._settings.pending_bound:
             message = f"{self._settings.pending_bound} requests pending"
             self._error(ws, frame.request_id, 0, ErrorKind.OVERFLOW, message)
@@ -695,13 +718,13 @@ class Hub:
         source: calls.Source = calls.Source.SERVER_SYNCED,
     ) -> None:
         """Sends a request to the EA serving its role and symbol; with none, has the spawner open
-        its chart and defers it, or refuses it once that chart failed to open."""
-        if row.role is ChartRole.SPAWNER:
-            key = (ChartRole.SPAWNER, None)
-            state = None
+        its chart and defers a read or refuses a command. Orders normally follow a publisher's
+        price subscription; refusing a command with no publisher guards an unavailable chart."""
+        if row.role is ChartRole.ACCOUNT and symbol is not None:
+            key = (ChartRole.PUBLISHER, symbol)
         else:
             key = (row.role, symbol)
-            state = self.use_chart(key)
+        state = self.use_chart(key)
         ea = self._served.get(key)
         if ea is not None and self._eas[ea].outbound.queue.qsize() < self._settings.ea_queue_bound:
             results = Results(row, arguments, self._clock, self._repeated_hours)
@@ -715,11 +738,14 @@ class Hub:
             message = f"{self._settings.ea_queue_bound} frames queued for the EA"
             self._error(ws, client_id, 0, ErrorKind.OVERFLOW, message)
         elif state is ChartState.FAILED:
-            self._chart_failed(ws, client_id, key)
-        elif row.role is ChartRole.SPAWNER:
-            self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no spawner is connected")
+            self._chart_failed(ws, client_id, key, row.wait)
+        elif key[0] is ChartRole.ACCOUNT:
+            self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no account EA is connected")
+        elif row.wait is calls.Wait.COMMAND:
+            message = f"no publisher for {symbol}; chart requested"
+            self._error(ws, client_id, 0, ErrorKind.NOT_SERVED, message)
         else:
-            message = f"no {row.role} EA for {symbol}; chart requested"
+            message = f"no {key[0]} EA for {symbol}; chart requested"
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
 
     def _relay_read(
@@ -739,7 +765,7 @@ class Hub:
             message = f"no publisher for {symbol}; chart requested"
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
         elif state is ChartState.FAILED:
-            self._chart_failed(ws, client_id, key)
+            self._chart_failed(ws, client_id, key, row.wait)
         elif relay is None:
             message = f"no {row.call.name.lower()} relayed for {symbol}"
             self._deferred(ws, client_id, ErrorKind.SYNCING, message)
@@ -752,7 +778,8 @@ class Hub:
 
     def _answer(self, ws, ea: _Ea, answer: binary.Answer) -> None:
         """Passes an EA's answer part on to the consumer that asked, its results in true UTC; a part
-        for a request not pending on this EA is dropped with a warning."""
+        for a request not pending on this EA is dropped with a warning. Conversion stays on the hub
+        loop: each EA result part is bounded by calls.PART_BYTES."""
         pending = self._requests.get(ws, answer.request_id)
         if pending is None:
             logger.warning(
@@ -885,13 +912,18 @@ class Hub:
         error = binary.AnswerError(kind, message)
         self._to_consumer(ws, binary.Answer(client_id, part, True, 0, error=error))
 
-    def _chart_failed(self, ws, client_id: int, key: ChartKey) -> None:
-        """Answers a request ea_error naming its chart that failed to open, with the MQL5 error the
-        spawner met."""
+    def _chart_failed(self, ws, client_id: int, key: ChartKey, wait: calls.Wait) -> None:
+        """Refuses a request whose chart failed to open, carrying its MQL5 error."""
         chart_role, symbol = key
         mql5_error, _failed_at = self._failed[key]
-        message = f"the {chart_role} chart of {symbol} failed to open: MQL5 error {mql5_error}"
-        error = binary.AnswerError(ErrorKind.EA_ERROR, message)
+        if chart_role is ChartRole.ACCOUNT:
+            message = f"the account chart failed to open: MQL5 error {mql5_error}"
+        else:
+            message = f"the {chart_role} chart of {symbol} failed to open: MQL5 error {mql5_error}"
+        if wait is calls.Wait.COMMAND:
+            error = binary.AnswerError(ErrorKind.NOT_SERVED, message)
+        else:
+            error = binary.AnswerError(ErrorKind.EA_ERROR, message)
         self._to_consumer(ws, binary.Answer(client_id, 0, True, mql5_error, error=error))
 
     # ── Sending ───────────────────────────────────────────────────────────────
@@ -999,8 +1031,13 @@ class Hub:
         if consumer is not None:
             consumer.outbound.sender.cancel()
             self._requests.consumer_left(ws)
+            for subscription in consumer.subscriptions:
+                self._forget_subscriber(ws, subscription)
             self._mark_used(consumer.subscriptions)
-            self._tell_publishers()
+            for symbol in {
+                item.symbol for item in consumer.subscriptions if item.symbol is not None
+            }:
+                self._tell_publisher(symbol)
         elif ea is not None:
             ea.outbound.sender.cancel()
             if self._served.get(ea.key) is ws:
@@ -1027,10 +1064,13 @@ class Hub:
                         )
                 if ea.chart_role is ChartRole.SPAWNER:
                     self._spawner = None
+                    self._chart_status = None
                     self._sent.clear()
                     for key in list(self._close_sent):
                         if key not in self._resync_closing:
                             del self._close_sent[key]
+                elif ea.chart_role is ChartRole.ACCOUNT:
+                    self._request_chart(ea.key)
                 else:
                     if ea.chart_role is ChartRole.PUBLISHER:
                         del self._told[ea.symbol]

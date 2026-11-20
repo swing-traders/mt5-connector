@@ -8,9 +8,10 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from hub_double import HubDouble, asked, eventually, zeroed
+from hub_double import HubDouble, asked, assert_frame_equal, eventually, tick_rows, zeroed
 from websockets.asyncio.server import serve
 
+from mt5connector.client import errors
 from mt5connector.client import hub as hub_module
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import (
@@ -115,7 +116,7 @@ async def test_connect_says_hello_and_subscribes_what_is_wanted_under_op_ids(hub
 @pytest.mark.parametrize(
     "frame",
     [
-        binary.Ticks("EURUSD", (tick(1), tick(2))),
+        binary.Ticks("EURUSD", tick_rows(tick(1), tick(2))),
         binary.Bar(
             "EURUSD",
             Series.M1,
@@ -148,7 +149,8 @@ async def test_a_pushed_stream_frame_is_handed_to_the_owner(hub, frame):
     await hub.push(frame)
 
     await eventually(lambda: owner.frames)
-    assert owner.frames == [frame]
+    assert len(owner.frames) == 1
+    assert_frame_equal(owner.frames[0], frame)
     await hub_session.disconnect()
 
 
@@ -259,19 +261,118 @@ async def test_after_a_reconnect_a_subscribe_waits_for_the_hello_and_rides_the_r
     assert socket.sent[-1] == binary.Subscribe(2, Subscription(Stream.TICKS, "USDJPY"))
 
 
+async def test_a_request_before_its_first_hello_is_not_sent():
+    owner = Owner()
+    hub_session = HubSession(config(1), asyncio.get_running_loop(), owner.on_frame, None, owner.log)
+    socket = HeldSocket(lambda frame: isinstance(frame, binary.AdapterHello))
+    hub_session._ws = socket
+    resend = asyncio.create_task(hub_session._send_wanted())
+    await socket.holding.wait()
+    try:
+        with pytest.raises(
+            ServerUnreachable, match="account_info: not sent:.*awaiting its hello"
+        ) as caught:
+            await asyncio.wait_for(hub_session.account_info(), 0.2)
+        assert type(caught.value) is errors.NotSent
+        assert socket.sent == [HELLO]
+        assert hub_session._in_flight == {}
+    finally:
+        socket.released.set()
+        await resend
+
+
+async def test_a_request_during_sixty_subscription_replay_is_sent_after_the_hello():
+    owner = Owner()
+    hub_session = HubSession(config(1), asyncio.get_running_loop(), owner.on_frame, None, owner.log)
+    wanted = [Subscription(Stream.TICKS, f"S{index:02}") for index in range(60)]
+    for subscription in wanted:
+        await hub_session.subscribe(subscription)
+    socket = HeldSocket(lambda frame: isinstance(frame, binary.Subscribe))
+    hub_session._ws = socket
+    hub_session._on_reconnected()
+    await socket.holding.wait()
+    read = asyncio.create_task(hub_session.account_info())
+    try:
+        await asyncio.wait_for(
+            eventually(lambda: any(isinstance(frame, binary.Request) for frame in socket.sent)),
+            0.2,
+        )
+        request = next(frame for frame in socket.sent if isinstance(frame, binary.Request))
+        assert len([frame for frame in socket.sent if isinstance(frame, binary.Subscribe)]) == 1
+        count, body = calls.write_result(calls.CALLS[Call.ACCOUNT_INFO], account(42))
+        hub_session._on_message(
+            binary.encode(binary.Answer(request.request_id, 0, True, 0, count, body))
+        )
+        assert (await asyncio.wait_for(read, 0.2)).result.login == 42
+    finally:
+        socket.released.set()
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
+        await asyncio.gather(*hub_session._tasks)
+    assert socket.sent[0] == HELLO
+    assert [
+        frame.subscription for frame in socket.sent if isinstance(frame, binary.Subscribe)
+    ] == wanted
+
+
+@pytest.mark.parametrize("reconnect", [False, True])
+async def test_a_refused_request_write_fails_not_sent_with_no_flight(hub, reconnect):
+    owner = Owner()
+    hub_session = session(hub, owner)
+    await hub_session.connect()
+    connected_socket = hub_session._ws
+
+    class RefusingSocket(HeldSocket):
+        async def send(self, raw):
+            if raw[1] == binary.FrameKind.HELLO:
+                return
+            if reconnect:
+                hub_session._on_reconnected()
+            raise hub_module.WebSocketClientError("write refused")
+
+    socket = RefusingSocket(lambda frame: False)
+    hub_session._ws = socket
+    try:
+        with pytest.raises(ServerUnreachable, match="account_info: not sent:.*write") as caught:
+            await asyncio.wait_for(hub_session.account_info(), 0.2)
+        assert type(caught.value) is errors.NotSent
+        assert socket.sent == []
+        assert hub_session._in_flight == {}
+    finally:
+        hub_session._ws = connected_socket
+        await hub_session.disconnect()
+
+
+async def test_a_command_refused_not_served_raises_the_hubs_reason_without_reasking(hub):
+    hub_session = session(hub, Owner())
+    await hub_session.connect()
+    hub.answers[Call.ORDER_SEND] = [
+        binary.AnswerError(ErrorKind.NOT_SERVED, "no publisher for X; chart requested")
+    ]
+    try:
+        with pytest.raises(errors.HubAnswerError, match="order_send: no publisher for X") as caught:
+            await asyncio.wait_for(hub_session.order_send({"symbol": "X"}), 0.2)
+        assert type(caught.value) is errors.NotServed
+        assert len(hub.asked(Call.ORDER_SEND)) == 1
+    finally:
+        await hub_session.disconnect()
+
+
 async def test_a_refusal_and_an_undecodable_frame_are_logged_and_the_stream_goes_on(hub):
     owner = Owner()
     hub_session = session(hub, owner)
     await hub_session.connect()
     await eventually(lambda: hub.connections)
-    frame = binary.Ticks("EURUSD", (tick(),))
+    frame = binary.Ticks("EURUSD", tick_rows(tick()))
 
     await hub.push(binary.Refusal("a text frame"))
     await hub.connections[-1].send('{"v": 1, "type": "tick"}')
     await hub.push(frame)
 
     await eventually(lambda: owner.frames)
-    assert owner.frames == [frame]
+    assert len(owner.frames) == 1
+    assert_frame_equal(owner.frames[0], frame)
     errors = [call.args[0] for call in owner.log.error.call_args_list]
     assert errors[0] == "hub session: the hub refused a frame: a text frame"
     assert errors[1].startswith("hub session: a frame it cannot decode: offset 0: version 123")
@@ -284,8 +385,8 @@ async def test_a_frame_the_owner_fails_on_is_logged_and_the_session_goes_on(hub)
     await hub_session.connect()
     await eventually(lambda: hub.connections)
 
-    await hub.push(binary.Ticks("EURUSD", (tick(),)))
-    await hub.push(binary.Ticks("EURUSD", (tick(),)))
+    await hub.push(binary.Ticks("EURUSD", tick_rows(tick())))
+    await hub.push(binary.Ticks("EURUSD", tick_rows(tick())))
 
     await eventually(lambda: len(owner.log.exception.call_args_list) == 2)
     message, failure = owner.log.exception.call_args.args
@@ -340,7 +441,8 @@ async def test_two_calls_answered_in_reverse_order_resolve_each_with_its_own_ans
 
     account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
-    first, second = await asked(hub, 2)
+    requests = {request.call: request for request in await asked(hub, 2)}
+    first, second = requests[Call.ACCOUNT_INFO], requests[Call.SYMBOL_INFO_TICK]
     await hub.answer(second, tick())
     await hub.answer(first, account(1_234))
 
@@ -494,8 +596,9 @@ async def cancelled_once_sent(hub, hub_session, monkeypatch, call) -> binary.Req
     send = hub_session._send
 
     async def sending(raw):
-        await send(raw)
+        sent = await send(raw)
         sent_once.set()
+        return sent
 
     monkeypatch.setattr(hub_session, "_send", sending)
     task = asyncio.create_task(call)
@@ -877,11 +980,14 @@ async def test_a_resend_a_reconnect_overtakes_does_not_open_the_next_connection_
     hub_session._on_reconnected()
     await socket.holding.wait()
     hub_session._reconnects += 1
-    hub_session._greeting.clear()
     socket.released.set()
     await asyncio.gather(*hub_session._tasks)
 
-    assert not hub_session._greeting.is_set()
+    with pytest.raises(ServerUnreachable, match="account_info: not sent:.*reconnecting") as caught:
+        await asyncio.wait_for(hub_session.account_info(), 0.2)
+    assert type(caught.value) is errors.NotSent
+    assert not any(isinstance(frame, binary.Request) for frame in socket.sent)
+    assert hub_session._in_flight == {}
 
 
 async def test_an_answer_of_one_record_in_two_parts_fails_its_call():
@@ -924,7 +1030,8 @@ async def test_an_answer_whose_payload_runs_short_fails_its_request_at_once_and_
     loop = asyncio.get_running_loop()
     account_read = asyncio.create_task(hub_session.account_info())
     tick_read = asyncio.create_task(hub_session.symbol_info_tick("EURUSD"))
-    first, second = await asked(hub, 2)
+    requests = {request.call: request for request in await asked(hub, 2)}
+    first, second = requests[Call.ACCOUNT_INFO], requests[Call.SYMBOL_INFO_TICK]
 
     started = loop.time()
     # An answer's payload opens with its part and last_error, eight bytes; this one carries three.

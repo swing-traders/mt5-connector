@@ -43,7 +43,7 @@ The repository ships two distributions, versioned together: one release builds b
 
 | Distribution | Import packages | Installs into | Carries |
 |---|---|---|---|
-| `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the history client and the downloader, and the wire vocabulary |
+| `mt5-connector-client` | `mt5connector.client`, `mt5connector.wire` | the Python that runs NautilusTrader | the data and execution clients, the instrument provider, the factories, the history client, and the wire vocabulary |
 | `mt5-connector-server` | `mt5connector.server` | the Linux Python that runs the hub beside the terminal | the hub, the EA's source, and a copy of the wire vocabulary made when its wheel is built |
 
 `mt5connector` is a namespace package, so the two install side by side in one environment. The wire vocabulary — the inventory of the `MetaTrader5` package, the broker clock and the history protocol's names — lives once, in the client's tree.
@@ -61,7 +61,6 @@ The repository ships two distributions, versioned together: one release builds b
   - [Quick start](#quick-start)
   - [Configuration](#configuration)
     - [Symbol naming](#symbol-naming)
-  - [Downloading history](#downloading-history)
   - [Running in a node](#running-in-a-node)
     - [Bar types](#bar-types)
   - [The MT5 server](#the-mt5-server)
@@ -282,72 +281,6 @@ Its loads — NautilusTrader's `load_all_async` and `load_ids_async`, and `load_
 
 ---
 
-## Downloading history
-
-`MT5DataDownloader` writes a symbol's bars and quote ticks into a NautilusTrader Parquet catalog, read through the hub's [history calls](packages/server/mt5connector/server/README.md#history) on its connection's hub session; `download_ticks`, `download_bars` and `download_all` are coroutines.
-
-The downloader walks back from `end`, one request per window, until `start` or the floor the hub's `ranges` holds for the series — read before the walk, again after a window answers no rows, and once the walk ends — and records that floor in its result when it lies inside the range:
-
-- bars by the windows the terminal answers in one read, `maxbars − 11` periods, each bar stamped at the close the hub answers for it — the range names the closes — and typed by the price its symbol's chart mode names: BID or LAST, LAST where the definition states none;
-- ticks one UTC day at a time, both sizes of each the instrument's largest order.
-
-A window the hub answers with an error, or whose answer is lost, is recorded among the result's errors and the walk goes on, and so is a `ranges` read the hub answers with an error; any other error reading it raises.
-
-```python
-import asyncio
-from datetime import datetime, timezone
-
-from mt5connector.client.config import MT5Config
-from mt5connector.client.connection import MT5Connection
-from mt5connector.client.providers import MT5InstrumentProvider
-from mt5connector.client.downloader import MT5DataDownloader
-from nautilus_trader.common.component import LiveClock
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-
-async def main() -> None:
-    config = MT5Config(account=12345678, server="Exness-MT5Trial9", ws_url="ws://127.0.0.1:9000")
-
-    conn     = MT5Connection(config)
-    await conn.connect()
-
-    provider = MT5InstrumentProvider(conn, venue=config.venue, clock=LiveClock())
-    catalog  = ParquetDataCatalog("./catalog")
-
-    # Write the instrument definition first (required by the backtest engine)
-    instrument = await provider.load_symbol("EURUSDm")
-    catalog.write_data([instrument])
-
-    # Download bars
-    downloader = MT5DataDownloader(conn, provider, catalog)
-    result = await downloader.download_bars(
-        symbol    = "EURUSDm",
-        start     = datetime(2024, 1,  1, tzinfo=timezone.utc),
-        end       = datetime(2024, 12, 31, tzinfo=timezone.utc),
-        timeframe = 16385,  # MT5 timeframe constant: 16385 = H1
-    )
-    print(result)
-    await conn.disconnect()
-
-
-asyncio.run(main())
-```
-
-**MT5 timeframe constants:**
-
-| Timeframe | Constant |
-|-----------|----------|
-| M1  | 1 |
-| M5  | 5 |
-| M15 | 15 |
-| M30 | 30 |
-| H1  | 16385 |
-| H4  | 16388 |
-| D1  | 16408 |
-| W1  | 32769 |
-
----
-
 ## Running in a node
 
 The data and execution clients run in NautilusTrader's `TradingNode`, and the node's instrument set is NT's own: each client loads what its `instrument_provider` config names, as NT's adapters do.
@@ -425,8 +358,11 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
   - `session` is the session a caller's own reads ride on that loop, the history reads below among them; it raises `RuntimeError` on a connection not connected.
   - A connect on a connection not disconnected — connected, connecting or disconnecting — and a disconnect on one not connected raise `RuntimeError` naming its state; used as an async context manager, a connection connects on entry and disconnects on exit. A lost hub leaves the connection connected: NautilusTrader's client reconnects its session, as it does a client's.
 - Each client holds a hub session, `mt5connector.client.hub.HubSession`, on NautilusTrader's own `WebSocketClient`, which reconnects with backoff; on each reconnect the session says hello and subscribes everything it wants again, and a subscription it changes before that hello waits to ride it. NautilusTrader's client can still send a frame it held through the outage ahead of the hello: the hub refuses it and closes the connection, and the next reconnect's resend is clean — nothing is lost, at the cost of one more reconnect.
+- A session's `on_frame` callback receives `binary.Ticks.ticks` as a NumPy structured array of `mirror.TICKS` records. Read fields as `frame.ticks[index]["bid"]`; tick rows have no dict methods. Producers construct the same array representation; the wire bytes are unchanged.
 - A session also asks the hub's calls: `request(call, **arguments)`, or the method named after each call with its arguments, answers `Answered(result, last_error)` once every part of the answer arrived — a struct as its record type, rows as numpy arrays, transactions as `TradeTransaction` frames.
-  - It raises the `HubAnswerError` of the answer's error kind. `Syncing`, `NotReady` and `NoPublisher` carry `retry_after_s`, and `deferring(call, **arguments)` asks again after each such delay until it is answered otherwise or its caller cancels. With `on_syncing=OnSyncing.RAISE` it raises `Syncing` at once, retaining the delay; other deferrals are still retried.
+  - A request is sent immediately or raises `NotSent`, a `ServerUnreachable`: its connection is reconnecting, its hello has not gone out, or its write was refused. The hub never saw that request. Requests do not wait for subscription replay; replay is the session's own desired-state reconciliation, with hello first and subscriptions in first-wanted order.
+  - It raises the `HubAnswerError` of the answer's error kind. `Syncing`, `NotReady` and `NoPublisher` carry `retry_after_s`, and `deferring(call, **arguments)` asks again after each such delay until it is answered otherwise or its caller cancels.
+  - A command the hub cannot execute now is refused with `NotServed`, without a retry delay, and rejected unsent. It guards an unavailable publisher or an unverified clock: normal orders follow price subscriptions, which open the publisher first. A refused command is never held or retried, even though the hub still requests the missing chart.
   - A request unanswered past the hub's deadline and a margin, or in flight when the connection drops, raises `ResponseLost`.
   - A frame of the hub's the session cannot decode is logged as an error: an answer fails the request it answers with `ProtocolError`, a frame whose header breaks fails every request in flight with it, and a stream frame fails nothing.
   - An `order_send` answered sent stays outstanding, across a disconnect too, until its `REQUEST` transaction reaches the session. A reconnect, and a connect after a disconnect, ask each symbol's publisher for the outstanding ones' `REQUEST` transactions, hand each to the owner as the `TradeTransaction` a live one arrives as, and drop with one warning those the publisher no longer holds.
@@ -440,14 +376,30 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 `mt5connector.client.history` reads history as coroutines on the hub session each is handed as its first argument, every epoch true-UTC seconds:
 
 - `bars(session, symbol, series, first_open_s, last_open_s)` answers the bars of a `Series` opened in that window as a numpy array of `MqlRates`' fields and each bar's `time_close`; `ticks(session, symbol, start_s, end_s, flags=TickFlags.INFO)` the ticks of those seconds as the package's array; and `ranges(session, symbol)` the hub's `Ranges`: the terminal's `maxbars`, each series' `SeriesRange` floor, the first real tick's `first_tick`, the exclusive UTC-day edge `claimable_through` certified by the hub's re-sync record, and its latest `resync_failure`, empty after success.
-- Each takes keyword-only `on_syncing=OnSyncing.WAIT` and `source=Source.SERVER_SYNCED`, with `OnSyncing` in `client.history` and `Source` in `wire.calls`. `on_syncing=OnSyncing.RAISE` raises the first `Syncing` with its `retry_after_s`; `WAIT` re-asks after its delay. `not_ready` and `no_publisher` are retried in either mode, with no deadline of their own. Any other error is the hub's `HubAnswerError` raised — `InvalidWindow` for a window starting after the terminal's time — and an answer lost to the session's deadline or a reconnect raises `ResponseLost`.
-- The server-synced default sends no extra wire argument and waits for any due re-sync. `source=Source.TERMINAL` accepts the terminal's live recording and waits only from a re-sync's deletion until measurement restores the months. This changes the gate, not the returned rows or ranges fields. The data client uses `TERMINAL` in its three history paths; the downloader and catalog providers use the default.
+- Each takes keyword-only `source=Source.SERVER_SYNCED`, with `Source` in `wire.calls`. `syncing`, `not_ready` and `no_publisher` are retried after their delays, with no deadline of their own. Any other error is the hub's `HubAnswerError` raised — `InvalidWindow` for a window starting after the terminal's time — and an answer lost to the session's deadline or a reconnect raises `ResponseLost`.
+- The server-synced default sends no extra wire argument and waits for any due re-sync. `source=Source.TERMINAL` accepts the terminal's live recording and waits only from a re-sync's deletion until measurement restores the months. This changes the gate, not the returned rows or ranges fields. The data client uses `TERMINAL` in its three history paths; catalog providers use the default.
 - `opens_closing(series, first_close, last_close)` gives the opens a window of closes is read by, and `closing(rows, first_close, last_close)` keeps the bars closing in it.
 - A caller awaits one on its connection's session, on the loop the connection was connected on: `await history.bars(conn.session, "EURUSDm", Series.H1, first_open_s, last_open_s)`.
 
 ---
 
 ## Releases
+
+### 0.21.0+st
+
+- The client requires `nautilus_trader==1.231.0+st.39`.
+- A request that cannot be written immediately raises `NotSent`. A command the hub cannot serve immediately raises `NotServed`; it is rejected unsent without waiting or retrying. An unknown command outcome stays with NT's reconciliation.
+- A bracket command no longer waits for a sibling's verdict.
+- Reads on command paths and in reports are asked once.
+- The server runs a dedicated account EA. Symbol-named position, order and margin-rate reads use that symbol's publisher; account-wide reads use the account EA. Health requires both the spawner and account EA and a fresh verified clock, which any serving EA can relay.
+- The EA-to-hub binary protocol adds `chart_status` (kind 22), carrying the spawner's listed-chart count and terminal capacity as two uint32 values. Health exposes `chart_count` and `chart_limit`; the count is cleared when the spawner disconnects and remains unknown until its replacement reports.
+- Symbol-named account reads defer until the symbol's publisher opens.
+- Chart opens progress ahead of unrelated closes. Each spawner pass permits one chart close and one Market Watch deselection, preserving hidden conversion symbols.
+- Instrument loads, cancel batches and report reads fan out by key. Historical quote and bar construction yields between batches; pushed tick frames carry a structured NumPy array in `Ticks.ticks`.
+- The history API no longer accepts `on_syncing`, and `OnSyncing` is removed. Remove that argument and its import; history reads continue waiting out the hub's deferrals.
+- `MT5DataDownloader` is removed. Read `history.bars`, `history.ticks` or `history.ranges` on the connection's session instead.
+
+### Publishing
 
 - `VERSION` holds the one version both distributions carry.
 - The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The manual `terminal-image.yml` Action builds the terminal-only image and skips publishing a build already tagged. A terminal upgrade changes that one image reference in a PR, checked by the image tier.
@@ -466,7 +418,7 @@ just test
 All tests but the image tier's and the live hub tier's mock the MT5 terminal — no live connection required to run them.
 
 ```
-tests/client/              — the adapter: connection, data and execution clients, instruments, factories, the history client and the downloader
+tests/client/              — the adapter: connection, data and execution clients, instruments, factories and the history client
 tests/server/              — the WS hub: its streams, requests, clock gate, epoch conversion and settings, the EA's half of the protocol, and the MQL5 generator
 tests/image/               — the server image, started on a made-up account; its GUI driver and log tail
 tests/live/                — the hub and its EAs in two running images, through the client's hub session
@@ -504,7 +456,6 @@ mt5-connector/
 │   │       │   ├── constants.py     # venue, account-loop and reconnect defaults
 │   │       │   ├── currencies.py    # the precision ladder a venue currency code is built by
 │   │       │   ├── data.py          # MT5DataClient — pushed ticks, marks and venue bars, and history requests
-│   │       │   ├── downloader.py    # MT5DataDownloader — historical bar download
 │   │       │   ├── errors.py        # custom exceptions
 │   │       │   ├── execution.py     # MT5LiveExecutionClient — orders, their events, and reconciliation reports
 │   │       │   ├── factories.py     # LiveDataClientFactory + LiveExecClientFactory wiring
@@ -581,6 +532,7 @@ The hub has not verified the broker clock: the terminal is still booting, or it 
 - A reduce-only order is an exit of the position its submit names (NT's position id, the venue's position identifier), translated into what the venue holds for one, which is one stop loss and one take profit per position:
   - A stop-market order becomes the position's stop loss and a limit order its take profit. The order's venue order id is synthetic, `<identifier>-SL-<n>` or `<identifier>-TP-<n>`; a later order of the same kind moves the bracket and cancels the order it took the place of.
   - A cancel clears the bracket, and a modify moves it. The bracket has no volume and covers whatever the position holds, so the quantity a modify states changes nothing at the venue and is the order's own figure.
+  - Each bracket command sets both slots, carrying NT's current level for the other exit without waiting for its verdict. A later refusal never resends or rolls back that command; the caller owns reasserting its desired levels.
   - The venue answers a request setting a bracket to what it already holds with "no changes" (10025), which confirms the setting: a stop or target sent again to the level the venue holds is accepted like any other.
   - A market order closes the position by its current ticket at the order's quantity, whatever brackets stand: the venue alone judges that volume, and the position's stop loss and take profit stay on whatever remains.
   - A stop loss or take profit that fires is a fill of the order holding that bracket. The order first takes the ticket of the order the venue executed the bracket with as its venue order id, and each fill reports under the ticket of its execution.
@@ -588,7 +540,10 @@ The hub has not verified the broker clock: the terminal is still booting, or it 
   - A bracket can execute in parts, each part an execution of its own: the order keeps every execution ticket it took, across a restart too, and a later deal of one of them fills that order even after another order took the bracket.
   - An exit order reports once, under the ticket it took last, however many executions the venue records for it, and always as the exit: its own type, quantity and level. Once its bracket no longer holds it, the report carries the volume its executions filled at their average price, and reads filled when they filled the order, canceled when they did not.
   - A pending order bound to a position, a reduce-only stop-limit order, and an exit that expires are rejected before anything is sent: the venue ignores a pending order's position, and its fill would open a new one.
-- A submit, modify or cancel the terminal answered sent is settled by the venue's verdict, its `REQUEST` transaction; one the venue may have acted on without the client learning it — a verdict of 10031, an answer lost to a timeout or a connection closed after the request arrived — emits no event and logs a warning, and the transactions the venue pushes for it or NT's reconciliation settle the order. A request the terminal refused or that never reached the venue is rejected at once, one that never left the client as `not sent`.
+- A submit, modify or cancel follows what the client knows:
+  - A known unsent command — `NotSent`, `NotServed` or another hub refusal — is rejected at once with `not sent: …`, without waiting or retrying. Submit emits `OrderRejected`, modify `OrderModifyRejected` and cancel `OrderCancelRejected`.
+  - A command the venue may have acted on — a verdict of 10031, `ResponseLost`, a broken answer, an EA gone or a timeout — emits no event and logs one warning. Its venue transactions or NT's in-flight reconciliation settle the order.
+  - Reads on command paths and in reports ask once. A deferral rejects the command unsent or raises to NT from the report; reads completing a pushed venue event and the client's startup load honour the API's deferrals until answered or cancelled.
 - Fills come from the venue's deals alone, pushed as they happen, once per deal; deals already in the history when the client connects are never emitted, except a stop loss's or take profit's deal no exit order in NT's cache has booked while an exit holds its execution or occupies that bracket. Connect emits those before it returns, and fails naming the deal when it cannot build one, so the next start tries again.
 - Past backtest performance does not guarantee live performance. Spreads, slippage, and execution latency differ between backtest and live environments.
 

@@ -859,6 +859,7 @@ async def test_deleting_one_symbols_months_does_not_wait_for_anothers(
         verified(port) as spawner,
     ):
         try:
+            account = await FakeEa.connect(port, ChartRole.ACCOUNT, "EURUSD")
             await eventually(entered.is_set, timeout=SWEEP_BOUND_S)
             await eventually(lambda: not eurusd.exists(), timeout=1)
             assert audcad.exists()
@@ -892,6 +893,7 @@ async def test_deleting_one_symbols_months_does_not_wait_for_anothers(
                 await ea.close()
         finally:
             released.set()
+            await account.close()
 
 
 def test_dispatch_on_a_symbol_that_has_a_machine_raises(tmp_path):

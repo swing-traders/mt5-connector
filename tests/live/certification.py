@@ -1,0 +1,314 @@
+"""Health observations and explicit controls for certification's throwaway server."""
+
+import asyncio
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import IntEnum, StrEnum
+from http import HTTPStatus
+from pathlib import PurePosixPath
+from urllib.error import HTTPError
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
+
+from mt5connector.wire import calls
+from mt5connector.wire.push_wire import ChartRole
+
+
+async def health(url):
+    parts = urlsplit(url)
+    endpoint = urlunsplit(
+        ("https" if parts.scheme == "wss" else "http", parts.netloc, "/health", "", "")
+    )
+
+    def read():
+        try:
+            response = urlopen(endpoint, timeout=5)
+        except HTTPError as failure:
+            response = failure
+        with response:
+            return HTTPStatus(response.status), json.load(response)
+
+    return await asyncio.to_thread(read)
+
+
+async def until(read, accepts, seconds, description, interval=0.02):
+    deadline = time.monotonic() + seconds
+    while True:
+        value = await read()
+        if accepts(value):
+            return value
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{description} not observed within {seconds} s")
+        await asyncio.sleep(interval)
+
+
+async def observed_pending(url, coroutines):
+    """The completed answers and roles observed while those reads were pending."""
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    roles = set()
+    try:
+        while not all(task.done() for task in tasks):
+            status, body = await health(url)
+            assert status is HTTPStatus.OK, body
+            roles.update(ChartRole[row["role"].upper()] for row in body["result"]["pending"])
+            await asyncio.sleep(0)
+        return [task.result() for task in tasks], roles
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def publisher_ready(session, symbol):
+    # Each attempt = READ_DEADLINE_S + advertised retry_after_s; cold opens have no total deadline.
+    return await session.deferring(calls.Call.SYMBOL_INFO_TICK, symbol=symbol)
+
+
+def container_log_time(line):
+    value = datetime.fromisoformat(line.split(" ", 1)[0])
+    if value.tzinfo is None:
+        raise ValueError("container log timestamp has no timezone")
+    return value.timestamp()
+
+
+def journal_event_time(line):
+    match = re.search(r" (?:experts|terminal): [^\t]*\t[^\t]*\t(\d{2}:\d{2}:\d{2}\.\d{3})\t", line)
+    if match is None:
+        return None
+    delivered = datetime.fromtimestamp(container_log_time(line), UTC)
+    clock = datetime.strptime(match[1], "%H:%M:%S.%f").time()
+    event = delivered.replace(
+        hour=clock.hour, minute=clock.minute, second=clock.second, microsecond=clock.microsecond
+    )
+    if event > delivered:
+        event -= timedelta(days=1)
+    return event.timestamp()
+
+
+def journal_after(log, acknowledged_at):
+    lines = []
+    for line in log.splitlines():
+        event = journal_event_time(line)
+        if event is not None and event >= acknowledged_at:
+            lines.append(line)
+    return lines
+
+
+def retained_publisher_closes(log, now, seconds):
+    symbols = set()
+    for line in log.splitlines():
+        match = re.search(
+            r"the publisher chart of (.+?)(?: out of use| neither closed|, asked for)", line
+        )
+        left = re.search(r"publisher EA for (.+?) left its chart out of use: closing it", line)
+        if "closing it" in line and (match is not None or left is not None):
+            symbol = match[1] if match is not None else left[1]
+            if container_log_time(line) >= now - seconds:
+                symbols.add(symbol)
+    return symbols
+
+
+class ProbeEvent(StrEnum):
+    START = "START"
+    CHART_ADDED = "CHART_ADDED"
+    CHART_GONE = "CHART_GONE"
+    WATCH_SELECTED = "WATCH_SELECTED"
+    WATCH_GONE = "WATCH_GONE"
+    WATCH_HELD = "WATCH_HELD"
+    CONNECTED = "CONNECTED"
+    DISCONNECTED = "DISCONNECTED"
+    ACK = "ACK"
+    FAILED = "FAILED"
+    TRADE_OPEN = "TRADE_OPEN"
+    TRADE_CLOSED = "TRADE_CLOSED"
+
+
+class ProbeCommand(IntEnum):
+    OPEN_STRAY = 1
+    CLOSE_SYMBOL = 2
+    SELECT_SYMBOL = 3
+    FIND_PUBLISHER = 4
+    CREATE_TICKS = 5
+    BURST_TICKS = 6
+    TRADE_SESSION = 7
+    LOG_BOUNDARY = 8
+
+
+@dataclass(frozen=True)
+class Observation:
+    microseconds: int
+    event: ProbeEvent
+    symbol: str
+    chart: int
+    selected: bool
+    visible: bool
+    positions: int
+    orders: int
+    token: str
+
+
+class Throwaway:
+    """An explicitly named certification container and its terminal probe."""
+
+    def __init__(self):
+        self.container = os.environ["MT5_CERT_CONTAINER"]
+        self.network = os.environ["MT5_CERT_NETWORK"]
+        self.probe_file = os.environ["MT5_CERT_PROBE_FILE"]
+        self.control_file = str(
+            PurePosixPath(self.probe_file).with_name("connector-chart-probe.commands.tsv")
+        )
+        self.idle_seconds = float(os.environ["MT5_CERT_IDLE_SECONDS"])
+        self.resync_symbol = os.environ["MT5_CERT_RESYNC_SYMBOL"]
+        self.runtime = shutil.which("docker") or shutil.which("podman")
+        if self.runtime is None:
+            raise RuntimeError("certification needs docker or podman")
+        if not 0 < self.idle_seconds <= 10:
+            raise ValueError("MT5_CERT_IDLE_SECONDS must be in (0, 10]")
+        self.network_attached = True
+
+    async def run(self, *arguments, input_text=None, combine_output=False):
+        process = await asyncio.create_subprocess_exec(
+            self.runtime,
+            *arguments,
+            stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT if combine_output else asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(None if input_text is None else input_text.encode()), 240
+        )
+        if process.returncode:
+            raise AssertionError(f"container control failed: {(stderr or stdout).decode()}")
+        return stdout.decode()
+
+    async def logs(self, since):
+        return await self.run(
+            "logs", "--timestamps", "--since", str(since), self.container, combine_output=True
+        )
+
+    async def observations(self):
+        contents = await self.run(
+            "exec",
+            self.container,
+            "python3",
+            "-c",
+            "import pathlib,sys; data=pathlib.Path(sys.argv[1]).read_bytes(); "
+            "sys.stdout.buffer.write(data[:data.rfind(b'\\n')+1])",
+            self.probe_file,
+        )
+        rows = csv.DictReader(io.StringIO(contents), delimiter="\t")
+        result = [
+            Observation(
+                int(row["microseconds"]),
+                ProbeEvent(row["event"]),
+                row["symbol"],
+                int(row["chart"]),
+                row["selected"] == "1",
+                row["visible"] == "1",
+                int(row["positions"]),
+                int(row["orders"]),
+                row["token"],
+            )
+            for row in rows
+        ]
+        assert result and result[0].event is ProbeEvent.START, "terminal probe is not running"
+        assert not any(row.event is ProbeEvent.FAILED for row in result), "terminal probe failed"
+        return result
+
+    async def command(self, operation, symbol):
+        token = str(time.monotonic_ns())
+        await self.run(
+            "exec",
+            "-i",
+            self.container,
+            "python3",
+            "-c",
+            "import pathlib,sys; p=pathlib.Path(sys.argv[1]); t=p.with_suffix('.next'); "
+            "t.write_text(sys.stdin.read(),encoding='utf-8'); t.replace(p)",
+            self.control_file,
+            input_text=f"{token}\t{operation.value}\t{symbol}\n",
+        )
+        rows = await until(
+            self.observations,
+            lambda rows: any(row.event is ProbeEvent.ACK and row.token == token for row in rows),
+            5,
+            "terminal probe command acknowledgement",
+        )
+        return next(row for row in rows if row.event is ProbeEvent.ACK and row.token == token)
+
+    async def trade_session_open(self, symbol):
+        acknowledged = await self.command(ProbeCommand.TRADE_SESSION, symbol)
+        state = next(
+            row
+            for row in await self.observations()
+            if row.token == acknowledged.token
+            and row.event in (ProbeEvent.TRADE_OPEN, ProbeEvent.TRADE_CLOSED)
+        )
+        return state.event is ProbeEvent.TRADE_OPEN
+
+    async def caught_up_log(self, since):
+        boundary = await self.command(ProbeCommand.LOG_BOUNDARY, "")
+        return await until(
+            lambda: self.logs(since),
+            lambda log: f"chart probe: log boundary {boundary.token}" in log,
+            120,
+            "delivery of the terminal journal boundary",
+        )
+
+    async def history_snapshot(self, symbol):
+        return json.loads(
+            await self.run(
+                "exec",
+                self.container,
+                "python3",
+                "-c",
+                "import json,os,sys; "
+                "from mt5connector.server.settings import read_hub_settings; "
+                "root=read_hub_settings(os.environ).history_store; "
+                "record=root/'.mt5-connector/resync.json'; "
+                "print(json.dumps({'symbol':sys.argv[1],"
+                "'files':sorted(map(str,root.glob('*/ticks/'+sys.argv[1]+'/*.tkc'))),"
+                "'resync':json.loads(record.read_text()) if record.exists() else None}))",
+                symbol,
+            )
+        )
+
+    async def cut_network(self):
+        await self.run("network", "disconnect", self.network, self.container)
+        self.network_attached = False
+
+    async def restore_network(self):
+        if not self.network_attached:
+            await self.run("network", "connect", self.network, self.container)
+            self.network_attached = True
+
+    async def start(self):
+        await self.run("start", self.container)
+
+
+def listed_charts(rows):
+    charts = {}
+    for row in rows:
+        if row.event is ProbeEvent.CHART_ADDED:
+            charts[row.chart] = row.symbol
+        elif row.event is ProbeEvent.CHART_GONE:
+            charts.pop(row.chart, None)
+    return charts
+
+
+def selected_symbols(rows):
+    symbols = {}
+    for row in rows:
+        if row.event in (ProbeEvent.WATCH_SELECTED, ProbeEvent.WATCH_HELD):
+            symbols[row.symbol] = row
+        elif row.event is ProbeEvent.WATCH_GONE:
+            symbols.pop(row.symbol, None)
+    return symbols

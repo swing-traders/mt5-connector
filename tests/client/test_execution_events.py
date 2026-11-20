@@ -210,6 +210,38 @@ async def test_a_deal_added_fills_at_once_under_the_venues_position_and_the_deal
     h.venue.history_deals_get.assert_called_once_with(ticket=7001)
 
 
+@pytest.mark.parametrize("deferred_read", ["deal", "identity"])
+async def test_a_pushed_fill_waits_out_its_deferred_read_and_emits_once(exec_venue, deferred_read):
+    h = build(exec_venue)
+    if deferred_read == "deal":
+        order = h.place(h.limit(), ticket=9001)
+    else:
+        order = h.place(h.limit(), status=OrderStatus.SUBMITTED)
+    await h.connect()
+    deal = ours_deal(ticket=7001, order=9001, position_id=8133477)
+    asked_at = []
+    read = h.venue.history_deals_get if deferred_read == "deal" else h.venue.orders_get
+
+    def deferred_once(**query):
+        asked_at.append(asyncio.get_running_loop().time())
+        if len(asked_at) == 1:
+            raise errors.NotReady("the event read is not ready", 0, 0.025)
+        if deferred_read == "deal":
+            return (deal,)
+        else:
+            return (
+                ours_order(ticket=9001, comment=execution.order_comment(order.client_order_id)),
+            )
+
+    h.venue.history_deals_get.return_value = (deal,)
+    read.side_effect = deferred_once
+    await asyncio.wait_for(h.delivered(deal_added(deal)), 1.0)
+    assert [fill.client_order_id for fill in fills(h)] == [order.client_order_id]
+    assert read.call_count == 2
+    assert asked_at[1] - asked_at[0] >= 0.025
+    assert h.logged(LogLevel.ERROR) == []
+
+
 async def test_deals_already_in_the_history_at_connect_are_never_emitted(exec_venue):
     h = build(exec_venue)
     h.place(h.limit(), ticket=9001)

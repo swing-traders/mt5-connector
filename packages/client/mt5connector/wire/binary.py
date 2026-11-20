@@ -7,6 +7,8 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag, StrEnum
 
+import numpy as np
+
 from . import mirror
 from .history_wire import BARS, Series
 from .push_wire import (
@@ -46,6 +48,7 @@ def _pod(array: mirror.Array) -> struct.Struct:
 
 
 TICK = _pod(mirror.TICKS)
+_TICKS = np.dtype(list(mirror.TICKS.dtype))
 RATES = _pod(mirror.RATES)
 # A bar as the hub sends it to a consumer: its MqlRates, then its close.
 BAR = _pod(BARS)
@@ -78,6 +81,7 @@ class FrameKind(IntEnum):
     REQUEST = 19
     ANSWER = 20
     BUSY = 21
+    CHART_STATUS = 22
 
 
 class ErrorKind(IntEnum):
@@ -91,6 +95,7 @@ class ErrorKind(IntEnum):
     EA_GONE = 6
     TIMEOUT = 7
     EA_ERROR = 8
+    NOT_SERVED = 9
 
 
 # The kinds that defer a request: each carries the delay before asking again.
@@ -276,10 +281,10 @@ class Duplicate:
 
 @dataclass(frozen=True)
 class Ticks:
-    """A symbol's ticks, each its MqlTick's fields."""
+    """A symbol's ticks as a structured array of MqlTick records."""
 
     symbol: str
-    ticks: tuple[dict[str, object], ...]
+    ticks: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -318,6 +323,14 @@ class ServerTime:
     current: int
     gmt: int
     connected: bool
+
+
+@dataclass(frozen=True)
+class ChartStatus:
+    """The spawner's listed chart count and terminal chart capacity."""
+
+    count: int
+    capacity: int
 
 
 @dataclass(frozen=True)
@@ -396,6 +409,7 @@ Frame = (
     | Bar
     | TradeTransaction
     | ServerTime
+    | ChartStatus
     | Commissions
     | Sessions
     | Request
@@ -416,6 +430,7 @@ _SENT_BY: dict[Sender, frozenset[FrameKind]] = {
             FrameKind.BAR,
             FrameKind.TRADE_TRANSACTION,
             FrameKind.SERVER_TIME,
+            FrameKind.CHART_STATUS,
             FrameKind.COMMISSIONS,
             FrameKind.SESSIONS,
             FrameKind.ANSWER,
@@ -758,8 +773,7 @@ def encode(frame: Frame) -> bytes:
         kind = FrameKind.TICK
         count = len(frame.ticks)
         writer.string(frame.symbol)
-        for tick in frame.ticks:
-            write_pod(writer, TICK, mirror.TICKS, tick)
+        writer.raw(frame.ticks.tobytes())
     elif isinstance(frame, Bar):
         kind = FrameKind.BAR
         writer.string(frame.symbol)
@@ -871,7 +885,9 @@ def _payload(
         frame = ChartKept(*_read_chart(reader), reader.i32("positions"), reader.i32("orders"))
     elif kind is FrameKind.TICK:
         symbol = _symbol(reader)
-        frame = Ticks(symbol, tuple(read_pod(reader, TICK, mirror.TICKS) for _ in range(count)))
+        frame = Ticks(
+            symbol, np.frombuffer(reader.raw(count * _TICKS.itemsize, mirror.TICKS.name), _TICKS)
+        )
     elif kind is FrameKind.BAR and sender is Sender.EA:
         symbol = _symbol(reader)
         timeframe = reader.i32("timeframe")
@@ -894,6 +910,10 @@ def _payload(
         )
     elif kind is FrameKind.COMMISSIONS:
         frame = Commissions(_symbol(reader), read_schedule(reader))
+    elif kind is FrameKind.CHART_STATUS:
+        frame = ChartStatus(reader.u32("count"), reader.u32("capacity"))
+        if frame.capacity == 0:
+            raise CodecError("the terminal's chart capacity is zero")
     elif kind is FrameKind.SESSIONS:
         frame = Sessions(_symbol(reader), read_sessions(reader))
     elif kind is FrameKind.REQUEST:

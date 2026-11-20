@@ -1,8 +1,5 @@
-// The EA inside the terminal, in the role its chart's template sets: the spawner serves the
-// account, relays the trade server's time and opens and closes the charts the hub asks for; a
-// publisher serves its symbol's ticks, closed bars, transactions, reads and trade commands; a
-// history EA serves its symbol's history, read in its own thread once it has measured the symbol.
-// Every frame it sends and reads is the hub protocol's binary one.
+// The chart's template assigns this EA its role: chart control, account-wide reads, a symbol's live
+// streams, or its measured history. Every frame it sends and reads is binary.
 #property script_show_inputs
 
 #include <MQL5Book/ws/wsclient.mqh>
@@ -13,9 +10,10 @@ input string Server = "ws://127.0.0.1:9000/";
 input int ReconnectIntervalSec = 3;
 input int RelaySeconds = 5;
 input int PollMilliseconds = 16;
-// The templates the spawner applies to a chart it opens for a publisher and for a history EA.
+// The templates the spawner applies to the charts it opens.
 input string ChartTemplate = "ticks.tpl";
 input string HistoryTemplate = "ticks_history.tpl";
+input string AccountTemplate = "ticks_account.tpl";
 // The whole time from a dead connection's last pong to the hub dropping it, while the hub's writes
 // to it drain: the hub's ping interval, ping timeout and close timeout together.
 input int HubPingTimeoutSec = 50;
@@ -28,6 +26,50 @@ input int HubPingTimeoutSec = 50;
 // The REQUEST transactions a publisher keeps for the outcomes call, the latest first.
 #define OUTCOME_RING 1000
 #define DAY_SECONDS 86400
+#define SLOW_TICK_MS 100
+// Spacing for loading retries, whose MT5 wait is documented at the pages below.
+#define HISTORY_CALL_SPACING_MS 1000
+// Scheduling margin on https://www.mql5.com/en/docs/series/timeseries_access.
+#define BUSY_MARGIN_S 15
+// One-second poll plus scheduling margin: https://www.mql5.com/en/docs/common/sleep.
+#define BUSY_PAUSE_S (1 + BUSY_MARGIN_S)
+// The 45 s EA synchronisation wait plus margin: https://www.mql5.com/en/docs/series/copyticks.
+#define BUSY_COPY_TICKS_S 60
+// A 45 s EA sync wait plus margin: https://www.mql5.com/en/docs/series/timeseries_access.
+#define BUSY_COPY_RATES_S 60
+// Service bound; no wait is specified: https://www.mql5.com/en/docs/trading/historyselect.
+#define BUSY_HISTORY_SELECT_S 30
+
+enum ENUM_PASS_STEP
+{
+    PASS_DRAIN, PASS_OPEN, PASS_CLOSE, PASS_CURSOR, PASS_RELAY,
+    PASS_TICKS, PASS_BARS, PASS_ACCOUNT, PASS_HISTORY, PASS_RECONNECT
+};
+enum ENUM_CHART_OPEN_CALL
+{
+    OPEN_CALL_NONE, OPEN_CALL_SYMBOL_EXIST, OPEN_CALL_SYMBOL_SELECT,
+    OPEN_CALL_CHART_OPEN, OPEN_CALL_TEMPLATE
+};
+ENUM_PASS_STEP g_longestStep = PASS_DRAIN;
+ulong g_longestStepMs = 0;
+
+void ObserveStep(const ENUM_PASS_STEP step, const ulong started)
+{
+    const ulong elapsed = GetTickCount64() - started;
+    if (elapsed > g_longestStepMs)
+    {
+        g_longestStepMs = elapsed;
+        g_longestStep = step;
+    }
+}
+
+void FinishPass(const ulong started)
+{
+    const ulong elapsed = GetTickCount64() - started;
+    if (elapsed >= SLOW_TICK_MS)
+        PrintFormat("ticks: slow tick: %I64u ms (%s, %I64u ms)", elapsed,
+                    EnumToString(g_longestStep), g_longestStepMs);
+}
 
 // The two session schedules a symbol states per weekday.
 enum ENUM_SESSION_KIND
@@ -80,9 +122,7 @@ long g_openedCharts[];
 ENUM_CHART_ROLE g_openedRoles[];
 string g_openedSymbols[];
 
-// The open_chart and close_chart frames the spawner has not served, in arrival order. It serves one
-// per timer pass: the terminal tears a chart down, and loads a template's EA, after the call
-// returns.
+// Chart teardown and template loading finish after the call returns.
 ENUM_HUB_FRAME g_chartFrameKinds[];
 ENUM_CHART_ROLE g_chartFrameRoles[];
 string g_chartFrameSymbols[];
@@ -95,8 +135,7 @@ long g_closingCharts[];
 string g_closingSymbols[];
 ulong g_closingSince[];
 
-// The charts the last periodic sweep found that the connector has not allocated; one found again
-// is closed.
+// Charts unallocated on the preceding cleanup round; a second sighting permits their close.
 long g_unallocatedSeen[];
 // The charts the sweep closed that the terminal still lists; a chart is closed by the sweep once.
 long g_sweptCharts[];
@@ -104,6 +143,27 @@ long g_sweptCharts[];
 // or whose deselect the terminal refused; a symbol is reported once per spell.
 string g_heldReported[];
 string g_refusedReported[];
+string g_heldThisRound[];
+string g_refusedThisRound[];
+string g_goneSymbols[];
+long g_templateFailedCharts[];
+string g_templateFailedSymbols[];
+bool g_chartCloseUsed = false;
+bool g_deselectUsed = false;
+enum ENUM_CLEANUP_PHASE
+{
+    CLEANUP_CHARTS,
+    CLEANUP_SYMBOLS
+};
+ENUM_CLEANUP_PHASE g_cleanupPhase = CLEANUP_CHARTS;
+bool g_cleanupStarted = false;
+long g_cleanupChart = -1;
+int g_cleanupSymbol = -1;
+long g_listedThisRound[];
+long g_unallocatedThisRound[];
+// Last observed chart symbols, updated by opens and completed teardowns between cursor rounds.
+long g_knownCharts[];
+string g_knownSymbols[];
 
 // The publisher's outcome log, a ring: g_outcomeNext is the slot the next transaction takes.
 Outcome g_outcomes[OUTCOME_RING];
@@ -152,6 +212,19 @@ void SendServerTime()
     frame.I64((long)TimeCurrent());
     frame.I64((long)TimeGMT());
     frame.U8((uchar)TerminalInfoInteger(TERMINAL_CONNECTED));
+    frame.Seal(0);
+    Send(frame);
+}
+
+void SendChartStatus()
+{
+    uint count = 0;
+    for (long chart = ChartFirst(); chart != -1; chart = ChartNext(chart))
+        count++;
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_CHART_STATUS, 0, 0);
+    frame.U32(count);
+    frame.U32(CHARTS_MAX);
     frame.Seal(0);
     Send(frame);
 }
@@ -274,19 +347,16 @@ void SendSessions()
     Send(frame);
 }
 
-// The relay cadence, by role
 void Relay()
 {
     g_lastRelay = GetTickCount64();
-    switch (Role)
+    SendServerTime();
+    if (Role == ROLE_SPAWNER)
+        SendChartStatus();
+    if (Role == ROLE_PUBLISHER)
     {
-    case ROLE_SPAWNER:
-        SendServerTime();
-        break;
-    case ROLE_PUBLISHER:
         SendCommissions();
         SendSessions();
-        break;
     }
 }
 
@@ -656,11 +726,15 @@ void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
     {
         // A ticket the history does not hold answers no record, its error the answer's.
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_TICKET);
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistoryOrderSelect(ticket))
             AnswerHistoryOrder(answer, ticket);
     }
     else if (arguments.Has(HUB_ARG_HISTORY_ORDERS_GET_POSITION))
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_POSITION)))
             AnswerSelectedOrders(answer);
         else
@@ -668,6 +742,8 @@ void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
     }
     else
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_DATE_FROM),
                           (datetime)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_DATE_TO)))
             AnswerSelectedOrders(answer);
@@ -708,11 +784,15 @@ void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
     {
         // A ticket the history does not hold answers no record, its error the answer's.
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_TICKET);
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistoryDealSelect(ticket))
             AnswerDeal(answer, ticket);
     }
     else if (arguments.Has(HUB_ARG_HISTORY_DEALS_GET_POSITION))
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_POSITION)))
             AnswerSelectedDeals(answer);
         else
@@ -720,6 +800,8 @@ void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
     }
     else
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_FROM),
                           (datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_TO)))
             AnswerSelectedDeals(answer);
@@ -790,6 +872,98 @@ void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer 
     default:
         answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
         break;
+    }
+}
+
+class AccountRequest
+{
+public:
+    ulong id;
+    ENUM_HUB_CALL call;
+    RequestArguments arguments;
+    Answer answer;
+    bool prepared;
+    int lastError;
+    uint part;
+    int first;
+    int start;
+
+    AccountRequest(const ulong requestId, const ENUM_HUB_CALL requested)
+        : id(requestId), call(requested), prepared(false), lastError(0), part(0),
+          first(0), start(0) {}
+};
+AccountRequest *g_account[];
+
+// A synchronous selection blocks every request waiting on this EA.
+void BusyAccountCall(const uint bound)
+{
+    for (int i = 0; i < ArraySize(g_account); i++)
+        SendBusy(g_account[i].id, bound);
+}
+
+void DropAllAccount()
+{
+    for (int i = 0; i < ArraySize(g_account); i++)
+        delete g_account[i];
+    ArrayFree(g_account);
+}
+
+void StartAccount(const ulong requestId, const ENUM_HUB_CALL call, const uint count,
+                  BinaryReader &reader)
+{
+    AccountRequest *r = new AccountRequest(requestId, call);
+    if (!r.arguments.Read(call, count, reader))
+    {
+        SendError(requestId, HUB_ERROR_EA_ERROR, "arguments out of the call's layout",
+                  ERR_INVALID_PARAMETER);
+        delete r;
+    }
+    else
+    {
+        const int n = ArraySize(g_account);
+        ArrayResize(g_account, n + 1);
+        g_account[n] = r;
+        SendBusy(r.id, BUSY_MARGIN_S);
+    }
+}
+
+void ServeAccountQueue()
+{
+    if (ArraySize(g_account) == 0)
+        return;
+    AccountRequest *r = g_account[0];
+    if (!r.prepared)
+    {
+        ResetLastError();
+        ServeAccount(r.call, r.arguments, r.answer);
+        r.lastError = GetLastError();
+        r.prepared = true;
+        if (r.answer.rows.failed)
+            r.answer.Fail("a record holds a string too long for the protocol", 0);
+    }
+    bool last = r.answer.failed;
+    if (r.answer.failed)
+    {
+        SendError(r.id, HUB_ERROR_EA_ERROR, r.answer.message, r.answer.error);
+    }
+    else
+    {
+        const int records = ArraySize(r.answer.ends);
+        int next = r.first;
+        while (next < records && (next == r.first
+               || r.answer.ends[next] - r.start <= HUB_PART_BYTES))
+            next++;
+        const int end = next == 0 ? 0 : r.answer.ends[next - 1];
+        last = next == records;
+        SendPart(r.id, r.part, last, r.lastError, r.answer.rows, r.start, end, next - r.first);
+        r.part++;
+        r.start = end;
+        r.first = next;
+    }
+    if (last)
+    {
+        ArrayRemove(g_account, 0, 1);
+        delete r;
     }
 }
 
@@ -879,6 +1053,11 @@ void ServeSymbol(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &
     case HUB_CALL_OUTCOMES:
         AnswerOutcomes(arguments, answer);
         break;
+    case HUB_CALL_POSITIONS_GET:
+    case HUB_CALL_ORDERS_GET:
+    case HUB_CALL_SYMBOL_MARGIN_RATE:
+        ServeAccount(call, arguments, answer);
+        break;
     default:
         answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
         break;
@@ -892,7 +1071,7 @@ void Serve(const ulong requestId, const ENUM_HUB_CALL call, RequestArguments &ar
     ResetLastError();
     switch (Role)
     {
-    case ROLE_SPAWNER:
+    case ROLE_ACCOUNT:
         ServeAccount(call, arguments, answer);
         break;
     case ROLE_PUBLISHER:
@@ -914,6 +1093,8 @@ void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
     else if (!HubServes(Role, call))
         SendError(requestId, HUB_ERROR_EA_ERROR, "the call is not served by this EA's role",
                   ERR_FUNCTION_NOT_ALLOWED);
+    else if (Role == ROLE_ACCOUNT)
+        StartAccount(requestId, call, count, reader);
     else if (!arguments.Read(call, count, reader))
         SendError(requestId, HUB_ERROR_EA_ERROR, "arguments out of the call's layout",
                   ERR_INVALID_PARAMETER);
@@ -933,11 +1114,6 @@ void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
 #define MINUTE_MS (MINUTE_SECONDS * 1000)
 // The rows one read of a walk covers: a day of M1 bars.
 #define WALK_ROWS 1440
-// How often a history request's busy is renewed, well within its bound.
-#define HISTORY_BUSY_RENEWAL_S (HUB_HISTORY_BUSY_S / 3)
-// The least time between two calls of one history read, so a call the terminal answers at once with
-// a loading error is not made again in a spin.
-#define HISTORY_CALL_SPACING_MS 1000
 // The turns the store's first date may stand still before it is read deep again, the deep reads
 // without a movement after which the store is taken as stalled, and the polls a frame a stalled
 // store leaves unbuilt gets before it is empty history.
@@ -1015,8 +1191,6 @@ public:
     long quoteTime;
     long present;
     bool answering;
-    // When the hub last heard the request is busy, and when its run began, which bounds the run.
-    ulong busyAt;
     ulong startedAt;
     MqlRates rates[];
     MqlTick ticks[];
@@ -1030,13 +1204,20 @@ public:
 
     HistoryRequest(const ulong requestId, const ENUM_HUB_CALL requested)
         : id(requestId), call(requested), symbol(""), timeframe(0), period(0), from(0), to(0),
-          flags(0), quoteRead(false), quoteTime(0), present(0), answering(false), busyAt(0),
+          flags(0), quoteRead(false), quoteTime(0), present(0), answering(false),
           startedAt(0), maxbars(0), sent(0), part(0), lastError(0)
     {
     }
 };
 
 HistoryRequest *g_history[];
+
+// A series call blocks the turns of the whole history queue.
+void BusyHistoryCall(const uint bound)
+{
+    for (int i = 0; i < ArraySize(g_history); i++)
+        SendBusy(g_history[i].id, bound);
+}
 // The floors of this EA's series by timeframe, the ticks' under HUB_TICK_TIMEFRAME.
 int g_floorSeries[];
 Floor g_floors[];
@@ -1346,6 +1527,11 @@ int CallRead(const HistoryRequest *r, const ENUM_HISTORY_READ read, const int ti
              const long from, const long toOrCount, MqlTick &ticks[], MqlRates &rates[])
 {
     int copied = -1;
+    if (IsBarRead(read))
+        BusyHistoryCall(BUSY_COPY_RATES_S);
+    else
+        BusyHistoryCall(BUSY_COPY_TICKS_S);
+    ResetLastError();
     switch (read)
     {
     case READ_TICKS_RANGE:
@@ -1371,23 +1557,6 @@ int CallRead(const HistoryRequest *r, const ENUM_HISTORY_READ read, const int ti
     return copied;
 }
 
-// Tells the hub again that the request is busy once its last busy falls due.
-void RenewBusy(HistoryRequest *r, const ulong now)
-{
-    if (now - r.busyAt >= (ulong)HISTORY_BUSY_RENEWAL_S * 1000)
-    {
-        SendBusy(r.id, HUB_HISTORY_BUSY_S);
-        r.busyAt = now;
-        PrintFormat("ticks: request %I64u: busy again for %d s", r.id, HUB_HISTORY_BUSY_S);
-    }
-}
-
-void RenewEveryBusy(const ulong now)
-{
-    for (int i = 0; i < ArraySize(g_history); i++)
-        RenewBusy(g_history[i], now);
-}
-
 // Makes the read until the terminal settles its answer, into `ticks` or `rates` by its kind; a bar
 // read's answer stands once an identical call answers it again. False, the run stopped, past its
 // bound, on the chart closing, the program stopping, the connection lost or an answer's error.
@@ -1395,12 +1564,12 @@ bool Settle(const HistoryRequest *r, HistoryRun &run, const ENUM_HISTORY_READ re
             const int timeframe, const long from, const long toOrCount, MqlTick &ticks[],
             MqlRates &rates[])
 {
-    const ulong bound = (ulong)HUB_HISTORY_BUSY_S * 1000;
+    const ulong bound = (ulong)HUB_HISTORY_DEADLINE_S * 1000;
     string unsettled = StringFormat("%s %s: not settled within %d s", r.symbol, EnumToString(read),
-                                    HUB_HISTORY_BUSY_S);
+                                    HUB_HISTORY_DEADLINE_S);
     if (read == READ_FIRST_TICK)
         unsettled = StringFormat("%s: the tick history is still syncing after %d s", r.symbol,
-                                 HUB_HISTORY_BUSY_S);
+                                 HUB_HISTORY_DEADLINE_S);
     const bool bars = IsBarRead(read);
     bool settled = false;
     // A bar read's answer awaiting the identical call that confirms it: its count and its first and
@@ -1432,10 +1601,8 @@ bool Settle(const HistoryRequest *r, HistoryRun &run, const ENUM_HISTORY_READ re
         }
         else
         {
-            RenewEveryBusy(now);
             attempt++;
             const ulong started = GetMicrosecondCount();
-            ResetLastError();
             copied = CallRead(r, read, timeframe, from, toOrCount, ticks, rates);
             run.lastError = GetLastError();
             long first = 0;
@@ -1516,9 +1683,7 @@ bool SettleBars(const HistoryRequest *r, HistoryRun &run, const ENUM_HISTORY_REA
     return Settle(r, run, read, timeframe, from, toOrCount, none, rows);
 }
 
-// Renews every busy that falls due and answers whether the wait goes on: false, the run stopped, on
-// the chart closing, the program stopping, the connection lost or the run past its bound, `late`
-// then the reason.
+// Whether the run may keep waiting; `late` names an exhausted history-attempt lifetime.
 bool KeepWaiting(const HistoryRequest *r, HistoryRun &run, const string late)
 {
     const ulong now = GetTickCount64();
@@ -1528,16 +1693,15 @@ bool KeepWaiting(const HistoryRequest *r, HistoryRun &run, const string late)
         run.Stop(RUN_UNPROVEN, "the program is stopping", 0);
     else if (!wss.isConnected())
         run.Stop(RUN_UNPROVEN, "the hub connection is lost", 0);
-    else if (now - r.startedAt >= (ulong)HUB_HISTORY_BUSY_S * 1000)
+    else if (now - r.startedAt >= (ulong)HUB_HISTORY_DEADLINE_S * 1000)
         run.Stop(RUN_UNPROVEN, late, ERR_HISTORY_TIMEOUT);
-    else
-        RenewEveryBusy(now);
     return run.Going();
 }
 
 // A second's sleep, then the hub's frames read.
 void Pause()
 {
+    BusyHistoryCall(BUSY_PAUSE_S);
     Sleep(1000);
     ReadHub();
 }
@@ -1562,6 +1726,7 @@ void DeepRead(const HistoryRequest *r)
 {
     MqlRates rows[];
     const ulong started = GetMicrosecondCount();
+    BusyHistoryCall(BUSY_COPY_RATES_S);
     ResetLastError();
     const int copied = CopyRates(r.symbol, PERIOD_M1, (datetime)BEFORE_HISTORY_SECONDS,
                                  (datetime)(BEFORE_HISTORY_SECONDS + MINUTE_SECONDS), rows);
@@ -1596,7 +1761,7 @@ void AwaitStore(const HistoryRequest *r, HistoryRun &run)
                               StringFormat("%s: the history store is still loading after %d s: "
                                            "terminal first broker %I64d, "
                                            "server first broker %I64d",
-                                           r.symbol, HUB_HISTORY_BUSY_S, terminalFirst,
+                                           r.symbol, HUB_HISTORY_DEADLINE_S, terminalFirst,
                                            serverFirst)))
         {
             known = StoreFacts(r.symbol, serverFirst, terminalFirst);
@@ -1678,6 +1843,7 @@ bool FrameBuilt(const int bars, const long maxbars, const bool known, const long
 void BuildRead(const HistoryRequest *r, const int timeframe, const int period, const string name)
 {
     MqlRates rows[];
+    BusyHistoryCall(BUSY_COPY_RATES_S);
     ResetLastError();
     const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)timeframe,
                                  (datetime)BEFORE_HISTORY_SECONDS,
@@ -1695,7 +1861,7 @@ string FrameLate(const HistoryRequest *r, const string name, const long frameFir
 {
     return StringFormat("%s %s: the frame is not built within %d s: the frame stops at broker "
                         "%I64d, the store reaches broker %I64d, after %d build reads", r.symbol,
-                        name, HUB_HISTORY_BUSY_S, frameFirst, storeFirst, reads);
+                        name, HUB_HISTORY_DEADLINE_S, frameFirst, storeFirst, reads);
 }
 
 // Whether the request goes on while a frame is built; its bound passing here stops it with the
@@ -1719,7 +1885,7 @@ int BuiltBars(const HistoryRequest *r, HistoryRun &run, const int timeframe, con
 {
     long storeFirst = 0;
     const string unknown = StringFormat("%s: the history store's first date is not known within "
-                                        "%d s", r.symbol, HUB_HISTORY_BUSY_S);
+                                        "%d s", r.symbol, HUB_HISTORY_DEADLINE_S);
     while (!StoreFirst(r.symbol, storeFirst) && KeepWaiting(r, run, unknown))
         Pause();
     int bars = Bars(r.symbol, (ENUM_TIMEFRAMES)timeframe);
@@ -1797,6 +1963,7 @@ bool FirstRow(const HistoryRequest *r, HistoryRun &run, const int timeframe, con
     if (bars > maxbars)
     {
         MqlRates rows[];
+        BusyHistoryCall(BUSY_COPY_RATES_S);
         ResetLastError();
         const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)timeframe, (int)(maxbars - 1), 1,
                                      rows);
@@ -1813,7 +1980,7 @@ bool FirstRow(const HistoryRequest *r, HistoryRun &run, const int timeframe, con
     else
     {
         const string late = StringFormat("%s %s: the first row is not known within %d s", r.symbol,
-                                         name, HUB_HISTORY_BUSY_S);
+                                         name, HUB_HISTORY_DEADLINE_S);
         while (!FirstDate(r.symbol, timeframe, first) && KeepWaiting(r, run, late))
             Pause();
     }
@@ -3050,15 +3217,14 @@ void StartHistory(const ulong requestId, const ENUM_HUB_CALL call, RequestArgume
         const int n = ArraySize(g_history);
         ArrayResize(g_history, n + 1);
         g_history[n] = r;
-        r.busyAt = GetTickCount64();
-        SendBusy(r.id, HUB_HISTORY_BUSY_S);
+        SendBusy(r.id, BUSY_MARGIN_S);
         PrintFormat("ticks: request %I64u, %s: busy for %d s", r.id, Described(r),
-                    HUB_HISTORY_BUSY_S);
+                    BUSY_MARGIN_S);
     }
 }
 
 // Sends each answering request's next part; once none is answering, runs the oldest request not yet
-// run, which may hold this pass for minutes; then renews every busy that falls due.
+// run, which may hold this pass for minutes under its per-call busy.
 void ServeHistory()
 {
     for (int i = ArraySize(g_history) - 1; i >= 0; i--)
@@ -3081,7 +3247,6 @@ void ServeHistory()
         next.startedAt = GetTickCount64();
         Evaluate(next);
     }
-    RenewEveryBusy(GetTickCount64());
 }
 
 // ── Transactions, as the trade_transaction frame and an outcome carry them ───────────────────────
@@ -3238,8 +3403,37 @@ int OpenedIndex(const ENUM_CHART_ROLE role, const string symbol)
     return -1;
 }
 
+void RememberKnownChart(const long chart, const string symbol)
+{
+    for (int i = 0; i < ArraySize(g_knownCharts); i++)
+    {
+        if (g_knownCharts[i] == chart)
+        {
+            g_knownSymbols[i] = symbol;
+            return;
+        }
+    }
+    Push(g_knownCharts, chart);
+    Push(g_knownSymbols, symbol);
+}
+
+void ForgetKnownChart(const long chart)
+{
+    for (int i = ArraySize(g_knownCharts) - 1; i >= 0; i--)
+    {
+        if (g_knownCharts[i] == chart)
+        {
+            ArrayRemove(g_knownCharts, i, 1);
+            ArrayRemove(g_knownSymbols, i, 1);
+        }
+    }
+}
+
 void RememberOpened(const long chart, const ENUM_CHART_ROLE role, const string symbol)
 {
+    RememberKnownChart(chart, symbol);
+    if (g_cleanupPhase == CLEANUP_CHARTS)
+        Push(g_listedThisRound, chart);
     const int n = ArraySize(g_openedCharts);
     ArrayResize(g_openedCharts, n + 1);
     ArrayResize(g_openedRoles, n + 1);
@@ -3332,6 +3526,9 @@ void ForgetGoneClosing()
     {
         if (!Listed(g_closingCharts[i]))
         {
+            ForgetKnownChart(g_closingCharts[i]);
+            if (!Holds(g_goneSymbols, g_closingSymbols[i]))
+                Push(g_goneSymbols, g_closingSymbols[i]);
             ForgetClosing(i);
         }
         else if (now - g_closingSince[i] >= (ulong)CHART_CLOSE_GONE_SECONDS * 1000)
@@ -3401,10 +3598,19 @@ void KeepListed(const long &listed[])
         if (!found)
             ArrayRemove(g_sweptCharts, i, 1);
     }
+    for (int i = ArraySize(g_knownCharts) - 1; i >= 0; i--)
+    {
+        bool found = false;
+        for (int j = 0; j < ArraySize(listed) && !found; j++)
+            found = listed[j] == g_knownCharts[i];
+        if (!found)
+            ForgetKnownChart(g_knownCharts[i]);
+    }
 }
 
 void CloseUnallocated(const long chart, const string symbol)
 {
+    g_chartCloseUsed = true;
     Push(g_sweptCharts, chart);
     // Read ahead of the close: a synchronous chart call on a chart being torn down blocks the EA.
     string expert;
@@ -3423,109 +3629,140 @@ void CloseUnallocated(const long chart, const string symbol)
     }
 }
 
-// Closes every listed chart the connector has not allocated, each once and only when an earlier
-// sighting pass found it so; a sighting pass also records what it found unallocated. Leaves the
-// symbols of the allocated charts in allocated[]. A chart being torn down, or closed by the sweep
-// and still listed, is passed over before any read of it.
-void SweepCharts(string &allocated[], const bool sighting)
+bool WaitingOpen(const string symbol)
 {
-    ForgetClosedCharts();
-    long listed[];
-    long unallocated[];
-    long chart = ChartFirst();
-    while (chart != -1)
-    {
-        Push(listed, chart);
-        if (!IsClosing(chart) && !Swept(chart))
-        {
-            const string symbol = ChartSymbol(chart);
-            if (symbol == "")
-            {
-                // A chart that no longer exists answers an empty symbol.
-            }
-            else if (Allocated(chart))
-            {
-                Push(allocated, symbol);
-            }
-            else
-            {
-                Push(unallocated, chart);
-                if (Seen(chart))
-                    CloseUnallocated(chart, symbol);
-            }
-        }
-        chart = ChartNext(chart);
-    }
-    if (sighting)
-        ArraySwap(g_unallocatedSeen, unallocated);
-    KeepListed(listed);
+    for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
+        if (g_chartFrameKinds[i] == HUB_FRAME_OPEN_CHART && g_chartFrameSymbols[i] == symbol)
+            return true;
+    return false;
 }
 
-// Takes out of Market Watch every visible symbol no allocated chart has, when the terminal lets it:
-// a symbol with open positions or pending orders, and one whose chart is still being torn down,
-// stay and are reported once per spell.
-void SweepMarketWatch(const string &allocated[])
+void ForgetReported(string &values[], const string symbol)
 {
-    string held[];
-    string refused[];
-    for (int i = SymbolsTotal(true) - 1; i >= 0; i--)
+    for (int i = ArraySize(values) - 1; i >= 0; i--)
+        if (values[i] == symbol)
+            ArrayRemove(values, i, 1);
+}
+
+void CleanupSymbol(const string symbol)
+{
+    if (SymbolInfoInteger(symbol, SYMBOL_VISIBLE) == 0)
+        return;
+    if (HasClosingChart(symbol) || WaitingOpen(symbol) || Holds(g_knownSymbols, symbol))
+        return;
+    int positions = 0;
+    int orders = 0;
+    CountHoldings(symbol, positions, orders);
+    if (positions > 0 || orders > 0)
     {
-        const string symbol = SymbolName(i, true);
-        if (Holds(allocated, symbol) || HasClosingChart(symbol)
-            || SymbolInfoInteger(symbol, SYMBOL_VISIBLE) == 0)
-            continue;
-        int positions = 0;
-        int orders = 0;
-        CountHoldings(symbol, positions, orders);
-        if (positions > 0 || orders > 0)
+        Push(g_heldThisRound, symbol);
+        if (!Holds(g_heldReported, symbol))
         {
-            Push(held, symbol);
-            if (!Holds(g_heldReported, symbol))
-                PrintFormat("ticks: '%s' stays in Market Watch: %d open positions, %d pending "
-                            "orders", symbol, positions, orders);
+            Push(g_heldReported, symbol);
+            PrintFormat("ticks: '%s' stays in Market Watch: %d open positions, %d pending "
+                        "orders", symbol, positions, orders);
         }
-        else if (SymbolSelect(symbol, false))
+    }
+    else if (!g_deselectUsed)
+    {
+        g_deselectUsed = true;
+        ForgetReported(g_heldReported, symbol);
+        if (SymbolSelect(symbol, false))
         {
+            ForgetReported(g_refusedReported, symbol);
             PrintFormat("ticks: took '%s' out of Market Watch", symbol);
         }
         else
         {
-            Push(refused, symbol);
+            Push(g_refusedThisRound, symbol);
             if (!Holds(g_refusedReported, symbol))
+            {
+                Push(g_refusedReported, symbol);
                 PrintFormat("ticks: '%s' stays in Market Watch: SymbolSelect refused it: %d",
                             symbol, GetLastError());
+            }
         }
     }
-    ArraySwap(g_heldReported, held);
-    ArraySwap(g_refusedReported, refused);
 }
 
-// Charts first: the terminal refuses to take a symbol out of Market Watch while its chart is open.
+// One terminal item per pass; a close and a deselect have independent budgets.
 void Sweep()
 {
-    string allocated[];
-    SweepCharts(allocated, true);
-    SweepMarketWatch(allocated);
+    if (ArraySize(g_goneSymbols) > 0)
+    {
+        const string symbol = g_goneSymbols[0];
+        ArrayRemove(g_goneSymbols, 0, 1);
+        CleanupSymbol(symbol);
+    }
+    if (g_cleanupPhase == CLEANUP_CHARTS)
+    {
+        if (!g_cleanupStarted)
+        {
+            g_cleanupChart = ChartFirst();
+            g_cleanupStarted = true;
+        }
+        if (g_cleanupChart == -1)
+        {
+            ArraySwap(g_unallocatedSeen, g_unallocatedThisRound);
+            ArrayResize(g_unallocatedThisRound, 0);
+            KeepListed(g_listedThisRound);
+            ArrayResize(g_listedThisRound, 0);
+            g_cleanupPhase = CLEANUP_SYMBOLS;
+            g_cleanupSymbol = SymbolsTotal(true) - 1;
+            ArrayResize(g_heldThisRound, 0);
+            ArrayResize(g_refusedThisRound, 0);
+        }
+        else
+        {
+            const long chart = g_cleanupChart;
+            g_cleanupChart = ChartNext(chart);
+            Push(g_listedThisRound, chart);
+            if (!IsClosing(chart) && !Swept(chart))
+            {
+                const string symbol = ChartSymbol(chart);
+                if (symbol != "")
+                    RememberKnownChart(chart, symbol);
+                if (symbol != "" && !Allocated(chart))
+                {
+                    Push(g_unallocatedThisRound, chart);
+                    if (Seen(chart) && !g_chartCloseUsed)
+                        CloseUnallocated(chart, symbol);
+                }
+            }
+        }
+    }
+    else if (g_cleanupSymbol >= 0)
+    {
+        const string symbol = SymbolName(g_cleanupSymbol, true);
+        g_cleanupSymbol--;
+        if (symbol != "")
+            CleanupSymbol(symbol);
+    }
+    else
+    {
+        ArraySwap(g_heldReported, g_heldThisRound);
+        ArraySwap(g_refusedReported, g_refusedThisRound);
+        g_cleanupPhase = CLEANUP_CHARTS;
+        g_cleanupStarted = false;
+    }
 }
 
 // The template that attaches the EA in the role.
 string TemplateOf(const ENUM_CHART_ROLE role)
 {
-    if (role == ROLE_HISTORY)
+    if (role == ROLE_ACCOUNT)
+        return AccountTemplate;
+    else if (role == ROLE_HISTORY)
         return HistoryTemplate;
     else
         return ChartTemplate;
 }
 
-// Have a chart of the role and symbol open, and tell the hub whether one is: a chart whose EA is
-// gone takes its template again, and a chart the spawner opened is loading its EA, so the open is
-// idempotent
 void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
 {
     ForgetClosedCharts();
     const long marked = MarkedChart(role, symbol);
-    // The MQL5 call that failed, empty while a chart of the role and symbol is open, and its error.
-    string failing = "";
+    ENUM_CHART_OPEN_CALL failing = OPEN_CALL_NONE;
     int error = 0;
     if (marked >= 0 && RunsThisEa(marked))
     {
@@ -3542,7 +3779,7 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
         }
         else
         {
-            failing = "ChartApplyTemplate";
+            failing = OPEN_CALL_TEMPLATE;
             error = GetLastError();
         }
     }
@@ -3556,12 +3793,12 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
         ResetLastError();
         if (!SymbolExist(symbol, custom))
         {
-            failing = "SymbolExist";
+            failing = OPEN_CALL_SYMBOL_EXIST;
             error = ERR_MARKET_UNKNOWN_SYMBOL;
         }
         else if (!SymbolSelect(symbol, true))
         {
-            failing = "SymbolSelect";
+            failing = OPEN_CALL_SYMBOL_SELECT;
             error = GetLastError();
         }
         else
@@ -3569,18 +3806,15 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             const long chart = ChartOpen(symbol, PERIOD_M1);
             if (chart == 0)
             {
-                failing = "ChartOpen";
+                failing = OPEN_CALL_CHART_OPEN;
                 error = GetLastError();
             }
             else if (!ChartApplyTemplate(chart, TemplateOf(role)))
             {
-                failing = "ChartApplyTemplate";
+                failing = OPEN_CALL_TEMPLATE;
                 error = GetLastError();
-                if (ChartClose(chart))
-                    RememberClosing(chart, symbol);
-                else
-                    PrintFormat("ticks: ChartClose of the %s chart of '%s' failed: %d",
-                                ChartRoleName(role), symbol, GetLastError());
+                Push(g_templateFailedCharts, chart);
+                Push(g_templateFailedSymbols, symbol);
             }
             else
             {
@@ -3589,14 +3823,28 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             }
         }
     }
-    if (failing == "")
+    if (failing == OPEN_CALL_NONE)
     {
         SendChartOpened(role, symbol);
     }
     else
     {
-        PrintFormat("ticks: cannot open the %s chart of '%s': %s failed with error %d",
-                    ChartRoleName(role), symbol, failing, error);
+        if (failing == OPEN_CALL_CHART_OPEN)
+            PrintFormat("ticks: cannot open '%s': ChartOpen failed: %d "
+                        "(the terminal's chart limit is %d)", symbol, error, CHARTS_MAX);
+        else
+        {
+            string callName = "";
+            switch (failing)
+            {
+            case OPEN_CALL_SYMBOL_EXIST: callName = "SymbolExist"; break;
+            case OPEN_CALL_SYMBOL_SELECT: callName = "SymbolSelect"; break;
+            case OPEN_CALL_TEMPLATE: callName = "ChartApplyTemplate"; break;
+            }
+            PrintFormat("ticks: cannot open the %s chart of '%s': %s failed with error %d",
+                        ChartRoleName(role), symbol, callName, error);
+        }
+        SendChartStatus();
         SendChartFailed(role, symbol, error);
     }
 }
@@ -3606,6 +3854,7 @@ void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
 // releases the chart: the hub no longer wants it.
 void CloseChart(const ENUM_CHART_ROLE role, const string symbol)
 {
+    g_chartCloseUsed = true;
     ForgetClosedCharts();
     int positions = 0;
     int orders = 0;
@@ -3724,34 +3973,84 @@ void QueueChartFrame(const ENUM_HUB_FRAME kind, const ENUM_CHART_ROLE role, cons
     g_chartFrameSymbols[n] = symbol;
 }
 
-// Serve the oldest chart frame while the hub takes this EA's frames, so its answer reaches the
-// hub, unless a chart of its symbol the spawner closed is still listed; then it waits, and every
-// frame behind it
+void ForgetChartFrame(const int i)
+{
+    ArrayRemove(g_chartFrameKinds, i, 1);
+    ArrayRemove(g_chartFrameRoles, i, 1);
+    ArrayRemove(g_chartFrameSymbols, i, 1);
+}
+
+// A fresh open waits only on its own symbol's teardown.
+bool PrepareOpen(const string symbol)
+{
+    if (HasClosingChart(symbol))
+        return false;
+    for (long chart = ChartFirst(); chart != -1; chart = ChartNext(chart))
+    {
+        if (!IsClosing(chart) && !Swept(chart) && ChartSymbol(chart) == symbol && !Allocated(chart))
+        {
+            if (!g_chartCloseUsed)
+                CloseUnallocated(chart, symbol);
+            return false;
+        }
+    }
+    return true;
+}
+
 void ServeChartFrame()
 {
+    if (Role != ROLE_SPAWNER || !wss.isConnected() || g_refused)
+        return;
+    g_chartCloseUsed = false;
+    g_deselectUsed = false;
     ForgetGoneClosing();
-    if (wss.isConnected() && !g_refused && ArraySize(g_chartFrameKinds) > 0
-        && !HasClosingChart(g_chartFrameSymbols[0]))
+    for (int i = 0; i < ArraySize(g_chartFrameKinds);)
     {
-        if (g_chartFrameKinds[0] == HUB_FRAME_OPEN_CHART)
+        bool priorClose = false;
+        for (int j = 0; j < i && !priorClose; j++)
+            priorClose = g_chartFrameKinds[j] == HUB_FRAME_CLOSE_CHART
+                         && g_chartFrameSymbols[j] == g_chartFrameSymbols[i];
+        const ulong openedAt = GetTickCount64();
+        if (g_chartFrameKinds[i] == HUB_FRAME_OPEN_CHART && !priorClose
+            && PrepareOpen(g_chartFrameSymbols[i]))
         {
-            // Charts the connector has not allocated go before a fresh one of the symbol opens.
-            string allocated[];
-            SweepCharts(allocated, false);
-            if (HasClosingChart(g_chartFrameSymbols[0]))
-                return;
+            OpenChart(g_chartFrameRoles[i], g_chartFrameSymbols[i]);
+            ForgetChartFrame(i);
+            ObserveStep(PASS_OPEN, openedAt);
+            break;
         }
-        const ENUM_HUB_FRAME kind = g_chartFrameKinds[0];
-        const ENUM_CHART_ROLE role = g_chartFrameRoles[0];
-        const string symbol = g_chartFrameSymbols[0];
-        ArrayRemove(g_chartFrameKinds, 0, 1);
-        ArrayRemove(g_chartFrameRoles, 0, 1);
-        ArrayRemove(g_chartFrameSymbols, 0, 1);
-        if (kind == HUB_FRAME_OPEN_CHART)
-            OpenChart(role, symbol);
-        else
-            CloseChart(role, symbol);
+        ObserveStep(PASS_OPEN, openedAt);
+        i++;
     }
+    const ulong closedAt = GetTickCount64();
+    if (!g_chartCloseUsed)
+    {
+        for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
+        {
+            if (g_chartFrameKinds[i] == HUB_FRAME_CLOSE_CHART)
+            {
+                if (!HasClosingChart(g_chartFrameSymbols[i]))
+                {
+                    CloseChart(g_chartFrameRoles[i], g_chartFrameSymbols[i]);
+                    ForgetChartFrame(i);
+                }
+                break;
+            }
+        }
+        if (!g_chartCloseUsed && ArraySize(g_templateFailedCharts) > 0)
+        {
+            const long chart = g_templateFailedCharts[0];
+            const string symbol = g_templateFailedSymbols[0];
+            ArrayRemove(g_templateFailedCharts, 0, 1);
+            ArrayRemove(g_templateFailedSymbols, 0, 1);
+            if (Listed(chart) && !IsClosing(chart))
+                CloseUnallocated(chart, symbol);
+        }
+    }
+    ObserveStep(PASS_CLOSE, closedAt);
+    const ulong cursorAt = GetTickCount64();
+    Sweep();
+    ObserveStep(PASS_CURSOR, cursorAt);
 }
 
 void OnDuplicateFrame(BinaryReader &reader)
@@ -3921,6 +4220,7 @@ void Reconnect()
     ClearWanted();
     // The hub answered every request of the connection that left.
     DropAllHistory();
+    DropAllAccount();
     Print("Reconnecting");
     if (!wss.open())
         Print("Failed to reconnect to server");
@@ -3995,6 +4295,7 @@ void OnDeinit(const int reason)
 {
     EventKillTimer();
     DropAllHistory();
+    DropAllAccount();
     if (wss != NULL)
     {
         wss.close();
@@ -4009,43 +4310,73 @@ void OnTimer()
 {
     if (g_closing)
         return;
+    const ulong started = GetTickCount64();
+    g_longestStepMs = 0;
     ReadHub();
+    ObserveStep(PASS_DRAIN, started);
     if (!g_closing)
         ServeChartFrame();
     // TimeLocal, not TimeCurrent: the time of the last quote stands still while the market is
     // closed.
     if (!g_closing && !wss.isConnected() && TimeLocal() - g_lastReconnect >= ReconnectIntervalSec)
+    {
+        const ulong reconnectAt = GetTickCount64();
         Reconnect();
+        ObserveStep(PASS_RECONNECT, reconnectAt);
+    }
     if (!g_closing && wss.isConnected())
     {
         // The terminal queues no tick event while one is queued or handled, so a tick that arrives
         // then is read from the cursor here, at the latest one poll interval on.
         if (Role == ROLE_PUBLISHER)
         {
+            const ulong ticksAt = GetTickCount64();
             PublishTicks();
+            ObserveStep(PASS_TICKS, ticksAt);
+            const ulong barsAt = GetTickCount64();
             PublishBars();
+            ObserveStep(PASS_BARS, barsAt);
+        }
+        if (Role == ROLE_ACCOUNT)
+        {
+            const ulong accountAt = GetTickCount64();
+            ServeAccountQueue();
+            ObserveStep(PASS_ACCOUNT, accountAt);
         }
         if (Role == ROLE_HISTORY)
+        {
+            const ulong historyAt = GetTickCount64();
             ServeHistory();
+            ObserveStep(PASS_HISTORY, historyAt);
+        }
         if (GetTickCount64() - g_lastRelay >= (ulong)RelaySeconds * 1000)
         {
+            const ulong relayAt = GetTickCount64();
             Relay();
-            if (Role == ROLE_SPAWNER && !g_refused)
-                Sweep();
+            ObserveStep(PASS_RELAY, relayAt);
         }
     }
+    FinishPass(started);
 }
 
 void OnTick()
 {
     if (g_closing)
         return;
+    const ulong started = GetTickCount64();
+    g_longestStepMs = 0;
     ReadHub();
+    ObserveStep(PASS_DRAIN, started);
     if (!g_closing && wss.isConnected() && Role == ROLE_PUBLISHER)
     {
+        const ulong ticksAt = GetTickCount64();
         PublishTicks();
+        ObserveStep(PASS_TICKS, ticksAt);
+        const ulong barsAt = GetTickCount64();
         PublishBars();
+        ObserveStep(PASS_BARS, barsAt);
     }
+    FinishPass(started);
 }
 
 // Every trade transaction of the publisher's symbol, as it arrives, a REQUEST transaction also into

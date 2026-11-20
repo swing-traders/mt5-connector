@@ -14,7 +14,7 @@ ArgType = calls.ArgType
 _TICKS = np.dtype(list(mirror.TICKS.dtype))
 _BARS = np.dtype(list(BARS.dtype))
 
-SPAWNER_CALLS = {
+ACCOUNT_CALLS = {
     Call.ACCOUNT_INFO,
     Call.TERMINAL_INFO,
     Call.SYMBOLS_GET,
@@ -108,7 +108,7 @@ def test_each_call_is_served_by_the_role_the_design_gives_it():
         served.setdefault(row.role, set()).add(call)
 
     assert served == {
-        ChartRole.SPAWNER: SPAWNER_CALLS,
+        ChartRole.ACCOUNT: ACCOUNT_CALLS,
         ChartRole.PUBLISHER: PUBLISHER_CALLS,
         ChartRole.HISTORY: HISTORY_CALLS,
         None: HUB_CALLS,
@@ -274,10 +274,10 @@ def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_it
             "XAUUSD",
         ),
         (Call.ORDER_SEND, {"request": calls.trade_request({"symbol": "US500#"})}, "US500#"),
-        (Call.POSITIONS_GET, {"symbol": "EURUSD"}, None),
+        (Call.POSITIONS_GET, {"symbol": "EURUSD"}, "EURUSD"),
         (Call.RANGES, {"symbol": "GBPUSD"}, "GBPUSD"),
     ],
-    ids=["read", "history", "command", "spawner", "ranges"],
+    ids=["read", "history", "command", "symbol-positions", "ranges"],
 )
 def test_a_request_is_routed_by_its_calls_symbol(call, arguments, symbol):
     assert calls.routed_symbol(calls.CALLS[call], arguments) == symbol

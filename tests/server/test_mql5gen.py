@@ -343,14 +343,14 @@ def test_the_history_constants_are_the_protocols():
         "HUB_RATES_SIZE",
         "HUB_PART_BYTES",
         "HUB_ROLE_EA",
-        "HUB_HISTORY_BUSY_S",
+        "HUB_HISTORY_DEADLINE_S",
         "HUB_RETRY_AFTER_MS",
         "HUB_SPAN_MARGIN",
         "HUB_TICK_SERIES",
         "HUB_TICK_TIMEFRAME",
         "HUB_PROPERTY_FAILURES_MAX",
     }
-    assert values["HUB_HISTORY_BUSY_S"] == "900"
+    assert values["HUB_HISTORY_DEADLINE_S"] == "900"
     assert values["HUB_RETRY_AFTER_MS"] == "5000"
     assert values["HUB_SPAN_MARGIN"] == "11"
     assert values["HUB_TICK_SERIES"] == '"ticks"'
@@ -401,14 +401,21 @@ def test_the_chart_roles_are_numbered_as_the_templates_set_them_and_named_as_the
     named = dict(re.findall(r'case (ROLE_\w+):\s+name = "(\w+)";', text))
     read = dict(re.findall(r'name == "(\w+)"\)\s+role = (\w+);', text))
 
-    # image/install-ea.sh writes these values into the three roles' templates.
+    # image/install-ea.sh writes these values into the roles' templates.
     assert enum(text, "ENUM_CHART_ROLE") == {
         "ROLE_SPAWNER": 0,
         "ROLE_PUBLISHER": 1,
         "ROLE_HISTORY": 2,
+        "ROLE_ACCOUNT": 3,
     }
     assert named == {f"ROLE_{role.name}": role.value for role in ChartRole}
     assert read == {role.value: f"ROLE_{role.name}" for role in ChartRole}
+
+
+def test_the_chart_controller_emits_a_false_rpc_guard(text):
+    _, _, body = functions(text)["HubServes"]
+    segment = re.search(r"case ROLE_SPAWNER:(.*?)(?=case ROLE_|$)", body, re.S).group(1)
+    assert "serves = false;" in segment
 
 
 def test_each_role_serves_the_calls_the_registry_gives_it(text):
@@ -420,11 +427,19 @@ def test_each_role_serves_the_calls_the_registry_gives_it(text):
     }
 
     assert serves == {
-        f"ROLE_{role.name}": {row.call.name for row in calls.CALLS.values() if row.role is role}
+        f"ROLE_{role.name}": {row.call.name for row in calls.CALLS.values() if role in row.roles}
         for role in ChartRole
     }
     assert serves["ROLE_HISTORY"] == {"COPY_RATES_RANGE", "COPY_TICKS_RANGE", "RANGES"}
-    assert serves["ROLE_PUBLISHER"] == {"SYMBOL_INFO", "SYMBOL_INFO_TICK", "ORDER_SEND", "OUTCOMES"}
+    assert serves["ROLE_PUBLISHER"] == {
+        "SYMBOL_INFO",
+        "SYMBOL_INFO_TICK",
+        "ORDER_SEND",
+        "OUTCOMES",
+        "POSITIONS_GET",
+        "ORDERS_GET",
+        "SYMBOL_MARGIN_RATE",
+    }
 
 
 def test_each_served_calls_arguments_are_read_by_their_registry_index_and_type(text):

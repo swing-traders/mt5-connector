@@ -20,9 +20,14 @@ import types
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 
 import pytest
+from websockets.sync.client import connect
+
+from mt5connector.server.wire import binary
+from mt5connector.server.wire.push_wire import ChartRole
 
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
@@ -36,6 +41,8 @@ _ACCOUNT = {
 }
 # The stop timeout the image's contract asks for, over the entrypoint's own stop bounds together.
 _STOP_TIMEOUT_SECONDS = 190
+# Entrypoint: display + restore + two retry loops (final window poll included) + search close.
+_BOOT_SECONDS = 30 + (40 + 5) + 2 * (3 * (120 + 3 * (40 + 5) + 60 + 10 + 5) + 2 * 5) + 60
 _HUB_PORT = 9000
 _IMAGE_FILES = Path(__file__).resolve().parents[2] / "image"
 _BASES = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
@@ -441,6 +448,85 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
         5_000_000_000,
         3,
     )
+
+
+@_needs_image
+def test_the_native_certification_probe_compiles_without_warnings():
+    probe = Path(__file__).resolve().parents[1] / "live/chart_probe.mq5"
+    script = r"""
+import os,re,shutil,subprocess
+from pathlib import Path
+prefix=Path(os.environ["WINEPREFIX"])
+stage=prefix/"drive_c/probecheck"
+stage.mkdir()
+shutil.copyfile("/chart_probe.mq5",stage/"chart_probe.mq5")
+editor=prefix/"drive_c/Program Files/MetaTrader 5/MetaEditor64.exe"
+subprocess.run(["xvfb-run","-a","wine",str(editor),
+                r"/compile:C:\probecheck\chart_probe.mq5",
+                r"/log:C:\probecheck\chart_probe.log"],timeout=180)
+subprocess.run(["wineserver","-w"],check=True,timeout=60)
+log=(stage/"chart_probe.log").read_text(encoding="utf-16")
+print(log)
+assert (stage/"chart_probe.ex5").exists()
+assert re.search(r"Result: 0 errors, 0 warnings(?:,|$)",log)
+"""
+    result = subprocess.run(
+        [
+            _runtime(),
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-v",
+            f"{probe}:/chart_probe.mq5:ro,z",
+            "--entrypoint",
+            "python",
+            _IMAGE,
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@_needs_image
+def test_the_chart_templates_install_each_role_in_both_terminal_locations():
+    script = """
+from pathlib import Path
+terminal = Path('/home/mt5/.wine/drive_c/Program Files/MetaTrader 5')
+for directory in (terminal / 'MQL5/Profiles/Templates', terminal / 'Profiles/Templates'):
+    for name, role in (
+        ('ticks_spawner.tpl', 0), ('ticks.tpl', 1),
+        ('ticks_history.tpl', 2), ('ticks_account.tpl', 3),
+    ):
+        data = (directory / name).read_bytes()
+        assert data.startswith(bytes((255, 254))), name
+        assert bytes((13, 0, 10, 0)) in data, name
+        text = data.decode('utf-16')
+        assert f'Role={role}' in text.splitlines(), name
+        assert 'AccountTemplate=ticks_account.tpl' in text, name
+"""
+    result = subprocess.run(
+        [
+            _runtime(),
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "python",
+            _IMAGE,
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @_needs_image
@@ -1086,10 +1172,34 @@ def _booted(runtime: str, tmp_path, name: str):
             check=True,
             timeout=60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=_BOOT_SECONDS)
         yield name
+    except BaseException:
+        print(_logs(runtime, name), flush=True)
+        raise
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
+
+
+def test_a_failed_boot_prints_its_log_before_removing_the_container(monkeypatch, tmp_path, capsys):
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="retained boot log", stderr="")
+
+    def failed_boot(*args, **kwargs):
+        raise AssertionError("boot failed")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(sys.modules[__name__], "_await_log", failed_boot)
+    with pytest.raises(AssertionError, match="boot failed"):
+        with _booted("runtime", tmp_path, "owned-image-test"):
+            pytest.fail("a failed boot must not enter the body")
+    assert "retained boot log" in capsys.readouterr().out
+    assert commands.index(["runtime", "logs", "owned-image-test"]) < commands.index(
+        ["runtime", "rm", "-f", "-v", "owned-image-test"]
+    )
 
 
 def _windows_python(runtime: str, name: str) -> str:
@@ -1210,9 +1320,10 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
         subprocess.run(
             [runtime, "restart", "-t", str(_STOP_TIMEOUT_SECONDS), name],
             capture_output=True,
+            check=True,
             timeout=_STOP_TIMEOUT_SECONDS + 60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=300)
+        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=_BOOT_SECONDS)
         after = _allowlist(runtime, name)
         kept = subprocess.run(
             [runtime, "exec", name, "ls", _CONFIG, _COMMON_FILES, _BASES],
@@ -1226,12 +1337,14 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
         ).returncode
         printed = _logs(runtime, name)
 
-    assert before == after == {"checked": 1, "urls": 1}
-    assert restored == 0
-    assert printed.count("mt5: restored the terminal's baked state, its history store aside") == 2
-    assert "written-by-a-run" not in kept
-    assert "synced" in kept
-    assert queried.returncode != 0
+        assert before == after == {"checked": 1, "urls": 1}
+        assert restored == 0
+        assert (
+            printed.count("mt5: restored the terminal's baked state, its history store aside") == 2
+        )
+        assert "written-by-a-run" not in kept
+        assert "synced" in kept
+        assert queried.returncode != 0
 
 
 # Writes each argument as a line of a journal dated past any real day, as the terminal writes one.
@@ -1346,7 +1459,8 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
         assert answered is not None, "the hub never answered /health"
         answered_at = datetime.now(UTC)
         status, body = answered
-        assert status == 503
+        assert status == HTTPStatus.SERVICE_UNAVAILABLE
+        assert body["result"]["account"] is False
         assert (body["ok"], body["result"]["spawner"], body["result"]["clock"]) == (
             False,
             False,
@@ -1363,5 +1477,26 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
         latest = probes[-1]
         assert latest["ExitCode"] == 1, latest
         assert "503" in latest["Output"] and "not found" not in latest["Output"], latest
+
+        spec = importlib.util.spec_from_file_location(
+            "image_ea_wire", Path(__file__).resolve().parents[1] / "server" / "ea_wire.py"
+        )
+        ea_wire = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = ea_wire
+        spec.loader.exec_module(ea_wire)
+        with connect(f"ws://127.0.0.1:{hub}") as spawner:
+            spawner.send(ea_wire.encode_ea(binary.EaHello(ChartRole.SPAWNER, "EURUSD")))
+            deadline = time.monotonic() + 5
+            while True:
+                after_spawner = _health(hub)
+                if after_spawner is not None and after_spawner[1]["result"]["spawner"]:
+                    break
+                assert time.monotonic() < deadline, "the fake spawner's hello was not accepted"
+                time.sleep(0.01)
+            status, body = after_spawner
+            assert status == HTTPStatus.SERVICE_UNAVAILABLE
+            assert body["error"] == "no account EA is connected"
+            assert body["result"]["spawner"] is True
+            assert body["result"]["account"] is False
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)

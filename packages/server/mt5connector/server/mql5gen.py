@@ -267,7 +267,7 @@ def _constants() -> str:
         ("HUB_RATES_SIZE", str(binary.RATES.size)),
         ("HUB_PART_BYTES", str(calls.PART_BYTES)),
         ("HUB_ROLE_EA", f'"{Role.EA.value}"'),
-        ("HUB_HISTORY_BUSY_S", str(calls.HISTORY_BUSY_S)),
+        ("HUB_HISTORY_DEADLINE_S", str(calls.HISTORY_BUSY_S)),
         ("HUB_RETRY_AFTER_MS", str(int(calls.RETRY_AFTER_S * 1000))),
         ("HUB_SPAN_MARGIN", str(history_wire.SPAN_MARGIN)),
         ("HUB_TICK_SERIES", f'"{Series.TICKS.value}"'),
@@ -331,8 +331,8 @@ def _chart_role_named() -> str:
 def _serves() -> str:
     cases = []
     for role in ChartRole:
-        served = [f"call == HUB_CALL_{row.call.name}" for row in _ea_rows() if row.role is role]
-        condition = "\n                 || ".join(served)
+        served = [f"call == HUB_CALL_{row.call.name}" for row in _ea_rows() if role in row.roles]
+        condition = "\n                 || ".join(served) if served else "false"
         cases.append(f"    case ROLE_{role.name}:\n        serves = {condition};\n        break;")
     return (
         "// Whether an EA of the role serves the call.\n"

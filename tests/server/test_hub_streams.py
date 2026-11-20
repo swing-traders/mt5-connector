@@ -10,12 +10,25 @@ from types import SimpleNamespace
 
 import pytest
 import websockets
-from ea_wire import FakeEa, encode_ea, frame, zeroed
-from hub_doubles import Consumer, Peer, run_hub, sample, settings, settle
+from ea_wire import FakeEa, answer, encode_ea, frame, tick_rows, zeroed
+from hub_doubles import (
+    MAX_AGE_S,
+    Consumer,
+    Peer,
+    eventually,
+    health,
+    health_of,
+    run_hub,
+    sample,
+    settings,
+    settle,
+    verified,
+    verified_by,
+)
 from mirror_samples import BROKER_EPOCH, CLOCK, UTC_EPOCH
 
 from mt5connector.server import ws_server
-from mt5connector.server.wire import binary, mirror
+from mt5connector.server.wire import binary, calls, mirror
 from mt5connector.server.wire.binary import FrameKind
 from mt5connector.server.wire.history_wire import Series
 from mt5connector.server.wire.push_wire import (
@@ -31,6 +44,7 @@ IDLE_S = 900
 CLOSE_BOUND_S = 30
 PUBLISHER = ChartRole.PUBLISHER
 SPAWNER = ChartRole.SPAWNER
+ACCOUNT_OPEN = binary.OpenChart(ChartRole.ACCOUNT, "EURUSD")
 
 
 def ticks_of(symbol):
@@ -78,6 +92,12 @@ async def publisher(port, symbol="EURUSD"):
     return ea
 
 
+async def connected_spawner(port):
+    ea = await FakeEa.connect(port, SPAWNER, "EURUSD")
+    assert await ea.received() == ACCOUNT_OPEN
+    return ea
+
+
 async def nothing(ws, timeout=0.3):
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(ws.recv(), timeout)
@@ -104,13 +124,69 @@ async def test_a_publishers_ticks_reach_the_consumers_of_its_symbol_alone_in_tru
     await first.subscribed(1, ticks_of("EURUSD"))
     await other.subscribed(1, ticks_of("XAUUSD"))
 
-    await eurusd.send(binary.Ticks("EURUSD", (tick(msc=1), tick(msc=2))))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(*(tick(msc=i) for i in range(1_000)))))
 
-    assert await first.received() == binary.Ticks(
-        "EURUSD", (tick(UTC_EPOCH, msc=1), tick(UTC_EPOCH, msc=2))
+    assert await asyncio.wait_for(first.ws.recv(), 1.0) == binary.encode(
+        binary.Ticks("EURUSD", tick_rows(*(tick(UTC_EPOCH, msc=i) for i in range(1_000))))
     )
     await nothing(other.ws)
     await close_all(server, first, other, eurusd)
+
+
+async def test_an_unsubscribe_among_forty_symbols_tells_only_its_publisher():
+    hub, server, port = await run_hub()
+    symbols = [f"S{index:02}" for index in range(40)]
+    publishers = [await publisher(port, symbol) for symbol in symbols]
+    consumers = [await Consumer.connect(port) for _ in symbols]
+    try:
+        for consumer, symbol in zip(consumers, symbols, strict=True):
+            await consumer.subscribed(1, ticks_of(symbol))
+        for ea, symbol in zip(publishers, symbols, strict=True):
+            assert await ea.received() == binary.Wanted(symbol, True, ())
+
+        await consumers[0].send(binary.Unsubscribe(2, ticks_of(symbols[0])))
+        assert await consumers[0].received() == binary.Ack(2)
+        assert await publishers[0].received() == binary.Wanted(symbols[0], False, ())
+        await asyncio.gather(*(nothing(ea.ws, timeout=0.05) for ea in publishers[1:]))
+    finally:
+        await asyncio.gather(*(peer.close() for peer in [*consumers, *publishers]))
+        server.close()
+
+
+async def test_a_consumer_overflow_cascading_through_its_ea_does_not_break_fan_out():
+    hub, server, port = await run_hub(consumer_queue_bound=2, ea_queue_bound=5)
+    async with verified(port) as spawner:
+        first, second, ea = Peer(stuck=True), Peer(stuck=True), Peer(stuck=True)
+        tasks = [asyncio.create_task(hub.handler(peer)) for peer in (first, second, ea)]
+        first.put_frame(binary.AdapterHello())
+        second.put_frame(binary.AdapterHello())
+        ea.put_ea(binary.EaHello(PUBLISHER, "EURUSD"))
+        await settle()
+        for peer, series in ((first, Series.M1), (second, Series.M5)):
+            peer.put_frame(binary.Subscribe(1, ticks_of("EURUSD")))
+            peer.put_frame(binary.Subscribe(2, Subscription(Stream.BARS, "EURUSD", series)))
+        await settle()
+        count, body = calls.encode_arguments(
+            calls.CALLS[calls.Call.SYMBOL_INFO_TICK], {"symbol": "EURUSD"}
+        )
+        for peer in (first, second):
+            peer.put_frame(binary.Request(1, calls.Call.SYMBOL_INFO_TICK, count, body))
+        await settle()
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
+        await settle()
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
+        await settle()
+        try:
+            assert first.closed == (ws_server.OVERFLOW, "queue overflow")
+            assert second.closed == (ws_server.OVERFLOW, "queue overflow")
+            assert ea.closed == (ws_server.OVERFLOW, "queue overflow")
+            await asyncio.wait_for(asyncio.gather(*tasks), 1.0)
+        finally:
+            for peer in (first, second, ea):
+                await peer.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await spawner.close()
+    server.close()
 
 
 async def test_ticks_in_two_frames_are_passed_on_in_the_order_published():
@@ -119,8 +195,8 @@ async def test_ticks_in_two_frames_are_passed_on_in_the_order_published():
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD"))
 
-    await eurusd.send(binary.Ticks("EURUSD", (tick(bid=1.08501),)))
-    await eurusd.send(binary.Ticks("EURUSD", (tick(bid=1.08502),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick(bid=1.08501))))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick(bid=1.08502))))
 
     received = [await consumer.received(), await consumer.received()]
     assert [frame_.ticks[0]["bid"] for frame_ in received] == [1.08501, 1.08502]
@@ -169,11 +245,11 @@ async def test_a_frame_a_publisher_sends_for_another_symbol_is_dropped_with_a_wa
     await consumer.subscribed(1, ticks_of("EURUSD"))
     await consumer.subscribed(2, Subscription(Stream.TRADE_TRANSACTIONS))
 
-    await gbpusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await gbpusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
     await gbpusd.send(transaction("EURUSD"))
     await gbpusd.send(transaction("", TransactionType.REQUEST, request_symbol="EURUSD"))
     await gbpusd.send(transaction(""))
-    await eurusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
 
     assert isinstance(await consumer.received(), binary.Ticks)
     await nothing(consumer.ws)
@@ -263,7 +339,7 @@ async def test_an_unsubscribe_is_acknowledged_and_ends_the_stream():
 
     await consumer.send(binary.Unsubscribe(2, ticks_of("EURUSD")))
     acked = await consumer.received()
-    await eurusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
 
     assert acked == binary.Ack(2)
     await nothing(consumer.ws)
@@ -289,7 +365,7 @@ async def test_a_second_ea_for_a_served_role_and_symbol_is_told_it_is_a_duplicat
 
     assert await second.received() == binary.Duplicate(PUBLISHER, "EURUSD")
     await asyncio.wait_for(second.ws.wait_closed(), 1)
-    await first.send(binary.Ticks("EURUSD", (tick(),)))
+    await first.send(binary.Ticks("EURUSD", tick_rows(tick())))
     assert isinstance(await consumer.received(), binary.Ticks)
     (warning,) = warnings(caplog)
     assert warning.startswith("refusing a second publisher EA for EURUSD from ")
@@ -309,7 +385,7 @@ async def test_a_refused_duplicates_frames_are_dropped_silently(caplog):
     await settle()
 
     second.put_ea(binary.EaHello(PUBLISHER, "EURUSD"))
-    second.put_ea(binary.Ticks("EURUSD", (tick(),)))
+    second.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     handled = asyncio.create_task(hub.handler(second))
     await settle()
 
@@ -324,7 +400,7 @@ async def test_a_refused_duplicates_frames_are_dropped_silently(caplog):
 
 async def test_a_second_spawner_is_a_duplicate_and_the_first_stays_the_spawner():
     hub, server, port = await run_hub()
-    first = await FakeEa.connect(port, SPAWNER, "EURUSD")
+    first = await connected_spawner(port)
 
     second = await FakeEa.connect(port, SPAWNER, "GBPUSD")
 
@@ -340,7 +416,7 @@ async def test_a_second_spawner_is_a_duplicate_and_the_first_stays_the_spawner()
 
 async def test_a_subscription_to_a_symbol_no_publisher_serves_has_the_spawner_open_its_chart():
     hub, server, port = await run_hub()
-    spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
+    spawner = await connected_spawner(port)
     gbpusd = await publisher(port, "GBPUSD")
     consumer = await Consumer.connect(port)
 
@@ -350,7 +426,7 @@ async def test_a_subscription_to_a_symbol_no_publisher_serves_has_the_spawner_op
     await nothing(gbpusd.ws)
     usdjpy = await FakeEa.connect(port, PUBLISHER, "USDJPY")
     assert await usdjpy.received() == binary.Wanted("USDJPY", True, ())
-    await usdjpy.send(binary.Ticks("USDJPY", (tick(),)))
+    await usdjpy.send(binary.Ticks("USDJPY", tick_rows(tick())))
     assert (await consumer.received()).symbol == "USDJPY"
     await close_all(server, consumer, spawner, gbpusd, usdjpy)
 
@@ -360,7 +436,7 @@ async def test_a_chart_requested_while_no_spawner_is_connected_is_sent_on_its_he
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("USDJPY"))
 
-    spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
+    spawner = await connected_spawner(port)
 
     assert await spawner.received() == binary.OpenChart(PUBLISHER, "USDJPY")
     await close_all(server, consumer, spawner)
@@ -368,7 +444,7 @@ async def test_a_chart_requested_while_no_spawner_is_connected_is_sent_on_its_he
 
 async def test_a_chart_is_requested_once_per_spawner_connection_until_its_ea_says_hello():
     hub, server, port = await run_hub()
-    spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
+    spawner = await connected_spawner(port)
     await asyncio.sleep(0.05)
 
     states = [hub.use_chart((PUBLISHER, "USDJPY")), hub.use_chart((PUBLISHER, "USDJPY"))]
@@ -385,7 +461,7 @@ async def test_a_chart_is_requested_once_per_spawner_connection_until_its_ea_say
 
 async def test_a_chart_in_use_whose_ea_leaves_is_requested_again():
     hub, server, port = await run_hub()
-    spawner = await FakeEa.connect(port, SPAWNER, "EURUSD")
+    spawner = await connected_spawner(port)
     usdjpy = await publisher(port, "USDJPY")
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("USDJPY"))
@@ -486,7 +562,7 @@ async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_until_it_op
         [ChartState.FAILED, ChartState.FAILED],
         ChartState.REQUESTED,
     )
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN] + [binary.OpenChart(PUBLISHER, "XYZ")] * 2
     (warning,) = warnings(caplog)
     assert "4301" in warning
     await _closed(tasks, spawner)
@@ -515,7 +591,7 @@ async def test_a_chart_the_spawner_failed_to_open_is_answered_failed_for_twice_t
         ChartState.FAILED,
         ChartState.REQUESTED,
     )
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN] + [binary.OpenChart(PUBLISHER, "XYZ")] * 2
     assert (PUBLISHER, "XYZ") not in hub._failed
     (warning,) = warnings(caplog)
     assert "4102" in warning
@@ -551,8 +627,8 @@ async def test_a_subscription_to_a_failed_chart_asks_again_only_past_the_hold(cl
     await handled(late)
     await delivered(queued, spawner)
 
-    assert within == [binary.OpenChart(PUBLISHER, "XYZ")]
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
+    assert within == [ACCOUNT_OPEN, binary.OpenChart(PUBLISHER, "XYZ")]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN] + [binary.OpenChart(PUBLISHER, "XYZ")] * 2
     await _closed(tasks, spawner, early, late)
 
 
@@ -580,9 +656,9 @@ async def test_a_spawner_reconnecting_within_the_hold_does_not_replay_the_failed
     past = hub.use_chart((PUBLISHER, "XYZ"))
     await delivered(queued, reconnected)
 
-    assert within == []
+    assert within == [ACCOUNT_OPEN]
     assert past == ChartState.REQUESTED
-    assert sent_to_ea(reconnected) == [binary.OpenChart(PUBLISHER, "XYZ")]
+    assert sent_to_ea(reconnected) == [ACCOUNT_OPEN, binary.OpenChart(PUBLISHER, "XYZ")]
     await _closed(tasks.values(), reconnected)
 
 
@@ -596,7 +672,7 @@ async def test_a_spawner_reconnecting_past_the_hold_replays_the_failed_chart(clo
     tasks = await _greeted(hub, (reconnected, SPAWNER, "EURUSD"))
     await delivered(queued, reconnected)
 
-    assert sent_to_ea(reconnected) == [binary.OpenChart(PUBLISHER, "XYZ")]
+    assert sent_to_ea(reconnected) == [ACCOUNT_OPEN, binary.OpenChart(PUBLISHER, "XYZ")]
     await _closed(tasks.values(), reconnected)
 
 
@@ -623,7 +699,7 @@ async def test_a_failed_chart_clears_on_its_eas_hello_and_a_use_after_the_ea_lef
         ChartState.PUBLISHED,
         ChartState.REQUESTED,
     )
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "XYZ")] * 2
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN] + [binary.OpenChart(PUBLISHER, "XYZ")] * 2
     await _closed(tasks, spawner)
 
 
@@ -674,9 +750,14 @@ async def test_the_spawner_is_told_to_close_each_chart_out_of_use_for_the_idle_p
     hub.close_idle_charts()
     await settle()
 
-    assert early == []
+    assert early == [binary.encode(ACCOUNT_OPEN)]
     assert sorted(sent_to_ea(spawner), key=str) == sorted(
-        [binary.CloseChart(PUBLISHER, "GBPUSD"), binary.CloseChart(PUBLISHER, "USDJPY")], key=str
+        [
+            ACCOUNT_OPEN,
+            binary.CloseChart(PUBLISHER, "GBPUSD"),
+            binary.CloseChart(PUBLISHER, "USDJPY"),
+        ],
+        key=str,
     )
     await _closed(tasks, spawner, usdjpy, gbpusd, xauusd, consumer)
 
@@ -695,8 +776,8 @@ async def test_a_touch_moves_a_charts_idle_deadline(clock):
     hub.close_idle_charts()
     await settle()
 
-    assert (touched, early) == (ChartState.PUBLISHED, [])
-    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    assert (touched, early) == (ChartState.PUBLISHED, [binary.encode(ACCOUNT_OPEN)])
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.CloseChart(PUBLISHER, "USDJPY")]
     await _closed(tasks, spawner, usdjpy)
 
 
@@ -718,8 +799,8 @@ async def test_a_chart_the_spawner_keeps_open_is_closed_only_after_a_further_idl
     await settle()
 
     close = binary.CloseChart(PUBLISHER, "USDJPY")
-    assert kept == [close]
-    assert sent_to_ea(spawner) == [close, close]
+    assert kept == [ACCOUNT_OPEN, close]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, close, close]
     assert sent_to_ea(usdjpy) == [binary.Wanted("USDJPY", False, ())]
     await _closed(tasks, spawner, usdjpy)
 
@@ -743,8 +824,8 @@ async def test_after_a_chart_kept_the_next_close_is_sent_a_full_idle_period_late
     await settle()
 
     close = binary.CloseChart(PUBLISHER, "USDJPY")
-    assert kept == [close]
-    assert sent_to_ea(spawner) == [close, close]
+    assert kept == [ACCOUNT_OPEN, close]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, close, close]
     assert warnings(caplog) == []
     await _closed(tasks, spawner, usdjpy)
 
@@ -769,7 +850,7 @@ async def test_a_publisher_saying_hello_while_its_close_is_pending_is_not_revive
     hub.close_idle_charts()
     await settle()
 
-    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.CloseChart(PUBLISHER, "USDJPY")]
     assert sent_to_ea(again) == [binary.Wanted("USDJPY", False, ())]
     assert warnings(caplog) == []
     await _closed(tasks, spawner)
@@ -800,8 +881,8 @@ async def test_a_hello_once_its_chart_has_closed_starts_its_idle_period(clock):
     await settle()
 
     close = binary.CloseChart(PUBLISHER, "USDJPY")
-    assert early == [close]
-    assert sent_to_ea(spawner) == [close, close]
+    assert early == [ACCOUNT_OPEN, close]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, close, close]
     await _closed(tasks, spawner, reopened)
 
 
@@ -831,9 +912,9 @@ async def test_a_close_neither_ended_nor_kept_within_its_bound_is_sent_again_onc
     await settle()
 
     close = binary.CloseChart(PUBLISHER, "USDJPY")
-    assert within == [close]
-    assert once == [close, close]
-    assert sent_to_ea(spawner) == [close, close, close]
+    assert within == [ACCOUNT_OPEN, close]
+    assert once == [ACCOUNT_OPEN, close, close]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, close, close, close]
     resent = warnings(caplog)
     assert len(resent) == 2
     assert all("publisher" in warning and "USDJPY" in warning for warning in resent)
@@ -863,8 +944,8 @@ async def test_a_pending_close_of_a_chart_in_use_again_ends_at_its_bound_unsent(
 
     close = binary.CloseChart(PUBLISHER, "USDJPY")
     assert used == ChartState.PUBLISHED
-    assert in_use == [close]
-    assert sent_to_ea(spawner) == [close, close]
+    assert in_use == [ACCOUNT_OPEN, close]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, close, close]
     assert warnings(caplog) == []
     await _closed(tasks, spawner, usdjpy)
 
@@ -901,8 +982,8 @@ async def test_a_close_that_overflows_the_spawners_queue_leaves_no_close_pending
     await settle()
 
     assert stuck.closed == (ws_server.OVERFLOW, "queue overflow")
-    assert early == []
-    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "XAUUSD")]
+    assert early == [ACCOUNT_OPEN]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.CloseChart(PUBLISHER, "XAUUSD")]
     await _closed(tasks, spawner, gbpusd, usdjpy, again)
 
 
@@ -928,9 +1009,10 @@ async def test_a_chart_asked_for_and_never_served_is_closed_and_withdrawn_once_o
     await delivered(queued, spawner)
 
     assert (requested, again) == (ChartState.REQUESTED, ChartState.REQUESTED)
-    assert in_use == [binary.OpenChart(*key)]
+    assert in_use == [ACCOUNT_OPEN, binary.OpenChart(*key)]
     assert withdrawn
     assert sent_to_ea(spawner) == [
+        ACCOUNT_OPEN,
         binary.OpenChart(*key),
         binary.CloseChart(*key),
         binary.OpenChart(*key),
@@ -954,7 +1036,7 @@ async def test_a_chart_asked_for_and_never_served_stays_while_a_consumer_subscri
     hub.close_idle_charts()
     await delivered(queued, spawner)
 
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "USDJPY")]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.OpenChart(PUBLISHER, "USDJPY")]
     await _closed(tasks, spawner, consumer)
 
 
@@ -969,7 +1051,7 @@ async def test_an_ea_leaving_a_chart_out_of_use_has_the_spawner_close_it(clock, 
     await _left(tasks, usdjpy)
     await delivered(queued, spawner)
 
-    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.CloseChart(PUBLISHER, "USDJPY")]
     assert len([r for r in caplog.records if "left its chart out of use" in r.getMessage()]) == 1
     await _closed(tasks.values(), spawner)
 
@@ -984,7 +1066,7 @@ async def test_an_ea_leaving_a_chart_used_within_the_idle_period_has_it_requeste
     await _left(tasks, usdjpy)
     await delivered(queued, spawner)
 
-    assert sent_to_ea(spawner) == [binary.OpenChart(PUBLISHER, "USDJPY")]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.OpenChart(PUBLISHER, "USDJPY")]
     await _closed(tasks.values(), spawner)
 
 
@@ -1000,7 +1082,7 @@ async def test_an_ea_leaving_while_its_close_is_pending_is_not_closed_again(cloc
     await _left(tasks, usdjpy)
     await delivered(queued, spawner)
 
-    assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+    assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.CloseChart(PUBLISHER, "USDJPY")]
     await _closed(tasks.values(), spawner)
 
 
@@ -1012,7 +1094,7 @@ async def test_a_subscription_arriving_while_its_publishers_close_is_pending(clo
         clock[0] = 1_000.0 + IDLE_S
         hub.close_idle_charts()
         await settle()
-        assert sent_to_ea(spawner) == [binary.CloseChart(PUBLISHER, "USDJPY")]
+        assert sent_to_ea(spawner) == [ACCOUNT_OPEN, binary.CloseChart(PUBLISHER, "USDJPY")]
         tasks.append(asyncio.create_task(hub.handler(consumer)))
         consumer.put_frame(binary.AdapterHello())
         consumer.put_frame(binary.Subscribe(1, ticks_of("USDJPY")))
@@ -1024,6 +1106,7 @@ async def test_a_subscription_arriving_while_its_publishers_close_is_pending(clo
             hub.close_idle_charts()
         await settle()
         assert sent_to_ea(spawner) == [
+            ACCOUNT_OPEN,
             binary.CloseChart(PUBLISHER, "USDJPY"),
             binary.OpenChart(PUBLISHER, "USDJPY"),
         ]
@@ -1053,7 +1136,7 @@ async def test_two_repeated_broker_hours_alternating_are_each_warned_of_once(cap
     await settle()
 
     for epoch in (REPEATED, REPEATED_A_YEAR_BEFORE, REPEATED + 60, REPEATED_A_YEAR_BEFORE + 60):
-        ea.put_ea(binary.Ticks("EURUSD", (tick(epoch),)))
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick(epoch))))
     await settle()
 
     assert [raw[1] for raw in consumer.sent] == [FrameKind.ACK] + [FrameKind.TICK] * 4
@@ -1149,15 +1232,15 @@ async def test_a_consumer_whose_queue_overflows_is_closed_with_4008_and_the_rest
 
     # The stuck consumer's ack is in the send that never completes; three ticks fill its queue.
     for _ in range(3):
-        ea.put_ea(binary.Ticks("EURUSD", (tick(),)))
+        ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     await settle()
     full = stuck.closed
-    ea.put_ea(binary.Ticks("EURUSD", (tick(),)))
+    ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     await settle()
 
     assert full is None
     assert stuck.closed == (ws_server.OVERFLOW, "queue overflow")
-    ea.put_ea(binary.Ticks("EURUSD", (tick(),)))
+    ea.put_ea(binary.Ticks("EURUSD", tick_rows(tick())))
     await settle()
     assert len(reading.sent) == 1 + 5
     assert reading.closed is None
@@ -1188,6 +1271,7 @@ async def _refused(port, hello: bytes | None, sent: bytes | str) -> binary.Refus
 
 EA_HELLO = encode_ea(binary.EaHello(PUBLISHER, "EURUSD"))
 ADAPTER_HELLO = binary.encode(binary.AdapterHello())
+PUBLISHER_SERVER_TIME = encode_ea(sample("EURUSD"))
 
 
 @pytest.mark.parametrize(
@@ -1198,9 +1282,8 @@ ADAPTER_HELLO = binary.encode(binary.AdapterHello())
         (None, binary.encode(binary.Subscribe(1, ticks_of("EURUSD")))),
         (ADAPTER_HELLO, ADAPTER_HELLO),
         (EA_HELLO, EA_HELLO),
-        (EA_HELLO, encode_ea(sample("EURUSD"))),
         (EA_HELLO, binary.encode(binary.Subscribe(1, ticks_of("EURUSD")))),
-        (ADAPTER_HELLO, encode_ea(binary.Ticks("EURUSD", (tick(),)))),
+        (ADAPTER_HELLO, encode_ea(binary.Ticks("EURUSD", tick_rows(tick())))),
         (EA_HELLO, encode_ea(binary.RatesBar("EURUSD", mirror.TIMEFRAME_MN1, rates()))),
         (ADAPTER_HELLO, frame(FrameKind.ACK, b"", flags=1)),
     ],
@@ -1210,7 +1293,6 @@ ADAPTER_HELLO = binary.encode(binary.AdapterHello())
         "op-before-hello",
         "second-adapter-hello",
         "second-ea-hello",
-        "server-time-from-a-publisher",
         "op-from-an-ea",
         "tick-from-a-consumer",
         "bar-of-no-series",
@@ -1252,7 +1334,7 @@ async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on():
 
     await broken.ws.send(b"\x02\x0d")
     await asyncio.wait_for(broken.ws.wait_closed(), 1)
-    await eurusd.send(binary.Ticks("EURUSD", (tick(),)))
+    await eurusd.send(binary.Ticks("EURUSD", tick_rows(tick())))
 
     assert isinstance(await consumer.received(), binary.Ticks)
     await close_all(server, consumer, eurusd)
@@ -1261,21 +1343,80 @@ async def test_a_malformed_frame_closes_its_connection_and_the_hub_serves_on():
 # ── Relays ────────────────────────────────────────────────────────────────────
 
 
-async def test_the_spawners_server_time_is_never_fanned_out_and_one_for_another_symbol_dropped(
+async def test_a_publishers_server_time_sample_reaches_the_clock_gate():
+    hub, server, port = await run_hub()
+    ea = await publisher(port)
+    try:
+        await ea.ws.send(PUBLISHER_SERVER_TIME)
+        await eventually(lambda: health(port)[1]["result"]["sample_age_s"] is not None)
+        assert (await health_of(port))[1]["result"]["clock"] is None
+    finally:
+        await close_all(server, ea)
+
+
+async def test_a_publisher_keeps_the_gate_open_while_the_connected_spawner_is_silent():
+    hub, server, port = await run_hub()
+    async with verified(port) as spawner:
+        account = await FakeEa.connect(port, ChartRole.ACCOUNT, "EURUSD")
+        ea = await publisher(port, "GBPUSD")
+    consumer = await Consumer.connect(port)
+    try:
+        async with verified_by(ea):
+            await asyncio.sleep(MAX_AGE_S * 3)
+            status, body = await health_of(port)
+            assert status == 200
+            assert body["result"]["sample_age_s"] < MAX_AGE_S
+
+            await consumer.ask(1, calls.Call.SYMBOL_INFO_TICK, symbol="GBPUSD")
+            requested = await ea.request()
+            assert requested.call == calls.Call.SYMBOL_INFO_TICK
+            assert calls.decode_arguments(calls.CALLS[requested.call], requested) == {
+                "symbol": "GBPUSD"
+            }
+            await ea.send(answer(requested.request_id, calls.Call.SYMBOL_INFO_TICK, tick()))
+            received = await consumer.received()
+            assert received.error is None
+            assert (
+                calls.read_hub_result(calls.CALLS[calls.Call.SYMBOL_INFO_TICK], received)["bid"]
+                == 1.085
+            )
+    finally:
+        await close_all(server, consumer, ea, spawner, account)
+
+
+async def test_a_history_eas_server_time_for_another_symbol_is_dropped_with_a_warning(caplog):
+    caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
+    hub, server, port = await run_hub()
+    ea = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+    try:
+        await ea.send(sample("GBPUSD"))
+        await nothing(ea.ws, timeout=0.05)
+        assert warnings(caplog) == [
+            "dropping a server-time sample for 'GBPUSD' from the history for EURUSD"
+        ]
+    finally:
+        await close_all(server, ea)
+
+
+async def test_server_time_is_never_fanned_out_and_only_its_serving_eas_symbol_is_taken(
     caplog,
 ):
     caplog.set_level(logging.WARNING, logger="mt5connector.server.ws_server")
     hub, server, port = await run_hub()
     spawner = await FakeEa.connect(port, SPAWNER, "EURUSD.a")
+    ea = await publisher(port, "GBPUSD")
     consumer = await Consumer.connect(port)
     await consumer.subscribed(1, ticks_of("EURUSD.a"))
-    measured = binary.ServerTime("EURUSD.a", 1_752_580_800, 1_752_580_798, 1_752_570_000, True)
+    try:
+        measured = binary.ServerTime("EURUSD.a", 1_752_580_800, 1_752_580_798, 1_752_570_000, True)
+        await spawner.send(measured)
+        await spawner.send(binary.ServerTime("GBPUSD", 1, 1, 1, True))
+        async with verified_by(ea):
+            assert (await health_of(port))[1]["result"]["clock"]["symbol"] == "GBPUSD"
+            await nothing(consumer.ws)
 
-    await spawner.send(measured)
-    await spawner.send(binary.ServerTime("GBPUSD", 1, 1, 1, True))
-    await nothing(consumer.ws)
-
-    assert warnings(caplog) == [
-        "dropping a server-time sample for 'GBPUSD' from the spawner for EURUSD.a"
-    ]
-    await close_all(server, consumer, spawner)
+        assert warnings(caplog) == [
+            "dropping a server-time sample for 'GBPUSD' from the spawner for EURUSD.a"
+        ]
+    finally:
+        await close_all(server, consumer, spawner, ea)

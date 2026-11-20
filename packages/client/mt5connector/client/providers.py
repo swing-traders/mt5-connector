@@ -22,6 +22,7 @@ from mt5connector.client.commissions import (
     parse_schedule,
     taker_fee,
 )
+from mt5connector.client.concurrency import _fan_out
 from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.errors import (
     EaError,
@@ -128,26 +129,28 @@ class MT5InstrumentProvider(InstrumentProvider):
         """The instrument of each symbol, then of each venue symbol quoting a pair their conversions
         need, each built from its definition, and the quoting symbol per pair, `loaded` the symbols
         already held; the terminal's symbols are listed unless `listing` holds them. Raises naming
-        the first symbol the venue does not know or whose definition is refused."""
+        a symbol the venue does not know or whose definition is refused."""
         session = self._conn.session
         account = AccountSnapshot.from_mt5((await session.account_info()).result)
         ts = self._clock.timestamp_ns()
-        definitions = {}
-        for symbol in symbols:
-            definitions[symbol] = await _definition(session, symbol)
+        definitions = dict(
+            zip(
+                symbols,
+                await _fan_out(*(_definition(session, symbol) for symbol in symbols)),
+                strict=True,
+            )
+        )
         if listing is None:
             listing = await _asked(session, calls.Call.SYMBOLS_GET)
         pairs, quoting = await _quote_conversions(
             session, definitions, _listed_pairs(listing), loaded | set(symbols), account.currency
         )
-        instruments = []
-        for info, rule in (definitions | quoting).values():
-            try:
-                instruments.append(
-                    await self._load_definition(session, info, rule, account, pairs, ts)
-                )
-            except MT5InstrumentError as exc:
-                raise MT5InstrumentError(f"{info.name}: {exc}") from exc
+        instruments = await _fan_out(
+            *(
+                self._load_definition(session, info, rule, account, pairs, ts)
+                for info, rule in (definitions | quoting).values()
+            )
+        )
         return instruments, pairs
 
     async def _load_definition(
@@ -161,14 +164,25 @@ class MT5InstrumentProvider(InstrumentProvider):
     ):
         """Builds the instrument a symbol's definition describes, its fee from its commission rule
         and its trading sessions as relayed."""
-        sessions = parse_sessions(
-            await _asked(session, calls.Call.TRADING_SESSIONS, symbol=info.name)
-        )
-        fee, fee_stamp = await _fee(session, info, rule, pairs)
-        margin_rates = await _asked(session, calls.Call.SYMBOL_MARGIN_RATE, symbol=info.name)
-        return parse_symbol_info(
-            info, self._venue, account, fee, fee_stamp, sessions, ts, margin_rates
-        )
+        try:
+            sessions, fee_result, margin_rates = await _fan_out(
+                _asked(session, calls.Call.TRADING_SESSIONS, symbol=info.name),
+                _fee(session, info, rule, pairs),
+                _asked(session, calls.Call.SYMBOL_MARGIN_RATE, symbol=info.name),
+            )
+            fee, fee_stamp = fee_result
+            return parse_symbol_info(
+                info,
+                self._venue,
+                account,
+                fee,
+                fee_stamp,
+                parse_sessions(sessions),
+                ts,
+                margin_rates,
+            )
+        except MT5InstrumentError as exc:
+            raise MT5InstrumentError(f"{info.name}: {exc}") from exc
 
     # ── Conversion pairs ──────────────────────────────────────────────────────
 
@@ -288,10 +302,9 @@ async def _quote_conversions(
         found = await _select_quoted_pairs(session, listed, needed - asked, traded)
         asked |= needed
         pairs |= found
-        pending = []
-        for symbol in sorted(set(found.values()) - definitions.keys()):
-            quoting[symbol] = await _definition(session, symbol)
-            pending.append(quoting[symbol])
+        symbols = sorted(set(found.values()) - definitions.keys())
+        pending = await _fan_out(*(_definition(session, symbol) for symbol in symbols))
+        quoting.update(zip(symbols, pending, strict=True))
     return pairs, quoting
 
 
@@ -301,8 +314,11 @@ async def _select_quoted_pairs(
     """The venue symbol quoting each pair of `needed`: one the run trades, else one fully tradable,
     else the first that quotes, each in alphabetical order; a pair none quotes is left out."""
     pairs = {}
-    for pair in sorted(needed):
-        symbol = await _select_quoting_symbol(session, listed[pair], traded)
+    ordered = sorted(needed)
+    symbols = await _fan_out(
+        *(_select_quoting_symbol(session, listed[pair], traded) for pair in ordered)
+    )
+    for pair, symbol in zip(ordered, symbols, strict=True):
         if symbol is not None:
             pairs[pair] = symbol
     return pairs

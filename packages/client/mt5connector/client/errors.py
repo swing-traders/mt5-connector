@@ -17,6 +17,10 @@ class ServerUnreachable(MT5ConnectionError):
     """Raised when the hub cannot be reached or answers outside its contract."""
 
 
+class NotSent(ServerUnreachable):
+    """Raised when the session could not send a request: the hub never saw it."""
+
+
 class ResponseLost(ServerUnreachable):
     """Raised when a request reached the hub but no answer within its contract came back, so it may
     have been acted on."""
@@ -42,6 +46,10 @@ class Deferred(HubAnswerError):
     def __init__(self, message: str, last_error: int, retry_after_s: float) -> None:
         super().__init__(message, last_error)
         self.retry_after_s = retry_after_s
+
+
+class NotServed(HubAnswerError):
+    """Raised when the hub cannot execute a command now and refuses it unsent."""
 
 
 class Syncing(Deferred):

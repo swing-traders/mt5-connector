@@ -15,6 +15,21 @@ _RATES = np.dtype(list(mirror.RATES.dtype))
 _TICKS = np.dtype(list(mirror.TICKS.dtype))
 
 
+def tick_rows(*records):
+    return np.array(
+        [tuple(record[name] for name in mirror.TICKS.names) for record in records], dtype=_TICKS
+    )
+
+
+def assert_frame_equal(actual, expected):
+    assert type(actual) is type(expected)
+    if isinstance(expected, binary.Ticks):
+        assert actual.symbol == expected.symbol
+        np.testing.assert_array_equal(actual.ticks, expected.ticks)
+    else:
+        assert actual == expected
+
+
 def frame(kind: FrameKind, payload: bytes, *, correlation=0, count=0, flags=0, version=2) -> bytes:
     return binary.HEADER.pack(version, kind, flags, correlation, count, len(payload)) + payload
 
@@ -54,6 +69,10 @@ def encode_ea(sent) -> bytes:
         writer.i64(sent.gmt)
         writer.boolean(sent.connected)
         return frame(FrameKind.SERVER_TIME, writer.payload())
+    elif isinstance(sent, binary.ChartStatus):
+        writer.u32(sent.count)
+        writer.u32(sent.capacity)
+        return frame(FrameKind.CHART_STATUS, writer.payload())
     elif isinstance(sent, binary.Commissions):
         writer.string(sent.symbol)
         binary.write_schedule(writer, sent.schedule)
