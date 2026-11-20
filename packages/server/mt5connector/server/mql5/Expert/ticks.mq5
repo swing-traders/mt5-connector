@@ -31,6 +31,8 @@ input int HubPingTimeoutSec = 50;
 #define HISTORY_CALL_SPACING_MS 1000
 // Scheduling margin on https://www.mql5.com/en/docs/series/timeseries_access.
 #define BUSY_MARGIN_S 15
+// One-second poll plus scheduling margin: https://www.mql5.com/en/docs/common/sleep.
+#define BUSY_PAUSE_S (1 + BUSY_MARGIN_S)
 // The 45 s EA synchronisation wait plus margin: https://www.mql5.com/en/docs/series/copyticks.
 #define BUSY_COPY_TICKS_S 60
 // A 45 s EA sync wait plus margin: https://www.mql5.com/en/docs/series/timeseries_access.
@@ -1699,6 +1701,7 @@ bool KeepWaiting(const HistoryRequest *r, HistoryRun &run, const string late)
 // A second's sleep, then the hub's frames read.
 void Pause()
 {
+    BusyHistoryCall(BUSY_PAUSE_S);
     Sleep(1000);
     ReadHub();
 }

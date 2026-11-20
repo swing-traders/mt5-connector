@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 
@@ -20,11 +21,15 @@ pytestmark = pytest.mark.skipif(SYMBOL is None, reason="MT5_LIVE_HUB_SYMBOL is n
 
 CALL_BUSY_S = 60
 QUEUE_BUSY_S = 15
+WAIT_BUSY_S = 16
 PAUSE_S = 120
 
 
-async def cold_symbol(session, control):
-    symbol = (await symbols_for(session, 1, control))[0]
+async def cold_symbol(session, control, symbol=None):
+    if symbol is None:
+        symbol = (await symbols_for(session, 1, control))[0]
+    else:
+        assert symbol in await symbols_for(session, None, control)
     saved = json.loads(
         await control.run(
             "exec",
@@ -63,8 +68,37 @@ async def test_a_fresh_volumes_cold_ranges_survives_under_per_call_busy(observed
     assert answer.result.first_tick > 0
     records = busy_records(observed)
     print(json.dumps({"symbol": symbol, "hub_busy_frames": records}))
-    assert {bound for _at, _request, bound in records} == {QUEUE_BUSY_S, CALL_BUSY_S}
+    bounds = {bound for _at, _request, bound in records}
+    assert {QUEUE_BUSY_S, CALL_BUSY_S} <= bounds <= {QUEUE_BUSY_S, CALL_BUSY_S, WAIT_BUSY_S}
     assert "pong is overdue" not in await throwaway.logs(since)
+
+
+async def test_a_cold_measurement_polling_over_seventy_seconds_keeps_its_request(
+    observed, throwaway
+):
+    symbol = os.environ.get("MT5_CERT_LONG_MEASUREMENT_SYMBOL")
+    if symbol is None:
+        pytest.skip("MT5_CERT_LONG_MEASUREMENT_SYMBOL names the prepared long-backfill symbol")
+    await cold_symbol(observed, throwaway, symbol)
+    answer = await synced(observed, calls.Call.RANGES, symbol=symbol)
+    assert answer.result.first_tick > 0
+    start = None
+    request = None
+    longest = 0
+    records = busy_records(observed)
+    for at, request_id, bound in records:
+        if bound == WAIT_BUSY_S:
+            if start is None or request_id != request:
+                start = at
+                request = request_id
+            longest = max(longest, at - start)
+        else:
+            start = None
+    print(json.dumps({"symbol": symbol, "hub_busy_frames": records, "longest_poll_s": longest}))
+    # A series-call busy would reset this window; only consecutive polling waits count.
+    assert (
+        longest > CALL_BUSY_S + calls.BUSY_MARGIN_S
+    ), "the fixture did not exercise a measurement polling gap beyond the old series-call deadline"
 
 
 async def test_a_paused_history_call_expires_at_its_own_busy_bound(observed, throwaway):
