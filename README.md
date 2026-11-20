@@ -392,6 +392,7 @@ The adapter runs against `mt5-connector-server`: a WebSocket hub that carries wh
 - A bracket command no longer waits for a sibling's verdict.
 - Reads on command paths and in reports are asked once.
 - The server runs a dedicated account EA. Symbol-named position, order and margin-rate reads use that symbol's publisher; account-wide reads use the account EA. Health requires both the spawner and account EA and a fresh verified clock, which any serving EA can relay.
+- The EA-to-hub binary protocol adds `chart_status` (kind 22), carrying the spawner's listed-chart count and terminal capacity as two uint32 values. Health exposes `chart_count` and `chart_limit`; the count is cleared when the spawner disconnects and remains unknown until its replacement reports.
 - Symbol-named account reads defer until the symbol's publisher opens.
 - Chart opens progress ahead of unrelated closes. Each spawner pass permits one chart close and one Market Watch deselection, preserving hidden conversion symbols.
 - Instrument loads, cancel batches and report reads fan out by key. Historical quote and bar construction yields between batches; pushed tick frames carry a structured NumPy array in `Ticks.ticks`.

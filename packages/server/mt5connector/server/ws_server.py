@@ -1064,6 +1064,7 @@ class Hub:
                         )
                 if ea.chart_role is ChartRole.SPAWNER:
                     self._spawner = None
+                    self._chart_status = None
                     self._sent.clear()
                     for key in list(self._close_sent):
                         if key not in self._resync_closing:

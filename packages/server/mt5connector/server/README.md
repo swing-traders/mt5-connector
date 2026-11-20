@@ -185,7 +185,7 @@ A running re-sync owns its months until it ends; months becoming due meanwhile s
 - Until a sample verifies it the hub answers reads `not_ready` and commands `not_served`. No verification by `MT5_CLOCK_BOOTSTRAP_SECONDS` after start, and a sample the clock contradicts, are logged as critical and leave the gate shut; the hub keeps serving, and a later verifying sample opens it.
 - `GET /health` on the hub's port answers HTTP 200 while the spawner and account EA are connected, the latest sample is fresh and the clock verified. Otherwise it answers HTTP 503 naming why; without the account EA it names "no account EA is connected". Another method answers 405.
 - Its body carries `spawner` and `account`, whether each is connected; `clock`, the verification's `symbol`, `trade_server`, `current`, `gmt`, `skew_s` and `offset_s`, or null; `sample_age_s`; `bootstrap_missed`; `in_flight`, the requests pending; and `pending`, each EA's `role`, `symbol` and `requests` pending.
-- `chart_count` is the spawner's last reported number of listed charts, null before its first report. `chart_limit` is true when that count reaches the terminal's capacity. Reaching capacity leaves a healthy hub at 200; it does not change the clock or connection checks.
+- `chart_count` is the spawner's last reported number of listed charts, null before its first report and after its departure. `chart_limit` is true when that count reaches the terminal's capacity. Reaching capacity leaves a healthy hub at 200; it does not change the clock or connection checks.
 - The spawner's hello requests the account chart on its own symbol. That chart stays open and is requested again if its EA leaves; account reads defer until its EA says hello.
 
 ### Streams, charts and relays
