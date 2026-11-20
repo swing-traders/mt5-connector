@@ -10,7 +10,11 @@ enum ProbeEvent
     START, CHART_ADDED, CHART_GONE, WATCH_SELECTED, WATCH_GONE, WATCH_HELD,
     CONNECTED, DISCONNECTED, ACK, FAILED
 };
-enum ProbeCommand { OPEN_STRAY = 1, CLOSE_SYMBOL = 2, SELECT_SYMBOL = 3, FIND_PUBLISHER = 4 };
+enum ProbeCommand
+{
+    OPEN_STRAY = 1, CLOSE_SYMBOL = 2, SELECT_SYMBOL = 3, FIND_PUBLISHER = 4,
+    CREATE_TICKS = 5, BURST_TICKS = 6
+};
 struct ChartState { long id; string symbol; };
 struct WatchState { string symbol; bool visible; int positions; int orders; };
 
@@ -153,6 +157,44 @@ void Commands()
             }
         }
         ok = count <= 1;
+    }
+    else if (operation == CREATE_TICKS)
+    {
+        ok = CustomSymbolCreate(symbol, "ConnectorProbe", _Symbol)
+             && CustomSymbolSetInteger(symbol, SYMBOL_TRADE_MODE, SYMBOL_TRADE_MODE_DISABLED)
+             && SymbolSelect(symbol, true);
+        if (ok)
+        {
+            MqlTick seed[];
+            ArrayResize(seed, 1);
+            ZeroMemory(seed[0]);
+            seed[0].time = TimeTradeServer() - 10;
+            seed[0].time_msc = (long)seed[0].time * 1000;
+            seed[0].bid = 1;
+            seed[0].ask = 1.0001;
+            seed[0].flags = TICK_FLAG_BID | TICK_FLAG_ASK;
+            ok = CustomTicksAdd(symbol, seed) == 1;
+        }
+    }
+    else if (operation == BURST_TICKS)
+    {
+        ok = (bool)SymbolInfoInteger(symbol, SYMBOL_CUSTOM);
+        if (ok)
+        {
+            MqlTick ticks[];
+            ArrayResize(ticks, 5000);
+            const long first = (long)TimeTradeServer() * 1000 - 5000;
+            for (int i = 0; i < ArraySize(ticks); i++)
+            {
+                ZeroMemory(ticks[i]);
+                ticks[i].time_msc = first + i;
+                ticks[i].time = (datetime)(ticks[i].time_msc / 1000);
+                ticks[i].bid = 1 + i * 0.00001;
+                ticks[i].ask = ticks[i].bid + 0.0001;
+                ticks[i].flags = TICK_FLAG_BID | TICK_FLAG_ASK;
+            }
+            ok = CustomTicksAdd(symbol, ticks) == ArraySize(ticks);
+        }
     }
     else
         ok = false;

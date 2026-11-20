@@ -134,6 +134,7 @@ class Hub:
         self._served: dict[tuple[ChartRole, str | None], object] = {}
         self._told: dict[str, binary.Wanted] = {}
         self._spawner: object | None = None
+        self._chart_status: binary.ChartStatus | None = None
         self._requested: set[ChartKey] = set()
         self._sent: set[ChartKey] = set()
         self._failed: dict[ChartKey, tuple[int, float]] = {}
@@ -234,6 +235,7 @@ class Hub:
                 (ChartRole.ACCOUNT, None) in self._served,
                 self._requests.all(),
                 labels,
+                self._chart_status,
             )
             return _json(connection, status, body)
         elif request.path == HEALTH_PATH:
@@ -402,6 +404,8 @@ class Hub:
             self._publish(ea, frame)
         elif isinstance(frame, binary.ServerTime):
             self._server_time(ea, frame)
+        elif isinstance(frame, binary.ChartStatus) and spawner:
+            self._chart_status = frame
         elif isinstance(frame, binary.Commissions) and publisher:
             self._relayed_commissions(ea, frame)
         elif isinstance(frame, binary.Sessions) and publisher:
@@ -560,10 +564,11 @@ class Hub:
             self._failed.pop(key, None)
         elif isinstance(frame, binary.ChartFailed):
             logger.warning(
-                "the spawner cannot open the %s chart of %s: MQL5 error %d",
+                "the spawner cannot open the %s chart of %s: MQL5 error %d (chart status %s)",
                 frame.chart_role,
                 frame.symbol,
                 frame.error,
+                self._chart_status,
             )
             self._failed[key] = (frame.error, time.monotonic())
             self._sent.discard(key)
@@ -733,7 +738,7 @@ class Hub:
             message = f"{self._settings.ea_queue_bound} frames queued for the EA"
             self._error(ws, client_id, 0, ErrorKind.OVERFLOW, message)
         elif state is ChartState.FAILED:
-            self._chart_failed(ws, client_id, key)
+            self._chart_failed(ws, client_id, key, row.wait)
         elif key[0] is ChartRole.ACCOUNT:
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, "no account EA is connected")
         elif row.wait is calls.Wait.COMMAND:
@@ -760,7 +765,7 @@ class Hub:
             message = f"no publisher for {symbol}; chart requested"
             self._deferred(ws, client_id, ErrorKind.NO_PUBLISHER, message)
         elif state is ChartState.FAILED:
-            self._chart_failed(ws, client_id, key)
+            self._chart_failed(ws, client_id, key, row.wait)
         elif relay is None:
             message = f"no {row.call.name.lower()} relayed for {symbol}"
             self._deferred(ws, client_id, ErrorKind.SYNCING, message)
@@ -907,16 +912,20 @@ class Hub:
         error = binary.AnswerError(kind, message)
         self._to_consumer(ws, binary.Answer(client_id, part, True, 0, error=error))
 
-    def _chart_failed(self, ws, client_id: int, key: ChartKey) -> None:
-        """Answers a request ea_error naming its chart that failed to open, with the MQL5 error the
-        spawner met."""
+    def _chart_failed(self, ws, client_id: int, key: ChartKey, wait: calls.Wait) -> None:
+        """Defers a read or refuses a command whose chart failed to open."""
         chart_role, symbol = key
         mql5_error, _failed_at = self._failed[key]
         if chart_role is ChartRole.ACCOUNT:
             message = f"the account chart failed to open: MQL5 error {mql5_error}"
         else:
             message = f"the {chart_role} chart of {symbol} failed to open: MQL5 error {mql5_error}"
-        error = binary.AnswerError(ErrorKind.EA_ERROR, message)
+        if wait is calls.Wait.COMMAND:
+            error = binary.AnswerError(ErrorKind.NOT_SERVED, message)
+        else:
+            error = binary.AnswerError(
+                ErrorKind.NO_PUBLISHER, message, int(self._settings.retry_after_s * 1000)
+            )
         self._to_consumer(ws, binary.Answer(client_id, 0, True, mql5_error, error=error))
 
     # ── Sending ───────────────────────────────────────────────────────────────

@@ -26,6 +26,38 @@ input int HubPingTimeoutSec = 50;
 // The REQUEST transactions a publisher keeps for the outcomes call, the latest first.
 #define OUTCOME_RING 1000
 #define DAY_SECONDS 86400
+#define SLOW_TICK_MS 100
+
+enum ENUM_PASS_STEP
+{
+    PASS_DRAIN, PASS_OPEN, PASS_CLOSE, PASS_CURSOR, PASS_RELAY,
+    PASS_TICKS, PASS_BARS, PASS_ACCOUNT, PASS_HISTORY, PASS_RECONNECT
+};
+enum ENUM_CHART_OPEN_CALL
+{
+    OPEN_CALL_NONE, OPEN_CALL_SYMBOL_EXIST, OPEN_CALL_SYMBOL_SELECT,
+    OPEN_CALL_CHART_OPEN, OPEN_CALL_TEMPLATE
+};
+ENUM_PASS_STEP g_longestStep = PASS_DRAIN;
+ulong g_longestStepMs = 0;
+
+void ObserveStep(const ENUM_PASS_STEP step, const ulong started)
+{
+    const ulong elapsed = GetTickCount64() - started;
+    if (elapsed > g_longestStepMs)
+    {
+        g_longestStepMs = elapsed;
+        g_longestStep = step;
+    }
+}
+
+void FinishPass(const ulong started)
+{
+    const ulong elapsed = GetTickCount64() - started;
+    if (elapsed >= SLOW_TICK_MS)
+        PrintFormat("ticks: slow tick: %I64u ms (%s, %I64u ms)", elapsed,
+                    EnumToString(g_longestStep), g_longestStepMs);
+}
 
 // The two session schedules a symbol states per weekday.
 enum ENUM_SESSION_KIND
@@ -172,6 +204,19 @@ void SendServerTime()
     Send(frame);
 }
 
+void SendChartStatus()
+{
+    uint count = 0;
+    for (long chart = ChartFirst(); chart != -1; chart = ChartNext(chart))
+        count++;
+    BinaryWriter frame;
+    frame.Begin(HUB_FRAME_CHART_STATUS, 0, 0);
+    frame.U32(count);
+    frame.U32(CHARTS_MAX);
+    frame.Seal(0);
+    Send(frame);
+}
+
 // The symbol's commission rules, their enums by name
 void SendCommissions()
 {
@@ -294,6 +339,8 @@ void Relay()
 {
     g_lastRelay = GetTickCount64();
     SendServerTime();
+    if (Role == ROLE_SPAWNER)
+        SendChartStatus();
     if (Role == ROLE_PUBLISHER)
     {
         SendCommissions();
@@ -804,6 +851,91 @@ void ServeAccount(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer 
     }
 }
 
+class AccountRequest
+{
+public:
+    ulong id;
+    ENUM_HUB_CALL call;
+    RequestArguments arguments;
+    Answer answer;
+    bool prepared;
+    int lastError;
+    uint part;
+    int first;
+    int start;
+
+    AccountRequest(const ulong requestId, const ENUM_HUB_CALL requested)
+        : id(requestId), call(requested), prepared(false), lastError(0), part(0),
+          first(0), start(0) {}
+};
+AccountRequest *g_account[];
+
+void DropAllAccount()
+{
+    for (int i = 0; i < ArraySize(g_account); i++)
+        delete g_account[i];
+    ArrayFree(g_account);
+}
+
+void StartAccount(const ulong requestId, const ENUM_HUB_CALL call, const uint count,
+                  BinaryReader &reader)
+{
+    AccountRequest *r = new AccountRequest(requestId, call);
+    if (!r.arguments.Read(call, count, reader))
+    {
+        SendError(requestId, HUB_ERROR_EA_ERROR, "arguments out of the call's layout",
+                  ERR_INVALID_PARAMETER);
+        delete r;
+    }
+    else
+    {
+        const int n = ArraySize(g_account);
+        ArrayResize(g_account, n + 1);
+        g_account[n] = r;
+        SendBusy(r.id, HUB_HISTORY_BUSY_S);
+    }
+}
+
+void ServeAccountQueue()
+{
+    if (ArraySize(g_account) == 0)
+        return;
+    AccountRequest *r = g_account[0];
+    if (!r.prepared)
+    {
+        ResetLastError();
+        ServeAccount(r.call, r.arguments, r.answer);
+        r.lastError = GetLastError();
+        r.prepared = true;
+        if (r.answer.rows.failed)
+            r.answer.Fail("a record holds a string too long for the protocol", 0);
+    }
+    bool last = r.answer.failed;
+    if (r.answer.failed)
+    {
+        SendError(r.id, HUB_ERROR_EA_ERROR, r.answer.message, r.answer.error);
+    }
+    else
+    {
+        const int records = ArraySize(r.answer.ends);
+        int next = r.first;
+        while (next < records && (next == r.first
+               || r.answer.ends[next] - r.start <= HUB_PART_BYTES))
+            next++;
+        const int end = next == 0 ? 0 : r.answer.ends[next - 1];
+        last = next == records;
+        SendPart(r.id, r.part, last, r.lastError, r.answer.rows, r.start, end, next - r.first);
+        r.part++;
+        r.start = end;
+        r.first = next;
+    }
+    if (last)
+    {
+        ArrayRemove(g_account, 0, 1);
+        delete r;
+    }
+}
+
 // ── The publisher's calls: its symbol ────────────────────────────────────────────────────────────
 
 void AnswerSymbolInfo(RequestArguments &arguments, Answer &answer)
@@ -930,6 +1062,8 @@ void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
     else if (!HubServes(Role, call))
         SendError(requestId, HUB_ERROR_EA_ERROR, "the call is not served by this EA's role",
                   ERR_FUNCTION_NOT_ALLOWED);
+    else if (Role == ROLE_ACCOUNT)
+        StartAccount(requestId, call, count, reader);
     else if (!arguments.Read(call, count, reader))
         SendError(requestId, HUB_ERROR_EA_ERROR, "arguments out of the call's layout",
                   ERR_INVALID_PARAMETER);
@@ -3488,14 +3622,6 @@ bool WaitingOpen(const string symbol)
     return false;
 }
 
-bool WaitingClose()
-{
-    for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
-        if (g_chartFrameKinds[i] == HUB_FRAME_CLOSE_CHART)
-            return true;
-    return ArraySize(g_templateFailedCharts) > 0;
-}
-
 void ForgetReported(string &values[], const string symbol)
 {
     for (int i = ArraySize(values) - 1; i >= 0; i--)
@@ -3617,13 +3743,11 @@ string TemplateOf(const ENUM_CHART_ROLE role)
         return ChartTemplate;
 }
 
-// Open the role's chart and answer it; return false only while a queued close can free its slot.
-bool OpenChart(const ENUM_CHART_ROLE role, const string symbol)
+void OpenChart(const ENUM_CHART_ROLE role, const string symbol)
 {
     ForgetClosedCharts();
     const long marked = MarkedChart(role, symbol);
-    // The MQL5 call that failed, empty while a chart of the role and symbol is open, and its error.
-    string failing = "";
+    ENUM_CHART_OPEN_CALL failing = OPEN_CALL_NONE;
     int error = 0;
     if (marked >= 0 && RunsThisEa(marked))
     {
@@ -3640,7 +3764,7 @@ bool OpenChart(const ENUM_CHART_ROLE role, const string symbol)
         }
         else
         {
-            failing = "ChartApplyTemplate";
+            failing = OPEN_CALL_TEMPLATE;
             error = GetLastError();
         }
     }
@@ -3654,12 +3778,12 @@ bool OpenChart(const ENUM_CHART_ROLE role, const string symbol)
         ResetLastError();
         if (!SymbolExist(symbol, custom))
         {
-            failing = "SymbolExist";
+            failing = OPEN_CALL_SYMBOL_EXIST;
             error = ERR_MARKET_UNKNOWN_SYMBOL;
         }
         else if (!SymbolSelect(symbol, true))
         {
-            failing = "SymbolSelect";
+            failing = OPEN_CALL_SYMBOL_SELECT;
             error = GetLastError();
         }
         else
@@ -3667,14 +3791,12 @@ bool OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             const long chart = ChartOpen(symbol, PERIOD_M1);
             if (chart == 0)
             {
-                if (WaitingClose())
-                    return false;
-                failing = "ChartOpen";
+                failing = OPEN_CALL_CHART_OPEN;
                 error = GetLastError();
             }
             else if (!ChartApplyTemplate(chart, TemplateOf(role)))
             {
-                failing = "ChartApplyTemplate";
+                failing = OPEN_CALL_TEMPLATE;
                 error = GetLastError();
                 Push(g_templateFailedCharts, chart);
                 Push(g_templateFailedSymbols, symbol);
@@ -3686,17 +3808,30 @@ bool OpenChart(const ENUM_CHART_ROLE role, const string symbol)
             }
         }
     }
-    if (failing == "")
+    if (failing == OPEN_CALL_NONE)
     {
         SendChartOpened(role, symbol);
     }
     else
     {
-        PrintFormat("ticks: cannot open the %s chart of '%s': %s failed with error %d",
-                    ChartRoleName(role), symbol, failing, error);
+        if (failing == OPEN_CALL_CHART_OPEN)
+            PrintFormat("ticks: cannot open '%s': ChartOpen failed: %d "
+                        "(the terminal's chart limit is %d)", symbol, error, CHARTS_MAX);
+        else
+        {
+            string callName = "";
+            switch (failing)
+            {
+            case OPEN_CALL_SYMBOL_EXIST: callName = "SymbolExist"; break;
+            case OPEN_CALL_SYMBOL_SELECT: callName = "SymbolSelect"; break;
+            case OPEN_CALL_TEMPLATE: callName = "ChartApplyTemplate"; break;
+            }
+            PrintFormat("ticks: cannot open the %s chart of '%s': %s failed with error %d",
+                        ChartRoleName(role), symbol, callName, error);
+        }
+        SendChartStatus();
         SendChartFailed(role, symbol, error);
     }
-    return true;
 }
 
 // Close the chart of the role and symbol; while the account holds positions or pending orders on
@@ -3860,17 +3995,19 @@ void ServeChartFrame()
         for (int j = 0; j < i && !priorClose; j++)
             priorClose = g_chartFrameKinds[j] == HUB_FRAME_CLOSE_CHART
                          && g_chartFrameSymbols[j] == g_chartFrameSymbols[i];
+        const ulong openedAt = GetTickCount64();
         if (g_chartFrameKinds[i] == HUB_FRAME_OPEN_CHART && !priorClose
-            && PrepareOpen(g_chartFrameSymbols[i])
-            && OpenChart(g_chartFrameRoles[i], g_chartFrameSymbols[i]))
+            && PrepareOpen(g_chartFrameSymbols[i]))
         {
+            OpenChart(g_chartFrameRoles[i], g_chartFrameSymbols[i]);
             ForgetChartFrame(i);
+            ObserveStep(PASS_OPEN, openedAt);
+            break;
         }
-        else
-        {
-            i++;
-        }
+        ObserveStep(PASS_OPEN, openedAt);
+        i++;
     }
+    const ulong closedAt = GetTickCount64();
     if (!g_chartCloseUsed)
     {
         for (int i = 0; i < ArraySize(g_chartFrameKinds); i++)
@@ -3895,7 +4032,10 @@ void ServeChartFrame()
                 CloseUnallocated(chart, symbol);
         }
     }
+    ObserveStep(PASS_CLOSE, closedAt);
+    const ulong cursorAt = GetTickCount64();
     Sweep();
+    ObserveStep(PASS_CURSOR, cursorAt);
 }
 
 void OnDuplicateFrame(BinaryReader &reader)
@@ -4065,6 +4205,7 @@ void Reconnect()
     ClearWanted();
     // The hub answered every request of the connection that left.
     DropAllHistory();
+    DropAllAccount();
     Print("Reconnecting");
     if (!wss.open())
         Print("Failed to reconnect to server");
@@ -4139,6 +4280,7 @@ void OnDeinit(const int reason)
 {
     EventKillTimer();
     DropAllHistory();
+    DropAllAccount();
     if (wss != NULL)
     {
         wss.close();
@@ -4153,41 +4295,73 @@ void OnTimer()
 {
     if (g_closing)
         return;
+    const ulong started = GetTickCount64();
+    g_longestStepMs = 0;
     ReadHub();
+    ObserveStep(PASS_DRAIN, started);
     if (!g_closing)
         ServeChartFrame();
     // TimeLocal, not TimeCurrent: the time of the last quote stands still while the market is
     // closed.
     if (!g_closing && !wss.isConnected() && TimeLocal() - g_lastReconnect >= ReconnectIntervalSec)
+    {
+        const ulong reconnectAt = GetTickCount64();
         Reconnect();
+        ObserveStep(PASS_RECONNECT, reconnectAt);
+    }
     if (!g_closing && wss.isConnected())
     {
         // The terminal queues no tick event while one is queued or handled, so a tick that arrives
         // then is read from the cursor here, at the latest one poll interval on.
         if (Role == ROLE_PUBLISHER)
         {
+            const ulong ticksAt = GetTickCount64();
             PublishTicks();
+            ObserveStep(PASS_TICKS, ticksAt);
+            const ulong barsAt = GetTickCount64();
             PublishBars();
+            ObserveStep(PASS_BARS, barsAt);
+        }
+        if (Role == ROLE_ACCOUNT)
+        {
+            const ulong accountAt = GetTickCount64();
+            ServeAccountQueue();
+            ObserveStep(PASS_ACCOUNT, accountAt);
         }
         if (Role == ROLE_HISTORY)
+        {
+            const ulong historyAt = GetTickCount64();
             ServeHistory();
+            ObserveStep(PASS_HISTORY, historyAt);
+        }
         if (GetTickCount64() - g_lastRelay >= (ulong)RelaySeconds * 1000)
         {
+            const ulong relayAt = GetTickCount64();
             Relay();
+            ObserveStep(PASS_RELAY, relayAt);
         }
     }
+    FinishPass(started);
 }
 
 void OnTick()
 {
     if (g_closing)
         return;
+    const ulong started = GetTickCount64();
+    g_longestStepMs = 0;
     ReadHub();
+    ObserveStep(PASS_DRAIN, started);
     if (!g_closing && wss.isConnected() && Role == ROLE_PUBLISHER)
     {
+        const ulong ticksAt = GetTickCount64();
         PublishTicks();
+        ObserveStep(PASS_TICKS, ticksAt);
+        const ulong barsAt = GetTickCount64();
         PublishBars();
+        ObserveStep(PASS_BARS, barsAt);
     }
+    FinishPass(started);
 }
 
 // Every trade transaction of the publisher's symbol, as it arrives, a REQUEST transaction also into

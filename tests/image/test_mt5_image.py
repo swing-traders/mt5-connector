@@ -451,6 +451,72 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
 
 
 @_needs_image
+def test_the_installed_spawner_has_no_capacity_retry():
+    result = subprocess.run(
+        [
+            _runtime(),
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "python",
+            _IMAGE,
+            "-c",
+            "from importlib.resources import files; "
+            "source=(files('mt5connector.server')/'mql5/Expert/ticks.mq5').read_text(); "
+            "assert 'WaitingClose(' not in source, 'the installed spawner retries capacity'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@_needs_image
+def test_the_native_certification_probe_compiles_without_warnings():
+    probe = Path(__file__).resolve().parents[1] / "live/chart_probe.mq5"
+    script = r"""
+import os,re,shutil,subprocess
+from pathlib import Path
+prefix=Path(os.environ["WINEPREFIX"])
+stage=prefix/"drive_c/probecheck"
+stage.mkdir()
+shutil.copyfile("/chart_probe.mq5",stage/"chart_probe.mq5")
+editor=prefix/"drive_c/Program Files/MetaTrader 5/MetaEditor64.exe"
+subprocess.run(["xvfb-run","-a","wine",str(editor),
+                r"/compile:C:\probecheck\chart_probe.mq5",
+                r"/log:C:\probecheck\chart_probe.log"],timeout=180)
+subprocess.run(["wineserver","-w"],check=True,timeout=60)
+log=(stage/"chart_probe.log").read_text(encoding="utf-16")
+print(log)
+assert (stage/"chart_probe.ex5").exists()
+assert re.search(r"Result: 0 errors, 0 warnings(?:,|$)",log)
+"""
+    result = subprocess.run(
+        [
+            _runtime(),
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-v",
+            f"{probe}:/chart_probe.mq5:ro,z",
+            "--entrypoint",
+            "python",
+            _IMAGE,
+            "-c",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@_needs_image
 def test_the_chart_templates_install_each_role_in_both_terminal_locations():
     script = """
 from pathlib import Path

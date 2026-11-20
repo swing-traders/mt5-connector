@@ -88,6 +88,8 @@ class ProbeCommand(IntEnum):
     CLOSE_SYMBOL = 2
     SELECT_SYMBOL = 3
     FIND_PUBLISHER = 4
+    CREATE_TICKS = 5
+    BURST_TICKS = 6
 
 
 @dataclass(frozen=True)

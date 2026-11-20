@@ -69,6 +69,10 @@ def encode_ea(sent) -> bytes:
         writer.i64(sent.gmt)
         writer.boolean(sent.connected)
         return frame(FrameKind.SERVER_TIME, writer.payload())
+    elif isinstance(sent, binary.ChartStatus):
+        writer.u32(sent.count)
+        writer.u32(sent.capacity)
+        return frame(FrameKind.CHART_STATUS, writer.payload())
     elif isinstance(sent, binary.Commissions):
         writer.string(sent.symbol)
         binary.write_schedule(writer, sent.schedule)

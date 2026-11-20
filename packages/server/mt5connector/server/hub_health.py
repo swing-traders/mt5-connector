@@ -7,6 +7,7 @@ from http import HTTPStatus
 
 from mt5connector.server.hub_gate import ClockGate
 from mt5connector.server.hub_requests import Pending
+from mt5connector.server.wire.binary import ChartStatus
 
 
 def health(
@@ -15,6 +16,7 @@ def health(
     account: bool,
     pending: list[Pending],
     labels: dict[object, tuple[str, str]],
+    chart_status: ChartStatus | None,
 ) -> tuple[HTTPStatus, dict[str, object]]:
     """The status and the body of /health; `labels` names each EA by its chart's role and symbol."""
     age_s = gate.sample_age_s()
@@ -22,6 +24,8 @@ def health(
     result = {
         "spawner": spawner,
         "account": account,
+        "chart_count": None if chart_status is None else chart_status.count,
+        "chart_limit": chart_status is not None and chart_status.count >= chart_status.capacity,
         "clock": None if gate.verification is None else dataclasses.asdict(gate.verification),
         "sample_age_s": None if age_s is None else round(age_s, 3),
         "bootstrap_missed": gate.bootstrap_missed,

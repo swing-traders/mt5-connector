@@ -81,6 +81,7 @@ class FrameKind(IntEnum):
     REQUEST = 19
     ANSWER = 20
     BUSY = 21
+    CHART_STATUS = 22
 
 
 class ErrorKind(IntEnum):
@@ -325,6 +326,14 @@ class ServerTime:
 
 
 @dataclass(frozen=True)
+class ChartStatus:
+    """The spawner's listed chart count and terminal chart capacity."""
+
+    count: int
+    capacity: int
+
+
+@dataclass(frozen=True)
 class Commissions:
     """A symbol's SymbolInfoCommissions answer: `ret`, `last_error` and its `rules`."""
 
@@ -400,6 +409,7 @@ Frame = (
     | Bar
     | TradeTransaction
     | ServerTime
+    | ChartStatus
     | Commissions
     | Sessions
     | Request
@@ -420,6 +430,7 @@ _SENT_BY: dict[Sender, frozenset[FrameKind]] = {
             FrameKind.BAR,
             FrameKind.TRADE_TRANSACTION,
             FrameKind.SERVER_TIME,
+            FrameKind.CHART_STATUS,
             FrameKind.COMMISSIONS,
             FrameKind.SESSIONS,
             FrameKind.ANSWER,
@@ -899,6 +910,10 @@ def _payload(
         )
     elif kind is FrameKind.COMMISSIONS:
         frame = Commissions(_symbol(reader), read_schedule(reader))
+    elif kind is FrameKind.CHART_STATUS:
+        frame = ChartStatus(reader.u32("count"), reader.u32("capacity"))
+        if frame.capacity == 0:
+            raise CodecError("the terminal's chart capacity is zero")
     elif kind is FrameKind.SESSIONS:
         frame = Sessions(_symbol(reader), read_sessions(reader))
     elif kind is FrameKind.REQUEST:
