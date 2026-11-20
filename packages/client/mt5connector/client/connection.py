@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING
 
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
-from mt5connector.client.errors import Deferred, MT5ConnectionError, NotReady, Syncing
+from mt5connector.client.errors import (
+    Deferred,
+    MalformedAnswer,
+    MT5ConnectionError,
+    NotReady,
+    Syncing,
+)
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import mirror
 from mt5connector.wire.binary import ErrorKind
@@ -102,14 +108,12 @@ class AccountSnapshot:
 
     @classmethod
     def from_mt5(cls, info) -> AccountSnapshot:
-        """Build from the raw mt5.account_info() namedtuple; raises MT5ConnectionError for a margin
-        mode the package does not define."""
+        """Build from the raw mt5.account_info() namedtuple; raises MalformedAnswer for a figure not
+        finite and a margin or stop-out mode the package does not define."""
         if info.margin_mode not in _MARGIN_MODES:
-            raise MT5ConnectionError(f"account_info: margin mode {info.margin_mode} is unknown")
+            raise MalformedAnswer(f"account_info: margin mode {info.margin_mode} is unknown")
         if info.margin_so_mode not in _STOP_OUT_MODES:
-            raise MT5ConnectionError(
-                f"account_info: stop-out mode {info.margin_so_mode} is unknown"
-            )
+            raise MalformedAnswer(f"account_info: stop-out mode {info.margin_so_mode} is unknown")
         return cls(
             login=info.login,
             server=info.server,
@@ -145,7 +149,7 @@ class AccountSnapshot:
 def _finite(value: float, field: str) -> Decimal:
     number = Decimal(str(value))
     if not number.is_finite():
-        raise MT5ConnectionError(f"account_info: {field} {value} is not finite")
+        raise MalformedAnswer(f"account_info: {field} {value} is not finite")
     return number
 
 
