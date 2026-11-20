@@ -27,6 +27,10 @@ class ProtocolError(ServerUnreachable):
     breaks the hub protocol's layout."""
 
 
+class MalformedAnswer(MT5ConnectionError):
+    """Raised for an answer whose fields cannot be read as the value they state."""
+
+
 class HubAnswerError(MT5ConnectionError):
     """Raised for a request the hub or its EA answered without a result, carrying the MQL5 error the
     answer folds in."""

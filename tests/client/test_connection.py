@@ -5,19 +5,27 @@ import asyncio
 import logging
 import time
 from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 from hub_double import eventually, zeroed
+from session_double import SessionDouble
 from venue_doubles import account_info
 from websockets.asyncio.server import serve
 
-from mt5connector.client import history
+from mt5connector.client import connection, history
 from mt5connector.client.config import MT5Config
 from mt5connector.client.connection import AccountSnapshot, ConnectionState, MT5Connection
-from mt5connector.client.errors import EaError, InvalidWindow, MT5ConnectionError, ResponseLost
+from mt5connector.client.errors import (
+    EaError,
+    InvalidWindow,
+    MalformedAnswer,
+    MT5ConnectionError,
+    ResponseLost,
+)
 from mt5connector.client.factories import _connection_registry, _ensure_connection
-from mt5connector.client.hub import HubSession
+from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls
 from mt5connector.wire.binary import ErrorKind
 from mt5connector.wire.history_wire import BARS, Series
@@ -246,6 +254,31 @@ class TestReadiness:
             await conn.connect()
 
         await asyncio.wait_for(hub.connections[0].wait_closed(), 2)
+        assert_not_connected(conn, "DISCONNECTED")
+
+    @pytest.mark.parametrize(
+        ("account", "refusal"),
+        [
+            (account_info(equity=float("nan")), "^account_info: equity nan is not finite$"),
+            (account_info(margin_mode=99), "^account_info: margin mode 99 is unknown$"),
+        ],
+        ids=["equity_nan", "margin_mode_unknown"],
+    )
+    async def test_an_account_answer_whose_fields_cannot_be_read_fails_the_connect_as_malformed(
+        self, config, account, refusal
+    ):
+        session = SessionDouble(config, asyncio.get_running_loop(), None, None, None)
+
+        async def answered() -> Answered:
+            return Answered(account, 0)
+
+        session.account_info = answered
+        conn = MT5Connection(config)
+
+        with patch.object(connection, "HubSession", return_value=session):
+            with pytest.raises(MalformedAnswer, match=refusal):
+                await conn.connect()
+
         assert_not_connected(conn, "DISCONNECTED")
 
 
