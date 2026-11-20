@@ -133,6 +133,14 @@ def test_retained_closes_include_renewals_and_expire_at_the_owning_bound():
     assert retained_publisher_closes(log, now, 30) == {"FIRST", "RENEWED", "LEFT"}
 
 
+def test_close_backlog_does_not_treat_a_renewal_as_a_new_idle_close():
+    log = (
+        "2026-11-19T19:54:49Z WARNING: the publisher chart of RETAINED neither closed nor "
+        "was kept within 30 s: closing it again"
+    )
+    assert close_backlog(log, ["RETAINED"]) == (set(), set())
+
+
 def test_log_time_refuses_a_timestamp_without_its_timezone():
     with pytest.raises(ValueError, match="timestamp has no timezone"):
         container_log_time("2026-11-19T19:54:26 INFO: a hub event")

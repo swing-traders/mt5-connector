@@ -128,15 +128,9 @@ def close_backlog(log, symbols, *, acknowledged_at=None):
     closed = set()
     for line in lines:
         asked = re.search(r"the (\w+) chart of (.+) out of use for \d+ s: closing it$", line)
-        renewed = re.search(
-            r"the (\w+) chart of (.+) neither closed nor was kept within \d+ s: closing it again$",
-            line,
-        )
         finished = re.search(r"ticks: closed the (\w+) chart of '(.*)'$", line)
         if asked is not None and asked[2] in symbols:
             requested.add((ChartRole(asked[1]), asked[2]))
-        if renewed is not None and renewed[2] in symbols:
-            requested.add((ChartRole(renewed[1]), renewed[2]))
         if finished is not None:
             closed.add((ChartRole(finished[1]), finished[2]))
     return requested, requested - closed
