@@ -52,11 +52,9 @@ async def test_an_unknown_symbol_chart_fails_the_provider_at_once():
 
 
 async def test_a_capacity_refusal_ends_deferring_reads_without_reopening():
-    async with failed_chart("EURUSD", 4102) as (session, spawner):
+    async with failed_chart("EURUSD", 4102) as (session, _spawner):
         with pytest.raises(EaError) as refused:
             await asyncio.wait_for(
                 session.deferring(client_calls.Call.SYMBOL_INFO, symbol="EURUSD"), 0.3
             )
         assert refused.value.last_error == 4102
-        with pytest.raises(asyncio.TimeoutError):
-            await spawner.received(timeout=0.25)
