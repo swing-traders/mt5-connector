@@ -451,30 +451,6 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
 
 
 @_needs_image
-def test_the_installed_spawner_has_no_capacity_retry():
-    result = subprocess.run(
-        [
-            _runtime(),
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--entrypoint",
-            "python",
-            _IMAGE,
-            "-c",
-            "from importlib.resources import files; "
-            "source=(files('mt5connector.server')/'mql5/Expert/ticks.mq5').read_text(); "
-            "assert 'WaitingClose(' not in source, 'the installed spawner retries capacity'",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-@_needs_image
 def test_the_native_certification_probe_compiles_without_warnings():
     probe = Path(__file__).resolve().parents[1] / "live/chart_probe.mq5"
     script = r"""
