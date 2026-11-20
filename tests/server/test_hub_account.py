@@ -162,7 +162,8 @@ async def test_account_chart_failure_is_reported_and_its_hello_clears_it(account
     await spawner.send(binary.ChartFailed(ChartRole.ACCOUNT, "EURUSD", 4301))
     await consumer.ask(1, calls.Call.ACCOUNT_INFO)
     refused = await consumer.received()
-    assert refused.error.kind is ErrorKind.EA_ERROR
+    assert refused.error.kind is ErrorKind.NO_PUBLISHER
+    assert refused.error.retry_after_ms == 5000
     assert refused.last_error == 4301
     account = await connect_account(port, peers)
     await consumer.ask(2, calls.Call.ACCOUNT_INFO)

@@ -123,9 +123,7 @@ async def test_99_charts_and_ten_fresh_subscriptions_keep_the_spawner_alive(live
                 assert status is HTTPStatus.OK and body["result"]["spawner"], body
                 await asyncio.sleep(1)
             log = await throwaway.logs(since)
-            assert not any(
-                "spawner" in line and "pong is overdue" in line for line in log.splitlines()
-            ), log
+            assert "pong is overdue" not in log, log
         finally:
             await unsubscribe(session, fresh)
 
@@ -194,10 +192,7 @@ async def test_capacity_is_reported_without_losing_the_spawner(live, throwaway):
                 await asyncio.gather(recovery, return_exceptions=True)
             status, body = await health(HUB_URL)
             assert status is HTTPStatus.OK and body["result"]["spawner"], body
-            assert not any(
-                "spawner" in line and "pong is overdue" in line
-                for line in (await throwaway.logs(since)).splitlines()
-            )
+            assert "pong is overdue" not in await throwaway.logs(since)
         finally:
             await unsubscribe(session, [fresh])
 
@@ -236,9 +231,7 @@ async def test_account_queue_streams_its_first_part_and_keeps_a_publisher_respon
         )
         assert first - began <= 0.1
         log = await throwaway.logs(since)
-        assert not any(
-            "account" in line and "pong is overdue" in line for line in log.splitlines()
-        ), log
+        assert "pong is overdue" not in log, log
     finally:
         for task in tasks:
             task.cancel()

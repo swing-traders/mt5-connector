@@ -125,6 +125,8 @@ async def test_before_a_verifying_sample_every_request_is_answered_not_ready_and
     assert body["result"] | {"sample_age_s": None} == {
         "spawner": False,
         "account": False,
+        "chart_count": None,
+        "chart_limit": False,
         "clock": None,
         "sample_age_s": None,
         "bootstrap_missed": False,
