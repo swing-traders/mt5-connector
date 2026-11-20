@@ -16,6 +16,7 @@ from certification import (
     container_log_time,
     health,
     journal_after,
+    journal_event_time,
     listed_charts,
     observed_pending,
     publisher_ready,
@@ -112,10 +113,20 @@ def closed_lines(log, symbols):
     ]
 
 
-def close_backlog(log, symbols):
+def close_backlog(log, symbols, *, acknowledged_at=None):
+    if acknowledged_at is None:
+        lines = log.splitlines()
+    else:
+        lines = []
+        for line in log.splitlines():
+            event = journal_event_time(line)
+            if event is None:
+                event = container_log_time(line)
+            if event < acknowledged_at:
+                lines.append(line)
     requested = set()
     closed = set()
-    for line in log.splitlines():
+    for line in lines:
         asked = re.search(r"the (\w+) chart of (.+) out of use for \d+ s: closing it$", line)
         renewed = re.search(
             r"the (\w+) chart of (.+) neither closed nor was kept within \d+ s: closing it again$",
@@ -684,20 +695,21 @@ async def test_read_only_ceiling_45_pairs_15_idle_and_10_fresh(live, throwaway):
             holding[symbol].cancel()
         await asyncio.gather(*(holding[symbol] for symbol in idle), return_exceptions=True)
         await unsubscribe(session, idle)
-        at_request = await until(
+        await until(
             lambda: throwaway.logs(since),
             lambda log: len(close_backlog(log, idle)[0]) >= 15,
             throwaway.idle_seconds + 10,
             "the ceiling run's idle-close requests",
         )
-        waiting = close_backlog(at_request, idle)[1]
-        assert waiting, "the fixture's close backlog already drained"
 
         async def subscribe_fresh(symbol):
             await session.subscribe(Subscription(Stream.TICKS, symbol))
             return int(time.time() * 1000) / 1000
 
         acknowledged_at = min(await asyncio.gather(*(subscribe_fresh(symbol) for symbol in fresh)))
+        caught_up = await throwaway.caught_up_log(since)
+        waiting = close_backlog(caught_up, idle, acknowledged_at=acknowledged_at)[1]
+        assert waiting, "the fixture's close backlog already drained at acknowledgement"
         await asyncio.wait_for(
             asyncio.gather(*(publisher_ready(session, symbol) for symbol in fresh)),
             max(0, case_deadline - time.monotonic()),

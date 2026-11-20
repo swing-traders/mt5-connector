@@ -16,8 +16,10 @@ from certification import (
     publisher_ready,
     retained_publisher_closes,
 )
+from test_hub_certification import close_backlog
 
 from mt5connector.wire import calls
+from mt5connector.wire.push_wire import ChartRole
 
 
 async def test_publisher_preparation_keeps_the_sessions_deferral_lifetime():
@@ -90,6 +92,29 @@ def test_delayed_journal_delivery_across_midnight_keeps_the_previous_day():
         journal_event_time(line)
         == datetime(2026, 11, 19, 23, 59, 59, 999000, tzinfo=UTC).timestamp()
     )
+
+
+def test_acknowledged_backlog_uses_caught_up_event_times_and_excludes_later_requests():
+    log = "\n".join(
+        [
+            "2026-11-19T19:54:26.100Z INFO: the publisher chart of FIRST "
+            "out of use for 2 s: closing it",
+            "2026-11-19T19:54:26.100Z INFO: the publisher chart of SECOND "
+            "out of use for 2 s: closing it",
+            "2026-11-19T19:54:26.600Z INFO: the publisher chart of LATE "
+            "out of use for 2 s: closing it",
+            "2026-11-19T19:54:27Z experts: AA\t0\t19:54:26.531\t"
+            "ticks (FIRST,M1)\tticks: closed the publisher chart of 'FIRST'",
+            "2026-11-19T19:54:27Z experts: AA\t0\t19:54:26.700\t"
+            "ticks (SECOND,M1)\tticks: closed the publisher chart of 'SECOND'",
+        ]
+    )
+    acknowledged = datetime(2026, 11, 19, 19, 54, 26, 541000, tzinfo=UTC).timestamp()
+    requested, waiting = close_backlog(
+        log, ["FIRST", "SECOND", "LATE"], acknowledged_at=acknowledged
+    )
+    assert requested == {(ChartRole.PUBLISHER, "FIRST"), (ChartRole.PUBLISHER, "SECOND")}
+    assert waiting == {(ChartRole.PUBLISHER, "SECOND")}
 
 
 def test_retained_closes_include_renewals_and_expire_at_the_owning_bound():
