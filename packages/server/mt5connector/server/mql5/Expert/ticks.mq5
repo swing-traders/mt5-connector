@@ -27,6 +27,16 @@ input int HubPingTimeoutSec = 50;
 #define OUTCOME_RING 1000
 #define DAY_SECONDS 86400
 #define SLOW_TICK_MS 100
+// Spacing for loading retries, whose MT5 wait is documented at the pages below.
+#define HISTORY_CALL_SPACING_MS 1000
+// Scheduling margin on https://www.mql5.com/en/docs/series/timeseries_access.
+#define BUSY_MARGIN_S 15
+// The 45 s EA synchronisation wait plus margin: https://www.mql5.com/en/docs/series/copyticks.
+#define BUSY_COPY_TICKS_S 60
+// A 45 s EA sync wait plus margin: https://www.mql5.com/en/docs/series/timeseries_access.
+#define BUSY_COPY_RATES_S 60
+// Service bound; no wait is specified: https://www.mql5.com/en/docs/trading/historyselect.
+#define BUSY_HISTORY_SELECT_S 30
 
 enum ENUM_PASS_STEP
 {
@@ -714,11 +724,15 @@ void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
     {
         // A ticket the history does not hold answers no record, its error the answer's.
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_TICKET);
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistoryOrderSelect(ticket))
             AnswerHistoryOrder(answer, ticket);
     }
     else if (arguments.Has(HUB_ARG_HISTORY_ORDERS_GET_POSITION))
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_POSITION)))
             AnswerSelectedOrders(answer);
         else
@@ -726,6 +740,8 @@ void AnswerHistoryOrders(RequestArguments &arguments, Answer &answer)
     }
     else
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_DATE_FROM),
                           (datetime)arguments.Integer(HUB_ARG_HISTORY_ORDERS_GET_DATE_TO)))
             AnswerSelectedOrders(answer);
@@ -766,11 +782,15 @@ void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
     {
         // A ticket the history does not hold answers no record, its error the answer's.
         const ulong ticket = (ulong)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_TICKET);
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistoryDealSelect(ticket))
             AnswerDeal(answer, ticket);
     }
     else if (arguments.Has(HUB_ARG_HISTORY_DEALS_GET_POSITION))
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_POSITION)))
             AnswerSelectedDeals(answer);
         else
@@ -778,6 +798,8 @@ void AnswerHistoryDeals(RequestArguments &arguments, Answer &answer)
     }
     else
     {
+        BusyAccountCall(BUSY_HISTORY_SELECT_S);
+        ResetLastError();
         if (HistorySelect((datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_FROM),
                           (datetime)arguments.Integer(HUB_ARG_HISTORY_DEALS_GET_DATE_TO)))
             AnswerSelectedDeals(answer);
@@ -870,6 +892,13 @@ public:
 };
 AccountRequest *g_account[];
 
+// A synchronous selection blocks every request waiting on this EA.
+void BusyAccountCall(const uint bound)
+{
+    for (int i = 0; i < ArraySize(g_account); i++)
+        SendBusy(g_account[i].id, bound);
+}
+
 void DropAllAccount()
 {
     for (int i = 0; i < ArraySize(g_account); i++)
@@ -892,7 +921,7 @@ void StartAccount(const ulong requestId, const ENUM_HUB_CALL call, const uint co
         const int n = ArraySize(g_account);
         ArrayResize(g_account, n + 1);
         g_account[n] = r;
-        SendBusy(r.id, HUB_HISTORY_BUSY_S);
+        SendBusy(r.id, BUSY_MARGIN_S);
     }
 }
 
@@ -1083,11 +1112,6 @@ void OnRequest(const ulong requestId, const uint count, BinaryReader &reader)
 #define MINUTE_MS (MINUTE_SECONDS * 1000)
 // The rows one read of a walk covers: a day of M1 bars.
 #define WALK_ROWS 1440
-// How often a history request's busy is renewed, well within its bound.
-#define HISTORY_BUSY_RENEWAL_S (HUB_HISTORY_BUSY_S / 3)
-// The least time between two calls of one history read, so a call the terminal answers at once with
-// a loading error is not made again in a spin.
-#define HISTORY_CALL_SPACING_MS 1000
 // The turns the store's first date may stand still before it is read deep again, the deep reads
 // without a movement after which the store is taken as stalled, and the polls a frame a stalled
 // store leaves unbuilt gets before it is empty history.
@@ -1165,8 +1189,6 @@ public:
     long quoteTime;
     long present;
     bool answering;
-    // When the hub last heard the request is busy, and when its run began, which bounds the run.
-    ulong busyAt;
     ulong startedAt;
     MqlRates rates[];
     MqlTick ticks[];
@@ -1180,13 +1202,20 @@ public:
 
     HistoryRequest(const ulong requestId, const ENUM_HUB_CALL requested)
         : id(requestId), call(requested), symbol(""), timeframe(0), period(0), from(0), to(0),
-          flags(0), quoteRead(false), quoteTime(0), present(0), answering(false), busyAt(0),
+          flags(0), quoteRead(false), quoteTime(0), present(0), answering(false),
           startedAt(0), maxbars(0), sent(0), part(0), lastError(0)
     {
     }
 };
 
 HistoryRequest *g_history[];
+
+// A series call blocks the turns of the whole history queue.
+void BusyHistoryCall(const uint bound)
+{
+    for (int i = 0; i < ArraySize(g_history); i++)
+        SendBusy(g_history[i].id, bound);
+}
 // The floors of this EA's series by timeframe, the ticks' under HUB_TICK_TIMEFRAME.
 int g_floorSeries[];
 Floor g_floors[];
@@ -1496,6 +1525,11 @@ int CallRead(const HistoryRequest *r, const ENUM_HISTORY_READ read, const int ti
              const long from, const long toOrCount, MqlTick &ticks[], MqlRates &rates[])
 {
     int copied = -1;
+    if (IsBarRead(read))
+        BusyHistoryCall(BUSY_COPY_RATES_S);
+    else
+        BusyHistoryCall(BUSY_COPY_TICKS_S);
+    ResetLastError();
     switch (read)
     {
     case READ_TICKS_RANGE:
@@ -1521,23 +1555,6 @@ int CallRead(const HistoryRequest *r, const ENUM_HISTORY_READ read, const int ti
     return copied;
 }
 
-// Tells the hub again that the request is busy once its last busy falls due.
-void RenewBusy(HistoryRequest *r, const ulong now)
-{
-    if (now - r.busyAt >= (ulong)HISTORY_BUSY_RENEWAL_S * 1000)
-    {
-        SendBusy(r.id, HUB_HISTORY_BUSY_S);
-        r.busyAt = now;
-        PrintFormat("ticks: request %I64u: busy again for %d s", r.id, HUB_HISTORY_BUSY_S);
-    }
-}
-
-void RenewEveryBusy(const ulong now)
-{
-    for (int i = 0; i < ArraySize(g_history); i++)
-        RenewBusy(g_history[i], now);
-}
-
 // Makes the read until the terminal settles its answer, into `ticks` or `rates` by its kind; a bar
 // read's answer stands once an identical call answers it again. False, the run stopped, past its
 // bound, on the chart closing, the program stopping, the connection lost or an answer's error.
@@ -1545,12 +1562,12 @@ bool Settle(const HistoryRequest *r, HistoryRun &run, const ENUM_HISTORY_READ re
             const int timeframe, const long from, const long toOrCount, MqlTick &ticks[],
             MqlRates &rates[])
 {
-    const ulong bound = (ulong)HUB_HISTORY_BUSY_S * 1000;
+    const ulong bound = (ulong)HUB_HISTORY_DEADLINE_S * 1000;
     string unsettled = StringFormat("%s %s: not settled within %d s", r.symbol, EnumToString(read),
-                                    HUB_HISTORY_BUSY_S);
+                                    HUB_HISTORY_DEADLINE_S);
     if (read == READ_FIRST_TICK)
         unsettled = StringFormat("%s: the tick history is still syncing after %d s", r.symbol,
-                                 HUB_HISTORY_BUSY_S);
+                                 HUB_HISTORY_DEADLINE_S);
     const bool bars = IsBarRead(read);
     bool settled = false;
     // A bar read's answer awaiting the identical call that confirms it: its count and its first and
@@ -1582,10 +1599,8 @@ bool Settle(const HistoryRequest *r, HistoryRun &run, const ENUM_HISTORY_READ re
         }
         else
         {
-            RenewEveryBusy(now);
             attempt++;
             const ulong started = GetMicrosecondCount();
-            ResetLastError();
             copied = CallRead(r, read, timeframe, from, toOrCount, ticks, rates);
             run.lastError = GetLastError();
             long first = 0;
@@ -1666,9 +1681,7 @@ bool SettleBars(const HistoryRequest *r, HistoryRun &run, const ENUM_HISTORY_REA
     return Settle(r, run, read, timeframe, from, toOrCount, none, rows);
 }
 
-// Renews every busy that falls due and answers whether the wait goes on: false, the run stopped, on
-// the chart closing, the program stopping, the connection lost or the run past its bound, `late`
-// then the reason.
+// Whether the run may keep waiting; `late` names an exhausted history-attempt lifetime.
 bool KeepWaiting(const HistoryRequest *r, HistoryRun &run, const string late)
 {
     const ulong now = GetTickCount64();
@@ -1678,10 +1691,8 @@ bool KeepWaiting(const HistoryRequest *r, HistoryRun &run, const string late)
         run.Stop(RUN_UNPROVEN, "the program is stopping", 0);
     else if (!wss.isConnected())
         run.Stop(RUN_UNPROVEN, "the hub connection is lost", 0);
-    else if (now - r.startedAt >= (ulong)HUB_HISTORY_BUSY_S * 1000)
+    else if (now - r.startedAt >= (ulong)HUB_HISTORY_DEADLINE_S * 1000)
         run.Stop(RUN_UNPROVEN, late, ERR_HISTORY_TIMEOUT);
-    else
-        RenewEveryBusy(now);
     return run.Going();
 }
 
@@ -1712,6 +1723,7 @@ void DeepRead(const HistoryRequest *r)
 {
     MqlRates rows[];
     const ulong started = GetMicrosecondCount();
+    BusyHistoryCall(BUSY_COPY_RATES_S);
     ResetLastError();
     const int copied = CopyRates(r.symbol, PERIOD_M1, (datetime)BEFORE_HISTORY_SECONDS,
                                  (datetime)(BEFORE_HISTORY_SECONDS + MINUTE_SECONDS), rows);
@@ -1746,7 +1758,7 @@ void AwaitStore(const HistoryRequest *r, HistoryRun &run)
                               StringFormat("%s: the history store is still loading after %d s: "
                                            "terminal first broker %I64d, "
                                            "server first broker %I64d",
-                                           r.symbol, HUB_HISTORY_BUSY_S, terminalFirst,
+                                           r.symbol, HUB_HISTORY_DEADLINE_S, terminalFirst,
                                            serverFirst)))
         {
             known = StoreFacts(r.symbol, serverFirst, terminalFirst);
@@ -1828,6 +1840,7 @@ bool FrameBuilt(const int bars, const long maxbars, const bool known, const long
 void BuildRead(const HistoryRequest *r, const int timeframe, const int period, const string name)
 {
     MqlRates rows[];
+    BusyHistoryCall(BUSY_COPY_RATES_S);
     ResetLastError();
     const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)timeframe,
                                  (datetime)BEFORE_HISTORY_SECONDS,
@@ -1845,7 +1858,7 @@ string FrameLate(const HistoryRequest *r, const string name, const long frameFir
 {
     return StringFormat("%s %s: the frame is not built within %d s: the frame stops at broker "
                         "%I64d, the store reaches broker %I64d, after %d build reads", r.symbol,
-                        name, HUB_HISTORY_BUSY_S, frameFirst, storeFirst, reads);
+                        name, HUB_HISTORY_DEADLINE_S, frameFirst, storeFirst, reads);
 }
 
 // Whether the request goes on while a frame is built; its bound passing here stops it with the
@@ -1869,7 +1882,7 @@ int BuiltBars(const HistoryRequest *r, HistoryRun &run, const int timeframe, con
 {
     long storeFirst = 0;
     const string unknown = StringFormat("%s: the history store's first date is not known within "
-                                        "%d s", r.symbol, HUB_HISTORY_BUSY_S);
+                                        "%d s", r.symbol, HUB_HISTORY_DEADLINE_S);
     while (!StoreFirst(r.symbol, storeFirst) && KeepWaiting(r, run, unknown))
         Pause();
     int bars = Bars(r.symbol, (ENUM_TIMEFRAMES)timeframe);
@@ -1947,6 +1960,7 @@ bool FirstRow(const HistoryRequest *r, HistoryRun &run, const int timeframe, con
     if (bars > maxbars)
     {
         MqlRates rows[];
+        BusyHistoryCall(BUSY_COPY_RATES_S);
         ResetLastError();
         const int copied = CopyRates(r.symbol, (ENUM_TIMEFRAMES)timeframe, (int)(maxbars - 1), 1,
                                      rows);
@@ -1963,7 +1977,7 @@ bool FirstRow(const HistoryRequest *r, HistoryRun &run, const int timeframe, con
     else
     {
         const string late = StringFormat("%s %s: the first row is not known within %d s", r.symbol,
-                                         name, HUB_HISTORY_BUSY_S);
+                                         name, HUB_HISTORY_DEADLINE_S);
         while (!FirstDate(r.symbol, timeframe, first) && KeepWaiting(r, run, late))
             Pause();
     }
@@ -3200,15 +3214,14 @@ void StartHistory(const ulong requestId, const ENUM_HUB_CALL call, RequestArgume
         const int n = ArraySize(g_history);
         ArrayResize(g_history, n + 1);
         g_history[n] = r;
-        r.busyAt = GetTickCount64();
-        SendBusy(r.id, HUB_HISTORY_BUSY_S);
+        SendBusy(r.id, BUSY_MARGIN_S);
         PrintFormat("ticks: request %I64u, %s: busy for %d s", r.id, Described(r),
-                    HUB_HISTORY_BUSY_S);
+                    BUSY_MARGIN_S);
     }
 }
 
 // Sends each answering request's next part; once none is answering, runs the oldest request not yet
-// run, which may hold this pass for minutes; then renews every busy that falls due.
+// run, which may hold this pass for minutes under its per-call busy.
 void ServeHistory()
 {
     for (int i = ArraySize(g_history) - 1; i >= 0; i--)
@@ -3231,7 +3244,6 @@ void ServeHistory()
         next.startedAt = GetTickCount64();
         Evaluate(next);
     }
-    RenewEveryBusy(GetTickCount64());
 }
 
 // ── Transactions, as the trade_transaction frame and an outcome carry them ───────────────────────

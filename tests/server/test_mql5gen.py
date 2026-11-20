@@ -343,14 +343,14 @@ def test_the_history_constants_are_the_protocols():
         "HUB_RATES_SIZE",
         "HUB_PART_BYTES",
         "HUB_ROLE_EA",
-        "HUB_HISTORY_BUSY_S",
+        "HUB_HISTORY_DEADLINE_S",
         "HUB_RETRY_AFTER_MS",
         "HUB_SPAN_MARGIN",
         "HUB_TICK_SERIES",
         "HUB_TICK_TIMEFRAME",
         "HUB_PROPERTY_FAILURES_MAX",
     }
-    assert values["HUB_HISTORY_BUSY_S"] == "900"
+    assert values["HUB_HISTORY_DEADLINE_S"] == "900"
     assert values["HUB_RETRY_AFTER_MS"] == "5000"
     assert values["HUB_SPAN_MARGIN"] == "11"
     assert values["HUB_TICK_SERIES"] == '"ticks"'
