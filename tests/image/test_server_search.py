@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from test_mt5_image import _Win32Library
+from test_mt5_image import gui as gui
 
 _ROOT = Path(__file__).resolve().parents[2]
 _REQUESTED = "ExampleBroker-Demo"
@@ -19,33 +20,54 @@ _OTHER = "ExampleOther-Demo"
 
 
 @pytest.mark.parametrize(
-    ("results", "searches", "proceeds", "window_failures"),
+    ("results", "searches", "proceeds", "window_failures", "immediate"),
     [
-        ([[_OTHER, _REQUESTED]], 1, True, 0),
-        ([[_OTHER], [_OTHER, _REQUESTED]], 2, True, 0),
-        ([[_OTHER], [_OTHER], [_OTHER]], 3, False, 0),
-        ([[_OTHER], [_OTHER]], 2, False, 1),
+        ([[_OTHER, _REQUESTED]], 1, True, 0, False),
+        ([[_OTHER], [_OTHER, _REQUESTED]], 2, True, 0, False),
+        ([[_OTHER], [_OTHER], [_OTHER]], 3, False, 0, False),
+        ([[_OTHER], [_OTHER]], 2, False, 1, False),
+        ([[_REQUESTED + "-Old", _REQUESTED]], 1, True, 0, False),
+        ([[_REQUESTED + "-Old"]] * 3, 3, False, 0, False),
+        ([[_OTHER]], 1, False, 2, False),
+        ([[_OTHER, _REQUESTED]], 1, True, 0, True),
     ],
     ids=[
         "present-selects",
         "absent-then-present-retries",
         "absent-stops-startup",
         "window-failure-is-not-a-search",
+        "exact-name-after-prefix-neighbor",
+        "prefix-neighbor-is-not-the-requested-server",
+        "one-search-uses-singular",
+        "immediate-search-completion",
     ],
 )
 def test_startup_requires_the_requested_server(
-    tmp_path, results, searches, proceeds, window_failures
+    tmp_path, results, searches, proceeds, window_failures, immediate
 ):
     state = tmp_path / "terminal.json"
-    state.write_text(json.dumps({"results": results, "searches": 0, "selected": 0}))
+    state.write_text(
+        json.dumps(
+            {
+                "results": results,
+                "searches": 0,
+                "selected": 0,
+                "notified": False,
+                "immediate": immediate,
+            }
+        )
+    )
     functions = tmp_path / "entrypoint-functions.sh"
-    functions.write_text(
+    definitions, boundary, _ = (
         (_ROOT / "image/entrypoint.sh")
         .read_text()
-        .split("# A boot step failing because a supervised process stopped")[0]
+        .partition("# A boot step failing because a supervised process stopped")
     )
+    assert boundary, "entrypoint function boundary is missing"
+    functions.write_text(definitions)
     script = """
 source "$1"
+printf '%s' "$MT5_SERVER_SEARCH_STARTED_MARKER" > "$TEST_MARKER"
 start_terminal() { terminal_pid=1; }
 window_failures="$TEST_WINDOW_FAILURES"
 await_terminal_window() {
@@ -73,12 +95,11 @@ echo HUB_MAY_START
             "WINEPREFIX": str(tmp_path),
             "MT5_PYTHON_DIR": "",
             "MT5_SERVER": _REQUESTED,
-            "MT5_LOGIN": "test-login-must-stay-private",
-            "MT5_PASSWORD": "test-password-must-stay-private",
             "TEST_PYTHON": sys.executable,
             "TEST_DRIVER": str(Path(__file__).resolve()),
             "TEST_STATE": str(state),
             "TEST_WINDOW_FAILURES": str(window_failures),
+            "TEST_MARKER": str(tmp_path / "marker"),
         },
         capture_output=True,
         text=True,
@@ -89,15 +110,26 @@ echo HUB_MAY_START
     assert (result.returncode == 0) is proceeds, result.stdout + result.stderr
     assert ("HUB_MAY_START" in result.stdout) is proceeds
     assert held["searches"] == searches
+    assert result.stdout.splitlines().count((tmp_path / "marker").read_text()) == searches
     if proceeds:
         assert held["results"][searches - 1][held["selected"]] == _REQUESTED
+        assert held["notified"]
     else:
-        assert (
+        noun = "search" if searches == 1 else "searches"
+        assert result.stdout.splitlines()[-1].endswith(
             f"trade server search: requested {_REQUESTED}, "
-            f"terminal holds [{_OTHER}] after {searches} searches" in result.stdout.splitlines()[-1]
+            f"terminal holds [{', '.join(results[-1])}] after {searches} {noun}"
         )
-    assert "test-login-must-stay-private" not in result.stdout + result.stderr
-    assert "test-password-must-stay-private" not in result.stdout + result.stderr
+
+
+def test_search_requires_the_entrypoints_search_number(gui, monkeypatch):
+    monkeypatch.setenv("MT5_SERVER", _REQUESTED)
+    monkeypatch.delenv("MT5_SERVER_SEARCH_NUMBER", raising=False)
+    monkeypatch.setattr(sys, "argv", ["terminal_gui.py", "search-server"])
+    monkeypatch.setattr(gui, "search_server", lambda *args: None)
+
+    with pytest.raises(KeyError, match="MT5_SERVER_SEARCH_NUMBER"):
+        gui.main()
 
 
 def _drive() -> None:
@@ -110,7 +142,7 @@ def _drive() -> None:
     spec.loader.exec_module(gui)
     state_path = Path(os.environ["TEST_STATE"])
     state = json.loads(state_path.read_text())
-    enabled = iter([False, True])
+    enabled = iter([True] if state["immediate"] else [False, True])
     gui._enabled_main_window = lambda: 1
     gui._open_dialog = lambda *args: 2
     gui._current_page = lambda *args: 3
@@ -127,6 +159,7 @@ def _drive() -> None:
             case 0x00F5:  # BM_CLICK: one search acquires the corresponding response.
                 state["searches"] += 1
                 state["selected"] = 0
+                state["notified"] = False
                 return 0
             case 0x0146:  # CB_GETCOUNT
                 return len(state["results"][state["searches"] - 1])
@@ -142,6 +175,8 @@ def _drive() -> None:
                 state["selected"] = wparam
                 return wparam
             case 0x0111:  # WM_COMMAND: server selection notification.
+                assert (window, wparam, lparam) == (2, 10139 | (1 << 16), 10139)
+                state["notified"] = True
                 return 0
             case _:
                 raise AssertionError(f"unexpected terminal message {message}")

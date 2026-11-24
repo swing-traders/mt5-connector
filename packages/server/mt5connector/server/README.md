@@ -319,7 +319,11 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 
 1. Starts Xvfb at 1920x1080, and x11vnc in a debug image.
 2. **Restores the baked state,** before any Wine process of the run starts, since Wine reads its registry as it does. `rsync` copies `/opt/mt5-baked` back, comparing files by content: `terminal/` over the terminal directory and `metaquotes/` over the AppData tree, each deleting whatever the baked copy does not hold, `Bases` excluded, and the three registry files over the Wine prefix's. It is bounded at 40 s. Everything an earlier run of the container wrote — `Config\` with its server list and saved accounts, `Profiles\`, the chart profiles, the logs, the AppData tree, the registry — is undone, `Bases` is never written, and the log says so in one line.
-3. **Fetches and verifies the server list.** The entrypoint launches the terminal on the account without the startup script and searches `MT5_SERVER` on the first page of File → Open an Account. After each search it reads the available servers and current selection from File → Login to Trade Account, then explicitly selects the exact requested server if present and cancels without submitting a login. A missing server retries within the step's three attempts; exhaustion fails before the hub starts, naming the requested server, the available servers and the number of searches. Closing the terminal keeps the acquired server definitions.
+3. **Fetches and verifies the server list.**
+   - Launches the terminal on the account without the startup script and searches `MT5_SERVER` on the first page of File → Open an Account.
+   - Reads the available servers and current selection from File → Login to Trade Account, explicitly selects the exact requested server if present, and cancels without submitting a login.
+   - Retries a missing server within the step's three attempts. Exhaustion fails before the hub starts, naming the requested server, the available servers and the number of searches.
+   - Closes the terminal, which keeps the acquired server definitions.
 4. Launches `terminal64.exe /config:<the ini copy> /portable`. `ticks_setup` opens the spawner's chart on the spawner symbol. **Starts the log tail,** `/opt/mt5/tail_logs.py` under the Linux Python, which streams the terminal's journal (`logs\<YYYYMMDD>.log`) and its experts log (`MQL5\logs\<YYYYMMDD>.log`) into the container log from the start of this boot:
    - each line converted from the terminal's UTF-16LE to UTF-8, its byte-order mark and carriage return stripped, and prefixed `terminal:` or `experts:`, its text otherwise written as the terminal wrote it;
    - each log followed onto the next UTC day's file when it appears.
@@ -612,7 +616,7 @@ The files the build downloads itself are pinned by hash. The base images are pin
 
 ### The image tests
 
-`tests/image/test_mt5_image.py` starts a built image on an account no broker holds when `MT5_IMAGE_TEST` names it, on docker where it is installed and podman otherwise:
+`tests/image/test_mt5_image.py` starts a built image on a made-up account and the baked `MetaQuotes-Demo` server when `MT5_IMAGE_TEST` names it, on docker where it is installed and podman otherwise:
 
 ```bash
 MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
@@ -621,6 +625,7 @@ MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
 It pins that:
 
 - a start on that account boots up to the hub, printing the account's password nowhere;
+- a server absent from the terminal's catalog fails startup with the gate's diagnostic before the hub starts;
 - the logged terminal build matches its copied build file, and the boot pays no full recompile;
 - the copied-terminal build check rejects another build naming both numbers and bounds a missing start at 120 s;
 - the startup ini carries `MaxBars` as `MT5_MAX_BARS` sets it, the terminal's ceiling when it is unset, and an `MT5_MAX_BARS` that is no positive integer fails the start naming it;

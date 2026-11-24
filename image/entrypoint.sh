@@ -21,10 +21,12 @@ readonly call_seconds=10
 readonly gui_seconds=40
 readonly step_attempts=3
 readonly step_retry_seconds=5
+readonly MT5_SERVER_SEARCH_STARTED_MARKER="mt5: trade server search started"
 readonly restore_seconds=40
 readonly kill_after_seconds=5
 readonly -a driver=(wine "$MT5_PYTHON_DIR\\python.exe" 'Z:\opt\mt5\terminal_gui.py')
 export DISPLAY=:0
+export MT5_SERVER_SEARCH_STARTED_MARKER
 
 declare -A process_names=()
 terminal_pid=
@@ -67,6 +69,7 @@ gui() {
 retried() {
     local what=$1 own_dialog=$2 ini=$3
     shift 3
+    # This retry owner sees search starts even when its timeout kills the driver.
     local attempt status output detail message searches=0
     for ((attempt = 1; attempt <= step_attempts; attempt++)); do
         start_terminal "$(config_argument "$ini")"
@@ -82,7 +85,7 @@ retried() {
             status=0
             output=$(MT5_SERVER_SEARCH_NUMBER="$((searches + 1))" gui "$@" 2>&1) || status=$?
             # A terminal launch can fail before any search starts.
-            if [[ "$output" == *"mt5: trade server search started"* ]]; then
+            if [[ "$output" == *"$MT5_SERVER_SEARCH_STARTED_MARKER"* ]]; then
                 searches=$((searches + 1))
             fi
             end_with_stopped

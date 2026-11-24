@@ -667,18 +667,16 @@ def _open_row_editor(url_list: int, row: int) -> int:
     )
 
 
-def search_server(server: str, searches: int = 1) -> None:
-    """Search `server` and select its exact Login dropdown entry without submitting a login."""
+def search_server(server: str, searches: int) -> None:
+    """Search and select the exact server without logging in; raise DialogError when absent."""
     dialog = _open_dialog(_enabled_main_window(), ACCOUNT_MENU_PATH, "the account dialog")
     page = _current_page(dialog, "the account dialog")
     search_box = _control(page, SERVER_SEARCH_BOX_ID, WindowClass.EDIT, "the account dialog")
     find = _control(page, SERVER_SEARCH_BUTTON_ID, WindowClass.BUTTON, "the account dialog")
     _set_text(search_box, server, "the account dialog's search box")
-    # The page disables its button while a search runs, whatever the search finds.
+    # A search can finish before BM_CLICK returns; observing a disabled button is not required.
     _send(find, Message.BM_CLICK)
-    if user32.IsWindowEnabled(find):
-        raise DialogError("the account dialog's search did not start")
-    print("mt5: trade server search started", flush=True)
+    print(os.environ["MT5_SERVER_SEARCH_STARTED_MARKER"], flush=True)
     _wait_for(
         lambda: True if user32.IsWindowEnabled(find) else None,
         SEARCH_SECONDS,
@@ -728,9 +726,10 @@ def search_server(server: str, searches: int = 1) -> None:
         print("mt5: the Login server dropdown selected the requested trade server", flush=True)
     else:
         _close_dialog(dialog, Command.CANCEL, "the Login dialog")
+        noun = "search" if searches == 1 else "searches"
         raise DialogError(
             f"trade server search: requested {server}, "
-            f"terminal holds [{held}] after {searches} searches"
+            f"terminal holds [{held}] after {searches} {noun}"
         )
 
 
@@ -797,7 +796,7 @@ def main() -> None:
     actions.add_parser(Action.MAIN_WINDOW, help="Exit 0 once the terminal's main window is up.")
     actions.add_parser(
         Action.SEARCH_SERVER,
-        help="Search MT5_SERVER in the account dialog, adding its company's servers.",
+        help="Search, verify and select MT5_SERVER; fail if it is absent.",
     )
     webrequest = actions.add_parser(
         Action.ALLOW_WEBREQUEST, help="Allow WebRequest for one URL, on a list holding none."
@@ -812,9 +811,7 @@ def main() -> None:
             _main_window()
             print("mt5: the terminal's main window is up", flush=True)
         elif action == Action.SEARCH_SERVER:
-            search_server(
-                os.environ["MT5_SERVER"], int(os.environ.get("MT5_SERVER_SEARCH_NUMBER", "1"))
-            )
+            search_server(os.environ["MT5_SERVER"], int(os.environ["MT5_SERVER_SEARCH_NUMBER"]))
         elif action == Action.DISMISS_DIALOGS:
             dismiss_dialogs(args.own_caption)
         else:

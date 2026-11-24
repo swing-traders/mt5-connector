@@ -27,11 +27,11 @@ import pytest
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
 
-# Each distinctive enough that a stray print of it cannot hide in the output.
+# The made-up login and password stand out if either leaks into output.
 _ACCOUNT = {
     "MT5_LOGIN": "31415926",
     "MT5_PASSWORD": "mt5-image-test-not-a-secret",
-    "MT5_SERVER": "MT5ImageTest-Not-A-Server",
+    "MT5_SERVER": "MetaQuotes-Demo",
     "MT5_SPAWNER_SYMBOL": "EURUSD",
 }
 # The stop timeout the image's contract asks for, over the entrypoint's own stop bounds together.
@@ -606,7 +606,7 @@ def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password()
 
     assert "mt5: restored the terminal's baked state, its history store aside" in output
     assert "mt5: fetching the trade server's broker into the server list" in output
-    assert "mt5: the account dialog searched the trade server" in output
+    assert "mt5: the Login server dropdown selected the requested trade server" in output
     assert "mt5: adding 127.0.0.1 to the WebRequest allowlist" in output
     assert "mt5: the WebRequest allowlist holds 127.0.0.1 alone" in output
     assert _ACCOUNT["MT5_PASSWORD"] not in output
@@ -704,6 +704,21 @@ def _start_with(
         )
     finally:
         subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
+
+
+@_needs_image
+def test_a_missing_trade_server_fails_before_starting_the_hub(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(_ACCOUNT, "MT5_SERVER", "MT5ImageTest-Not-A-Server")
+
+    result = _start_with(
+        tmp_path, "/opt/conda/bin/mt5-connector-hub", "#!/bin/sh\nexit 42\n", timeout=420
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert f"trade server search: requested {_ACCOUNT['MT5_SERVER']}, terminal holds [" in output
+    assert "after 3 searches" in output
+    assert "mt5: starting the hub" not in output
 
 
 @_needs_image
