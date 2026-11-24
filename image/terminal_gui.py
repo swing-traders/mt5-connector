@@ -28,6 +28,7 @@ class WindowClass(StrEnum):
     DIALOG = "#32770"
     BUTTON = "Button"
     EDIT = "Edit"
+    COMBO_BOX = "ComboBox"
     LIST_VIEW = "SysListView32"
     TAB_CONTROL = "SysTabControl32"
 
@@ -45,6 +46,11 @@ class Message(IntEnum):
     WM_LBUTTONDBLCLK = 0x0203
     BM_GETCHECK = 0x00F0
     BM_CLICK = 0x00F5
+    CB_GETCOUNT = 0x0146
+    CB_GETCURSEL = 0x0147
+    CB_GETLBTEXT = 0x0148
+    CB_GETLBTEXTLEN = 0x0149
+    CB_SETCURSEL = 0x014E
     PSM_SETCURSEL = 0x0465
     PSM_GETCURRENTPAGEHWND = 0x0476
     TCM_GETITEMCOUNT = 0x1304
@@ -57,6 +63,10 @@ class Message(IntEnum):
 class Command(IntEnum):
     OK = 1
     CANCEL = 2
+
+
+class Notification(IntEnum):
+    CBN_SELCHANGE = 1
 
 
 class CheckState(IntEnum):
@@ -141,6 +151,10 @@ ACCOUNT_MENU_PATH = ("File", "Open an Account")
 ACCOUNT_CAPTION = "Open an Account"
 SERVER_SEARCH_BOX_ID = 10814  # the account dialog's first page: the search Edit
 SERVER_SEARCH_BUTTON_ID = 10815  # the account dialog's first page: "Find your company"
+# File > Login to Trade Account: the server ComboBox, distinct from the login ComboBox 10137.
+LOGIN_MENU_PATH = ("File", "Login to Trade Account")
+LOGIN_CAPTION = "Login"
+LOGIN_SERVER_ID = 10139
 
 MESSAGE_TIMEOUT_MS = 5000
 MAIN_WINDOW_SECONDS = 10
@@ -653,9 +667,8 @@ def _open_row_editor(url_list: int, row: int) -> int:
     )
 
 
-def search_server(server: str) -> None:
-    """Search `server` on the account dialog's first page, which adds its company's trade servers to
-    the terminal's server list, then cancel the dialog."""
+def search_server(server: str, searches: int = 1) -> None:
+    """Search `server` and select its exact Login dropdown entry without submitting a login."""
     dialog = _open_dialog(_enabled_main_window(), ACCOUNT_MENU_PATH, "the account dialog")
     page = _current_page(dialog, "the account dialog")
     search_box = _control(page, SERVER_SEARCH_BOX_ID, WindowClass.EDIT, "the account dialog")
@@ -665,13 +678,60 @@ def search_server(server: str) -> None:
     _send(find, Message.BM_CLICK)
     if user32.IsWindowEnabled(find):
         raise DialogError("the account dialog's search did not start")
+    print("mt5: trade server search started", flush=True)
     _wait_for(
         lambda: True if user32.IsWindowEnabled(find) else None,
         SEARCH_SECONDS,
         f"the account dialog's search did not finish within {SEARCH_SECONDS}s",
     )
     _close_dialog(dialog, Command.CANCEL, "the account dialog")
-    print("mt5: the account dialog searched the trade server", flush=True)
+    dialog = _open_dialog(_enabled_main_window(), LOGIN_MENU_PATH, "the Login dialog")
+    if _caption(dialog) != LOGIN_CAPTION:
+        raise DialogError("the Login command opened a dialog not captioned Login")
+    dropdown = _control(dialog, LOGIN_SERVER_ID, WindowClass.COMBO_BOX, "the Login dialog")
+    count = ctypes.c_ssize_t(_send(dropdown, Message.CB_GETCOUNT)).value
+    if count < 0:
+        raise DialogError("the Login server dropdown has no readable server list")
+    servers = []
+    for index in range(count):
+        length = ctypes.c_ssize_t(_send(dropdown, Message.CB_GETLBTEXTLEN, index)).value
+        if length < 0:
+            raise DialogError(f"the Login server dropdown has no text for item {index}")
+        text = ctypes.create_unicode_buffer(length + 1)
+        copied = ctypes.c_ssize_t(
+            _send(dropdown, Message.CB_GETLBTEXT, index, ctypes.addressof(text))
+        ).value
+        if copied != length:
+            raise DialogError(f"the Login server dropdown did not read item {index}")
+        servers.append(text.value)
+    selected = ctypes.c_ssize_t(_send(dropdown, Message.CB_GETCURSEL)).value
+    if selected < -1 or selected >= count:
+        raise DialogError("the Login server dropdown has an invalid selection")
+    selected_name = servers[selected] if selected >= 0 else "(none)"
+    held = ", ".join(servers)
+    print(
+        f"mt5: trade server search: terminal holds [{held}], selected {selected_name}",
+        flush=True,
+    )
+    if server in servers:
+        index = servers.index(server)
+        if _send(dropdown, Message.CB_SETCURSEL, index) != index:
+            raise DialogError("the Login server dropdown did not select the requested server")
+        # CB_SETCURSEL does not notify the dialog of a changed selection.
+        _send(
+            dialog,
+            Message.WM_COMMAND,
+            LOGIN_SERVER_ID | (Notification.CBN_SELCHANGE << 16),
+            dropdown,
+        )
+        _close_dialog(dialog, Command.CANCEL, "the Login dialog")
+        print("mt5: the Login server dropdown selected the requested trade server", flush=True)
+    else:
+        _close_dialog(dialog, Command.CANCEL, "the Login dialog")
+        raise DialogError(
+            f"trade server search: requested {server}, "
+            f"terminal holds [{held}] after {searches} searches"
+        )
 
 
 def allow_webrequest(url: str) -> None:
@@ -752,7 +812,9 @@ def main() -> None:
             _main_window()
             print("mt5: the terminal's main window is up", flush=True)
         elif action == Action.SEARCH_SERVER:
-            search_server(os.environ["MT5_SERVER"])
+            search_server(
+                os.environ["MT5_SERVER"], int(os.environ.get("MT5_SERVER_SEARCH_NUMBER", "1"))
+            )
         elif action == Action.DISMISS_DIALOGS:
             dismiss_dialogs(args.own_caption)
         else:

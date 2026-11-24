@@ -67,7 +67,7 @@ gui() {
 retried() {
     local what=$1 own_dialog=$2 ini=$3
     shift 3
-    local attempt status output detail message
+    local attempt status output detail message searches=0
     for ((attempt = 1; attempt <= step_attempts; attempt++)); do
         start_terminal "$(config_argument "$ini")"
         if [[ "$ini" == "$startup_ini" ]]; then
@@ -80,7 +80,11 @@ retried() {
             gui dismiss-dialogs "$own_dialog" \
                 || step "the dialog dismissal for $what failed with status $?"
             status=0
-            output=$(gui "$@" 2>&1) || status=$?
+            output=$(MT5_SERVER_SEARCH_NUMBER="$((searches + 1))" gui "$@" 2>&1) || status=$?
+            # A terminal launch can fail before any search starts.
+            if [[ "$output" == *"mt5: trade server search started"* ]]; then
+                searches=$((searches + 1))
+            fi
             end_with_stopped
             if ((status == 0)); then
                 [[ -z "$output" ]] || printf '%s\n' "$output"

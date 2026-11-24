@@ -319,7 +319,7 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 
 1. Starts Xvfb at 1920x1080, and x11vnc in a debug image.
 2. **Restores the baked state,** before any Wine process of the run starts, since Wine reads its registry as it does. `rsync` copies `/opt/mt5-baked` back, comparing files by content: `terminal/` over the terminal directory and `metaquotes/` over the AppData tree, each deleting whatever the baked copy does not hold, `Bases` excluded, and the three registry files over the Wine prefix's. It is bounded at 40 s. Everything an earlier run of the container wrote — `Config\` with its server list and saved accounts, `Profiles\`, the chart profiles, the logs, the AppData tree, the registry — is undone, `Bases` is never written, and the log says so in one line.
-3. **Fetches the server list.** The terminal logs in only to a trade server its `Config\servers.dat` lists. The entrypoint launches it on the account without the startup script, searches `MT5_SERVER` on the first page of File → Open an Account — which adds the broker's servers — and closes it, which keeps them.
+3. **Fetches and verifies the server list.** The entrypoint launches the terminal on the account without the startup script and searches `MT5_SERVER` on the first page of File → Open an Account. After each search it reads the available servers and current selection from File → Login to Trade Account, then explicitly selects the exact requested server if present and cancels without submitting a login. A missing server retries within the step's three attempts; exhaustion fails before the hub starts, naming the requested server, the available servers and the number of searches. Closing the terminal keeps the acquired server definitions.
 4. Launches `terminal64.exe /config:<the ini copy> /portable`. `ticks_setup` opens the spawner's chart on the spawner symbol. **Starts the log tail,** `/opt/mt5/tail_logs.py` under the Linux Python, which streams the terminal's journal (`logs\<YYYYMMDD>.log`) and its experts log (`MQL5\logs\<YYYYMMDD>.log`) into the container log from the start of this boot:
    - each line converted from the terminal's UTF-16LE to UTF-8, its byte-order mark and carriage return stripped, and prefixed `terminal:` or `experts:`, its text otherwise written as the terminal wrote it;
    - each log followed onto the next UTC day's file when it appears.
@@ -337,7 +337,7 @@ The WebRequest list's text cannot be read, so its row count confirms the URL. An
 
 Before every attempt, `dismiss-dialogs` lists owned dialogs, closes a recognised terminal update offer and cancels only that step's own dialog: Options or Open an Account. Unknown dialogs are named and left open. A main window that stays disabled also reports its owned dialogs.
 
-A terminal window, dialog or control that never appears exhausts its step's attempts and fails the start, naming the step. What the entrypoint cannot see — a server search that found nothing, a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
+A terminal window, dialog or control that never appears exhausts its step's attempts and fails the start, naming the step. A search that never supplies the requested server also fails the start. What the entrypoint cannot see — a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
 
 ### Stop
 
@@ -366,7 +366,7 @@ The image bakes the sections without a credential at `/opt/mt5/setup.ini`. At ev
 | `[StartUp]` | `Script` | `ticks_setup` |
 | | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, then closes its own. The symbol is `MT5_SPAWNER_SYMBOL` |
 
-The terminal must know the trade server `MT5_SERVER` names — its `Config\servers.dat` lists it — before the login can succeed: a server a fresh install does not know is added by searching for its name once (File → Open an Account), which the image does at every boot.
+The terminal must know the trade server `MT5_SERVER` names before the login can succeed. At every boot the image searches for that name (File → Open an Account), verifies it through the Login server dropdown, and retries a missing result up to three searches in total.
 
 #### The EA and the startup script
 
