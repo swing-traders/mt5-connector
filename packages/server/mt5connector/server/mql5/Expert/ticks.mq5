@@ -3949,6 +3949,9 @@ bool PodsPackToTheProtocol()
 
 int OnInit()
 {
+    PrintFormat("trading allowed: terminal=%s, expert=%s",
+                TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "true" : "false",
+                MQLInfoInteger(MQL_TRADE_ALLOWED) ? "true" : "false");
     PrintFormat("ticks EA initializing as the %s of '%s'", ChartRoleName(Role), _Symbol);
     if (RelaySeconds < 1)
     {

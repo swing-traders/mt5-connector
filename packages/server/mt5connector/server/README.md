@@ -374,6 +374,8 @@ The terminal must know the trade server `MT5_SERVER` names before the login can 
 
 #### The EA and the startup script
 
+Each initialization of `ticks`, in its spawner, publisher or history role, logs `trading allowed: terminal=<true|false>, expert=<true|false>` from the terminal's and that EA instance's trading permissions.
+
 The wheel carries their source; `python -c "import mt5connector.server, pathlib; print(pathlib.Path(mt5connector.server.__file__).parent / 'mql5')"` prints where it is installed. Each file goes into the terminal's `MQL5\` tree:
 
 | In the wheel's `mql5/` | In `MQL5\` |
