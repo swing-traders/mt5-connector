@@ -709,6 +709,8 @@ A `v*` tag push certifies that tag's commit before calling the wheel and image p
 
 `tests/live/test_tickgen_history.py` measures the generator of a candidate image against two weeks the strategy tester exported in its "Every tick" mode. A native capture checks real ticks field for field and a later tickless minute's rejection inside the tick era. The file runs on its own, never with the order-placement cases of the live tier, and reads only: it places no order and runs no tester. Its synthesis expectations come from `tests/live/tickgen_oracle.py`, the fitted rules written from their formulas alone, whose worked examples `tests/live/test_tickgen_oracle.py` pins in every test run.
 
+The tick-era-hole case needs an independently observed positive-volume M1 minute without a real tick, after real ticks have begun. Preparation fails if no recent native capture contains one. The shortened-cache lane only needs a native M1 read and does not require that hole; functional certification runs it first.
+
 1. Build the candidate image as [Building](#building) states, tagged `localhost/mt5-tickgen-candidate`.
 2. Prepare it from a running container of the image family whose volume has synced `BTCUSD.a`, logged into the demo connection. The driver copies that container's history into two volumes of its own, captures recent completed UTC days' native ticks and M1 bars on one with a test-only collector that calls `CopyTicksRange` and `CopyRates` alone, starts the candidate on the other and waits until it is healthy with its ranges settled, then writes `provenance.json` beside the capture. The collector rewrites its own copy's M1 frame short. The seed is read only, and no connection identity is written:
 
@@ -731,7 +733,7 @@ A `v*` tag push certifies that tag's commit before calling the wheel and image p
 
 4. Remove the driver's containers and volumes: `python tests/live/prepare_tickgen.py --cleanup --name mt5-tickgen-acceptance`.
 
-`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: the collector reads the candidate's own copy, rewrites that copy's M1 frame cache short, and records its M1 first date before the candidate starts. The case fails unless that date is after the January window. `--cleanup` refuses the flag. The expected M1 floor, quote floor, and January row count come from the independent native history exports, never a candidate hub:
+`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: it preserves the clone's full `M1.hc` under another name, leaves its `.hcc` store intact, and lets the native collector rebuild the frame with `MaxBars=100000`. A further native start at that cap records the frame's M1 first date before the uncapped candidate starts. The case fails unless that date is after the January window. `--cleanup` refuses the flag. The expected M1 floor, quote floor, and January row count come from the independent native tester exports, never a candidate hub:
 
 ```bash
 python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \

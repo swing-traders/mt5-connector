@@ -1,10 +1,8 @@
-"""Prepares the tick-generator acceptance: two private copies of a seed container's synced history,
-the venue's raw ticks and M1 bars of a mixed window captured on one by a native collector, a hub
-from the candidate image on the other, healthy with its symbol's ranges settled, and the provenance
-of all of it. With `--shorten-cache` the collector reads the candidate's own copy, whose M1 frame
-cache it rewrites short, and the driver records that copy's M1 first date before the candidate
-starts; the shortened-cache test fails unless it is after 2023-01-14. The seed container is only
-read. `--cleanup` removes the containers and the volumes this driver labels with its name."""
+"""Prepare private history clones, native captures, candidate hubs and their provenance.
+
+The history lane requires an observed tick-era hole. With `--shorten-cache`, MT5 instead rebuilds
+the clone's M1 frame at a lower cap before the uncapped candidate starts. The seed is only read.
+`--cleanup` removes the containers and volumes labelled with this preparation's name."""
 
 import argparse
 import asyncio
@@ -243,6 +241,8 @@ def collect(
     windows: list[tuple[str, int, int]],
     capture: str,
     output: Path,
+    *,
+    maxbars: int = 100_000_000,
 ) -> Path:
     """The collector's capture of each broker window, read in its own terminal on the clone, under
     raw-`capture`."""
@@ -265,6 +265,8 @@ def collect(
         f"{LABEL}={name}",
         "--env-file",
         str(env_file),
+        "-e",
+        f"MT5_MAX_BARS={maxbars}",
         "-v",
         f"{clone}:{BASES}",
         "-v",
@@ -465,17 +467,55 @@ def prepare(arguments: argparse.Namespace) -> None:
         if arguments.shorten_cache:
             raw_clone = clone
             cloned = m1_cache_bytes(arguments.image, clone)
+            podman(
+                "run",
+                "--rm",
+                "--user",
+                "root",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{clone}:/bases",
+                arguments.image,
+                "-c",
+                f"for cache in /bases/*/history/{SYMBOL}/cache/M1.hc; "
+                'do mv "$cache" "$cache.full"; done',
+            )
         else:
             # The collector's terminal rewrites its volume's M1 frame cache short, so it reads its
             # own copy of the history and the candidate another.
             raw_clone = clone_history(
                 arguments.image, arguments.name, seed_volume, f"{arguments.name}-raw-bases"
             )
-        fixture = mixed_fixture(arguments.image, arguments.name, env_file, raw_clone, clock, output)
+        if arguments.shorten_cache:
+            baseline = window(clock, "baseline", *BASELINE)
+            directory = collect(
+                arguments.image,
+                arguments.name,
+                env_file,
+                raw_clone,
+                [baseline],
+                "baseline",
+                output,
+                maxbars=100_000,
+            )
+            fixture = {"directory": directory.name, "label": "baseline"}
+        else:
+            fixture = mixed_fixture(
+                arguments.image, arguments.name, env_file, raw_clone, clock, output
+            )
         if arguments.shorten_cache:
             collected = m1_cache_bytes(arguments.image, clone)
+            # The probe must not expand the capped frame before the candidate starts.
             probe = collect(
-                arguments.image, arguments.name, env_file, clone, [], "m1-first", output
+                arguments.image,
+                arguments.name,
+                env_file,
+                clone,
+                [],
+                "m1-first",
+                output,
+                maxbars=100_000,
             )
             first = outcome_m1_first(probe, clock)
             log(
@@ -521,6 +561,7 @@ def prepare(arguments: argparse.Namespace) -> None:
     }
     if arguments.shorten_cache:
         provenance["m1_cache_bytes"] = {"cloned": cloned, "collected": collected}
+        provenance["collector_maxbars"] = 100_000
         provenance["m1_first_utc"] = first
     (output / "provenance.json").write_text(json.dumps(provenance, indent=1) + "\n")
     log(f"prepared: {output / 'provenance.json'}")

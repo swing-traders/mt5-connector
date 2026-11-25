@@ -4,7 +4,9 @@ Each directory contains compressed, unmodified CSV exports and their recording p
 
 `recording/TickExporter.mq5` runs as an expert in MT5's own Strategy Tester with the supplied `tester.ini`: M1, Every Tick (`Model=0`), local agents, no optimization or visual mode. It buffers native `SymbolInfoTick` results from `OnTick` and exports the corresponding native `CopyRates` bars. No connector generator is involved.
 
-`recording/NativeHistoryExport.mq5` runs as a native script outside the tester. It exports the M1 prefix through the first adjacent minute pair, the first positive-spread bar, the first real tick obtained by native `CopyTicks` from the first millisecond, and the January native bars. These are the witnesses for the floors and row count. Broker wall epochs map to UTC using New York wall time plus seven hours; the registered UTC values were calculated independently of the connector's clock implementation.
+The `ticks-floor-201704`, `ticks-spread-202011`, and `ticks-january-rows` tester exports witness the first adjacent M1 bars, the first positive-spread bar, and the complete January assertion window. The registered floors and row count are derived from their native tester CSVs.
+
+`recording/NativeHistoryExport.mq5` runs as a native script outside the tester. It additionally exports the M1 prefix before the first adjacent minute pair, the first positive-spread bar, the first real tick obtained by native `CopyTicks` from the first millisecond, and the January native bars. These independently cross-check the tester witnesses and establish the earlier sparse history and later real-tick boundary. Broker wall epochs map to UTC using New York wall time plus seven hours; the registered UTC values were calculated independently of the connector's clock implementation.
 
 The fitted-rule calibration uses the independent test-side oracle, whose source hash is recorded in the manifest. Both weeks require every full-volume minute to meet the native path within one point and every eligible scaffold to embed exactly. The worked path is taken from the native CSV.
 

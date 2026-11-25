@@ -53,5 +53,36 @@
     "first-real-tick.csv": "5ee9b2a76c4934aacdd95992b4599240bb83e1b9fe06f510512926e765cbea58",
     "january.csv": "27ee5efd4f742a7b4a499643dc992bfa2136d9a1e9355117a74b39dff5a99c2f",
     "metadata.csv": "2682c63943986f46c30eeb80995a19d7fdf89828c99eb3ea8c71dd194d4648cb"
+  },
+  "floor_tester_jobs": [
+    {
+      "job": "ticks-floor-201704",
+      "sha256": {
+        "ticks.csv": "f61a44f21b71e8611ddf69fb66edb71a58f2c56d6a320e197d4c878ba1453b80",
+        "bars.csv": "e2fe06a4a1327ba583a9a4828ea60dc97a617a0638c2b1ac15e34f084430a415",
+        "metadata.csv": "441572af1f8210a1edd7276212f093f1b3c55637dbbf51d029cf357e9ce9cf6e"
+      }
+    },
+    {
+      "job": "ticks-spread-202011",
+      "sha256": {
+        "ticks.csv": "66d22a49e719aa87c26291862fa47a54f5b2653a21be7059b0f31c48936fcc26",
+        "bars.csv": "eb21732380cbc5d6c87cfbe65f8f2b3a72abeefad4c358494e9ef199fb520f22",
+        "metadata.csv": "50fd285a651fd1d4048ebc0af2c9f70c59ce73d297f0f99261f142294a1d3275"
+      }
+    },
+    {
+      "job": "ticks-january-rows",
+      "sha256": {
+        "ticks.csv": "bbe5abc8a9dbf9129433ba8f913144aeb2df9ffbb48f92f703dc5d3ee64e691e",
+        "bars.csv": "83b4bf4f2c87db79a2183f72a9ac1eb95f81d212df2720947351ef501691fba5",
+        "metadata.csv": "21ffa6b2cb88be8b8171643ec7f169df08191d41555bee00a0f765ebe8827abc"
+      }
+    }
+  ],
+  "floor_reference_jobs": {
+    "m1": "ticks-floor-201704",
+    "quote": "ticks-spread-202011",
+    "january": "ticks-january-rows"
   }
 }

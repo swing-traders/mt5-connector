@@ -15,6 +15,7 @@ def materialize(destination):
     reference = json.loads((FIXTURES / "manifest.json").read_text())
     for week in [
         *reference["weeks"],
+        *reference["floor_tester_jobs"],
         {"job": "floors", "sha256": reference["native_floor_files"]},
     ]:
         output = destination / week["job"] / "out"
@@ -31,7 +32,7 @@ def materialize(destination):
 
 
 def run(runtime, image, seed, stem, output, environment, owned):
-    for shortened in (False, True):
+    for shortened in (True, False):
         name = f"{stem}-shortened" if shortened else f"{stem}-history"
         capture = output / ("shortened" if shortened else "history")
         with socket.socket() as available:
