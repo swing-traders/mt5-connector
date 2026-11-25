@@ -1,0 +1,138 @@
+name: functional
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  head:
+    name: head commit
+    runs-on: [self-hosted, Linux, X64]
+    if: >-
+      ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request
+      && (github.event.comment.body == '/functional'
+      || startsWith(github.event.comment.body, format('/functional{0}', fromJSON('"\n"')))
+      || startsWith(github.event.comment.body, format('/functional{0}', fromJSON('"\r\n"'))))
+      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+      github.event.comment.author_association)) }}
+    permissions:
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - name: Resolve the commit under test
+        id: head
+        uses: actions/github-script@v9
+        with:
+          script: |
+            if (context.eventName === "issue_comment") {
+              const { data: pull } = await github.rest.pulls.get({
+                ...context.repo,
+                pull_number: context.issue.number,
+              });
+              core.setOutput("sha", pull.head.sha);
+            } else {
+              core.setOutput("sha", context.sha);
+            }
+
+  certify:
+    name: functional certification
+    needs: head
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 360
+    concurrency:
+      group: functional-demo-login
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      statuses: write
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      MT5_SPAWNER_SYMBOL: BTCUSD.a
+      MT5_LIVE_HUB_SYMBOL: BTCUSD.a
+    steps:
+      - name: Mark the tested commit pending
+        uses: actions/github-script@v9
+        env:
+          SHA: ${{ needs.head.outputs.sha }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: process.env.SHA,
+              state: "pending", context: "functional",
+              description: "certification started",
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.head.outputs.sha }}
+          persist-credentials: false
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+
+      - name: Layer the dev tooling and the server
+        run: micromamba env update -n mt5-connector -f environment.dev.yml --yes
+
+      - name: Write the private connection environment
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+        run: |
+          umask 077
+          printf 'MT5_LOGIN=%s\nMT5_PASSWORD=%s\nMT5_SERVER=%s\nMT5_SPAWNER_SYMBOL=%s\nMT5_LIVE_HUB_SYMBOL=%s\n' \
+            "$MT5_LOGIN" "$MT5_PASSWORD" "$MT5_SERVER" \
+            "$MT5_SPAWNER_SYMBOL" "$MT5_LIVE_HUB_SYMBOL" \
+            > "$RUNNER_TEMP/mt5-functional-${{ github.run_id }}.env"
+
+      - name: Build and certify the image
+        run: just functional "$RUNNER_TEMP/mt5-functional-${{ github.run_id }}.env"
+
+      - name: Remove the private connection environment
+        if: always()
+        run: rm -f "$RUNNER_TEMP/mt5-functional-${{ github.run_id }}.env"
+
+      - name: Mark the tested commit's result
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          SHA: ${{ needs.head.outputs.sha }}
+          RESULT: ${{ job.status }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const passed = process.env.RESULT === "success";
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: process.env.SHA,
+              state: passed ? "success" : "failure", context: "functional",
+              description: passed ? "certification passed" : "certification failed or cancelled",
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+
+  publish:
+    needs: [head, certify]
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      && needs.certify.result == 'success'
+    permissions:
+      contents: write
+      packages: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/build-wheel.yml
+    with:
+      ref: ${{ needs.head.outputs.sha }}
+      publish: true

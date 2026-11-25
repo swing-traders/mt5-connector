@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import tickgen_capture
 import tickgen_oracle as oracle
+from tickgen_reference import REFERENCE
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import EaError
@@ -52,37 +53,9 @@ class Week:
     within_one_point: int
 
 
-WEEKS = (
-    Week(
-        "ticks-202301",
-        {
-            "ticks.csv": "d7da4b6574e1609b8be6fabc1075eafa9d1617d09a98eb85a73e04eabcc9778f",
-            "bars.csv": "3b9632f32335dcfade8d47e8ad53a5a386201b7e38dd9de6c7dd332fa9b33bd7",
-            "metadata.csv": "9d80528d44c3a43a597701dbeae98f7f2e1ffba0c21c9cff53cce8b15fd29657",
-        },
-        minutes=7188,
-        full_volume=6543,
-        deficit=645,
-        scaffolds=6401,
-        within_one_point=6543,
-    ),
-    Week(
-        "ticks-202310",
-        {
-            "ticks.csv": "4f821cc254ce0f4848927dc352c0d01da2cb877045065848e31fdadd54e755a2",
-            "bars.csv": "ce24e6bf8be125e0eb04e500b04913f2d13ff430c69964ee3ac3c3c6072205fa",
-            "metadata.csv": "78022247eec4f8c6d53748ae807940f73d1eb56ad60d1a942f31189a6186d14f",
-        },
-        minutes=7189,
-        full_volume=6236,
-        deficit=953,
-        scaffolds=6065,
-        within_one_point=6229,
-    ),
-)
-# The January minute, by raw broker epoch, whose path the worked rising-doji example registers.
-WORKED_MINUTE = 1673308440
-WORKED_PATH = [92543, 92545, 92544, 92546, 92545, 92547, 92546, 92550, 92549, 92543]
+WEEKS = tuple(Week(**week) for week in REFERENCE["weeks"])
+WORKED_MINUTE = REFERENCE["worked_minute"]
+WORKED_PATH = REFERENCE["worked_path"]
 
 
 def unavailable(reason: str):

@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import tickgen_capture
+from tickgen_reference import REFERENCE
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.hub import HubSession
@@ -29,16 +30,16 @@ from mt5connector.wire import calls
 from mt5connector.wire.broker_clock import BrokerClock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-SYMBOL = "AUDCAD+"
-# The symbol's digits, which the fixture's doji test reads; the tester exports record them.
-DIGITS = 5
+SYMBOL = REFERENCE["symbol"]
+DIGITS = REFERENCE["digits"]
 LABEL = "io.swing-traders.tickgen-acceptance"
 BASES = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
 TERMINAL = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5"
 CREDENTIALS = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_SPAWNER_SYMBOL")
 CLOCK_SETTINGS = ("MT5_BROKER_TZ", "MT5_BROKER_OFFSET_HOURS")
-BASELINE = (datetime(2024, 6, 23, tzinfo=UTC), datetime(2024, 6, 26, tzinfo=UTC))
-FALLBACK_LAST_DAY = datetime(2024, 12, 31, tzinfo=UTC)
+TODAY = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+BASELINE = (TODAY - timedelta(days=5), TODAY - timedelta(days=2))
+FALLBACK_LAST_DAY = TODAY - timedelta(days=1)
 # The fallback's UTC days captured per collector run.
 FALLBACK_BATCH_DAYS = 7
 DAY = timedelta(days=1)
@@ -54,6 +55,8 @@ SOURCES = (
     "packages/server/mt5connector/server/mql5/Expert/ticks.mq5",
     "tests/live/tickgen_raw.mq5",
     "tests/live/tickgen_oracle.py",
+    "tests/live/tickgen_reference.py",
+    "tests/fixtures/tickgen-btc/manifest.json",
     "tests/live/tickgen_capture.py",
     "tests/live/prepare_tickgen.py",
     "tests/live/test_tickgen_history.py",
@@ -68,7 +71,10 @@ class Unprepared(Exception):
 def podman(*arguments: str, check: bool = True) -> str:
     """The command's standard output; a failure raises with its standard error, never its
     arguments' environment."""
-    done = subprocess.run(["podman", *arguments], capture_output=True, text=True)
+    command = ["podman", *arguments]
+    if arguments[0] == "run":
+        command.insert(2, "--no-healthcheck")
+    done = subprocess.run(command, capture_output=True, text=True)
     if check and done.returncode != 0:
         raise Unprepared(f"podman {arguments[0]} failed ({done.returncode}): {done.stderr.strip()}")
     return done.stdout
@@ -495,7 +501,6 @@ def prepare(arguments: argparse.Namespace) -> None:
         "compiled": {"ticks.mq5": compiled["ticks"], "tickgen_raw.mq5": compiled["tickgen_raw"]},
         "terminal_build_image": compiled["terminal_build"],
         "terminal_build_running": running["terminal_build"],
-        "server": settings["MT5_SERVER"],
         "account": running["account"],
         "ranges": running["ranges"],
         "maxbars": running["maxbars"],

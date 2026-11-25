@@ -637,12 +637,23 @@ It pins that:
 - the main-window action reports the window;
 - a boot leaves WebRequest allowed for one URL;
 - a restart restores the baked state — a file added under `Config\` or the AppData tree removed, a same-length rewrite of a baked file with its timestamp undone, a value written into the terminal's registry key gone — and leaves `Bases` alone;
-- the terminal's journal and experts log reach the container log as UTF-8 under their prefixes, a journal line naming the login and the server arriving as the terminal wrote it;
 - the driver fails naming a control a dialog lacks;
 - the hub boots and answers `/health` 503, with no spawner connected and no clock verified, on the loopback port the runtime published it at, and the image's healthcheck reaches it and fails on that 503;
 - the image declares its healthcheck as the health probe, every 30 s under a 5 s timeout and unhealthy after 3 failures.
 
 Its tests of the driver's menu and tab lookups, of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — and of the health probe, passing on HTTP 200 alone and naming a 503 or a hub not listening, run without an image.
+
+### Functional certification
+
+From the repository root, `just functional` builds the checkout and certifies it on the demo connection in the private `.env`. An alternate file is `just functional /path/to/private.env`. It holds unquoted `NAME=value` lines for `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`; `MT5_SPAWNER_SYMBOL` and `MT5_LIVE_HUB_SYMBOL` are `BTCUSD.a`. Reserve the demo login for the complete run.
+
+The command requires Podman and the declared development environment. It verifies the requested server check, HTTP 200 from the hub, the authenticated demo identity, and the EA's native `trading allowed: terminal=true, expert=true` line. It requires a flat login, buys the symbol's minimum market volume, closes that position, retries a failed close once, and confirms no position or order remains. It runs the native terminal-log case from `tests/functional`, the live hub suite with full and capped terminals, and both historical suites with their native capture prerequisites. The final check requires the login to be flat again.
+
+Native tester references and independent floor witnesses are bundled in `tests/fixtures/tickgen-btc`. Their checksums are verified before the image starts; missing historical inputs fail rather than skip. Connection settings are copied to a private temporary environment file, passed through `--env-file`, and removed. Process output is redacted. Containers and capture volumes are removed; the main and capped history caches persist between runs.
+
+The `functional` Action runs on a self-hosted Linux X64 runner, with the connection from repository secrets `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`. A dispatch tests its selected commit. A pull-request comment whose first line is exactly `/functional`, from an owner, member, or collaborator, resolves and tests that pull request's head once and marks that commit's result. Comment commands use the workflow on the default branch.
+
+A `v*` tag push certifies that tag's commit before calling the wheel and image publishing workflow. Image publication still requires the image tier, and the release requires both wheels and that image. A direct manual `build-wheel` run produces unpublished wheel artifacts.
 
 ### The live hub tier
 
@@ -654,7 +665,7 @@ Its tests of the driver's menu and tab lookups, of the log tail — following th
 | `MT5_LIVE_HUB_URL` | the hub of container 1, its `MaxBars` the ceiling, which every case but the capped ones reads | `ws://127.0.0.1:9000` |
 | `MT5_LIVE_CAPPED_HUB_URL` | the hub of container 2, its `MaxBars` capped, which the span-cap case and the capped floor's case read; a case that finds no hub there fails naming it | `ws://127.0.0.1:9001` |
 
-Nothing starts a container for it, and no CI runs it. By hand, from the repository root:
+`just functional` starts and synchronizes both containers and runs this tier. By hand, from the repository root:
 
 1. Write a `.env` there, which is never committed: one unquoted `NAME=value` per line, holding nothing the shell interprets, since the container runtime reads each value verbatim and step 4 sources the file. It carries the entrypoint's `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, and the tier's `MT5_LIVE_HUB_SYMBOL`.
 2. Start both containers from the image under test, each with its own history volume. The two terminals log into the same account at once. Container 2's `MaxBars` of 100,000 caps one read's span at about 70 days of M1 periods:
@@ -699,7 +710,7 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
 `tests/live/test_tickgen_history.py` measures the generator of a candidate image against two weeks the strategy tester exported in its "Every tick" mode. A native capture checks real ticks field for field and a later tickless minute's rejection inside the tick era. The file runs on its own, never with the order-placement cases of the live tier, and reads only: it places no order and runs no tester. Its synthesis expectations come from `tests/live/tickgen_oracle.py`, the fitted rules written from their formulas alone, whose worked examples `tests/live/test_tickgen_oracle.py` pins in every test run.
 
 1. Build the candidate image as [Building](#building) states, tagged `localhost/mt5-tickgen-candidate`.
-2. Prepare it from a running container of the image family whose volume has synced the exported symbol, logged into a read-only login. The driver copies that container's history into two volumes of its own, captures the venue's ticks and M1 bars of the mixed window on one with a test-only collector script that calls `CopyTicksRange` and `CopyRates` alone — its terminal rewrites that volume's M1 frame short — starts the candidate's hub on the other and waits until it is healthy with the symbol's ranges settled, then writes `provenance.json` beside the capture. It reads the login from the seed container, which it never changes, and writes no credential:
+2. Prepare it from a running container of the image family whose volume has synced `BTCUSD.a`, logged into the demo connection. The driver copies that container's history into two volumes of its own, captures recent completed UTC days' native ticks and M1 bars on one with a test-only collector that calls `CopyTicksRange` and `CopyRates` alone, starts the candidate on the other and waits until it is healthy with its ranges settled, then writes `provenance.json` beside the capture. The collector rewrites its own copy's M1 frame short. The seed is read only, and no connection identity is written:
 
    ```bash
    python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \
@@ -710,23 +721,23 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
 3. Run the lane against it:
 
    ```bash
-   MT5_LIVE_HUB_SYMBOL=AUDCAD+ MT5_LIVE_HUB_URL=ws://127.0.0.1:21588 \
-   MT5_TICK_EXPORT_DIR=<tester jobs directory> \
+   MT5_LIVE_HUB_SYMBOL=BTCUSD.a MT5_LIVE_HUB_URL=ws://127.0.0.1:21588 \
+   MT5_TICK_EXPORT_DIR="$PWD/scripts/tickgen-exports" \
    MT5_TICK_RAW_DIR="$PWD/scripts/tickgen-acceptance" MT5_TICK_ACCEPTANCE_REQUIRED=1 \
    python -B -m pytest tests/live/test_tickgen_history.py -q -rA
    ```
 
-   `MT5_TICK_EXPORT_DIR` names the tester's `jobs/` directory holding `ticks-202301/out/` and `ticks-202310/out/`, each with its `bars.csv`, `ticks.csv` and `metadata.csv`, which the lane checks against their recorded hashes. Without `MT5_TICK_ACCEPTANCE_REQUIRED=1` a case whose inputs or hub are missing is skipped; with it, it fails.
+   `MT5_TICK_EXPORT_DIR` names a materialized copy of the bundled native tester exports, holding `ticks-202301/out/` and `ticks-202310/out/`, each with `bars.csv`, `ticks.csv`, and `metadata.csv`. `just functional` materializes these automatically. For a manual lane, run `python -c 'from pathlib import Path; from functional.history import materialize; materialize(Path("scripts/tickgen-exports"))'` first. The lane verifies their registered hashes. Without `MT5_TICK_ACCEPTANCE_REQUIRED=1` a case whose inputs or hub are missing is skipped; with it, it fails.
 
 4. Remove the driver's containers and volumes: `python tests/live/prepare_tickgen.py --cleanup --name mt5-tickgen-acceptance`.
 
-`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: the collector reads the candidate's own copy, its terminal rewriting that copy's M1 frame cache short, and a further collector run that reads nothing records the M1 frame's first date as a terminal on that copy holds it, before the candidate starts, into `provenance.json`; preparation refuses nothing on it, and the case fails unless that date is after 2023-01-14. `--cleanup` refuses the flag. The case then asks the candidate for the M1 floor, the quote floor and the January 2023 M1 bars a hub on an untouched copy answers:
+`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: the collector reads the candidate's own copy, rewrites that copy's M1 frame cache short, and records its M1 first date before the candidate starts. The case fails unless that date is after the January window. `--cleanup` refuses the flag. The expected M1 floor, quote floor, and January row count come from the independent native history exports, never a candidate hub:
 
 ```bash
 python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \
   --seed-container <container> --name mt5-tickgen-shortened --port 21589 \
   --output scripts/tickgen-shortened --shorten-cache
-MT5_LIVE_HUB_SYMBOL=AUDCAD+ MT5_LIVE_HUB_URL=ws://127.0.0.1:21589 \
+MT5_LIVE_HUB_SYMBOL=BTCUSD.a MT5_LIVE_HUB_URL=ws://127.0.0.1:21589 \
 MT5_TICK_RAW_DIR="$PWD/scripts/tickgen-shortened" MT5_TICK_ACCEPTANCE_REQUIRED=1 \
 python -B -m pytest tests/live/test_tickgen_shortened_cache.py -q -rA
 python tests/live/prepare_tickgen.py --cleanup --name mt5-tickgen-shortened

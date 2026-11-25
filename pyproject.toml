@@ -17,5 +17,6 @@ extend-exclude = "scripts/"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q -ra"
 asyncio_mode = "auto"

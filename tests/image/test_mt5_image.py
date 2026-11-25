@@ -1249,43 +1249,6 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
     assert queried.returncode != 0
 
 
-# Writes each argument as a line of a journal dated past any real day, as the terminal writes one.
-_LATER_JOURNAL = r"""
-journal="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/logs/29991231.log"
-{ printf '\377\376'; printf '%s\r\n' "$@" | iconv -f UTF-8 -t UTF-16LE; } > "$journal"
-"""
-
-
-@_needs_image
-def test_the_terminal_logs_reach_the_container_log_verbatim(tmp_path) -> None:
-    runtime = _runtime()
-    login = _ACCOUNT["MT5_LOGIN"]
-    server = _ACCOUNT["MT5_SERVER"]
-    with _booted(runtime, tmp_path, f"mt5-image-log-test-{os.getpid()}") as name:
-        subprocess.run(
-            [
-                runtime,
-                "exec",
-                name,
-                "sh",
-                "-c",
-                _LATER_JOURNAL,
-                "sh",
-                f"'{login}': authorized on {server} through Access Server",
-            ],
-            check=True,
-            timeout=30,
-        )
-        written = f"terminal: '{login}': authorized on {server} through Access Server"
-        _await_log(runtime, name, written, count=1, seconds=30)
-        # The experts log is written only once the startup script runs, after the journal.
-        _await_log(runtime, name, "\nexperts: ", count=1, seconds=60)
-        printed = _logs(runtime, name)
-
-    assert re.search(r"^terminal: .*MetaTrader 5 x64 build \d+ started", printed, re.MULTILINE)
-    assert "\x00" not in printed
-
-
 @_needs_image
 def test_a_dialog_without_the_expected_control_fails_the_driver_naming_it(tmp_path) -> None:
     runtime = _runtime()

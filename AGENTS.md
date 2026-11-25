@@ -23,7 +23,7 @@ It ships two distributions and the image that runs the server, never a deploymen
 Delivery:
 
 - PRs merge to `main`; CI runs `just lint` and `just test`, and builds the image and runs the image tier against it, on every PR and push to `main`.
-- `VERSION` is the one version both projects read. A release is a `vX.Y.Z+st` tag; CI builds both `py3-none-any` wheels, each with a sha256 sidecar, and the image, pushes the image once the image tier passes on it, then publishes the wheels as one GitHub release and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
+- `VERSION` is the one version both projects read. A release is a `vX.Y.Z+st` tag; its functional certification gates publishing from that same commit. CI builds both `py3-none-any` wheels, each with a sha256 sidecar, and the image, pushes the image once the image tier passes on it, then publishes the wheels as one GitHub release and rebuilds the PEP 503 index on this repository's GitHub Pages, a page per project.
 - The connector `Dockerfile` pins the published terminal image by tag and digest in its `terminal` stage. The separate terminal image is built by its manual Action and tagged by terminal build; an already tagged build is never pushed again. A terminal upgrade changes that one image reference.
 - Consumers pin a release exactly, suffix included, from that index: `+st` is a constant local segment marking the fork's own index, never a build counter, and PyPI accepts no local version, so no release elsewhere can satisfy the pin.
 
@@ -406,10 +406,11 @@ Measured on IC Markets and Bybit MT5 terminals, and none of it in the vendor's d
 
 ## Test tiers
 
-- **Every test but the image tier and the live hub tier runs without a terminal.** Client tests (`tests/client/`) hand a client a double of its connection or of its hub session (`session_double.py`), or serve its sessions a hub double on a loopback port (`hub_double.py`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
+- **Every test but the image, functional, and live hub tiers runs without a terminal.** Client tests (`tests/client/`) hand a client a double of its connection or of its hub session (`session_double.py`), or serve its sessions a hub double on a loopback port (`hub_double.py`); hub tests (`tests/server/`) serve a real hub on a loopback port and speak to it as EAs (`ea_wire.py`) and consumers (`hub_doubles.py`) do.
 - **Each side gets its own wire copy.** In one process `mt5connector.wire` and `mt5connector.server.wire` are distinct modules, so an enum identity check or an exception class from one does not match the other: a test hands the server objects from `mt5connector.server.wire`, and the client objects from `mt5connector.wire`.
 - **The image tier** (`tests/image/`) starts a built image on a made-up account and runs only when asked for, its GUI-driver and log-tail tests aside; the server README says how to run it.
 - **The live hub tier** (`tests/live/`) needs two running images' hubs on one account, one terminal's `MaxBars` capped; it runs only when asked for, and the server README's playbook says how to start both and run it.
+- **Functional certification** (`functional/`, `tests/functional/`) uses an authenticated demo connection; the server README gives its workflow and local command. Native tester and history exports are independent references, never derived from the candidate.
 - **An `xfail` is `strict=True` and names the defect it pins.** An xfail that starts passing is a fix to record, never a marker to leave.
 
 ---
