@@ -1,5 +1,6 @@
 """Terminal-free checks of the frozen gap input and native snapshot verifier."""
 
+import asyncio
 import csv
 import gzip
 import io
@@ -130,3 +131,44 @@ def test_other_symbols_resync_does_not_stop_the_reloaded_input():
     tickgen_gap.no_repeat_resync(
         "re-sync of BTCUSD.a: due 202611 (attempt 1 of 3)", "BTCUSD.a.GAPTEST"
     )
+
+
+@pytest.mark.parametrize("resync", [False, True])
+async def test_log_subscription_precedes_reads_and_stops_on_a_resync(monkeypatch, resync):
+    class Stream:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.returncode = None
+
+        def terminate(self):
+            self.returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    stream = Stream()
+    subscribed = False
+
+    async def subscribe(*arguments, **options):
+        nonlocal subscribed
+        assert arguments == ("podman", "logs", "--follow", "candidate")
+        subscribed = True
+        return stream
+
+    async def reads():
+        assert subscribed
+        if resync:
+            stream.stdout.feed_data(b"re-sync of SYMBOL: due 202611\n")
+            await asyncio.Event().wait()
+        return "answered"
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", subscribe)
+    if resync:
+        with pytest.raises(RuntimeError, match="after native tick reload"):
+            await tickgen_gap.subscribed_reads("candidate", "SYMBOL", reads, timeout=1)
+    else:
+        assert (
+            await tickgen_gap.subscribed_reads("candidate", "SYMBOL", reads, timeout=1)
+            == "answered"
+        )
+    assert stream.returncode == 0

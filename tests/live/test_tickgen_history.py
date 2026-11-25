@@ -256,26 +256,14 @@ def gap_provenance(monkeypatch):
         tickgen_gap.no_repeat_resync(captured.stdout + captured.stderr, prepared["symbol"])
 
     async def guarded_reads(reads):
-        async def watch():
-            while True:
-                await asyncio.to_thread(no_repeat_resync)
-                await asyncio.sleep(0.25)
-
-        operation = asyncio.create_task(original_reads(reads))
-        guard = asyncio.create_task(watch())
-        try:
-            done, _pending = await asyncio.wait(
-                (operation, guard), return_when=asyncio.FIRST_COMPLETED
-            )
-            if guard in done:
-                await guard
-            answer = await operation
-            await asyncio.to_thread(no_repeat_resync)
-            return answer
-        finally:
-            for task in (operation, guard):
-                task.cancel()
-            await asyncio.gather(operation, guard, return_exceptions=True)
+        answer = await tickgen_gap.subscribed_reads(
+            prepared["container"],
+            prepared["symbol"],
+            lambda: original_reads(reads),
+            timeout=2 * SYNCED_S + 120,
+        )
+        no_repeat_resync()
+        return answer
 
     no_repeat_resync()
     monkeypatch.setattr(module, "session_reads", guarded_reads)
@@ -442,6 +430,12 @@ def test_every_minute_follows_its_emitted_count_schedule_and_meets_equal_count_e
 
 def test_the_worked_rising_doji_minute_emits_its_registered_path(weeks):
     export, read = weeks[0]
+    bar, direction = next((bar, d) for bar, d in fitted(export, read) if bar[0] == WORKED_MINUTE)
+    _time, opened, high, low, closed, volume, _spread = bar
+    assert opened == closed and high > low and volume > 1
+    assert direction == 1
+    assert oracle.bids(*bar[1:6], 1) != oracle.bids(*bar[1:6], -1)
+    assert [bid for _stamp, bid in export.ticks[WORKED_MINUTE]] == WORKED_PATH
 
     assert bid_points(candidate_minute(read, WORKED_MINUTE), export.digits) == WORKED_PATH
 

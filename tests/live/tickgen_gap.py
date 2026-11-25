@@ -1,5 +1,6 @@
 """Frozen native gap inputs and independent installed-input verification."""
 
+import asyncio
 import csv
 import gzip
 import hashlib
@@ -17,6 +18,45 @@ def no_repeat_resync(printed: str, symbol: str) -> None:
     events = [line for line in printed.splitlines() if f"re-sync of {symbol}:" in line]
     if events:
         raise RuntimeError("hub re-synced after native tick reload: " + "\n".join(events))
+
+
+async def subscribed_reads(container, symbol, reads, *, timeout):
+    # Log replay covers events between process creation and the follow stream attaching.
+    stream = await asyncio.create_subprocess_exec(
+        "podman",
+        "logs",
+        "--follow",
+        container,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    async def watch():
+        while line := await stream.stdout.readline():
+            no_repeat_resync(line.decode(errors="replace"), symbol)
+        raise RuntimeError("the re-sync event subscription ended")
+
+    guard = asyncio.create_task(watch())
+    operation = asyncio.create_task(reads())
+    try:
+        async with asyncio.timeout(timeout):
+            done, _pending = await asyncio.wait(
+                (operation, guard), return_when=asyncio.FIRST_COMPLETED
+            )
+            if guard in done:
+                await guard
+            return await operation
+    finally:
+        for task in (operation, guard):
+            task.cancel()
+        await asyncio.gather(operation, guard, return_exceptions=True)
+        if stream.returncode is None:
+            stream.terminate()
+            try:
+                await asyncio.wait_for(stream.wait(), 5)
+            except TimeoutError:
+                stream.kill()
+                await stream.wait()
 
 
 @dataclass(frozen=True)
