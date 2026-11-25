@@ -4,10 +4,13 @@ the hub of a terminal whose MaxBars is the ceiling, MT5_LIVE_CAPPED_HUB_URL one 
 capped; the server README's live-tier playbook starts both."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -460,17 +463,26 @@ async def test_a_cold_m1_window_a_week_back_answers_its_bars_and_the_m1_floor(se
     assert Series.M1 in held.series
 
 
-@pytest.mark.parametrize(
-    ("start", "end"),
-    [
-        (datetime(2026, 11, 2, tzinfo=UTC), datetime(2026, 11, 7, tzinfo=UTC)),
-        (datetime(2026, 11, 2, 14, 24, tzinfo=UTC), datetime(2026, 11, 2, 14, 25, tzinfo=UTC)),
-    ],
-    ids=["five-days", "minute-1424"],
-)
+@pytest.fixture(scope="module")
+def native_windows():
+    prepared = os.environ.get("MT5_LIVE_PREPARED_DIR")
+    if prepared is None:
+        pytest.skip("MT5_LIVE_PREPARED_DIR is not set")
+    directory = Path(prepared)
+    recorded = json.loads((directory / "provenance.json").read_text())
+    assert recorded["symbol"] == SYMBOL
+    for capture, files in recorded["captures"].items():
+        for name, digest in files.items():
+            assert hashlib.sha256((directory / capture / name).read_bytes()).hexdigest() == digest
+    return recorded["windows"]
+
+
+@pytest.mark.parametrize("window", ["five-days", "minute-1424"])
 async def test_each_real_tick_minute_has_its_m1_tick_volume_of_bid_flagged_ticks(
-    session, start, end
+    session, native_windows, window
 ):
+    start = datetime.fromtimestamp(native_windows[window]["start_utc"], UTC)
+    end = datetime.fromtimestamp(native_windows[window]["end_utc_exclusive"], UTC)
     hub_session, _ = session
     held = await ranges(hub_session)
     if held.first_tick == 0:

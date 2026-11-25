@@ -24,25 +24,55 @@ void OnStart()
     {
         PrintFormat("ticks_setup: a '%s' chart runs '%s' at start - not opening the spawner",
                     ChartSymbol(running), ExpertName);
+        StartupResult(true, "");
     }
     else
     {
+        ResetLastError();
         long chart = ChartOpen(Symbol(), PERIOD_M1);
         if (chart == 0)
         {
-            PrintFormat("ticks_setup: ChartOpen failed for '%s': %d", Symbol(), GetLastError());
+            StartupResult(false, StringFormat("ChartOpen failed for '%s': %d",
+                                              Symbol(), GetLastError()));
         }
         else if (!ChartApplyTemplate(chart, TemplateFile))
         {
-            PrintFormat("ticks_setup: ChartApplyTemplate failed for '%s': %d", Symbol(),
-                        GetLastError());
+            StartupResult(false, StringFormat("ChartApplyTemplate failed for '%s': %d",
+                                              Symbol(), GetLastError()));
         }
         else
         {
             PrintFormat("ticks_setup: '%s' attached to a '%s' chart as the spawner", ExpertName,
                         Symbol());
+            StartupResult(true, "");
             ChartClose(ChartID());
         }
+    }
+}
+
+// A closed file is published atomically so the entrypoint never reads a partial failure.
+void StartupResult(const bool ready, const string detail)
+{
+    string destination;
+    if (ready)
+        destination = "ticks_setup.ready";
+    else
+        destination = "ticks_setup.error";
+    const string temporary = destination + ".tmp";
+    ResetLastError();
+    const int file = FileOpen(temporary, FILE_WRITE | FILE_TXT | FILE_ANSI, 0, CP_UTF8);
+    if (file == INVALID_HANDLE)
+    {
+        PrintFormat("ticks_setup: startup result could not be opened: %d", GetLastError());
+        TerminalClose(1);
+        return;
+    }
+    const uint written = FileWriteString(file, detail + "\n");
+    FileClose(file);
+    if (written == 0 || !FileMove(temporary, 0, destination, FILE_REWRITE))
+    {
+        PrintFormat("ticks_setup: startup result could not be published: %d", GetLastError());
+        TerminalClose(1);
     }
 }
 

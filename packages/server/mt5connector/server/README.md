@@ -322,13 +322,13 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 3. **Fetches and verifies the server list.**
    - Launches the terminal on the account without the startup script and searches `MT5_SERVER` on the first page of File → Open an Account.
    - Reads the available servers and current selection from File → Login to Trade Account, explicitly selects the exact requested server if present, and cancels without submitting a login.
-   - Retries a missing server within the step's three attempts. Exhaustion fails before the hub starts, naming the requested server, the available servers and the number of searches.
+   - Searches once. An absent server or a selection failure exits non-zero before the hub starts, with one line naming the requested server and the servers the terminal holds.
    - Closes the terminal, which keeps the acquired server definitions.
-4. Launches `terminal64.exe /config:<the ini copy> /portable`. `ticks_setup` opens the spawner's chart on the spawner symbol. **Starts the log tail,** `/opt/mt5/tail_logs.py` under the Linux Python, which streams the terminal's journal (`logs\<YYYYMMDD>.log`) and its experts log (`MQL5\logs\<YYYYMMDD>.log`) into the container log from the start of this boot:
+4. Launches `terminal64.exe /config:<the ini copy> /portable`. `ticks_setup` opens the spawner's chart on the spawner symbol once and publishes its startup result. The first failed chart open exits startup non-zero before the hub starts, with one line naming the symbol and MT5's error code. **Starts the log tail,** `/opt/mt5/tail_logs.py` under the Linux Python, which streams the terminal's journal (`logs\<YYYYMMDD>.log`) and its experts log (`MQL5\logs\<YYYYMMDD>.log`) into the container log from the start of this boot:
    - each line converted from the terminal's UTF-16LE to UTF-8, its byte-order mark and carriage return stripped, and prefixed `terminal:` or `experts:`, its text otherwise written as the terminal wrote it;
    - each log followed onto the next UTC day's file when it appears.
 5. **Adds `127.0.0.1` to the WebRequest allowlist,** which no ini key sets: on the Experts tab of Tools → Options it ticks "Allow WebRequest for listed URL" where unticked, adds `127.0.0.1` to the list, and applies the dialog. The list must then hold that one URL.
-6. Starts the hub (`mt5-connector-hub`, the Linux Python).
+6. Requires the spawner chart's successful startup result, then starts the hub (`mt5-connector-hub`, the Linux Python). Startup never retries a failed server search or chart open; the runtime's container restart policy controls another start.
 7. Supervises Xvfb, the terminal and the hub: the first of them to exit ends the container with its status, and whatever started the container decides whether to start it again. A lost broker session is the terminal's own to recover and ends nothing, and so does a log tail that exits: the log names its status and the tail is restarted, skipping what the logs hold at its first read — so the lines written between the stopped tail's last read and the restart are lost.
 
 **The dialogs are driven by control identity**, by `/opt/mt5/terminal_gui.py` under the Windows Python, through Win32 messages and never a screen position:
@@ -337,11 +337,11 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 - a dialog is opened by the command id its menu path holds in `terminal64.exe`'s own menu resources;
 - a control is found by its id and class, the Options page by its tab's name.
 
-The WebRequest list's text cannot be read, so its row count confirms the URL. An allowlist retry finding exactly one URL applies it without adding another. The server search and allowlist steps each get three attempts within the same start. Each attempt launches its terminal, waits up to 120 s for its window, and runs its GUI action bounded at 40 s. A failed attempt closes its terminal, killing it if it does not exit within 60 s, before the 5 s retry delay. Each failure names its step, attempt and driver error, including the last window poll's output; the third fails startup. The server's name reaches the driver through `MT5_SERVER` alone.
+The WebRequest list's text cannot be read, so its row count confirms the URL. An allowlist retry finding exactly one URL applies it without adding another. Only the allowlist step gets three attempts within the same start. Each attempt launches its terminal, waits up to 120 s for its window, and runs its GUI action bounded at 40 s. A failed allowlist attempt closes its terminal, killing it if it does not exit within 60 s, before the 5 s retry delay. Each allowlist failure names its step, attempt and driver error, including the last window poll's output; the third fails startup. A chart-open failure stops the start even while the allowlist is being configured. The server's name reaches the driver through `MT5_SERVER` alone.
 
 Before every attempt, `dismiss-dialogs` lists owned dialogs, closes a recognised terminal update offer and cancels only that step's own dialog: Options or Open an Account. Unknown dialogs are named and left open. A main window that stays disabled also reports its owned dialogs.
 
-A terminal window, dialog or control that never appears exhausts its step's attempts and fails the start, naming the step. A search that never supplies the requested server also fails the start. What the entrypoint cannot see — a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
+A terminal window, dialog or control that never appears fails its step, naming it; only the allowlist can retry. A search that does not supply the requested server fails immediately. A spawner chart that does not open or accept its template fails startup. A refused login without a chart error can still leave the hub's `/health` at 503: no sample verifies the broker clock, so the hub answers requests `not_ready` and logs the missed bootstrap window as critical.
 
 ### Stop
 
@@ -626,7 +626,8 @@ MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
 
 It pins that:
 
-- a start on that account boots up to the hub, printing the account's password nowhere;
+- a start on that unknown account fails before the hub when no spawner starts, printing the account's password nowhere;
+- a failed native chart result exits startup with its symbol and MT5 error code, before the hub starts;
 - a server absent from the terminal's catalog fails startup with the gate's diagnostic before the hub starts;
 - the logged terminal build matches its copied build file, and the boot pays no full recompile;
 - the copied-terminal build check rejects another build naming both numbers and bounds a missing start at 120 s;
@@ -638,8 +639,10 @@ It pins that:
 - a boot leaves WebRequest allowed for one URL;
 - a restart restores the baked state — a file added under `Config\` or the AppData tree removed, a same-length rewrite of a baked file with its timestamp undone, a value written into the terminal's registry key gone — and leaves `Bases` alone;
 - the driver fails naming a control a dialog lacks;
-- the hub boots and answers `/health` 503, with no spawner connected and no clock verified, on the loopback port the runtime published it at, and the image's healthcheck reaches it and fails on that 503;
+- the standalone hub, launched directly rather than through terminal startup, answers `/health` 503 with no spawner or verified clock, and the image's healthcheck reaches it and fails on that 503;
 - the image declares its healthcheck as the health probe, every 30 s under a 5 s timeout and unhealthy after 3 failures.
+
+GUI and baked-state cases run the image's terminal bootstrap without a hub or startup script. Supervisor and GUI-retry cases pair a native startup-result double with a stubbed hub; authenticated spawner startup is certified by the functional tier.
 
 Its tests of the driver's menu and tab lookups, of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — and of the health probe, passing on HTTP 200 alone and naming a 503 or a hub not listening, run without an image.
 
@@ -649,7 +652,9 @@ From the repository root, `just functional` builds the checkout and certifies it
 
 The command requires Podman and the declared development environment. It verifies the requested server check, HTTP 200 from the hub, the authenticated demo identity, and the EA's native `trading allowed: terminal=true, expert=true` line. It requires a flat login, buys the symbol's minimum market volume, closes that position, retries a failed close once, and confirms no position or order remains. It runs the native terminal-log case from `tests/functional`, the live hub suite with full and capped terminals, and both historical suites with their native capture prerequisites. The final check requires the login to be flat again.
 
-Native tester references and independent floor witnesses are bundled in `tests/fixtures/tickgen-btc`. Their checksums are verified before the image starts; missing historical inputs fail rather than skip. Connection settings are copied to a private temporary environment file, passed through `--env-file`, and removed. Process output is redacted. Containers and capture volumes are removed; the main and capped history caches persist between runs.
+Native tester references and independent floor witnesses are bundled in `tests/fixtures/tickgen-btc`. Their checksums are verified before the image starts. Every certification skip, including a collection skip or expected failure, becomes a named failure. Connection settings are copied to a private temporary environment file, passed through `--env-file`, and removed. Process output is redacted. Containers and capture volumes are removed; only the main history cache persists between runs.
+
+The real-tick volume windows come from independent native `CopyTicks` and `CopyRates` reads, with their bounds, counts, compiler result, source hash, and capture checksums recorded under the run's `live/provenance.json`. The five-day window starts after the first real tick's minute; the one-minute window is a positive-volume native bar at broker 14:24 within it. Both must end before the native live edge's stability margin. The capped history clone rebuilds M1 at `MT5_MAX_BARS=5000`; native reads must confirm that cap and an M1 first date at least two days after the first real tick. This leaves a full interior day for the unchanged floor-gap assertion.
 
 The `functional` Action runs on a self-hosted Linux X64 runner, with the connection from repository secrets `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`. A dispatch tests its selected commit. A pull-request comment whose first line is exactly `/functional`, from an owner, member, or collaborator, resolves the head at that comment's position in the PR timeline. It refuses subsequent head changes, checks out that exact SHA, and checks the approval again before exposing connection secrets. Comment commands use the workflow controls on the default branch and mark the approved commit's result.
 
@@ -664,18 +669,19 @@ A `v*` tag push certifies that tag's commit before calling the wheel and image p
 | `MT5_LIVE_HUB_SYMBOL` | the symbol every case reads and trades | — |
 | `MT5_LIVE_HUB_URL` | the hub of container 1, its `MaxBars` the ceiling, which every case but the capped ones reads | `ws://127.0.0.1:9000` |
 | `MT5_LIVE_CAPPED_HUB_URL` | the hub of container 2, its `MaxBars` capped, which the span-cap case and the capped floor's case read; a case that finds no hub there fails naming it | `ws://127.0.0.1:9001` |
+| `MT5_LIVE_PREPARED_DIR` | the native live preparation holding `provenance.json` and its checked captures | — |
 
 `just functional` starts and synchronizes both containers and runs this tier. By hand, from the repository root:
 
 1. Write a `.env` there, which is never committed: one unquoted `NAME=value` per line, holding nothing the shell interprets, since the container runtime reads each value verbatim and step 4 sources the file. It carries the entrypoint's `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, and the tier's `MT5_LIVE_HUB_SYMBOL`.
-2. Start both containers from the image under test, each with its own history volume. The two terminals log into the same account at once. Container 2's `MaxBars` of 100,000 caps one read's span at about 70 days of M1 periods:
+2. Start both containers from the image under test, each with its own history volume. The two terminals log into the same account at once. Container 2's `MaxBars` of 5,000 caps one read's span at about three days of M1 periods:
 
    ```bash
    image=localhost/mt5-connector-server
    bases="/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
    podman run -d --name mt5-live-1 --env-file .env -p 127.0.0.1:9000:9000 \
      -v mt5-live-1-bases:"$bases" --stop-timeout 190 "$image"
-   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=100000 \
+   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=5000 \
      -p 127.0.0.1:9001:9000 -v mt5-live-2-bases:"$bases" --stop-timeout 190 "$image"
    ```
 
@@ -689,9 +695,18 @@ A `v*` tag push certifies that tag's commit before calling the wheel and image p
 
    A symbol's first history request on a fresh volume waits for its bar store and its whole tick history, possibly hours, while each case waits at most two history bounds per read: the tier runs on volumes that have synced `MT5_LIVE_HUB_SYMBOL` before, which a `ranges` of it on each hub, asked again until it answers, does.
 
-4. Run the tier:
+4. The volume cases require independent native preparation. Replace container 2 with the prepared capped clone, wait for its health, and run the tier:
 
    ```bash
+   podman stop mt5-live-2
+   podman rm mt5-live-2
+   python tests/live/prepare_live.py --image "$image" --seed-container mt5-live-1 \
+     --name mt5-live-input --output "$PWD/scripts/mt5-live-input"
+   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=5000 \
+     -p 127.0.0.1:9001:9000 -v mt5-live-input-capped-bases:"$bases" \
+     --stop-timeout 190 "$image"
+   until curl -fsS http://127.0.0.1:9001/health >/dev/null; do sleep 10; done
+   export MT5_LIVE_PREPARED_DIR="$PWD/scripts/mt5-live-input"
    set -a; . ./.env; set +a
    pytest tests/live -q -rA
    ```
@@ -701,6 +716,7 @@ A `v*` tag push certifies that tag's commit before calling the wheel and image p
    ```bash
    podman stop mt5-live-1 mt5-live-2
    podman rm mt5-live-1 mt5-live-2
+   python tests/live/prepare_tickgen.py --cleanup --name mt5-live-input
    ```
 
 `docker` takes the same commands.

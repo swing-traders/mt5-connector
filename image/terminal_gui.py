@@ -667,7 +667,7 @@ def _open_row_editor(url_list: int, row: int) -> int:
     )
 
 
-def search_server(server: str, searches: int) -> None:
+def search_server(server: str) -> None:
     """Search and select the exact server without logging in; raise DialogError when absent."""
     dialog = _open_dialog(_enabled_main_window(), ACCOUNT_MENU_PATH, "the account dialog")
     page = _current_page(dialog, "the account dialog")
@@ -707,30 +707,30 @@ def search_server(server: str, searches: int) -> None:
         raise DialogError("the Login server dropdown has an invalid selection")
     selected_name = servers[selected] if selected >= 0 else "(none)"
     held = ", ".join(servers)
+    refusal = f"trade server search: requested {server}, terminal holds [{held}]"
     print(
         f"mt5: trade server search: terminal holds [{held}], selected {selected_name}",
         flush=True,
     )
     if server in servers:
         index = servers.index(server)
-        if _send(dropdown, Message.CB_SETCURSEL, index) != index:
-            raise DialogError("the Login server dropdown did not select the requested server")
-        # CB_SETCURSEL does not notify the dialog of a changed selection.
-        _send(
-            dialog,
-            Message.WM_COMMAND,
-            LOGIN_SERVER_ID | (Notification.CBN_SELCHANGE << 16),
-            dropdown,
-        )
-        _close_dialog(dialog, Command.CANCEL, "the Login dialog")
+        try:
+            if _send(dropdown, Message.CB_SETCURSEL, index) != index:
+                raise DialogError(refusal)
+            # CB_SETCURSEL does not notify the dialog of a changed selection.
+            _send(
+                dialog,
+                Message.WM_COMMAND,
+                LOGIN_SERVER_ID | (Notification.CBN_SELCHANGE << 16),
+                dropdown,
+            )
+            _close_dialog(dialog, Command.CANCEL, "the Login dialog")
+        except DialogError:
+            raise DialogError(refusal) from None
         print("mt5: the Login server dropdown selected the requested trade server", flush=True)
     else:
         _close_dialog(dialog, Command.CANCEL, "the Login dialog")
-        noun = "search" if searches == 1 else "searches"
-        raise DialogError(
-            f"trade server search: requested {server}, "
-            f"terminal holds [{held}] after {searches} {noun}"
-        )
+        raise DialogError(refusal)
 
 
 def allow_webrequest(url: str) -> None:
@@ -811,7 +811,7 @@ def main() -> None:
             _main_window()
             print("mt5: the terminal's main window is up", flush=True)
         elif action == Action.SEARCH_SERVER:
-            search_server(os.environ["MT5_SERVER"], int(os.environ["MT5_SERVER_SEARCH_NUMBER"]))
+            search_server(os.environ["MT5_SERVER"])
         elif action == Action.DISMISS_DIALOGS:
             dismiss_dialogs(args.own_caption)
         else:

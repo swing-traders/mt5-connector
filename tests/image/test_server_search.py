@@ -20,30 +20,28 @@ _OTHER = "ExampleOther-Demo"
 
 
 @pytest.mark.parametrize(
-    ("results", "searches", "proceeds", "window_failures", "immediate"),
+    ("results", "searches", "proceeds", "window_failures", "immediate", "selection_fails"),
     [
-        ([[_OTHER, _REQUESTED]], 1, True, 0, False),
-        ([[_OTHER], [_OTHER, _REQUESTED]], 2, True, 0, False),
-        ([[_OTHER], [_OTHER], [_OTHER]], 3, False, 0, False),
-        ([[_OTHER], [_OTHER]], 2, False, 1, False),
-        ([[_REQUESTED + "-Old", _REQUESTED]], 1, True, 0, False),
-        ([[_REQUESTED + "-Old"]] * 3, 3, False, 0, False),
-        ([[_OTHER]], 1, False, 2, False),
-        ([[_OTHER, _REQUESTED]], 1, True, 0, True),
+        ([[_OTHER, _REQUESTED]], 1, True, 0, False, False),
+        ([[_OTHER]], 1, False, 0, False, False),
+        ([[_OTHER]], 0, False, 1, False, False),
+        ([[_REQUESTED + "-Old", _REQUESTED]], 1, True, 0, False, False),
+        ([[_REQUESTED + "-Old"]], 1, False, 0, False, False),
+        ([[_OTHER, _REQUESTED]], 1, True, 0, True, False),
+        ([[_OTHER, _REQUESTED]], 1, False, 0, False, True),
     ],
     ids=[
         "present-selects",
-        "absent-then-present-retries",
-        "absent-stops-startup",
-        "window-failure-is-not-a-search",
+        "absent-stops-first-search",
+        "window-failure-stops-startup",
         "exact-name-after-prefix-neighbor",
         "prefix-neighbor-is-not-the-requested-server",
-        "one-search-uses-singular",
         "immediate-search-completion",
+        "selection-failure-stops-startup",
     ],
 )
 def test_startup_requires_the_requested_server(
-    tmp_path, results, searches, proceeds, window_failures, immediate
+    tmp_path, results, searches, proceeds, window_failures, immediate, selection_fails
 ):
     state = tmp_path / "terminal.json"
     state.write_text(
@@ -54,6 +52,7 @@ def test_startup_requires_the_requested_server(
                 "selected": 0,
                 "notified": False,
                 "immediate": immediate,
+                "selection_fails": selection_fails,
             }
         )
     )
@@ -114,22 +113,12 @@ echo HUB_MAY_START
     if proceeds:
         assert held["results"][searches - 1][held["selected"]] == _REQUESTED
         assert held["notified"]
-    else:
-        noun = "search" if searches == 1 else "searches"
-        assert result.stdout.splitlines()[-1].endswith(
-            f"trade server search: requested {_REQUESTED}, "
-            f"terminal holds [{', '.join(results[-1])}] after {searches} {noun}"
+    elif searches:
+        expected = (
+            f"mt5: trade server search: requested {_REQUESTED}, "
+            f"terminal holds [{', '.join(results[0])}]"
         )
-
-
-def test_search_requires_the_entrypoints_search_number(gui, monkeypatch):
-    monkeypatch.setenv("MT5_SERVER", _REQUESTED)
-    monkeypatch.delenv("MT5_SERVER_SEARCH_NUMBER", raising=False)
-    monkeypatch.setattr(sys, "argv", ["terminal_gui.py", "search-server"])
-    monkeypatch.setattr(gui, "search_server", lambda *args: None)
-
-    with pytest.raises(KeyError, match="MT5_SERVER_SEARCH_NUMBER"):
-        gui.main()
+        assert (result.stdout + result.stderr).splitlines().count(expected) == 1
 
 
 def _drive() -> None:
@@ -172,6 +161,8 @@ def _drive() -> None:
                     buffer.value = text
                 return len(text)
             case 0x014E:  # CB_SETCURSEL
+                if state["selection_fails"]:
+                    return -1
                 state["selected"] = wparam
                 return wparam
             case 0x0111:  # WM_COMMAND: server selection notification.

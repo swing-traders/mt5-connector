@@ -246,6 +246,25 @@ def collect(
     baked_ini = podman("run", "--rm", "--entrypoint", "cat", image, "/opt/mt5/setup.ini")
     setup = collector / "setup.ini"
     setup.write_text(baked_ini.replace("Script=ticks_setup", "Script=tickgen_raw"))
+    entrypoint = podman("run", "--rm", "--entrypoint", "cat", image, "/opt/mt5/entrypoint.sh")
+    definitions, boundary, _ = entrypoint.partition(
+        "# A boot step failing because a supervised process stopped"
+    )
+    if not boundary:
+        raise Unprepared("the image has no native bootstrap definitions")
+    native_boot = collector / "native-entrypoint.sh"
+    # A reference collector runs only the terminal; it neither attaches an EA nor starts a hub.
+    native_boot.write_text(definitions + """
+trap end_with_stopped EXIT
+trap stop_on_request TERM INT
+require_settings
+start_display
+restore_baked_terminal
+write_inis
+acquire_server_list
+allow_webrequest
+supervise
+""")
     baked = "/opt/mt5-baked/terminal/MQL5"
     podman(
         "run",
@@ -254,6 +273,8 @@ def collect(
         container,
         "--label",
         f"{LABEL}={name}",
+        "--entrypoint",
+        "tini",
         "--env-file",
         str(env_file),
         "-e",
@@ -263,12 +284,17 @@ def collect(
         "-v",
         f"{setup}:/opt/mt5/setup.ini:ro,z",
         "-v",
+        f"{native_boot}:/opt/mt5/native-entrypoint.sh:ro,z",
+        "-v",
         f"{collector / 'tickgen_raw.ex5'}:{baked}/Scripts/tickgen_raw.ex5:ro,z",
         "-v",
         f"{parameters}:{baked}/Files/tickgen_raw.txt:ro,z",
         "--stop-timeout",
         "190",
         image,
+        "--",
+        "bash",
+        "/opt/mt5/native-entrypoint.sh",
     )
     outcome_path = f"{TERMINAL}/MQL5/Files/tickgen-raw/outcome.txt"
     deadline = time.monotonic() + COLLECTOR_BOUND_S

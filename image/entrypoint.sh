@@ -9,6 +9,8 @@ readonly baked_dir=/opt/mt5-baked
 readonly runtime_dir=/tmp/mt5
 readonly startup_ini="$runtime_dir/setup.ini"
 readonly search_ini="$runtime_dir/search.ini"
+readonly spawner_ready="$terminal_dir/MQL5/Files/ticks_setup.ready"
+readonly spawner_error="$terminal_dir/MQL5/Files/ticks_setup.error"
 # Unset, the terminal's ceiling: it clamps a larger MaxBars to it. Set empty, it is refused.
 readonly max_bars="${MT5_MAX_BARS-100000000}"
 readonly window_wait_seconds=120
@@ -69,8 +71,7 @@ gui() {
 retried() {
     local what=$1 own_dialog=$2 ini=$3
     shift 3
-    # This retry owner sees search starts even when its timeout kills the driver.
-    local attempt status output detail message searches=0
+    local attempt status output detail message
     for ((attempt = 1; attempt <= step_attempts; attempt++)); do
         start_terminal "$(config_argument "$ini")"
         if [[ "$ini" == "$startup_ini" ]]; then
@@ -83,11 +84,7 @@ retried() {
             gui dismiss-dialogs "$own_dialog" \
                 || step "the dialog dismissal for $what failed with status $?"
             status=0
-            output=$(MT5_SERVER_SEARCH_NUMBER="$((searches + 1))" gui "$@" 2>&1) || status=$?
-            # A terminal launch can fail before any search starts.
-            if [[ "$output" == *"$MT5_SERVER_SEARCH_STARTED_MARKER"* ]]; then
-                searches=$((searches + 1))
-            fi
+            output=$(gui "$@" 2>&1) || status=$?
             end_with_stopped
             if ((status == 0)); then
                 [[ -z "$output" ]] || printf '%s\n' "$output"
@@ -178,6 +175,8 @@ restore_baked_terminal() {
 }
 
 start_terminal() {
+    refuse_failed_spawner
+    rm -f "$spawner_ready"
     wine "$terminal_dir/terminal64.exe" "$@" /portable >/dev/null 2>&1 &
     terminal_pid=$!
 }
@@ -222,7 +221,19 @@ discard_terminal() {
 # started with no account opens that dialog on its own, so this session starts with one.
 acquire_server_list() {
     step "fetching the trade server's broker into the server list"
-    retried "the server search" "Open an Account" "$search_ini" search-server
+    start_terminal "$(config_argument "$search_ini")"
+    await_terminal_window || fail "$await_error"
+    gui dismiss-dialogs "Open an Account" \
+        || step "the dialog dismissal for the server search failed with status $?"
+    local status=0 output
+    output=$(gui search-server 2>&1) || status=$?
+    end_with_stopped
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+    case $status in
+        0) ;;
+        124 | 137) fail "the server search did not finish within ${gui_seconds}s" ;;
+        *) exit 1 ;;
+    esac
     close_terminal
 }
 
@@ -262,6 +273,21 @@ config_argument() {
 allow_webrequest() {
     step "adding 127.0.0.1 to the WebRequest allowlist"
     retried "the WebRequest allowlist" Options "$startup_ini" allow-webrequest 127.0.0.1
+}
+
+refuse_failed_spawner() {
+    if [[ -f "$spawner_error" ]]; then
+        local detail
+        detail=$(<"$spawner_error")
+        trap - EXIT
+        fail "${detail//$'\r'/}"
+    fi
+}
+
+await_spawner() {
+    end_with_stopped
+    await "spawner chart" "$window_wait_seconds" test -f "$spawner_ready" || fail "$await_error"
+    end_with_stopped
 }
 
 # Streams the terminal's journal and experts log into the container's log. Its exit ends nothing: a
@@ -369,6 +395,7 @@ supervise() {
 
 # Ends the container with the exit of the first supervised process found stopped, if one has.
 end_with_stopped() {
+    refuse_failed_spawner
     local pid
     for pid in "${!process_names[@]}"; do
         if ! kill -0 "$pid" 2>/dev/null; then
@@ -402,5 +429,6 @@ write_inis
 acquire_server_list
 step "launching the terminal"
 allow_webrequest
+await_spawner
 start_hub
 supervise

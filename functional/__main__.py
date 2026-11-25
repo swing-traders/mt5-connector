@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import fcntl
+import json
 import os
 import shutil
 import signal
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from . import ROOT, history
 from .certify import CALL_SECONDS, certify
-from .runtime import BASES, Runtime
+from .runtime import Runtime
 from .settings import Redactor, load, write
 
 
@@ -126,10 +127,14 @@ def run(values, runtime):
         "MT5_FUNCTIONAL": "1",
         "MT5_IMAGE_TEST": image,
         "MT5_TICK_EXPORT_DIR": str(output / "exports"),
+        "PYTEST_PLUGINS": ",".join(
+            filter(None, (os.environ.get("PYTEST_PLUGINS"), "functional.pytest_gate"))
+        ),
     }
     cache = Path.home() / ".cache" / "mt5-connector"
     cache.mkdir(parents=True, exist_ok=True)
     owned_history = []
+    owned_live = None
     built = False
     with (
         (cache / "functional.lock").open("w") as lock,
@@ -159,44 +164,38 @@ def run(values, runtime):
                 env=environment,
             )
             asyncio.run(prime(runtime, port, values["MT5_LIVE_HUB_SYMBOL"]))
-            runtime.command("podman", "volume", "create", "--ignore", "mt5-functional-capped-bases")
-            clone_name = f"{stem}-clone"
-            runtime.containers.append(clone_name)
+            owned_live = f"{stem}-live"
+            live_output = output / "live"
             runtime.stream(
                 [
-                    "podman",
-                    "run",
-                    "--no-healthcheck",
-                    "--name",
-                    clone_name,
-                    "--user",
-                    "root",
-                    "--entrypoint",
-                    "rsync",
-                    "-v",
-                    f"mt5-functional-main-bases:{BASES}:ro",
-                    "-v",
-                    "mt5-functional-capped-bases:/to",
+                    sys.executable,
+                    "tests/live/prepare_live.py",
+                    "--image",
                     image,
-                    "-a",
-                    f"{BASES}/",
-                    "/to/",
-                ]
+                    "--seed-container",
+                    main_name,
+                    "--name",
+                    owned_live,
+                    "--output",
+                    str(live_output),
+                ],
+                env=environment,
             )
-            runtime.stop(clone_name)
+            recorded = json.loads((live_output / "provenance.json").read_text())
             capped_name = f"{stem}-capped"
             capped_port = runtime.boot(
                 image,
                 capped_name,
                 env_file,
-                maxbars=100_000,
-                volume="mt5-functional-capped-bases",
+                maxbars=recorded["cap"]["requested"],
+                volume=recorded["capped_volume"],
             )
             runtime.healthy(capped_name, capped_port)
             runtime.permissions(capped_name)
             asyncio.run(prime(runtime, capped_port, values["MT5_LIVE_HUB_SYMBOL"]))
             environment["MT5_LIVE_HUB_URL"] = f"ws://127.0.0.1:{port}"
             environment["MT5_LIVE_CAPPED_HUB_URL"] = f"ws://127.0.0.1:{capped_port}"
+            environment["MT5_LIVE_PREPARED_DIR"] = str(live_output)
             runtime.stream(
                 [sys.executable, "-m", "pytest", "tests/live/test_hub_live.py", "-v", "--tb=short"],
                 env=environment,
@@ -220,8 +219,21 @@ def run(values, runtime):
                 try:
                     runtime.cleanup()
                 finally:
-                    if built:
-                        runtime.command("podman", "image", "rm", image)
+                    try:
+                        if owned_live is not None:
+                            runtime.stream(
+                                [
+                                    sys.executable,
+                                    "tests/live/prepare_tickgen.py",
+                                    "--cleanup",
+                                    "--name",
+                                    owned_live,
+                                ],
+                                env=environment,
+                            )
+                    finally:
+                        if built:
+                            runtime.command("podman", "image", "rm", image)
     print("Functional certification passed.", flush=True)
 
 
