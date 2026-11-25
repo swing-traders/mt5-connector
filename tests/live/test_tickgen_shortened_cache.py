@@ -1,7 +1,7 @@
-"""The candidate hub tests/live/prepare_tickgen.py starts with `--shorten-cache`, on a history copy
-whose M1 frame cache the collector rewrote short, answering the floors and the bars of the
-untouched copy. It runs only when MT5_TICK_RAW_DIR is set; MT5_TICK_ACCEPTANCE_REQUIRED=1 fails
-every case whose inputs or hub are missing instead of skipping it."""
+"""Check a MaxBars=100000 M1 frame rebuild against independent native tester floors and rows.
+
+MT5_TICK_RAW_DIR names its preparation; MT5_TICK_ACCEPTANCE_REQUIRED=1 makes missing inputs fail.
+"""
 
 import asyncio
 import json

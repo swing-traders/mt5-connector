@@ -26,7 +26,7 @@ async def _ask(session, call, **arguments):
     return (await asyncio.wait_for(session.deferring(call, **arguments), CALL_SECONDS)).result
 
 
-async def _close_and_confirm_flat(session, symbol, filling):
+async def _close_and_confirm_flat(session, symbol, filling, report):
     for attempt in range(2):
         try:
             orders = await _ask(session, calls.Call.ORDERS_GET)
@@ -77,13 +77,17 @@ async def _close_and_confirm_flat(session, symbol, filling):
                     ):
                         raise CertificationError("the login is not flat after certification")
                     await asyncio.sleep(0.25)
+        except CertificationError:
+            raise
         except Exception as failure:
             if attempt == 1:
-                raise CertificationError("close failed after 2 attempts") from failure
-    raise AssertionError("the close attempts did not resolve")
+                raise CertificationError(f"close failed after 2 attempts: {failure}") from failure
+            report(
+                f"First close attempt failed: {type(failure).__name__}: {failure}; retrying once."
+            )
 
 
-async def certify(session, *, login, server, symbol):
+async def certify(session, *, login, server, symbol, report):
     account = await _ask(session, calls.Call.ACCOUNT_INFO)
     if account.login != login or account.server != server:
         raise CertificationError("the authenticated login or server does not match")
@@ -135,4 +139,4 @@ async def certify(session, *, login, server, symbol):
                     break
                 await asyncio.sleep(0.25)
     finally:
-        await _close_and_confirm_flat(session, symbol, filling)
+        await _close_and_confirm_flat(session, symbol, filling, report)

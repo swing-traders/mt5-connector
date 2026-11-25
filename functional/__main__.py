@@ -62,6 +62,7 @@ async def round_trip(runtime, port, values):
             login=int(values["MT5_LOGIN"]),
             server=values["MT5_SERVER"],
             symbol=values["MT5_LIVE_HUB_SYMBOL"],
+            report=lambda message: print(runtime.redact(message), flush=True),
         )
     finally:
         await session.disconnect()

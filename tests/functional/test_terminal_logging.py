@@ -75,8 +75,13 @@ def test_the_terminal_logs_reach_the_container_log_verbatim(tmp_path) -> None:
         )
         written = f"terminal: '{login}': authorized on {server} through Access Server"
         _await_log(runtime, name, written, count=1, seconds=30)
-        # The experts log is written only once the startup script runs, after the journal.
-        _await_log(runtime, name, "\nexperts: ", count=1, seconds=60)
+        _await_log(
+            runtime,
+            name,
+            "trading allowed: terminal=true, expert=true",
+            count=1,
+            seconds=60,
+        )
         printed = _logs(runtime, name)
 
     assert re.search(r"^terminal: .*MetaTrader 5 x64 build \d+ started", printed, re.MULTILINE)

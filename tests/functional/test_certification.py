@@ -64,7 +64,7 @@ class Session:
 
 async def test_the_smallest_buy_is_closed_and_the_account_is_flat():
     session = Session()
-    await certify(session, login=1, server="Example-Demo", symbol="TEST")
+    await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.position is None
     assert session.orders == []
     assert [request["type"] for request in session.sent] == [
@@ -75,17 +75,24 @@ async def test_the_smallest_buy_is_closed_and_the_account_is_flat():
     assert session.sent[1]["position"] == 42
 
 
-async def test_a_failed_close_is_retried_once():
+async def test_a_failed_close_is_logged_before_retrying_once():
     session = Session(close_failures=1)
-    await certify(session, login=1, server="Example-Demo", symbol="TEST")
+    messages = []
+
+    def report(message):
+        assert len(session.sent) == 2
+        messages.append(message)
+
+    await certify(session, login=1, server="Example-Demo", symbol="TEST", report=report)
     assert session.position is None
     assert len(session.sent) == 3
+    assert messages == ["First close attempt failed: TimeoutError: close failed; retrying once."]
 
 
 async def test_two_failed_closes_fail_loudly_without_a_third_attempt():
     session = Session(close_failures=2)
-    with pytest.raises(CertificationError, match="close failed after 2 attempts"):
-        await certify(session, login=1, server="Example-Demo", symbol="TEST")
+    with pytest.raises(CertificationError, match="close failed after 2 attempts: close failed"):
+        await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.position is not None
     assert len(session.sent) == 3
 
@@ -93,14 +100,14 @@ async def test_two_failed_closes_fail_loudly_without_a_third_attempt():
 async def test_a_lost_buy_answer_still_closes_the_filled_position():
     session = Session(buy_failure=True)
     with pytest.raises(TimeoutError, match="answer lost"):
-        await certify(session, login=1, server="Example-Demo", symbol="TEST")
+        await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.position is None
     assert len(session.sent) == 2
 
 
 async def test_a_lost_close_answer_rechecks_flatness_without_closing_twice():
     session = Session(close_answer_lost=True)
-    await certify(session, login=1, server="Example-Demo", symbol="TEST")
+    await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.position is None
     assert len(session.sent) == 2
 
@@ -110,8 +117,28 @@ async def test_invalid_login_or_permissions_refuse_before_placing_an_order(field
     session = Session()
     setattr(session.account, field, False if field == "trade_allowed" else "different")
     with pytest.raises(CertificationError):
-        await certify(session, login=1, server="Example-Demo", symbol="TEST")
+        await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.sent == []
+
+
+async def test_foreign_exposure_after_the_buy_refuses_without_retry():
+    session = Session()
+    original = session.deferring
+
+    async def deferring(call, **arguments):
+        answered = await original(call, **arguments)
+        if call == calls.Call.ORDER_SEND and arguments["request"]["type"] == mirror.ORDER_TYPE_SELL:
+            session.position = SimpleNamespace(ticket=99, magic=0)
+        return answered
+
+    session.deferring = deferring
+    messages = []
+    with pytest.raises(CertificationError, match="not flat after certification"):
+        await certify(
+            session, login=1, server="Example-Demo", symbol="TEST", report=messages.append
+        )
+    assert len(session.sent) == 2
+    assert messages == []
 
 
 async def test_existing_exposure_is_left_untouched():
@@ -119,7 +146,7 @@ async def test_existing_exposure_is_left_untouched():
     held = SimpleNamespace(ticket=43, magic=0)
     session.position = held
     with pytest.raises(CertificationError, match="not flat"):
-        await certify(session, login=1, server="Example-Demo", symbol="TEST")
+        await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.position is held
     assert session.sent == []
 
@@ -128,7 +155,7 @@ async def test_a_terminal_that_disallows_trading_refuses_before_any_order():
     session = Session()
     session.terminal.trade_allowed = False
     with pytest.raises(CertificationError, match="does not allow trading"):
-        await certify(session, login=1, server="Example-Demo", symbol="TEST")
+        await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.sent == []
 
 
@@ -137,6 +164,6 @@ async def test_a_resting_order_is_left_untouched():
     resting = SimpleNamespace(ticket=44, magic=0)
     session.orders = [resting]
     with pytest.raises(CertificationError, match="not flat"):
-        await certify(session, login=1, server="Example-Demo", symbol="TEST")
+        await certify(session, login=1, server="Example-Demo", symbol="TEST", report=print)
     assert session.orders == [resting]
     assert session.sent == []

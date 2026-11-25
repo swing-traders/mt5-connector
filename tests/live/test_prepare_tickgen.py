@@ -119,9 +119,7 @@ def test_an_output_directory_holding_an_earlier_capture_is_refused_before_any_co
     assert commands == []
 
 
-def test_shortened_cache_preparation_needs_a_native_read_but_no_tick_era_hole(
-    monkeypatch, tmp_path
-):
+def test_shortened_cache_preparation_records_the_native_capped_frame(monkeypatch, tmp_path):
     import mt5connector.client
 
     monkeypatch.setattr(prepare_tickgen, "CHECKOUT", tmp_path)
@@ -152,9 +150,6 @@ def test_shortened_cache_preparation_needs_a_native_read_but_no_tick_era_hole(
         directory.mkdir()
         return directory
 
-    def missing_hole(*arguments):
-        raise prepare_tickgen.Unprepared("no native tick-era hole")
-
     async def settled(port):
         return {
             "terminal_build": "test-build",
@@ -164,7 +159,6 @@ def test_shortened_cache_preparation_needs_a_native_read_but_no_tick_era_hole(
         }
 
     monkeypatch.setattr(prepare_tickgen, "collect", collect)
-    monkeypatch.setattr(prepare_tickgen, "mixed_fixture", missing_hole)
     monkeypatch.setattr(prepare_tickgen, "settled", settled)
     prepare_tickgen.prepare(
         argparse.Namespace(
@@ -177,7 +171,6 @@ def test_shortened_cache_preparation_needs_a_native_read_but_no_tick_era_hole(
         )
     )
     prepared = json.loads((tmp_path / "scripts/shortened/provenance.json").read_text())
-    assert captured == [("baseline", 100_000), ("m1-first", 100_000)]
+    assert captured == [("m1-first", 100_000)]
     assert prepared["m1_first_utc"] == 1_800_000_000
     assert prepared["collector_maxbars"] == 100_000
-    assert prepared["fixture"] == {"directory": "raw-baseline", "label": "baseline"}

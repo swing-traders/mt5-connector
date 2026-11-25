@@ -23,24 +23,22 @@ jobs:
       && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
       github.event.comment.author_association)) }}
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       sha: ${{ steps.head.outputs.sha }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
       - name: Resolve the commit under test
         id: head
         uses: actions/github-script@v9
         with:
           script: |
-            if (context.eventName === "issue_comment") {
-              const { data: pull } = await github.rest.pulls.get({
-                ...context.repo,
-                pull_number: context.issue.number,
-              });
-              core.setOutput("sha", pull.head.sha);
-            } else {
-              core.setOutput("sha", context.sha);
-            }
+            const approvedHead = require(`${process.env.GITHUB_WORKSPACE}/.github/functional-head.cjs`);
+            core.setOutput("sha", await approvedHead(github, context));
 
   certify:
     name: functional certification
@@ -52,10 +50,12 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      pull-requests: read
       statuses: write
     defaults:
       run:
         shell: bash -el {0}
+        working-directory: candidate
     env:
       MT5_SPAWNER_SYMBOL: BTCUSD.a
       MT5_LIVE_HUB_SYMBOL: BTCUSD.a
@@ -74,17 +74,43 @@ jobs:
               target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
             });
 
+      - name: Check out the trusted workflow controls
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+
+      - name: Refuse a moved approval before checking out candidate code
+        uses: actions/github-script@v9
+        env:
+          SHA: ${{ needs.head.outputs.sha }}
+        with:
+          script: |
+            const approvedHead = require(`${process.env.GITHUB_WORKSPACE}/control/.github/functional-head.cjs`);
+            await approvedHead(github, context, process.env.SHA);
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.head.outputs.sha }}
+          path: candidate
           persist-credentials: false
 
       - uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: environment.yml
+          environment-file: candidate/environment.yml
 
       - name: Layer the dev tooling and the server
         run: micromamba env update -n mt5-connector -f environment.dev.yml --yes
+
+      - name: Refuse a moved approval before exposing connection secrets
+        uses: actions/github-script@v9
+        env:
+          SHA: ${{ needs.head.outputs.sha }}
+        with:
+          script: |
+            const approvedHead = require(`${process.env.GITHUB_WORKSPACE}/control/.github/functional-head.cjs`);
+            await approvedHead(github, context, process.env.SHA);
 
       - name: Write the private connection environment
         env:
