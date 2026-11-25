@@ -66,3 +66,43 @@ def test_a_changed_native_export_fails_its_registered_checksum(tmp_path, monkeyp
     monkeypatch.setattr(history, "FIXTURES", fixture)
     with pytest.raises(ValueError, match="invalid checksum"):
         history.materialize(tmp_path / "exports")
+
+
+def test_historical_acceptance_prepares_the_reloaded_gap_before_the_full_suite(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(history, "ROOT", tmp_path)
+
+    class Runtime:
+        def __init__(self):
+            self.commands = []
+
+        def stream(self, arguments, *, env):
+            self.commands.append((arguments, env.copy()))
+
+    runtime = Runtime()
+    owned = []
+    history.run(
+        runtime,
+        "candidate",
+        "seed",
+        "acceptance",
+        tmp_path / "scripts/acceptance",
+        {"MT5_FUNCTIONAL_ENV_FILE": "/private/env"},
+        owned,
+    )
+    setup = next(
+        index
+        for index, (arguments, _env) in enumerate(runtime.commands)
+        if "tests/live/prepare_gap.py" in arguments
+    )
+    suite = next(
+        index
+        for index, (arguments, _env) in enumerate(runtime.commands)
+        if "tests/live/test_tickgen_history.py" in arguments
+    )
+    assert setup < suite
+    assert runtime.commands[suite][1]["MT5_GAP_PREPARED_DIR"] == str(
+        tmp_path / "scripts/acceptance/gap"
+    )
+    assert owned == []

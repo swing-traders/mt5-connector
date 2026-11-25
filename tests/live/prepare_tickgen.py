@@ -487,23 +487,18 @@ def prepare(arguments: argparse.Namespace) -> None:
             raw_clone = clone_history(
                 arguments.image, arguments.name, seed_volume, f"{arguments.name}-raw-bases"
             )
-        if arguments.shorten_cache:
-            baseline = window(clock, "baseline", *BASELINE)
-            directory = collect(
-                arguments.image,
-                arguments.name,
-                env_file,
-                raw_clone,
-                [baseline],
-                "baseline",
-                output,
-                maxbars=100_000,
-            )
-            fixture = {"directory": directory.name, "label": "baseline"}
-        else:
-            fixture = mixed_fixture(
-                arguments.image, arguments.name, env_file, raw_clone, clock, output
-            )
+        baseline = window(clock, "baseline", *BASELINE)
+        directory = collect(
+            arguments.image,
+            arguments.name,
+            env_file,
+            raw_clone,
+            [baseline],
+            "baseline",
+            output,
+            maxbars=100_000 if arguments.shorten_cache else 100_000_000,
+        )
+        fixture = {"directory": directory.name, "label": "baseline"}
         if arguments.shorten_cache:
             collected = m1_cache_bytes(arguments.image, clone)
             # The probe must not expand the capped frame before the candidate starts.

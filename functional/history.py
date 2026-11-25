@@ -1,4 +1,4 @@
-"""Materialize registered native exports and run the two historical acceptance lanes."""
+"""Materialize native exports and run historical acceptance with its controlled gap input."""
 
 import gzip
 import hashlib
@@ -56,6 +56,38 @@ def run(runtime, image, seed, stem, output, environment, owned):
         if shortened:
             arguments.append("--shorten-cache")
         runtime.stream(arguments, env=environment)
+        gap_name = None
+        test_environment = {
+            **environment,
+            "MT5_LIVE_HUB_URL": f"ws://127.0.0.1:{port}",
+            "MT5_TICK_RAW_DIR": str(capture),
+            "MT5_TICK_ACCEPTANCE_REQUIRED": "1",
+        }
+        if not shortened:
+            gap_name = f"{stem}-gap"
+            gap_capture = output / "gap"
+            with socket.socket() as available:
+                available.bind(("127.0.0.1", 0))
+                gap_port = available.getsockname()[1]
+            owned.append(gap_name)
+            runtime.stream(
+                [
+                    sys.executable,
+                    "tests/live/prepare_gap.py",
+                    "--image",
+                    image,
+                    "--name",
+                    gap_name,
+                    "--port",
+                    str(gap_port),
+                    "--output",
+                    str(gap_capture),
+                    "--env-file",
+                    environment["MT5_FUNCTIONAL_ENV_FILE"],
+                ],
+                env=environment,
+            )
+            test_environment["MT5_GAP_PREPARED_DIR"] = str(gap_capture)
         selected = (
             "tests/live/test_tickgen_shortened_cache.py"
             if shortened
@@ -63,13 +95,14 @@ def run(runtime, image, seed, stem, output, environment, owned):
         )
         runtime.stream(
             [sys.executable, "-m", "pytest", selected, "-v", "--tb=short"],
-            env={
-                **environment,
-                "MT5_LIVE_HUB_URL": f"ws://127.0.0.1:{port}",
-                "MT5_TICK_RAW_DIR": str(capture),
-                "MT5_TICK_ACCEPTANCE_REQUIRED": "1",
-            },
+            env=test_environment,
         )
+        if gap_name is not None:
+            runtime.stream(
+                [sys.executable, "tests/live/prepare_tickgen.py", "--cleanup", "--name", gap_name],
+                env=environment,
+            )
+            owned.remove(gap_name)
         runtime.stream(
             [sys.executable, "tests/live/prepare_tickgen.py", "--cleanup", "--name", name],
             env=environment,

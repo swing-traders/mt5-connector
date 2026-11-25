@@ -192,7 +192,8 @@ void OnStart()
         Sleep(1000);
     if (outcome == "" && m1First <= 0)
         outcome = "failed: M1's first date is not known";
-    string summary = StringFormat("m1_first %I64d\n", m1First);
+    string summary = StringFormat("terminal_build %I64d\nm1_first %I64d\n",
+                                  TerminalInfoInteger(TERMINAL_BUILD), m1First);
     for (int w = 0; w < ArraySize(labels) && outcome == ""; w++)
     {
         MqlTick ticks[];

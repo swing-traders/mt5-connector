@@ -1,8 +1,9 @@
 """The every-tick generator's historical acceptance against the candidate hub tests/live/
 prepare_tickgen.py starts: the tester's exported weeks, a doji read alone, the venue's real ticks,
-and a later tickless minute rejected inside the tick era. It runs only when MT5_TICK_EXPORT_DIR and
-MT5_TICK_RAW_DIR are set; MT5_TICK_ACCEPTANCE_REQUIRED=1 fails every case whose inputs or hub are
-missing instead of skipping it."""
+and a later tickless minute rejected inside the tick era. MT5_TICK_EXPORT_DIR and MT5_TICK_RAW_DIR
+name the tester lane's inputs; MT5_GAP_PREPARED_DIR names the reloaded custom-symbol input.
+MT5_TICK_ACCEPTANCE_REQUIRED=1 fails a case whose inputs or hub are missing instead of skipping it.
+"""
 
 import asyncio
 import csv
@@ -10,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import tickgen_capture
+import tickgen_gap
 import tickgen_oracle as oracle
 from tickgen_reference import REFERENCE
 
@@ -220,6 +223,64 @@ def last_non_doji(bars: list[tuple]) -> int | None:
         if c != o:
             return oracle.sign(c - o)
     return None
+
+
+@pytest.fixture
+def gap_provenance(monkeypatch):
+    directory = os.environ.get("MT5_GAP_PREPARED_DIR")
+    if directory is None:
+        unavailable("MT5_GAP_PREPARED_DIR must be set")
+    output = Path(directory)
+    prepared = json.loads((output / "provenance.json").read_text())
+    fixture = tickgen_gap.load()
+    tickgen_gap.verify_native(output / prepared["snapshot"], fixture, read_only=False)
+    assert prepared["symbol"] == fixture.provenance["symbol"]
+    assert sha256(CHECKOUT / EA_SOURCE) == prepared["source_sha256"][EA_SOURCE]
+    running = subprocess.run(
+        ["podman", "inspect", "--format", "{{.Image}} {{.State.Running}}", prepared["container"]],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert running.stdout.split() == [prepared["image_id"], "true"]
+    module = sys.modules[__name__]
+    original_reads = session_reads
+    monkeypatch.setattr(module, "SYMBOL", prepared["symbol"])
+    monkeypatch.setattr(module, "HUB_URL", f"ws://127.0.0.1:{prepared['port']}")
+    monkeypatch.setattr(module, "RAW_DIR", str(output))
+
+    def no_repeat_resync():
+        captured = subprocess.run(
+            ["podman", "logs", prepared["container"]], capture_output=True, text=True, check=True
+        )
+        tickgen_gap.no_repeat_resync(captured.stdout + captured.stderr, prepared["symbol"])
+
+    async def guarded_reads(reads):
+        async def watch():
+            while True:
+                await asyncio.to_thread(no_repeat_resync)
+                await asyncio.sleep(0.25)
+
+        operation = asyncio.create_task(original_reads(reads))
+        guard = asyncio.create_task(watch())
+        try:
+            done, _pending = await asyncio.wait(
+                (operation, guard), return_when=asyncio.FIRST_COMPLETED
+            )
+            if guard in done:
+                await guard
+            answer = await operation
+            await asyncio.to_thread(no_repeat_resync)
+            return answer
+        finally:
+            for task in (operation, guard):
+                task.cancel()
+            await asyncio.gather(operation, guard, return_exceptions=True)
+
+    no_repeat_resync()
+    monkeypatch.setattr(module, "session_reads", guarded_reads)
+    yield prepared
+    no_repeat_resync()
 
 
 @pytest.fixture(scope="module")
@@ -434,9 +495,9 @@ def test_a_doji_read_alone_goes_opposite_the_rising_bar_before_its_window(weeks)
 
 
 def test_a_tick_era_gap_fails_and_the_preceding_real_minutes_answer_the_venues_ticks(
-    provenance, weeks
+    gap_provenance,
 ):
-    fixture = provenance["fixture"]
+    fixture = gap_provenance["fixture"]
     capture = tickgen_capture.load(Path(RAW_DIR) / fixture["directory"], fixture["label"])
     raw = capture.minutes()
     start, empty = fixture["start"], fixture["empty"]
