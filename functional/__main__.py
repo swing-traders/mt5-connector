@@ -197,7 +197,15 @@ def run(values, runtime):
             environment["MT5_LIVE_CAPPED_HUB_URL"] = f"ws://127.0.0.1:{capped_port}"
             environment["MT5_LIVE_PREPARED_DIR"] = str(live_output)
             runtime.stream(
-                [sys.executable, "-m", "pytest", "tests/live/test_hub_live.py", "-v", "--tb=short"],
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "tests/live/test_hub_live.py",
+                    "tests/live/test_history_build_busy.py",
+                    "-v",
+                    "--tb=short",
+                ],
                 env=environment,
             )
             history.run(runtime, image, main_name, stem, output, environment, owned_history)
