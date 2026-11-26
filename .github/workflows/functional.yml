@@ -135,10 +135,6 @@ jobs:
       - name: Build and certify the image
         run: just functional "$RUNNER_TEMP/mt5-functional-${{ github.run_id }}.env"
 
-      - name: Report the runner's container journal
-        if: failure()
-        run: sudo journalctl --no-pager -o cat _UID="$(id -u)"
-
       - name: Remove the private connection environment
         if: always()
         run: rm -f "$RUNNER_TEMP/mt5-functional-${{ github.run_id }}.env"
