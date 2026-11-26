@@ -13,7 +13,7 @@ permissions:
 jobs:
   head:
     name: head commit
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     if: >-
       ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch'
       || (github.event_name == 'issue_comment' && github.event.issue.pull_request
@@ -43,7 +43,7 @@ jobs:
   certify:
     name: functional certification
     needs: head
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     concurrency:
       group: functional-demo-login
@@ -95,6 +95,14 @@ jobs:
           ref: ${{ needs.head.outputs.sha }}
           path: candidate
           persist-credentials: false
+
+      - name: Free disk space
+        run: >-
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          /opt/hostedtoolcache/CodeQL
+
+      - name: Verify Podman
+        run: podman info
 
       - uses: mamba-org/setup-micromamba@v2
         with:
