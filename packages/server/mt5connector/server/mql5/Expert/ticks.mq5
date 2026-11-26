@@ -2530,7 +2530,7 @@ void AppendBarTicks(const MqlRates &bar, const long d, const double point, const
     TickOffsets((long)bar.time, bar.tick_volume, count, offsets);
     const double spread = bar.spread * point;
     const int n = ArraySize(rows);
-    ArrayResize(rows, n + count, 4096);
+    ArrayResize(rows, n + count, n + count + 4096);
     for (int k = 0; k < count; k++)
     {
         const long stamp = (long)bar.time * 1000 + offsets[k];
