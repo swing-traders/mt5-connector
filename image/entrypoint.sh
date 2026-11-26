@@ -169,14 +169,18 @@ acquire_server_list() {
     await_terminal_window || fail "$await_error"
     gui dismiss-dialogs "Open an Account" \
         || fail "the dialog dismissal for the server search failed with status $?"
-    local status=0 output
+    local status=0 output detail
     output=$(gui search-server 2>&1) || status=$?
     end_with_stopped
     [[ -z "$output" ]] || printf '%s\n' "$output"
     case $status in
         0) ;;
         124 | 137) fail "the server search did not finish within ${gui_seconds}s" ;;
-        *) exit 1 ;;
+        *)
+            detail="${output##*$'\n'}"
+            detail="${detail#mt5: }"
+            fail "the server search: ${detail:-driver exited with status $status}"
+            ;;
     esac
     close_terminal
 }

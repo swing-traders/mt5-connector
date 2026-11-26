@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from entrypoint_double import boot_script
 from test_mt5_image import _Win32Library
 from test_mt5_image import gui as gui
 
@@ -56,16 +57,11 @@ def test_startup_requires_the_requested_server(
             }
         )
     )
-    functions = tmp_path / "entrypoint-functions.sh"
-    definitions, boundary, _ = (
-        (_ROOT / "image/entrypoint.sh")
-        .read_text()
-        .partition("# A boot step failing because a supervised process stopped")
-    )
-    assert boundary, "entrypoint function boundary is missing"
-    functions.write_text(definitions)
     script = """
-source "$1"
+require_settings() { :; }
+start_display() { :; }
+restore_baked_terminal() { :; }
+write_inis() { :; }
 printf '%s' "$MT5_SERVER_SEARCH_STARTED_MARKER" > "$TEST_MARKER"
 start_terminal() { terminal_pid=1; }
 window_failures="$TEST_WINDOW_FAILURES"
@@ -83,11 +79,13 @@ gui() {
     if [[ "$1" == dismiss-dialogs ]]; then return 0; fi
     "$TEST_PYTHON" "$TEST_DRIVER" "$@"
 }
-acquire_server_list
-echo HUB_MAY_START
+allow_webrequest() { allowlist_done=yes; }
+await_spawner() { [[ "${allowlist_done:-}" == yes ]]; }
+start_hub() { echo HUB_MAY_START; }
+supervise() { :; }
 """
     result = subprocess.run(
-        ["bash", "-c", script, "server-search-test", str(functions)],
+        ["bash", "-c", boot_script((_ROOT / "image/entrypoint.sh").read_text(), script)],
         env={
             **os.environ,
             "WINEPREFIX": str(tmp_path),
@@ -118,6 +116,48 @@ echo HUB_MAY_START
             f"terminal holds [{', '.join(results[0])}]"
         )
         assert (result.stdout + result.stderr).splitlines().count(expected) == 1
+
+
+@pytest.mark.parametrize(
+    ("detail", "status", "expected"),
+    [
+        ("Traceback: unexpected driver error", 1, "Traceback: unexpected driver error"),
+        ("", 17, "driver exited with status 17"),
+    ],
+    ids=["driver-crash", "silent-driver-crash"],
+)
+def test_a_server_search_driver_crash_names_the_step(tmp_path, detail, status, expected):
+    doubles = """
+require_settings() { :; }
+start_display() { :; }
+restore_baked_terminal() { :; }
+write_inis() { :; }
+start_terminal() { terminal_pid=1; }
+await_terminal_window() { :; }
+end_with_stopped() { :; }
+gui() {
+    if [[ "$1" == dismiss-dialogs ]]; then return 0; fi
+    printf '%s' "$TEST_DETAIL"
+    return "$TEST_STATUS"
+}
+start_hub() { echo HUB_STARTED; }
+"""
+    result = subprocess.run(
+        ["bash", "-c", boot_script((_ROOT / "image/entrypoint.sh").read_text(), doubles)],
+        env={
+            **os.environ,
+            "WINEPREFIX": str(tmp_path),
+            "MT5_PYTHON_DIR": "",
+            "TEST_DETAIL": detail,
+            "TEST_STATUS": str(status),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "HUB_STARTED" not in result.stdout
+    assert result.stderr.splitlines()[-1:] == [f"mt5: the server search: {expected}"]
 
 
 def _drive() -> None:

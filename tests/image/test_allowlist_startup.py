@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from entrypoint_double import boot_script
 
 
 @pytest.mark.parametrize(
@@ -14,15 +15,9 @@ import pytest
 )
 def test_the_first_allowlist_failure_stops_before_the_hub(tmp_path, window_ready, dismissal_ready):
     entrypoint = Path(__file__).resolve().parents[2] / "image/entrypoint.sh"
-    definitions, boundary, boot = entrypoint.read_text().partition(
-        "# A boot step failing because a supervised process stopped"
-    )
-    functions = tmp_path / "functions.sh"
-    functions.write_text(definitions)
     attempts = tmp_path / "attempts"
     attempts.write_text("")
     script = """
-source "$1"
 require_settings() { :; }
 start_display() { :; }
 restore_baked_terminal() { :; }
@@ -51,7 +46,7 @@ start_hub() { echo HUB_STARTED; }
 supervise() { :; }
 """
     result = subprocess.run(
-        ["bash", "-c", script + "\n# " + boundary + boot, "allowlist-test", str(functions)],
+        ["bash", "-c", boot_script(entrypoint.read_text(), script)],
         env={
             **os.environ,
             "WINEPREFIX": str(tmp_path),

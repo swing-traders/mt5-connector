@@ -22,15 +22,15 @@ for ((i=0;i<30;i++)); do
     [[ ! -S /tmp/.X11-unix/X0 ]] || break
     sleep 1
 done
-cp /src/NativeHistoryExport.mq5 "$WINEPREFIX/drive_c/NativeHistoryExport.mq5"
-wine "$td/MetaEditor64.exe" '/compile:C:\NativeHistoryExport.mq5' \
-    '/log:C:\NativeHistoryExport.log' >"$rt/compiler-private.log" 2>&1 || :
-result=$(iconv -f UTF-16 -t UTF-8 "$WINEPREFIX/drive_c/NativeHistoryExport.log" \
+cp /src/GapNative.mq5 "$WINEPREFIX/drive_c/GapNative.mq5"
+wine "$td/MetaEditor64.exe" '/compile:C:\GapNative.mq5' \
+    '/log:C:\GapNative.log' >"$rt/compiler-private.log" 2>&1 || :
+result=$(iconv -f UTF-16 -t UTF-8 "$WINEPREFIX/drive_c/GapNative.log" \
     | tr -d '\r' | grep '^Result:')
 [[ "$result" == "Result: 0 errors, 0 warnings"* ]] \
     || { printf 'CUSTOM_PROBE_COMPILE_FAILED: %s\n' "$result"; exit 2; }
 printf '%s\n' "$result"
-cp "$WINEPREFIX/drive_c/NativeHistoryExport.ex5" "$td/MQL5/Scripts/"
+cp "$WINEPREFIX/drive_c/GapNative.ex5" "$td/MQL5/Scripts/"
 mkdir -p "$td/MQL5/Files"
 cp /job/input/native-*.csv "$td/MQL5/Files/"
 case "$PROBE_MODE" in
@@ -50,7 +50,7 @@ esac
     } >"$rt/search.ini"
     {
         cat "$rt/search.ini"
-        printf '[StartUp]\r\nSymbol=BTCUSD.a\r\nPeriod=M1\r\nScript=NativeHistoryExport\r\n'
+        printf '[StartUp]\r\nSymbol=BTCUSD.a\r\nPeriod=M1\r\nScript=GapNative\r\n'
     } >"$rt/import.ini"
 )
 wine "$td/terminal64.exe" '/config:Z:\tmp\native-custom-probe\search.ini' \

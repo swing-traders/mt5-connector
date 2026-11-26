@@ -23,6 +23,24 @@ ENV_FILE = os.environ.get("MT5_FUNCTIONAL_ENV_FILE")
 PHASES = ("append", "merge", "keep_ticks", "keep_rates", "off_grid", "decrease", "bids", "offsets")
 
 
+def instrument(source):
+    edits = (
+        ("void SendBusy(", "void UnusedSendBusy(", True),
+        ("#property script_show_inputs", "", True),
+        ("\ninput ", "\n", False),
+        ("ArraySize(", "BuildSize(", False),
+        ("BuildSize(g_history)", "ArraySize(g_history)", False),
+        ("k < na + nb;", "k < na + nb && BuildStep();", True),
+    )
+    for before, after, unique in edits:
+        matches = source.count(before)
+        assert matches > 0, f"native probe edit {before!r} matched no source"
+        if unique:
+            assert matches == 1, f"native probe edit {before!r} matched {matches} times"
+        source = source.replace(before, after)
+    return source
+
+
 @pytest.fixture(scope="module")
 def native_builds(tmp_path_factory):
     if IMAGE is None or ENV_FILE is None:
@@ -31,15 +49,7 @@ def native_builds(tmp_path_factory):
     directory.chmod(0o755)
     source = ROOT / "packages/server/mt5connector/server/mql5/Expert/ticks.mq5"
     # Capture busy frames without opening a socket; execute the original builder and renewal.
-    staged = source.read_text().replace("void SendBusy(", "void UnusedSendBusy(", 1)
-    staged = staged.replace("#property script_show_inputs", "")
-    staged = staged.replace("\ninput ", "\n")
-    # Charge virtual work at data-array reads; leave the registry and socket library alone.
-    staged = staged.replace("ArraySize(", "BuildSize(").replace(
-        "BuildSize(g_history)", "ArraySize(g_history)"
-    )
-    staged = staged.replace("k < na + nb;", "k < na + nb && BuildStep();")
-    (directory / "ticks_under_test.mqh").write_text(staged)
+    (directory / "ticks_under_test.mqh").write_text(instrument(source.read_text()))
     for name in ("history_build_busy.mq5", "history_build_busy.sh"):
         shutil.copyfile(HERE / name, directory / name)
     owner = "mt5-build-busy-" + uuid.uuid4().hex[:12]

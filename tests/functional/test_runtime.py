@@ -19,6 +19,14 @@ class Response:
 @pytest.fixture
 def runtime(monkeypatch):
     owner = Runtime(lambda text: text)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        "functional.runtime.time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
     monkeypatch.setattr(
         owner,
         "command",

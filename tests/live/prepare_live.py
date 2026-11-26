@@ -3,7 +3,7 @@
 import argparse
 import json
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import prepare_tickgen as native
@@ -52,6 +52,7 @@ def provenance(output, captured, capped, clock):
     return {
         "prepared_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "symbol": native.SYMBOL,
+        "clock": {"timezone": clock.tz.key, "offset_hours": clock.offset // timedelta(hours=1)},
         "terminal_build": live["terminal_build"][0],
         "first_tick_broker": first,
         "windows": windows,
@@ -120,10 +121,6 @@ def prepare(arguments):
     ).strip()
     recorded["capped_volume"] = capped
     recorded["compiled"] = compiled["tickgen_raw"]
-    recorded["clock"] = {
-        "timezone": settings.get("MT5_BROKER_TZ", "America/New_York"),
-        "offset_hours": int(settings.get("MT5_BROKER_OFFSET_HOURS", "7")),
-    }
     (output / "provenance.json").write_text(json.dumps(recorded, indent=2) + "\n")
     print("LIVE_NATIVE_INPUT_VERIFIED " + json.dumps(recorded["windows"]), flush=True)
     print("LIVE_NATIVE_CAP_VERIFIED " + json.dumps(recorded["cap"]), flush=True)

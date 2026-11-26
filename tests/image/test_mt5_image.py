@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from entrypoint_double import boot_script
 
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
@@ -602,6 +603,7 @@ def test_a_start_on_an_unknown_account_fails_before_the_hub_and_prints_no_passwo
     assert "mt5: the Login server dropdown selected the requested trade server" in output
     assert "mt5: adding 127.0.0.1 to the WebRequest allowlist" in output
     assert "mt5: the WebRequest allowlist holds 127.0.0.1 alone" in output
+    assert "mt5: no spawner chart within 120s;" in output
     assert int(status) != 0
     assert "mt5: starting the hub" not in output
     assert _ACCOUNT["MT5_PASSWORD"] not in output
@@ -1079,21 +1081,17 @@ def _booted(runtime: str, tmp_path, name: str):
         check=True,
         timeout=60,
     )
-    definitions, boundary, _ = captured.stdout.partition(
-        "# A boot step failing because a supervised process stopped"
+    (scripts / "terminal-boot.sh").write_text(
+        boot_script(
+            captured.stdout,
+            """
+await_spawner() {
+    [[ -n "$tail_pid" ]] || fail "the WebRequest allowlist has not run before the spawner wait"
+}
+start_hub() { :; }
+""",
+        )
     )
-    assert boundary, "the image has no terminal bootstrap definitions"
-    (scripts / "terminal-boot.sh").write_text(definitions + """
-trap end_with_stopped EXIT
-trap stop_on_request TERM INT
-require_settings
-start_display
-restore_baked_terminal
-write_inis
-acquire_server_list
-allow_webrequest
-supervise
-""")
     setup = subprocess.run(
         [runtime, "run", "--rm", "--entrypoint", "cat", _IMAGE, "/opt/mt5/setup.ini"],
         capture_output=True,

@@ -370,7 +370,7 @@ The image bakes the sections without a credential at `/opt/mt5/setup.ini`. At ev
 | `[StartUp]` | `Script` | `ticks_setup` |
 | | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, then closes its own. The symbol is `MT5_SPAWNER_SYMBOL` |
 
-The terminal must know the trade server `MT5_SERVER` names before the login can succeed. At every boot the image searches for that name (File → Open an Account), verifies it through the Login server dropdown, and retries a missing result up to three searches in total.
+The terminal must know the trade server `MT5_SERVER` names before the login can succeed. At every boot the image searches for that name once (File → Open an Account) and verifies it through the Login server dropdown. A missing result exits before the hub starts; container restart is the retry layer.
 
 #### The EA and the startup script
 

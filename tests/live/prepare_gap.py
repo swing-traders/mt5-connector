@@ -11,8 +11,8 @@ from pathlib import Path
 import prepare_tickgen
 import tickgen_gap
 
-from functional.__main__ import connected
 from functional.runtime import BASES, Runtime
+from functional.session import connected
 from functional.settings import Redactor, load, write
 from mt5connector.server.hub_resync import Outcome
 from mt5connector.wire import calls
@@ -66,7 +66,7 @@ def native(runtime, image, name, env_file, volume, output, mode):
         "-v",
         f"{job}:/job",
         "-v",
-        f"{HERE / 'gap_native.mq5'}:/src/NativeHistoryExport.mq5:ro",
+        f"{HERE / 'gap_native.mq5'}:/src/GapNative.mq5:ro",
         "-v",
         f"{HERE / 'gap_native.sh'}:/opt/probe/install.sh:ro",
         "--entrypoint",

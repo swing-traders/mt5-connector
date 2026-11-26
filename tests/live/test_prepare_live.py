@@ -26,9 +26,10 @@ def native_capture(tmp_path):
     return captured, frame
 
 
-def test_the_recorded_windows_and_cap_come_from_native_outcomes(native_capture):
+@pytest.mark.parametrize(("timezone", "offset"), [("America/New_York", 7), ("Europe/London", 2)])
+def test_the_recorded_windows_and_cap_come_from_native_outcomes(native_capture, timezone, offset):
     captured, frame = native_capture
-    clock = BrokerClock(ZoneInfo("America/New_York"), timedelta(hours=7))
+    clock = BrokerClock(ZoneInfo(timezone), timedelta(hours=offset))
     record = prepare_live.provenance(captured.parent, captured, frame, clock)
     assert record["windows"]["five-days"] == {
         "from_broker": 1795132860,
@@ -48,6 +49,7 @@ def test_the_recorded_windows_and_cap_come_from_native_outcomes(native_capture):
         captured / "outcome.txt"
     )
     assert json.loads(json.dumps(record)) == record
+    assert record["clock"] == {"timezone": timezone, "offset_hours": offset}
 
 
 @pytest.mark.parametrize(

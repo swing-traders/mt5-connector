@@ -5,19 +5,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from entrypoint_double import boot_script
 
 
 @pytest.mark.parametrize("opened", [False, True], ids=["chart-failed", "chart-opened"])
 def test_the_hub_starts_only_after_the_spawner_chart_opens(tmp_path, opened):
     entrypoint = Path(__file__).resolve().parents[2] / "image/entrypoint.sh"
-    definitions, boundary, boot = entrypoint.read_text().partition(
-        "# A boot step failing because a supervised process stopped"
-    )
-    functions = tmp_path / "functions.sh"
-    functions.write_text(definitions)
     failure = "ChartOpen failed for 'TESTUSD': 4102"
     script = """
-source "$1"
 require_settings() { :; }
 start_display() { :; }
 restore_baked_terminal() { :; }
@@ -36,7 +31,7 @@ supervise() { :; }
 stop_everything() { :; }
 """
     done = subprocess.run(
-        ["bash", "-c", script + "\n# " + boundary + boot, "startup-test", str(functions)],
+        ["bash", "-c", boot_script(entrypoint.read_text(), script)],
         env={
             **os.environ,
             "WINEPREFIX": str(tmp_path),
