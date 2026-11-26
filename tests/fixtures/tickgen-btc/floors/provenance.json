@@ -1,0 +1,26 @@
+{
+  "recorded_utc": "2026-11-25T00:56:33.990013+00:00",
+  "terminal_build": 6316,
+  "symbol": "BTCUSD.a",
+  "range": {
+    "from_broker": 1491782400,
+    "to_broker": 1673740800,
+    "basis": "broker wall time"
+  },
+  "tester_settings": {
+    "Symbol": "BTCUSD.a",
+    "Period": "M1",
+    "Script": "NativeHistoryExport"
+  },
+  "native_every_tick_confirmed": false,
+  "source_image_id": "d2135d1b78a2f81540e83119d86424def1798478108b82216ce64062133a04e4",
+  "native_history_confirmed": true,
+  "exporter_sha256": "02fa82c8664d3c3efce9f7278850db88a142e634342c670fe534fa25d09940c0",
+  "files": {
+    "history-first.csv": "98a223b658d210b8be7b7b25468ff77357bd0d85a04479f0a916ff723c21c84b",
+    "spread-first.csv": "af90932b30ead235b4c968755413926b4ea52846b1f88580087320943ba2ec4a",
+    "first-real-tick.csv": "5ee9b2a76c4934aacdd95992b4599240bb83e1b9fe06f510512926e765cbea58",
+    "january.csv": "27ee5efd4f742a7b4a499643dc992bfa2136d9a1e9355117a74b39dff5a99c2f",
+    "metadata.csv": "2682c63943986f46c30eeb80995a19d7fdf89828c99eb3ea8c71dd194d4648cb"
+  }
+}

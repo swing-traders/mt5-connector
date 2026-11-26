@@ -100,6 +100,60 @@ bool ReadBars(const string symbol, const long from, const long to, MqlRates &bar
     return settled;
 }
 
+bool NativeWindow(const string symbol, const string label, long &from, long &to, string &summary)
+{
+    MqlTick first[];
+    const ulong started = GetTickCount64();
+    int copied = -1;
+    int error = 0;
+    while (!IsStopped() && GetTickCount64() - started < READ_BOUND_S * 1000)
+    {
+        ResetLastError();
+        copied = CopyTicks(symbol, first, COPY_TICKS_ALL, 1, 1);
+        error = GetLastError();
+        if (copied == 1 && error == 0)
+            break;
+        Sleep(1000);
+    }
+    if (copied != 1 || error != 0)
+        return false;
+    MqlTick latest;
+    if (!SymbolInfoTick(symbol, latest))
+        return false;
+    const long firstFull = ((long)first[0].time / 60 + 1) * 60;
+    const long end = firstFull + 5 * 86400;
+    if (end > (long)latest.time - 15 * 60)
+        return false;
+    if (label == "five-days")
+    {
+        from = firstFull;
+        to = end - 1;
+    }
+    else if (label == "minute-1424")
+    {
+        MqlRates bars[];
+        if (!ReadBars(symbol, firstFull + 2 * 86400, firstFull + 3 * 86400 - 1, bars))
+            return false;
+        bool found = false;
+        for (int i = 0; i < ArraySize(bars) && !found; i++)
+        {
+            if ((long)bars[i].time % 86400 == (14 * 60 + 24) * 60 && bars[i].tick_volume > 0)
+            {
+                from = (long)bars[i].time;
+                to = from + 59;
+                found = true;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    else
+        return false;
+    summary += StringFormat("first_tick %I64d\nwindow_%s %I64d %I64d\n",
+                            first[0].time, label, from, to);
+    return true;
+}
+
 string Exact(const double value)
 {
     return StringFormat("%.17g", value);
@@ -192,12 +246,17 @@ void OnStart()
         Sleep(1000);
     if (outcome == "" && m1First <= 0)
         outcome = "failed: M1's first date is not known";
-    string summary = StringFormat("m1_first %I64d\n", m1First);
+    string summary = StringFormat("terminal_build %I64d\nm1_first %I64d\nmaxbars %I64d\n",
+                                  TerminalInfoInteger(TERMINAL_BUILD), m1First,
+                                  TerminalInfoInteger(TERMINAL_MAXBARS));
     for (int w = 0; w < ArraySize(labels) && outcome == ""; w++)
     {
         MqlTick ticks[];
         MqlRates bars[];
-        if (!ReadTicks(symbol, froms[w], tos[w], ticks))
+        if (froms[w] == 0 && tos[w] == 0
+            && !NativeWindow(symbol, labels[w], froms[w], tos[w], summary))
+            outcome = StringFormat("failed: %s has no complete native real-tick window", labels[w]);
+        else if (!ReadTicks(symbol, froms[w], tos[w], ticks))
             outcome = StringFormat("failed: %s ticks did not settle", labels[w]);
         else if (!ReadBars(symbol, froms[w], tos[w], bars))
             outcome = StringFormat("failed: %s bars did not settle", labels[w]);

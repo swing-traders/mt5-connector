@@ -9,6 +9,8 @@ readonly baked_dir=/opt/mt5-baked
 readonly runtime_dir=/tmp/mt5
 readonly startup_ini="$runtime_dir/setup.ini"
 readonly search_ini="$runtime_dir/search.ini"
+readonly spawner_ready="$terminal_dir/MQL5/Files/ticks_setup.ready"
+readonly spawner_error="$terminal_dir/MQL5/Files/ticks_setup.error"
 # Unset, the terminal's ceiling: it clamps a larger MaxBars to it. Set empty, it is refused.
 readonly max_bars="${MT5_MAX_BARS-100000000}"
 readonly window_wait_seconds=120
@@ -19,12 +21,12 @@ readonly close_wait_seconds=60
 readonly stop_wait_seconds=10
 readonly call_seconds=10
 readonly gui_seconds=40
-readonly step_attempts=3
-readonly step_retry_seconds=5
+readonly MT5_SERVER_SEARCH_STARTED_MARKER="mt5: trade server search started"
 readonly restore_seconds=40
 readonly kill_after_seconds=5
 readonly -a driver=(wine "$MT5_PYTHON_DIR\\python.exe" 'Z:\opt\mt5\terminal_gui.py')
 export DISPLAY=:0
+export MT5_SERVER_SEARCH_STARTED_MARKER
 
 declare -A process_names=()
 terminal_pid=
@@ -62,49 +64,6 @@ run_bounded() {
 # window that stops answering would hold it, so it is bounded like any call.
 gui() {
     timeout --kill-after="$kill_after_seconds" "$gui_seconds" "${driver[@]}" "$@"
-}
-
-retried() {
-    local what=$1 own_dialog=$2 ini=$3
-    shift 3
-    local attempt status output detail message
-    for ((attempt = 1; attempt <= step_attempts; attempt++)); do
-        start_terminal "$(config_argument "$ini")"
-        if [[ "$ini" == "$startup_ini" ]]; then
-            process_names[$terminal_pid]=terminal
-            if [[ -z "$tail_pid" ]]; then
-                start_log_tail
-            fi
-        fi
-        if await_terminal_window; then
-            gui dismiss-dialogs "$own_dialog" \
-                || step "the dialog dismissal for $what failed with status $?"
-            status=0
-            output=$(gui "$@" 2>&1) || status=$?
-            end_with_stopped
-            if ((status == 0)); then
-                [[ -z "$output" ]] || printf '%s\n' "$output"
-                return
-            fi
-            case $status in
-                124 | 137) detail="$what did not finish within ${gui_seconds}s" ;;
-                *)
-                    [[ -z "$output" ]] || printf '%s\n' "$output"
-                    detail="${output##*$'\n'}"
-                    detail="${detail#mt5: }"
-                    ;;
-            esac
-        else
-            detail="$await_error"
-        fi
-        message="$what failed (attempt $attempt of $step_attempts): $detail"
-        step "$message"
-        discard_terminal
-        if ((attempt == step_attempts)); then
-            return 1
-        fi
-        sleep "$step_retry_seconds"
-    done
 }
 
 # A slow poll consumes the window's deadline rather than extending it.
@@ -171,6 +130,8 @@ restore_baked_terminal() {
 }
 
 start_terminal() {
+    refuse_failed_spawner
+    rm -f "$spawner_ready"
     wine "$terminal_dir/terminal64.exe" "$@" /portable >/dev/null 2>&1 &
     terminal_pid=$!
 }
@@ -199,23 +160,28 @@ close_terminal() {
     terminal_pid=
 }
 
-discard_terminal() {
-    unset "process_names[$terminal_pid]"
-    if ! request_terminal_close; then
-        step "killing the terminal, still running after ${close_wait_seconds}s"
-        bounded wineserver -k >/dev/null 2>&1 || :
-        kill -KILL "$terminal_pid" 2>/dev/null || :
-    fi
-    wait "$terminal_pid" || :
-    terminal_pid=
-}
-
 # The terminal logs in only to a trade server its server list holds: searching the server's name in
 # the account dialog adds its broker's servers, which the terminal keeps when it closes. A terminal
 # started with no account opens that dialog on its own, so this session starts with one.
 acquire_server_list() {
     step "fetching the trade server's broker into the server list"
-    retried "the server search" "Open an Account" "$search_ini" search-server
+    start_terminal "$(config_argument "$search_ini")"
+    await_terminal_window || fail "$await_error"
+    gui dismiss-dialogs "Open an Account" \
+        || fail "the dialog dismissal for the server search failed with status $?"
+    local status=0 output detail
+    output=$(gui search-server 2>&1) || status=$?
+    end_with_stopped
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+    case $status in
+        0) ;;
+        124 | 137) fail "the server search did not finish within ${gui_seconds}s" ;;
+        *)
+            detail="${output##*$'\n'}"
+            detail="${detail#mt5: }"
+            fail "the server search: ${detail:-driver exited with status $status}"
+            ;;
+    esac
     close_terminal
 }
 
@@ -254,7 +220,41 @@ config_argument() {
 # Puts 127.0.0.1 on the Options dialog's WebRequest list, which no ini key sets.
 allow_webrequest() {
     step "adding 127.0.0.1 to the WebRequest allowlist"
-    retried "the WebRequest allowlist" Options "$startup_ini" allow-webrequest 127.0.0.1
+    start_terminal "$(config_argument "$startup_ini")"
+    process_names[$terminal_pid]=terminal
+    start_log_tail
+    await_terminal_window || fail "the WebRequest allowlist: $await_error"
+    local status=0 output detail
+    if output=$(gui dismiss-dialogs Options 2>&1); then
+        output=$(gui allow-webrequest 127.0.0.1 2>&1) || status=$?
+    else
+        status=$?
+    fi
+    end_with_stopped
+    case $status in
+        0) [[ -z "$output" ]] || printf '%s\n' "$output" ;;
+        124 | 137) fail "the WebRequest allowlist did not finish within ${gui_seconds}s" ;;
+        *)
+            detail="${output##*$'\n'}"
+            detail="${detail#mt5: }"
+            fail "the WebRequest allowlist: ${detail:-driver exited with status $status}"
+            ;;
+    esac
+}
+
+refuse_failed_spawner() {
+    if [[ -f "$spawner_error" ]]; then
+        local detail
+        detail=$(<"$spawner_error")
+        trap - EXIT
+        fail "${detail//$'\r'/}"
+    fi
+}
+
+await_spawner() {
+    end_with_stopped
+    await "spawner chart" "$window_wait_seconds" test -f "$spawner_ready" || fail "$await_error"
+    end_with_stopped
 }
 
 # Streams the terminal's journal and experts log into the container's log. Its exit ends nothing: a
@@ -362,6 +362,7 @@ supervise() {
 
 # Ends the container with the exit of the first supervised process found stopped, if one has.
 end_with_stopped() {
+    refuse_failed_spawner
     local pid
     for pid in "${!process_names[@]}"; do
         if ! kill -0 "$pid" 2>/dev/null; then
@@ -395,5 +396,6 @@ write_inis
 acquire_server_list
 step "launching the terminal"
 allow_webrequest
+await_spawner
 start_hub
 supervise

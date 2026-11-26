@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "source_symbol": "BTCUSD.a",
+  "symbol": "BTCUSD.a.GAPTEST",
+  "digits": 2,
+  "terminal_build": 6316,
+  "recorded_date_utc": "2026-11-25",
+  "native_read_recorded_utc": "2026-11-25T08:13:51.849479+00:00",
+  "source_capture": {
+    "method": "Native CopyTicksRange(COPY_TICKS_ALL) and CopyRates(PERIOD_M1)",
+    "recorded_utc": "2026-11-25T08:08:32.158868+00:00",
+    "collector_sha256": "919c515b83020534de07f7ff0a701bd28de7b9bfaa9e619d49b70141fb8c4e71",
+    "files": {
+      "midnight-bars.csv": "879d3187790cf20e290ce473801a1c968afb62360b0b5d5868d9caa0ba68a3f8",
+      "midnight-ticks.csv": "558452415d0825881dc1b90e7fb4c9a877ba7438e669769860d73368755d4606",
+      "outcome.txt": "92d086df7ff6c1a879c290d374f3b9cde56833dad3be47be3cbd38eeb7fdfd56"
+    }
+  },
+  "range": {
+    "from_broker": 1795132800,
+    "to_broker": 1795140299,
+    "from_utc": "2026-11-19T22:00:00+00:00",
+    "to_utc": "2026-11-20T00:04:59+00:00",
+    "basis": "broker wall time for native CSV epochs"
+  },
+  "removed_minute_broker": 1795140120,
+  "removed_minute_utc": "2026-11-20T00:02:00+00:00",
+  "input_transform": "Import all captured broker ticks, remove only the named minute's ticks, and retain every original M1 bar.",
+  "counts": {
+    "broker_ticks": 52704,
+    "removed_ticks": 462,
+    "retained_ticks": 52242,
+    "preceding_ticks": 51273,
+    "bars": 125
+  },
+  "reference": {
+    "method": "Native CopyTicksRange(COPY_TICKS_ALL) on the installed custom symbol",
+    "state": "Post-import native capture, confirmed identical by a read-only clean reopen",
+    "reason": "Custom-symbol import clears flag bit 128. The hub must reproduce the native post-import representation field for field.",
+    "ticks": "native-ticks.csv",
+    "preceding_ticks": "native-preceding.csv",
+    "bar_inputs": "bars.csv"
+  },
+  "broker_equivalence": "Same count and order; every field equal except flags may have bit 128 cleared.",
+  "native_reader_sha256": "2f0b9289ce0c4de45be50aa6ebd0d127f6676990aeb7a00372aff4cd3491bb6a",
+  "native_first_dates": {
+    "server_first": 1795132800,
+    "terminal_first": 1795132800,
+    "frame_first": 1795132800
+  },
+  "files": {
+    "broker-ticks.csv": "558452415d0825881dc1b90e7fb4c9a877ba7438e669769860d73368755d4606",
+    "bars.csv": "879d3187790cf20e290ce473801a1c968afb62360b0b5d5868d9caa0ba68a3f8",
+    "native-ticks.csv": "a73769c8f1821041206f445d8631c2df5e29cae5bd8fbd9b8384b04c1c5ed7d9",
+    "native-preceding.csv": "8b5a615f856761a8260db3155e26e008fe78897e4eca5af8c5e90643d73b903f",
+    "native-gap-bar.csv": "33007554a1b2ef98a4745a23d3f1d80be355660d04bfd25daedae4a88637f616",
+    "native-metadata.csv": "0c1b98e51069f7d8b05f4642f8e9fd7d9ef22025d89020ecae5c225d5799113f"
+  }
+}

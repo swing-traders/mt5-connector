@@ -23,15 +23,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from entrypoint_double import boot_script
 
 _IMAGE = os.environ.get("MT5_IMAGE_TEST")
 _needs_image = pytest.mark.skipif(_IMAGE is None, reason="MT5_IMAGE_TEST names no image to run")
 
-# Each distinctive enough that a stray print of it cannot hide in the output.
+# The made-up login and password stand out if either leaks into output.
 _ACCOUNT = {
     "MT5_LOGIN": "31415926",
     "MT5_PASSWORD": "mt5-image-test-not-a-secret",
-    "MT5_SERVER": "MT5ImageTest-Not-A-Server",
+    "MT5_SERVER": "MetaQuotes-Demo",
     "MT5_SPAWNER_SYMBOL": "EURUSD",
 }
 # The stop timeout the image's contract asks for, over the entrypoint's own stop bounds together.
@@ -444,7 +445,7 @@ def test_the_image_declares_a_healthcheck_on_the_hubs_health() -> None:
 
 
 @_needs_image
-def test_the_booted_terminal_logs_the_pinned_build_and_pays_no_recompile():
+def test_the_booted_terminal_logs_the_pinned_build_and_pays_no_recompile(tmp_path):
     runtime = _runtime()
     expected = _image_build(runtime)
     inspected = subprocess.run(
@@ -459,21 +460,12 @@ def test_the_booted_terminal_logs_the_pinned_build_and_pays_no_recompile():
         expected
     )
     name = f"mt5-image-build-test-{os.getpid()}"
-    try:
-        subprocess.run(
-            [runtime, "run", "-d", "--name", name, *_account_env(), _IMAGE],
-            env={**os.environ, **_ACCOUNT},
-            check=True,
-            timeout=60,
-        )
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=420)
+    with _booted(runtime, tmp_path, name):
         output = _logs(runtime, name)
         builds = re.findall(r"MetaTrader 5 x64 build (\d+) started", output)
         assert builds
         assert set(builds) == {expected}
         assert "full recompilation" not in output
-    finally:
-        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
 
 
 def _image_build(runtime):
@@ -589,7 +581,7 @@ def test_the_copied_start_fails_naming_a_terminal_of_another_build(tmp_path):
 
 
 @_needs_image
-def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password() -> None:
+def test_a_start_on_an_unknown_account_fails_before_the_hub_and_prints_no_password() -> None:
     runtime = _runtime()
     name = f"mt5-image-boot-test-{os.getpid()}"
     try:
@@ -599,16 +591,21 @@ def test_a_start_on_an_unknown_account_boots_to_the_hub_and_prints_no_password()
             check=True,
             timeout=60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        status = subprocess.run(
+            [runtime, "wait", name], capture_output=True, text=True, timeout=420
+        ).stdout.strip()
         output = _logs(runtime, name)
     finally:
         subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
 
     assert "mt5: restored the terminal's baked state, its history store aside" in output
     assert "mt5: fetching the trade server's broker into the server list" in output
-    assert "mt5: the account dialog searched the trade server" in output
+    assert "mt5: the Login server dropdown selected the requested trade server" in output
     assert "mt5: adding 127.0.0.1 to the WebRequest allowlist" in output
     assert "mt5: the WebRequest allowlist holds 127.0.0.1 alone" in output
+    assert "mt5: no spawner chart within 120s;" in output
+    assert int(status) != 0
+    assert "mt5: starting the hub" not in output
     assert _ACCOUNT["MT5_PASSWORD"] not in output
 
 
@@ -674,7 +671,14 @@ def test_a_max_bars_that_is_no_positive_integer_fails_the_start_naming_it(max_ba
 
 
 def _start_with(
-    tmp_path, stub_at: str, stub: str, *, timeout: int, extra_mounts=()
+    tmp_path,
+    stub_at: str,
+    stub: str,
+    *,
+    timeout: int,
+    extra_mounts=(),
+    spawner_ready=False,
+    spawner_error=None,
 ) -> subprocess.CompletedProcess:
     """Start the image on the unknown account, an executable ``stub`` mounted over ``stub_at``; the
     container is removed however the start ends."""
@@ -683,6 +687,37 @@ def _start_with(
     script = tmp_path / "stub"
     script.write_text(stub)
     script.chmod(0o755)
+    mounts = [f"{script}:{stub_at}:ro,z", *extra_mounts]
+    if spawner_ready or spawner_error is not None:
+        # Supervisor/GUI doubles use a made-up login, which cannot run the native startup script.
+        wrapper = tmp_path / "native-ready.py"
+        wrapper.write_text(f"""import pathlib
+import runpy
+import sys
+
+runpy.run_path("/opt/mt5/terminal_gui_step.py", run_name="__main__")
+if sys.argv[1] == "allow-webrequest":
+    folder = pathlib.Path("C:/Program Files/MetaTrader 5/MQL5/Files")
+    folder.mkdir(parents=True, exist_ok=True)
+    error = {spawner_error!r}
+    if error is None:
+        (folder / "ticks_setup.ready").touch()
+    else:
+        (folder / "ticks_setup.error").write_text(error + chr(10), encoding="utf-8")
+""")
+        if stub_at == "/opt/mt5/terminal_gui.py":
+            mounts[0] = f"{script}:/opt/mt5/terminal_gui_step.py:ro,z"
+        else:
+            original = subprocess.run(
+                [runtime, "run", "--rm", "--entrypoint", "cat", _IMAGE, "/opt/mt5/terminal_gui.py"],
+                capture_output=True,
+                check=True,
+                timeout=60,
+            )
+            step = tmp_path / "terminal-gui-step.py"
+            step.write_bytes(original.stdout)
+            mounts.append(f"{step}:/opt/mt5/terminal_gui_step.py:ro,z")
+        mounts.append(f"{wrapper}:/opt/mt5/terminal_gui.py:ro,z")
     try:
         return subprocess.run(
             [
@@ -691,9 +726,7 @@ def _start_with(
                 "--rm",
                 "--name",
                 name,
-                "-v",
-                f"{script}:{stub_at}:ro,z",
-                *(part for mount in extra_mounts for part in ("-v", mount)),
+                *(part for mount in mounts for part in ("-v", mount)),
                 *_account_env(),
                 _IMAGE,
             ],
@@ -707,13 +740,48 @@ def _start_with(
 
 
 @_needs_image
+def test_a_missing_trade_server_fails_before_starting_the_hub(tmp_path, monkeypatch) -> None:
+    monkeypatch.setitem(_ACCOUNT, "MT5_SERVER", "MT5ImageTest-Not-A-Server")
+
+    result = _start_with(
+        tmp_path, "/opt/conda/bin/mt5-connector-hub", "#!/bin/sh\nexit 42\n", timeout=420
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert f"trade server search: requested {_ACCOUNT['MT5_SERVER']}, terminal holds [" in output
+    assert output.count("mt5: trade server search started") == 1
+    assert "mt5: starting the hub" not in output
+
+
+@_needs_image
 def test_the_first_process_to_exit_ends_the_container_with_its_status(tmp_path) -> None:
     result = _start_with(
-        tmp_path, "/opt/conda/bin/mt5-connector-hub", "#!/bin/sh\nexit 42\n", timeout=300
+        tmp_path,
+        "/opt/conda/bin/mt5-connector-hub",
+        "#!/bin/sh\nexit 42\n",
+        timeout=300,
+        spawner_ready=True,
     )
 
     assert result.returncode == 42
     assert "mt5: hub exited with status 42" in result.stdout + result.stderr
+
+
+@_needs_image
+def test_the_first_failed_native_chart_stops_the_image_before_the_hub(tmp_path):
+    failure = "ChartOpen failed for 'TESTUSD': 4102"
+    result = _start_with(
+        tmp_path,
+        "/opt/conda/bin/mt5-connector-hub",
+        "#!/bin/sh\nexit 42\n",
+        timeout=300,
+        spawner_error=failure,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert output.splitlines().count("mt5: " + failure) == 1
+    assert "mt5: starting the hub" not in output
 
 
 @_needs_image
@@ -736,67 +804,75 @@ def test_a_restore_that_never_returns_fails_the_start_naming_its_step(tmp_path) 
 
 
 @_needs_image
-def test_a_driver_action_that_never_returns_fails_the_start_naming_its_step(tmp_path) -> None:
-    stub = "import sys\nimport time\n\nif sys.argv[1] != 'main-window':\n    time.sleep(3600)\n"
+@pytest.mark.parametrize(
+    ("action", "failure"),
+    [
+        (
+            "dismiss-dialogs",
+            "the dialog dismissal for the server search failed with status 124",
+        ),
+        ("search-server", "the server search did not finish within 40s"),
+    ],
+)
+def test_a_driver_action_that_never_returns_fails_the_start_naming_its_step(
+    tmp_path, action, failure
+) -> None:
+    stub = (
+        "import sys\nimport threading\n\n"
+        f"if sys.argv[1] == {action!r}:\n    threading.Event().wait()\n"
+    )
 
     result = _start_with(tmp_path, "/opt/mt5/terminal_gui.py", stub, timeout=420)
 
     assert result.returncode != 0
-    assert (
-        "mt5: the server search failed (attempt 3 of 3): "
-        "the server search did not finish within 40s"
-    ) in result.stdout + result.stderr
+    assert ("mt5: " + failure) in result.stdout + result.stderr
 
 
-def _retry_driver(action, failures):
+def _failing_driver(action):
     return f"""
-import pathlib
 import runpy
 import sys
-action = sys.argv[1]
-if action == "dismiss-dialogs":
+
+if sys.argv[1] == "dismiss-dialogs":
     print("dismiss-dialogs", flush=True)
-elif action == {action!r}:
-    path = pathlib.Path("/tmp/step-attempts")
-    attempt = int(path.read_text()) + 1 if path.exists() else 1
-    path.write_text(str(attempt))
-    if attempt <= {failures}:
-        print("mt5: the step did not finish", flush=True)
-        sys.exit(1)
-if action != "dismiss-dialogs":
+elif sys.argv[1] == {action!r}:
+    print("mt5: forced {action} failure", flush=True)
+    sys.exit(1)
+else:
     runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
 """
 
 
 @_needs_image
 @pytest.mark.parametrize("action", ["allow-webrequest", "search-server"])
-def test_a_step_that_fails_once_is_retried_and_the_boot_goes_on(tmp_path, action):
+def test_the_first_failed_driver_action_stops_startup(tmp_path, action):
     hub = tmp_path / "hub"
     hub.write_text("#!/bin/sh\nexit 42\n")
     hub.chmod(0o755)
     result = _start_with(
         tmp_path,
         "/opt/mt5/terminal_gui.py",
-        _retry_driver(action, 1),
+        _failing_driver(action),
         extra_mounts=(
             f"{hub}:/opt/conda/bin/mt5-connector-hub:ro,z",
             f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",
         ),
         timeout=420,
+        spawner_ready=True,
     )
-    what = "the WebRequest allowlist" if action == "allow-webrequest" else "the server search"
     output = result.stdout + result.stderr
-    assert f"{what} failed (attempt 1 of 3)" in output
-    assert "mt5: starting the hub" in output
-    assert result.returncode == 42
+    if action == "allow-webrequest":
+        failure = "mt5: the WebRequest allowlist: forced allow-webrequest failure"
+    else:
+        failure = "mt5: forced search-server failure"
+    assert output.splitlines().count(failure) == 1
+    assert "mt5: starting the hub" not in output
+    assert result.returncode != 0
 
 
 @_needs_image
 @pytest.mark.parametrize("ini", ["search.ini", "setup.ini"], ids=["server-search", "webrequest"])
-def test_a_window_wait_that_fails_once_restarts_its_terminal_and_retries(tmp_path, ini):
-    hub = tmp_path / "hub"
-    hub.write_text("#!/bin/sh\nexit 42\n")
-    hub.chmod(0o755)
+def test_the_first_failed_window_wait_stops_startup(tmp_path, ini):
     stub = f"""
 import pathlib
 import runpy
@@ -811,124 +887,75 @@ if sys.argv[1] == "main-window":
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
         if b"terminal64.exe" in command and {ini.encode()!r} in command:
-            failed = pathlib.Path("Z:/tmp/failed-window-terminal")
-            if not failed.exists():
-                failed.write_text(process.name)
-            previous = failed.read_text()
-            if previous == process.name:
-                print("mt5: forced first terminal window poll failure", flush=True)
-                sys.exit(1)
-            if pathlib.Path("Z:/proc", previous).exists():
-                print("mt5: the previous terminal is still running", flush=True)
-                sys.exit(1)
-            break
+            print("mt5: forced terminal window poll failure", flush=True)
+            sys.exit(1)
 runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
 """
     result = _start_with(
         tmp_path,
         "/opt/mt5/terminal_gui.py",
         stub,
-        extra_mounts=(
-            f"{hub}:/opt/conda/bin/mt5-connector-hub:ro,z",
-            f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",
-        ),
+        extra_mounts=(f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",),
         timeout=420,
     )
     output = result.stdout + result.stderr
-    what = "the server search" if ini == "search.ini" else "the WebRequest allowlist"
-    assert f"{what} failed (attempt 1 of 3)" in output
-    assert "forced first terminal window poll failure" in output
-    assert "mt5: starting the hub" in output
-    assert result.returncode == 42
+    assert "forced terminal window poll failure" in output
+    assert "mt5: starting the hub" not in output
+    assert result.returncode != 0
+    assert output.count("mt5: launching the terminal") == int(ini == "setup.ini")
 
 
 @_needs_image
-def test_a_terminal_ignoring_close_is_killed_and_reaped_before_the_next_attempt(tmp_path):
-    hub = tmp_path / "hub"
-    hub.write_text("#!/bin/sh\nexit 42\n")
-    hub.chmod(0o755)
-    original_timeout = tmp_path / "timeout-real"
-    copied = subprocess.run(
-        [_runtime(), "run", "--rm", "--entrypoint", "cat", _IMAGE, "/usr/bin/timeout"],
-        capture_output=True,
-        check=True,
-        timeout=60,
-    )
-    original_timeout.write_bytes(copied.stdout)
-    original_timeout.chmod(0o755)
-    timeout = tmp_path / "timeout"
-    timeout.write_text("""#!/bin/sh
-if [ "$3" = wine ] && [ "$4" = taskkill ] && [ ! -e /tmp/ignored-close ]; then
-    touch /tmp/ignored-close
-    exit 0
-fi
-exec /opt/mt5/timeout-real "$@"
-""")
-    timeout.chmod(0o755)
+def test_an_allowlist_failure_prints_one_diagnostic_before_stopping(tmp_path):
     stub = """
-import pathlib
 import runpy
 import sys
 
-if sys.argv[1] == "search-server":
-    failed = pathlib.Path("Z:/tmp/failed-terminal-pids")
-    if not failed.exists():
-        pids = []
-        for process in pathlib.Path("Z:/proc").iterdir():
-            if not process.name.isdecimal():
-                continue
-            try:
-                command = (process / "cmdline").read_bytes()
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
-                continue
-            if b"terminal64.exe" in command and b"search.ini" in command:
-                pids.append(process.name)
-        if not pids:
-            raise RuntimeError("no terminal process serves the first attempt")
-        failed.write_text(" ".join(pids))
-        print("mt5: forced server search failure", flush=True)
-        sys.exit(1)
-    remaining = [pid for pid in failed.read_text().split() if pathlib.Path("Z:/proc", pid).exists()]
-    if remaining:
-        print("mt5: the failed terminal is still running or unreaped", flush=True)
-        sys.exit(1)
-    print("mt5: the failed terminal was killed and reaped", flush=True)
+if sys.argv[1] == "allow-webrequest":
+    print("driver diagnostic context")
+    print("mt5: WebRequest checkbox unavailable")
+    sys.exit(1)
 runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
 """
     result = _start_with(
         tmp_path,
         "/opt/mt5/terminal_gui.py",
         stub,
-        extra_mounts=(
-            f"{hub}:/opt/conda/bin/mt5-connector-hub:ro,z",
-            f"{timeout}:/usr/bin/timeout:ro,z",
-            f"{original_timeout}:/opt/mt5/timeout-real:ro,z",
-            f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",
-        ),
-        timeout=420,
-    )
-    output = result.stdout + result.stderr
-    assert "the server search failed (attempt 1 of 3): forced server search failure" in output
-    assert "mt5: killing the terminal, still running after 60s" in output
-    assert "mt5: the failed terminal was killed and reaped" in output
-    assert "mt5: starting the hub" in output
-    assert result.returncode == 42
-
-
-@_needs_image
-def test_a_webrequest_step_that_fails_three_times_fails_the_start_naming_it(tmp_path):
-    result = _start_with(
-        tmp_path,
-        "/opt/mt5/terminal_gui.py",
-        _retry_driver("allow-webrequest", 3),
         extra_mounts=(f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",),
         timeout=420,
     )
     output = result.stdout + result.stderr
     assert result.returncode != 0
-    assert "the WebRequest allowlist failed (attempt 3 of 3)" in output
-    # Three for the allowlist; one before the preceding search step.
-    assert output.count("\ndismiss-dialogs\n") == 4
+    assert (
+        output.splitlines().count("mt5: the WebRequest allowlist: WebRequest checkbox unavailable")
+        == 1
+    )
+    assert "driver diagnostic context" not in output
+    assert "mt5: starting the hub" not in output
+
+
+@_needs_image
+def test_a_webrequest_action_that_never_finishes_fails_naming_its_bound(tmp_path):
+    stub = """
+import runpy
+import sys
+import threading
+
+if sys.argv[1] == "allow-webrequest":
+    threading.Event().wait()
+runpy.run_path("/opt/mt5/terminal_gui_real.py", run_name="__main__")
+"""
+    result = _start_with(
+        tmp_path,
+        "/opt/mt5/terminal_gui.py",
+        stub,
+        extra_mounts=(f"{_IMAGE_FILES / 'terminal_gui.py'}:/opt/mt5/terminal_gui_real.py:ro,z",),
+        timeout=420,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert output.splitlines().count("mt5: the WebRequest allowlist did not finish within 40s") == 1
+    assert "mt5: starting the hub" not in output
 
 
 @_needs_image
@@ -980,28 +1007,13 @@ def test_a_terminal_that_exits_during_the_boot_ends_the_container_with_its_statu
 
 
 @_needs_image
-def test_a_stop_closes_the_terminal_and_ends_the_container_within_the_stop_timeout() -> None:
+def test_a_stop_closes_the_terminal_and_ends_the_container_within_the_stop_timeout(
+    tmp_path,
+) -> None:
     runtime = _runtime()
     name = f"mt5-image-stop-test-{os.getpid()}"
     stop_timeout = _STOP_TIMEOUT_SECONDS
-    try:
-        subprocess.run(
-            [
-                runtime,
-                "run",
-                "-d",
-                "--name",
-                name,
-                "--stop-timeout",
-                str(stop_timeout),
-                *_account_env(),
-                _IMAGE,
-            ],
-            env={**os.environ, **_ACCOUNT},
-            check=True,
-            timeout=60,
-        )
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+    with _booted(runtime, tmp_path, name):
         started = time.monotonic()
         subprocess.run([runtime, "stop", name], capture_output=True, timeout=stop_timeout + 30)
         stopped_after = time.monotonic() - started
@@ -1012,8 +1024,6 @@ def test_a_stop_closes_the_terminal_and_ends_the_container_within_the_stop_timeo
             timeout=30,
         ).stdout.strip()
         printed = _logs(runtime, name)
-    finally:
-        subprocess.run([runtime, "rm", "-f", name], capture_output=True, timeout=60)
 
     assert stopped_after < stop_timeout
     assert status == "0"
@@ -1057,14 +1067,39 @@ gui.main()
 
 @contextlib.contextmanager
 def _booted(runtime: str, tmp_path, name: str):
-    """A container of the image booted up to its hub, its history store a volume of its own and
-    the scripts above mounted; removed with its volume on exit."""
+    """The image's terminal-only bootstrap for GUI and baked-state tests on a made-up login."""
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     scripts.chmod(0o755)
     for script, text in (("read_allowlist.py", _READ_ALLOWLIST), ("absent.py", _ABSENT_CHECKBOX)):
         (scripts / script).write_text(text)
         (scripts / script).chmod(0o644)
+    captured = subprocess.run(
+        [runtime, "run", "--rm", "--entrypoint", "cat", _IMAGE, "/opt/mt5/entrypoint.sh"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    (scripts / "terminal-boot.sh").write_text(
+        boot_script(
+            captured.stdout,
+            """
+await_spawner() {
+    [[ -n "$tail_pid" ]] || fail "the WebRequest allowlist has not run before the spawner wait"
+}
+start_hub() { :; }
+""",
+        )
+    )
+    setup = subprocess.run(
+        [runtime, "run", "--rm", "--entrypoint", "cat", _IMAGE, "/opt/mt5/setup.ini"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    (scripts / "setup.ini").write_text(setup.stdout.partition("[StartUp]")[0])
     try:
         subprocess.run(
             [
@@ -1079,14 +1114,27 @@ def _booted(runtime: str, tmp_path, name: str):
                 _BASES,
                 "-v",
                 f"{scripts}:{_SCRIPTS}:ro,z",
+                "-v",
+                f"{scripts / 'setup.ini'}:/opt/mt5/setup.ini:ro,z",
+                "--entrypoint",
+                "/usr/bin/tini",
                 *_account_env(),
                 _IMAGE,
+                "--",
+                "/bin/bash",
+                f"{_SCRIPTS}/terminal-boot.sh",
             ],
             env={**os.environ, **_ACCOUNT},
             check=True,
             timeout=60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
+        _await_log(
+            runtime,
+            name,
+            "mt5: the WebRequest allowlist holds 127.0.0.1 alone",
+            count=1,
+            seconds=300,
+        )
         yield name
     finally:
         subprocess.run([runtime, "rm", "-f", "-v", name], capture_output=True, timeout=180)
@@ -1212,7 +1260,13 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
             capture_output=True,
             timeout=_STOP_TIMEOUT_SECONDS + 60,
         )
-        _await_log(runtime, name, "mt5: starting the hub", count=2, seconds=300)
+        _await_log(
+            runtime,
+            name,
+            "mt5: the WebRequest allowlist holds 127.0.0.1 alone",
+            count=2,
+            seconds=300,
+        )
         after = _allowlist(runtime, name)
         kept = subprocess.run(
             [runtime, "exec", name, "ls", _CONFIG, _COMMON_FILES, _BASES],
@@ -1232,43 +1286,6 @@ def test_a_restart_restores_the_baked_state_outside_the_history_store(tmp_path) 
     assert "written-by-a-run" not in kept
     assert "synced" in kept
     assert queried.returncode != 0
-
-
-# Writes each argument as a line of a journal dated past any real day, as the terminal writes one.
-_LATER_JOURNAL = r"""
-journal="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/logs/29991231.log"
-{ printf '\377\376'; printf '%s\r\n' "$@" | iconv -f UTF-8 -t UTF-16LE; } > "$journal"
-"""
-
-
-@_needs_image
-def test_the_terminal_logs_reach_the_container_log_verbatim(tmp_path) -> None:
-    runtime = _runtime()
-    login = _ACCOUNT["MT5_LOGIN"]
-    server = _ACCOUNT["MT5_SERVER"]
-    with _booted(runtime, tmp_path, f"mt5-image-log-test-{os.getpid()}") as name:
-        subprocess.run(
-            [
-                runtime,
-                "exec",
-                name,
-                "sh",
-                "-c",
-                _LATER_JOURNAL,
-                "sh",
-                f"'{login}': authorized on {server} through Access Server",
-            ],
-            check=True,
-            timeout=30,
-        )
-        written = f"terminal: '{login}': authorized on {server} through Access Server"
-        _await_log(runtime, name, written, count=1, seconds=30)
-        # The experts log is written only once the startup script runs, after the journal.
-        _await_log(runtime, name, "\nexperts: ", count=1, seconds=60)
-        printed = _logs(runtime, name)
-
-    assert re.search(r"^terminal: .*MetaTrader 5 x64 build \d+ started", printed, re.MULTILINE)
-    assert "\x00" not in printed
 
 
 @_needs_image
@@ -1315,7 +1332,7 @@ def _health(port: int) -> tuple[int, dict] | None:
 
 
 @_needs_image
-def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> None:
+def test_the_standalone_hub_answers_health_503_with_no_spawner_or_clock() -> None:
     runtime = _runtime()
     name = f"mt5-image-hub-test-{os.getpid()}"
     try:
@@ -1328,6 +1345,8 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
                 name,
                 "--publish",
                 f"127.0.0.1::{_HUB_PORT}",
+                "--entrypoint",
+                "mt5-connector-hub",
                 *_account_env(),
                 _IMAGE,
             ],
@@ -1336,7 +1355,6 @@ def test_the_hub_boots_and_answers_its_health_503_with_no_spawner_or_clock() -> 
             timeout=60,
         )
         hub = _published_port(runtime, name, _HUB_PORT)
-        _await_log(runtime, name, "mt5: starting the hub", count=1, seconds=300)
         deadline = time.monotonic() + 30
         answered = _health(hub)
         while answered is None and time.monotonic() < deadline:

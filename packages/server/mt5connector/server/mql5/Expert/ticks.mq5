@@ -1190,6 +1190,7 @@ void KeepRatesWithin(MqlRates &rows[], const long from, const long to)
     int kept = 0;
     for (int i = 0; i < ArraySize(rows); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         if ((long)rows[i].time >= from && (long)rows[i].time <= to)
         {
             rows[kept] = rows[i];
@@ -1204,6 +1205,7 @@ void KeepTicksWithin(MqlTick &rows[], const long fromMsc, const long toMsc)
     int kept = 0;
     for (int i = 0; i < ArraySize(rows); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         if (rows[i].time_msc >= fromMsc && rows[i].time_msc <= toMsc)
         {
             rows[kept] = rows[i];
@@ -1291,6 +1293,7 @@ void Chunks(const long lo, const long hi, const long span, long &los[], long &hi
     ArrayResize(his, (int)count);
     for (long i = 0; i < count; i++)
     {
+        RenewEveryBusy(GetTickCount64());
         los[(int)i] = lo + (hi - lo) * i / count;
         his[(int)i] = lo + (hi - lo) * (i + 1) / count - 1;
     }
@@ -1301,17 +1304,23 @@ void Chunks(const long lo, const long hi, const long span, long &los[], long &hi
 int FirstOffGrid(const MqlRates &rows[], const int period)
 {
     for (int i = 0; i < ArraySize(rows); i++)
+    {
+        RenewEveryBusy(GetTickCount64());
         if (((long)rows[i].time - (long)rows[0].time) % period != 0
             || (i > 0 && rows[i].time <= rows[i - 1].time))
             return i;
+    }
     return -1;
 }
 
 int FirstDecrease(const MqlTick &rows[])
 {
     for (int i = 1; i < ArraySize(rows); i++)
+    {
+        RenewEveryBusy(GetTickCount64());
         if (rows[i].time_msc < rows[i - 1].time_msc)
             return i;
+    }
     return -1;
 }
 
@@ -1833,14 +1842,20 @@ int Passing(const MqlRates &rows[], const ENUM_WALK_TEST test, const int period,
     if (test == WALK_PERIOD_PAIR)
     {
         for (int k = 0; k + 1 < ArraySize(rows) && passing < 0; k++)
+        {
+            RenewEveryBusy(GetTickCount64());
             if ((long)rows[k + 1].time - (long)rows[k].time == period)
                 passing = k;
+        }
     }
     else
     {
         for (int k = 0; k < tested && passing < 0; k++)
+        {
+            RenewEveryBusy(GetTickCount64());
             if (rows[k].spread > 0)
                 passing = k;
+        }
     }
     return passing;
 }
@@ -2212,6 +2227,7 @@ long SignOf(const long value)
 
 void Push(long &values[], const long value)
 {
+    RenewEveryBusy(GetTickCount64());
     const int n = ArraySize(values);
     ArrayResize(values, n + 1, 64);
     values[n] = value;
@@ -2238,6 +2254,7 @@ void ReverseOutside(long &prices[], const int from, long anchor, const long h, c
 {
     for (int i = from; i < ArraySize(prices); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         const long step = prices[i] - anchor;
         if (prices[i] < l || prices[i] > h)
             prices[i] = anchor - step;
@@ -2353,6 +2370,7 @@ int AppendSegment(const long a, const long b, const long n, const long h, const 
         long previous = a;
         for (long k = 1; k < m; k++)
         {
+            RenewEveryBusy(GetTickCount64());
             long j = k / 2;
             if (toward)
                 j = (k + 1) / 2;
@@ -2530,9 +2548,10 @@ void AppendBarTicks(const MqlRates &bar, const long d, const double point, const
     TickOffsets((long)bar.time, bar.tick_volume, count, offsets);
     const double spread = bar.spread * point;
     const int n = ArraySize(rows);
-    ArrayResize(rows, n + count, 4096);
+    ArrayResize(rows, n + count, n + count + 4096);
     for (int k = 0; k < count; k++)
     {
+        RenewEveryBusy(GetTickCount64());
         const long stamp = (long)bar.time * 1000 + offsets[k];
         const double bid = NormalizeDouble(bids[k] * point, digits);
         ZeroMemory(rows[n + k]);
@@ -2579,6 +2598,7 @@ bool LastDirection(const HistoryRequest *r, HistoryRun &run, const long before, 
         {
             for (int i = ArraySize(part) - 1; i >= 0 && !found; i--)
             {
+                RenewEveryBusy(GetTickCount64());
                 const long moved = SignOf(PointsOf(part[i].close, point)
                                           - PointsOf(part[i].open, point));
                 if (moved != 0)
@@ -2599,9 +2619,13 @@ void UnmarkTicked(const MqlRates &bars[], const MqlTick &ticks[], bool &tickless
     int next = 0;
     for (int i = 0; i < ArraySize(bars); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         const long open = (long)bars[i].time * 1000;
         while (next < ArraySize(ticks) && ticks[next].time_msc < open)
+        {
+            RenewEveryBusy(GetTickCount64());
             next++;
+        }
         if (next < ArraySize(ticks) && ticks[next].time_msc < open + MINUTE_MS)
             tickless[i] = false;
     }
@@ -2615,12 +2639,16 @@ void MarkTickless(const HistoryRequest *r, HistoryRun &run, const MqlRates &bars
 {
     ArrayResize(tickless, ArraySize(bars));
     for (int i = 0; i < ArraySize(bars); i++)
+    {
+        RenewEveryBusy(GetTickCount64());
         tickless[i] = true;
+    }
     UnmarkTicked(bars, real, tickless);
     int first = -1;
     int last = -1;
     for (int i = 0; i < ArraySize(bars); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         if (tickless[i] && first < 0)
             first = i;
         if (tickless[i])
@@ -2665,6 +2693,7 @@ void CheckTickEra(const HistoryRequest *r, HistoryRun &run, const long lo, const
         MarkTickless(r, run, bars, real, tickless);
     for (int i = 0; i < ArraySize(bars) && run.Going(); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         if (tickless[i] && bars[i].tick_volume > 0)
             run.Stop(RUN_FAILED,
                      StringFormat("%s ticks: minute broker %I64d holds a bar and no tick",
@@ -2716,15 +2745,22 @@ void AppendTickless(const HistoryRequest *r, HistoryRun &run, const MqlRates &ba
     int firstMoving = 0;
     while (firstMoving < ArraySize(bars)
            && PointsOf(bars[firstMoving].close, point) == PointsOf(bars[firstMoving].open, point))
+    {
+        RenewEveryBusy(GetTickCount64());
         firstMoving++;
+    }
     bool lookback = false;
     for (int i = 0; i < firstMoving; i++)
+    {
+        RenewEveryBusy(GetTickCount64());
         lookback = lookback || tickless[i];
+    }
     long direction = 0;
     if (lookback)
         LastDirection(r, run, (long)bars[0].time, point, direction);
     for (int i = 0; i < ArraySize(bars) && run.Going(); i++)
     {
+        RenewEveryBusy(GetTickCount64());
         const long moved = SignOf(PointsOf(bars[i].close, point) - PointsOf(bars[i].open, point));
         long d = 1;
         if (moved != 0)
@@ -2768,6 +2804,7 @@ void Merge(const MqlTick &a[], const MqlTick &b[], MqlTick &rows[])
     int j = 0;
     for (int k = 0; k < na + nb; k++)
     {
+        RenewEveryBusy(GetTickCount64());
         if (j >= nb || (i < na && a[i].time_msc <= b[j].time_msc))
         {
             rows[k] = a[i];
@@ -3949,6 +3986,9 @@ bool PodsPackToTheProtocol()
 
 int OnInit()
 {
+    PrintFormat("trading allowed: terminal=%s, expert=%s",
+                TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "true" : "false",
+                MQLInfoInteger(MQL_TRADE_ALLOWED) ? "true" : "false");
     PrintFormat("ticks EA initializing as the %s of '%s'", ChartRoleName(Role), _Symbol);
     if (RelaySeconds < 1)
     {

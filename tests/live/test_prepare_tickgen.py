@@ -2,6 +2,7 @@
 would create that already exists, and a flag whose value cannot be used."""
 
 import argparse
+import json
 import sys
 
 import prepare_tickgen
@@ -42,6 +43,25 @@ def test_an_existing_container_named_like_its_compile_container_refuses_before_a
         prepare_tickgen.prepare(arguments)
 
     assert commands == []
+
+
+def test_candidate_uses_production_restarts_and_the_existing_health_bound(monkeypatch, tmp_path):
+    sent = []
+    observed = []
+    env_file = tmp_path / ".env"
+    env_file.write_text("MT5_LOGIN=1\nMT5_PASSWORD=made-up\nMT5_SERVER=test-server\n")
+    monkeypatch.setattr(prepare_tickgen, "podman", lambda *a, **kw: sent.append(a) or "")
+    monkeypatch.setattr(
+        prepare_tickgen.Runtime,
+        "healthy",
+        lambda self, name, port, **kw: observed.append((name, port, kw)),
+    )
+
+    prepare_tickgen.start_candidate("image", "owned", env_file, "history", 9000)
+
+    run = sent[0]
+    assert run[run.index("--restart") + 1] == "unless-stopped"
+    assert observed == [("owned", 9000, {"seconds": prepare_tickgen.HEALTH_BOUND_S})]
 
 
 def test_a_port_outside_the_port_range_is_refused_before_any_command(monkeypatch, commands):
@@ -116,3 +136,60 @@ def test_an_output_directory_holding_an_earlier_capture_is_refused_before_any_co
 
     assert refused.value.code == 2
     assert commands == []
+
+
+def test_shortened_cache_preparation_records_the_native_capped_frame(monkeypatch, tmp_path):
+    import mt5connector.client
+
+    monkeypatch.setattr(prepare_tickgen, "CHECKOUT", tmp_path)
+    monkeypatch.setattr(mt5connector.client, "__file__", str(tmp_path / "client.py"))
+    monkeypatch.setattr(prepare_tickgen, "exists", lambda *args: False)
+    monkeypatch.setattr(prepare_tickgen, "podman", lambda *args, **kwargs: "image-id")
+    monkeypatch.setattr(prepare_tickgen, "seed_settings", lambda seed: ({}, "seed-volume"))
+    monkeypatch.setattr(
+        prepare_tickgen,
+        "compile_sources",
+        lambda *args: {
+            "image_ticks_sha256": "source-hash",
+            "ticks": "Result: 0 errors, 0 warnings",
+            "tickgen_raw": "Result: 0 errors, 0 warnings",
+            "terminal_build": "test-build",
+        },
+    )
+    monkeypatch.setattr(prepare_tickgen, "clone_history", lambda *args: "private-clone")
+    monkeypatch.setattr(prepare_tickgen, "m1_cache_bytes", lambda *args: 100)
+    monkeypatch.setattr(prepare_tickgen, "start_candidate", lambda *args: None)
+    monkeypatch.setattr(prepare_tickgen, "sha256", lambda path: "source-hash")
+    monkeypatch.setattr(prepare_tickgen, "outcome_m1_first", lambda *args: 1_800_000_000)
+    captured = []
+
+    def collect(image, name, env_file, clone, windows, capture, output, *, maxbars=100_000_000):
+        captured.append((capture, maxbars))
+        directory = output / f"raw-{capture}"
+        directory.mkdir()
+        return directory
+
+    async def settled(port):
+        return {
+            "terminal_build": "test-build",
+            "account": {"trade_allowed": True, "trade_mode": 0},
+            "ranges": {},
+            "maxbars": 100_000_000,
+        }
+
+    monkeypatch.setattr(prepare_tickgen, "collect", collect)
+    monkeypatch.setattr(prepare_tickgen, "settled", settled)
+    prepare_tickgen.prepare(
+        argparse.Namespace(
+            image="candidate",
+            seed_container="seed",
+            name="probe",
+            port=12345,
+            output="scripts/shortened",
+            shorten_cache=True,
+        )
+    )
+    prepared = json.loads((tmp_path / "scripts/shortened/provenance.json").read_text())
+    assert captured == [("m1-first", 100_000)]
+    assert prepared["m1_first_utc"] == 1_800_000_000
+    assert prepared["collector_maxbars"] == 100_000

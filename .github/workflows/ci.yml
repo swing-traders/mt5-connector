@@ -30,6 +30,9 @@ jobs:
       - name: Test (pytest)
         run: just test
 
+      - name: Test functional approval pinning
+        run: node --test .github/functional-head.test.cjs
+
   image:
     uses: ./.github/workflows/image.yml
     with:

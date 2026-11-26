@@ -1,16 +1,16 @@
-"""The candidate hub tests/live/prepare_tickgen.py starts with `--shorten-cache`, on a history copy
-whose M1 frame cache the collector rewrote short, answering the floors and the bars of the
-untouched copy. It runs only when MT5_TICK_RAW_DIR is set; MT5_TICK_ACCEPTANCE_REQUIRED=1 fails
-every case whose inputs or hub are missing instead of skipping it."""
+"""Check a MaxBars=100000 M1 frame rebuild against independent native tester floors and rows.
+
+MT5_TICK_RAW_DIR names its preparation; MT5_TICK_ACCEPTANCE_REQUIRED=1 makes missing inputs fail.
+"""
 
 import asyncio
 import json
 import os
 import subprocess
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from tickgen_reference import REFERENCE
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.hub import HubSession
@@ -24,14 +24,13 @@ RAW_DIR = os.environ.get("MT5_TICK_RAW_DIR")
 REQUIRED = os.environ.get("MT5_TICK_ACCEPTANCE_REQUIRED") == "1"
 EA_SOURCE = "packages/server/mt5connector/server/mql5/Expert/ticks.mq5"
 SYNCED_S = 2 * calls.HISTORY_BUSY_S
-# The floors and the January 2023 M1 row count a hub on an untouched copy of the history answers.
-M1_FLOOR = int(datetime(2018, 9, 14, 1, 58, tzinfo=UTC).timestamp())
-QUOTE_FLOOR = int(datetime(2018, 9, 26, 16, 16, tzinfo=UTC).timestamp())
+M1_FLOOR = REFERENCE["floors"]["m1_utc"]
+QUOTE_FLOOR = REFERENCE["floors"]["quote_utc"]
 JANUARY = (
-    int(datetime(2023, 1, 2, tzinfo=UTC).timestamp()),
-    int(datetime(2023, 1, 14, tzinfo=UTC).timestamp()),
+    REFERENCE["floors"]["january_start_utc"],
+    REFERENCE["floors"]["january_end_utc"],
 )
-JANUARY_ROWS = 14_251
+JANUARY_ROWS = REFERENCE["floors"]["january_rows"]
 
 
 def unavailable(reason: str):

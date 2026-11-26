@@ -28,3 +28,6 @@ black-fix:
 
 test:
     pytest
+
+functional env_file=".env":
+    python -m functional --env-file "$1"

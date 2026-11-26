@@ -1,8 +1,9 @@
 """The every-tick generator's historical acceptance against the candidate hub tests/live/
 prepare_tickgen.py starts: the tester's exported weeks, a doji read alone, the venue's real ticks,
-and a later tickless minute rejected inside the tick era. It runs only when MT5_TICK_EXPORT_DIR and
-MT5_TICK_RAW_DIR are set; MT5_TICK_ACCEPTANCE_REQUIRED=1 fails every case whose inputs or hub are
-missing instead of skipping it."""
+and a later tickless minute rejected inside the tick era. MT5_TICK_EXPORT_DIR and MT5_TICK_RAW_DIR
+name the tester lane's inputs; MT5_GAP_PREPARED_DIR names the reloaded custom-symbol input.
+MT5_TICK_ACCEPTANCE_REQUIRED=1 fails a case whose inputs or hub are missing instead of skipping it.
+"""
 
 import asyncio
 import csv
@@ -10,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -17,7 +19,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import tickgen_capture
+import tickgen_gap
 import tickgen_oracle as oracle
+from tickgen_reference import REFERENCE
 
 from mt5connector.client.config import MT5Config
 from mt5connector.client.errors import EaError
@@ -52,37 +56,9 @@ class Week:
     within_one_point: int
 
 
-WEEKS = (
-    Week(
-        "ticks-202301",
-        {
-            "ticks.csv": "d7da4b6574e1609b8be6fabc1075eafa9d1617d09a98eb85a73e04eabcc9778f",
-            "bars.csv": "3b9632f32335dcfade8d47e8ad53a5a386201b7e38dd9de6c7dd332fa9b33bd7",
-            "metadata.csv": "9d80528d44c3a43a597701dbeae98f7f2e1ffba0c21c9cff53cce8b15fd29657",
-        },
-        minutes=7188,
-        full_volume=6543,
-        deficit=645,
-        scaffolds=6401,
-        within_one_point=6543,
-    ),
-    Week(
-        "ticks-202310",
-        {
-            "ticks.csv": "4f821cc254ce0f4848927dc352c0d01da2cb877045065848e31fdadd54e755a2",
-            "bars.csv": "ce24e6bf8be125e0eb04e500b04913f2d13ff430c69964ee3ac3c3c6072205fa",
-            "metadata.csv": "78022247eec4f8c6d53748ae807940f73d1eb56ad60d1a942f31189a6186d14f",
-        },
-        minutes=7189,
-        full_volume=6236,
-        deficit=953,
-        scaffolds=6065,
-        within_one_point=6229,
-    ),
-)
-# The January minute, by raw broker epoch, whose path the worked rising-doji example registers.
-WORKED_MINUTE = 1673308440
-WORKED_PATH = [92543, 92545, 92544, 92546, 92545, 92547, 92546, 92550, 92549, 92543]
+WEEKS = tuple(Week(**week) for week in REFERENCE["weeks"])
+WORKED_MINUTE = REFERENCE["worked_minute"]
+WORKED_PATH = REFERENCE["worked_path"]
 
 
 def unavailable(reason: str):
@@ -249,6 +225,52 @@ def last_non_doji(bars: list[tuple]) -> int | None:
     return None
 
 
+@pytest.fixture
+def gap_provenance(monkeypatch):
+    directory = os.environ.get("MT5_GAP_PREPARED_DIR")
+    if directory is None:
+        unavailable("MT5_GAP_PREPARED_DIR must be set")
+    output = Path(directory)
+    prepared = json.loads((output / "provenance.json").read_text())
+    fixture = tickgen_gap.load()
+    tickgen_gap.verify_native(output / prepared["snapshot"], fixture, read_only=False)
+    assert prepared["symbol"] == fixture.provenance["symbol"]
+    assert sha256(CHECKOUT / EA_SOURCE) == prepared["source_sha256"][EA_SOURCE]
+    running = subprocess.run(
+        ["podman", "inspect", "--format", "{{.Image}} {{.State.Running}}", prepared["container"]],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert running.stdout.split() == [prepared["image_id"], "true"]
+    module = sys.modules[__name__]
+    original_reads = session_reads
+    monkeypatch.setattr(module, "SYMBOL", prepared["symbol"])
+    monkeypatch.setattr(module, "HUB_URL", f"ws://127.0.0.1:{prepared['port']}")
+    monkeypatch.setattr(module, "RAW_DIR", str(output))
+
+    def no_repeat_resync():
+        captured = subprocess.run(
+            ["podman", "logs", prepared["container"]], capture_output=True, text=True, check=True
+        )
+        tickgen_gap.no_repeat_resync(captured.stdout + captured.stderr, prepared["symbol"])
+
+    async def guarded_reads(reads):
+        answer = await tickgen_gap.subscribed_reads(
+            prepared["container"],
+            prepared["symbol"],
+            lambda: original_reads(reads),
+            timeout=2 * SYNCED_S + 120,
+        )
+        no_repeat_resync()
+        return answer
+
+    no_repeat_resync()
+    monkeypatch.setattr(module, "session_reads", guarded_reads)
+    yield prepared
+    no_repeat_resync()
+
+
 @pytest.fixture(scope="module")
 def provenance() -> dict:
     import mt5connector.client
@@ -408,6 +430,12 @@ def test_every_minute_follows_its_emitted_count_schedule_and_meets_equal_count_e
 
 def test_the_worked_rising_doji_minute_emits_its_registered_path(weeks):
     export, read = weeks[0]
+    bar, direction = next((bar, d) for bar, d in fitted(export, read) if bar[0] == WORKED_MINUTE)
+    _time, opened, high, low, closed, volume, _spread = bar
+    assert opened == closed and high > low and volume > 1
+    assert direction == 1
+    assert oracle.bids(*bar[1:6], 1) != oracle.bids(*bar[1:6], -1)
+    assert [bid for _stamp, bid in export.ticks[WORKED_MINUTE]] == WORKED_PATH
 
     assert bid_points(candidate_minute(read, WORKED_MINUTE), export.digits) == WORKED_PATH
 
@@ -461,9 +489,9 @@ def test_a_doji_read_alone_goes_opposite_the_rising_bar_before_its_window(weeks)
 
 
 def test_a_tick_era_gap_fails_and_the_preceding_real_minutes_answer_the_venues_ticks(
-    provenance, weeks
+    gap_provenance,
 ):
-    fixture = provenance["fixture"]
+    fixture = gap_provenance["fixture"]
     capture = tickgen_capture.load(Path(RAW_DIR) / fixture["directory"], fixture["label"])
     raw = capture.minutes()
     start, empty = fixture["start"], fixture["empty"]

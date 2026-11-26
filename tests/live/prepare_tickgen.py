@@ -1,10 +1,7 @@
-"""Prepares the tick-generator acceptance: two private copies of a seed container's synced history,
-the venue's raw ticks and M1 bars of a mixed window captured on one by a native collector, a hub
-from the candidate image on the other, healthy with its symbol's ranges settled, and the provenance
-of all of it. With `--shorten-cache` the collector reads the candidate's own copy, whose M1 frame
-cache it rewrites short, and the driver records that copy's M1 first date before the candidate
-starts; the shortened-cache test fails unless it is after 2023-01-14. The seed container is only
-read. `--cleanup` removes the containers and the volumes this driver labels with its name."""
+"""Prepare isolated history clones, native frame witnesses and candidate hub provenance.
+
+The shortened-cache setup rebuilds M1 at MaxBars=100000. The seed is only read.
+"""
 
 import argparse
 import asyncio
@@ -15,45 +12,40 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import tickgen_capture
+from tickgen_reference import REFERENCE
 
+from functional.runtime import Runtime
+from functional.settings import Redactor, load
 from mt5connector.client.config import MT5Config
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import calls
 from mt5connector.wire.broker_clock import BrokerClock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-SYMBOL = "AUDCAD+"
-# The symbol's digits, which the fixture's doji test reads; the tester exports record them.
-DIGITS = 5
+SYMBOL = REFERENCE["symbol"]
 LABEL = "io.swing-traders.tickgen-acceptance"
 BASES = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
 TERMINAL = "/home/mt5/.wine/drive_c/Program Files/MetaTrader 5"
 CREDENTIALS = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_SPAWNER_SYMBOL")
 CLOCK_SETTINGS = ("MT5_BROKER_TZ", "MT5_BROKER_OFFSET_HOURS")
-BASELINE = (datetime(2024, 6, 23, tzinfo=UTC), datetime(2024, 6, 26, tzinfo=UTC))
-FALLBACK_LAST_DAY = datetime(2024, 12, 31, tzinfo=UTC)
-# The fallback's UTC days captured per collector run.
-FALLBACK_BATCH_DAYS = 7
-DAY = timedelta(days=1)
 HEALTH_BOUND_S = 1800
 RANGES_BOUND_S = 4 * 3600
 COLLECTOR_BOUND_S = 2 * 3600
 POLL_S = 10
 # What a run for a name creates, each refused up front when it already exists.
 CONTAINERS = ("{name}", "{name}-compile", "{name}-raw")
-VOLUMES = ("{name}-bases", "{name}-raw-bases")
+VOLUMES = ("{name}-bases",)
 PORTS = range(1, 65536)
 SOURCES = (
     "packages/server/mt5connector/server/mql5/Expert/ticks.mq5",
     "tests/live/tickgen_raw.mq5",
     "tests/live/tickgen_oracle.py",
+    "tests/live/tickgen_reference.py",
+    "tests/fixtures/tickgen-btc/manifest.json",
     "tests/live/tickgen_capture.py",
     "tests/live/prepare_tickgen.py",
     "tests/live/test_tickgen_history.py",
@@ -68,7 +60,10 @@ class Unprepared(Exception):
 def podman(*arguments: str, check: bool = True) -> str:
     """The command's standard output; a failure raises with its standard error, never its
     arguments' environment."""
-    done = subprocess.run(["podman", *arguments], capture_output=True, text=True)
+    command = ["podman", *arguments]
+    if arguments[0] == "run":
+        command.insert(2, "--no-healthcheck")
+    done = subprocess.run(command, capture_output=True, text=True)
     if check and done.returncode != 0:
         raise Unprepared(f"podman {arguments[0]} failed ({done.returncode}): {done.stderr.strip()}")
     return done.stdout
@@ -98,6 +93,9 @@ def owned(name: str) -> dict[str, list[str]]:
 def cleanup(name: str) -> None:
     found = owned(name)
     for container in found["containers"]:
+        count = int(podman("inspect", "--format", "{{.RestartCount}}", container).strip())
+        for ordinal in range(1, count + 1):
+            log(f"{container}: restart {ordinal} observed before cleanup")
         podman("stop", "--time", "190", container, check=False)
         podman("rm", "--force", container)
         log(f"removed container {container}")
@@ -237,6 +235,8 @@ def collect(
     windows: list[tuple[str, int, int]],
     capture: str,
     output: Path,
+    *,
+    maxbars: int = 100_000_000,
 ) -> Path:
     """The collector's capture of each broker window, read in its own terminal on the clone, under
     raw-`capture`."""
@@ -249,6 +249,25 @@ def collect(
     baked_ini = podman("run", "--rm", "--entrypoint", "cat", image, "/opt/mt5/setup.ini")
     setup = collector / "setup.ini"
     setup.write_text(baked_ini.replace("Script=ticks_setup", "Script=tickgen_raw"))
+    entrypoint = podman("run", "--rm", "--entrypoint", "cat", image, "/opt/mt5/entrypoint.sh")
+    definitions, boundary, _ = entrypoint.partition(
+        "# A boot step failing because a supervised process stopped"
+    )
+    if not boundary:
+        raise Unprepared("the image has no native bootstrap definitions")
+    native_boot = collector / "native-entrypoint.sh"
+    # A reference collector runs only the terminal; it neither attaches an EA nor starts a hub.
+    native_boot.write_text(definitions + """
+trap end_with_stopped EXIT
+trap stop_on_request TERM INT
+require_settings
+start_display
+restore_baked_terminal
+write_inis
+acquire_server_list
+allow_webrequest
+supervise
+""")
     baked = "/opt/mt5-baked/terminal/MQL5"
     podman(
         "run",
@@ -257,12 +276,18 @@ def collect(
         container,
         "--label",
         f"{LABEL}={name}",
+        "--entrypoint",
+        "tini",
         "--env-file",
         str(env_file),
+        "-e",
+        f"MT5_MAX_BARS={maxbars}",
         "-v",
         f"{clone}:{BASES}",
         "-v",
         f"{setup}:/opt/mt5/setup.ini:ro,z",
+        "-v",
+        f"{native_boot}:/opt/mt5/native-entrypoint.sh:ro,z",
         "-v",
         f"{collector / 'tickgen_raw.ex5'}:{baked}/Scripts/tickgen_raw.ex5:ro,z",
         "-v",
@@ -270,6 +295,9 @@ def collect(
         "--stop-timeout",
         "190",
         image,
+        "--",
+        "bash",
+        "/opt/mt5/native-entrypoint.sh",
     )
     outcome_path = f"{TERMINAL}/MQL5/Files/tickgen-raw/outcome.txt"
     deadline = time.monotonic() + COLLECTOR_BOUND_S
@@ -303,52 +331,12 @@ def outcome_m1_first(directory: Path, clock: BrokerClock) -> int:
     return clock.to_utc(broker[0])
 
 
-def utc_epoch(moment: datetime) -> int:
-    return int(moment.timestamp())
-
-
-def window(clock: BrokerClock, label: str, start: datetime, end: datetime) -> tuple[str, int, int]:
-    """A UTC window [start, end) as the broker window the collector reads."""
-    return label, clock.to_broker(utc_epoch(start)), clock.to_broker(utc_epoch(end)) - 1
-
-
-def mixed_fixture(image, name, env_file, clone, clock, output) -> dict:
-    """The baseline capture's fixture, else the first later UTC day's through the fallback's last
-    day; fails naming every inspected window without one."""
-    inspected = []
-    baseline = window(clock, "baseline", *BASELINE)
-    directory = collect(image, name, env_file, clone, [baseline], baseline[0], output)
-    capture = tickgen_capture.load(directory, "baseline")
-    found = tickgen_capture.identify(capture, DIGITS)
-    inspected.append({"window": baseline, **tickgen_capture.counts(capture)})
-    day = BASELINE[1]
-    while found is None and day <= FALLBACK_LAST_DAY:
-        batch = []
-        while len(batch) < FALLBACK_BATCH_DAYS and day <= FALLBACK_LAST_DAY:
-            batch.append(window(clock, f"day-{day:%Y%m%d}", day, day + DAY))
-            day += DAY
-        directory = collect(image, name, env_file, clone, batch, batch[0][0], output)
-        for label, lo, hi in batch:
-            if found is None:
-                capture = tickgen_capture.load(directory, label)
-                found = tickgen_capture.identify(capture, DIGITS)
-                inspected.append({"window": (label, lo, hi), **tickgen_capture.counts(capture)})
-    if found is None:
-        raise Unprepared(f"no mixed fixture through {FALLBACK_LAST_DAY:%Y-%m-%d}: {inspected}")
-    return {
-        "directory": directory.name,
-        "label": capture.label,
-        "start": found.start,
-        "end": found.end,
-        "empty": found.empty,
-        "inspected": inspected,
-    }
-
-
 def start_candidate(image: str, name: str, env_file: Path, clone: str, port: int) -> None:
     podman(
         "run",
         "-d",
+        "--restart",
+        "unless-stopped",
         "--name",
         name,
         "--label",
@@ -363,18 +351,7 @@ def start_candidate(image: str, name: str, env_file: Path, clone: str, port: int
         "190",
         image,
     )
-    deadline = time.monotonic() + HEALTH_BOUND_S
-    healthy = False
-    while not healthy:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as answer:
-                healthy = answer.status == 200
-        except (urllib.error.URLError, ConnectionError):
-            healthy = False
-        if not healthy and time.monotonic() > deadline:
-            raise Unprepared(f"the candidate's hub was not healthy within {HEALTH_BOUND_S} s")
-        elif not healthy:
-            time.sleep(POLL_S)
+    Runtime(Redactor(load(env_file))).healthy(name, port, seconds=HEALTH_BOUND_S)
     log("the candidate's hub is healthy")
 
 
@@ -457,20 +434,34 @@ def prepare(arguments: argparse.Namespace) -> None:
             arguments.image, arguments.name, seed_volume, f"{arguments.name}-bases"
         )
         if arguments.shorten_cache:
-            raw_clone = clone
             cloned = m1_cache_bytes(arguments.image, clone)
-        else:
-            # The collector's terminal rewrites its volume's M1 frame cache short, so it reads its
-            # own copy of the history and the candidate another.
-            raw_clone = clone_history(
-                arguments.image, arguments.name, seed_volume, f"{arguments.name}-raw-bases"
+            podman(
+                "run",
+                "--rm",
+                "--user",
+                "root",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{clone}:/bases",
+                arguments.image,
+                "-c",
+                f"for cache in /bases/*/history/{SYMBOL}/cache/M1.hc; "
+                'do mv "$cache" "$cache.full"; done',
             )
-        fixture = mixed_fixture(arguments.image, arguments.name, env_file, raw_clone, clock, output)
-        if arguments.shorten_cache:
-            collected = m1_cache_bytes(arguments.image, clone)
+            # MT5 rebuilds the frame when its M1 chart opens at the native cap.
+            # The probe must not expand the capped frame before the candidate starts.
             probe = collect(
-                arguments.image, arguments.name, env_file, clone, [], "m1-first", output
+                arguments.image,
+                arguments.name,
+                env_file,
+                clone,
+                [],
+                "m1-first",
+                output,
+                maxbars=100_000,
             )
+            collected = m1_cache_bytes(arguments.image, clone)
             first = outcome_m1_first(probe, clock)
             log(
                 f"{SYMBOL} M1 frame cache: {cloned} bytes cloned, {collected} collected, "
@@ -482,7 +473,6 @@ def prepare(arguments: argparse.Namespace) -> None:
             path.unlink()
         private.rmdir()
     running = asyncio.run(settled(arguments.port))
-    raw = output / fixture["directory"]
     provenance = {
         "prepared_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "symbol": SYMBOL,
@@ -495,14 +485,12 @@ def prepare(arguments: argparse.Namespace) -> None:
         "compiled": {"ticks.mq5": compiled["ticks"], "tickgen_raw.mq5": compiled["tickgen_raw"]},
         "terminal_build_image": compiled["terminal_build"],
         "terminal_build_running": running["terminal_build"],
-        "server": settings["MT5_SERVER"],
         "account": running["account"],
         "ranges": running["ranges"],
         "maxbars": running["maxbars"],
         "volume": {
             "seed": seed_volume,
             "clone": clone,
-            "collector_clone": raw_clone,
             "clone_created": podman(
                 "volume", "inspect", "--format", "{{.CreatedAt}}", clone
             ).strip(),
@@ -511,11 +499,10 @@ def prepare(arguments: argparse.Namespace) -> None:
             "tz": settings.get("MT5_BROKER_TZ", "America/New_York"),
             "offset_hours": int(settings.get("MT5_BROKER_OFFSET_HOURS", "7")),
         },
-        "fixture": fixture,
-        "raw_sha256": {path.name: sha256(path) for path in sorted(raw.iterdir())},
     }
     if arguments.shorten_cache:
         provenance["m1_cache_bytes"] = {"cloned": cloned, "collected": collected}
+        provenance["collector_maxbars"] = 100_000
         provenance["m1_first_utc"] = first
     (output / "provenance.json").write_text(json.dumps(provenance, indent=1) + "\n")
     log(f"prepared: {output / 'provenance.json'}")

@@ -1,0 +1,39 @@
+{
+  "recorded_utc": "2026-11-25T00:37:50.876988+00:00",
+  "terminal_build": 6316,
+  "symbol": "BTCUSD.a",
+  "range": {
+    "from": "2023.01.09",
+    "to_exclusive": "2023.01.14",
+    "basis": "broker wall time"
+  },
+  "tester_settings": {
+    "Expert": "TickExporter",
+    "Symbol": "BTCUSD.a",
+    "Period": "M1",
+    "Model": "0",
+    "ExecutionMode": "0",
+    "Optimization": "0",
+    "FromDate": "2023.01.09",
+    "ToDate": "2023.01.14",
+    "ForwardMode": "0",
+    "Deposit": "10000",
+    "Currency": "USD",
+    "Leverage": "1:500",
+    "UseLocal": "1",
+    "UseRemote": "0",
+    "UseCloud": "0",
+    "Visual": "0",
+    "Report": "reference_report",
+    "ReplaceReport": "1",
+    "ShutdownTerminal": "1"
+  },
+  "native_every_tick_confirmed": true,
+  "source_image_id": "d2135d1b78a2f81540e83119d86424def1798478108b82216ce64062133a04e4",
+  "exporter_sha256": "ba8a785b8254e9d19d4151d76bbf17be7e17af91058e189bb568b7cc3ace77f1",
+  "files": {
+    "ticks.csv": "861344baaececa03bef67675b1ffedca4a15d14a94664c3fd704ac08ede86082",
+    "bars.csv": "e9d925f6a06c65aae95e16d546a91f2b41c64c4fadd4c44cc589ef6b2458e898",
+    "metadata.csv": "a3c9ce9e8eedeb10afbde87f6acb3978eeac44d2bc3d6e0feabf2de73b35aaeb"
+  }
+}

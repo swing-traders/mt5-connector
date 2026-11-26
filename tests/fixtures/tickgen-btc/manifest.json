@@ -1,0 +1,93 @@
+{
+  "symbol": "BTCUSD.a",
+  "digits": 2,
+  "weeks": [
+    {
+      "job": "ticks-202301",
+      "sha256": {
+        "ticks.csv": "861344baaececa03bef67675b1ffedca4a15d14a94664c3fd704ac08ede86082",
+        "bars.csv": "e9d925f6a06c65aae95e16d546a91f2b41c64c4fadd4c44cc589ef6b2458e898",
+        "metadata.csv": "a3c9ce9e8eedeb10afbde87f6acb3978eeac44d2bc3d6e0feabf2de73b35aaeb"
+      },
+      "minutes": 7166,
+      "full_volume": 7151,
+      "deficit": 15,
+      "scaffolds": 7109,
+      "within_one_point": 7151
+    },
+    {
+      "job": "ticks-202310",
+      "sha256": {
+        "ticks.csv": "eba43427742ab052c1a5992ca13f85ac23d2b9d1416c06c3475ceb7e54704802",
+        "bars.csv": "376caf5a8551262cb1626a45705cf2bd933534f0f9a02fca720acb1da07813c1",
+        "metadata.csv": "e4424aa8bb43fdc9138d63a466b0a5a624f56be05a6d76b5514aba9cd2e4998e"
+      },
+      "minutes": 7166,
+      "full_volume": 7148,
+      "deficit": 18,
+      "scaffolds": 7124,
+      "within_one_point": 7148
+    }
+  ],
+  "worked_minute": 1673241840,
+  "worked_path": [
+    1718874, 1718862, 1718849, 1718836, 1718840, 1718844,
+    1718849, 1718841, 1718833, 1718824, 1718843, 1718863,
+    1718883, 1718882, 1718883, 1718882, 1718901, 1718921,
+    1718941, 1718940, 1718941, 1718940, 1718959, 1718979,
+    1718999, 1718968, 1718937, 1718905, 1718915, 1718925,
+    1718936, 1718924, 1718912, 1718899, 1718887, 1718874
+  ],
+  "floors": {
+    "m1_broker": 1491782400,
+    "quote_broker": 1606720500,
+    "m1_utc": 1491771600,
+    "quote_utc": 1606713300,
+    "january_start_utc": 1672617600,
+    "january_end_utc": 1673654400,
+    "january_rows": 17121
+  },
+  "clock": {
+    "zone": "America/New_York",
+    "wall_hours_ahead": 7
+  },
+  "calibration_oracle_sha256": "17f1fafb0ef48e1a8467c13dfc9d8a670788e3fe82aa4f685920c73d78ed87d3",
+  "native_floor_files": {
+    "history-first.csv": "98a223b658d210b8be7b7b25468ff77357bd0d85a04479f0a916ff723c21c84b",
+    "spread-first.csv": "af90932b30ead235b4c968755413926b4ea52846b1f88580087320943ba2ec4a",
+    "first-real-tick.csv": "5ee9b2a76c4934aacdd95992b4599240bb83e1b9fe06f510512926e765cbea58",
+    "january.csv": "27ee5efd4f742a7b4a499643dc992bfa2136d9a1e9355117a74b39dff5a99c2f",
+    "metadata.csv": "2682c63943986f46c30eeb80995a19d7fdf89828c99eb3ea8c71dd194d4648cb"
+  },
+  "floor_tester_jobs": [
+    {
+      "job": "ticks-floor-201704",
+      "sha256": {
+        "ticks.csv": "f61a44f21b71e8611ddf69fb66edb71a58f2c56d6a320e197d4c878ba1453b80",
+        "bars.csv": "e2fe06a4a1327ba583a9a4828ea60dc97a617a0638c2b1ac15e34f084430a415",
+        "metadata.csv": "441572af1f8210a1edd7276212f093f1b3c55637dbbf51d029cf357e9ce9cf6e"
+      }
+    },
+    {
+      "job": "ticks-spread-202011",
+      "sha256": {
+        "ticks.csv": "66d22a49e719aa87c26291862fa47a54f5b2653a21be7059b0f31c48936fcc26",
+        "bars.csv": "eb21732380cbc5d6c87cfbe65f8f2b3a72abeefad4c358494e9ef199fb520f22",
+        "metadata.csv": "50fd285a651fd1d4048ebc0af2c9f70c59ce73d297f0f99261f142294a1d3275"
+      }
+    },
+    {
+      "job": "ticks-january-rows",
+      "sha256": {
+        "ticks.csv": "bbe5abc8a9dbf9129433ba8f913144aeb2df9ffbb48f92f703dc5d3ee64e691e",
+        "bars.csv": "83b4bf4f2c87db79a2183f72a9ac1eb95f81d212df2720947351ef501691fba5",
+        "metadata.csv": "21ffa6b2cb88be8b8171643ec7f169df08191d41555bee00a0f765ebe8827abc"
+      }
+    }
+  ],
+  "floor_reference_jobs": {
+    "m1": "ticks-floor-201704",
+    "quote": "ticks-spread-202011",
+    "january": "ticks-january-rows"
+  }
+}

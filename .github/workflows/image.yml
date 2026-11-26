@@ -9,6 +9,10 @@ on:
         description: Push the image once the image tier has passed on it.
         type: boolean
         required: true
+      ref:
+        description: The commit to build and test.
+        type: string
+        default: ""
 
 jobs:
   image:
@@ -19,6 +23,8 @@ jobs:
         shell: bash -el {0}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       # A runner guarantees 14 GB of disk, and the image alone, built beside the test environment,
       # takes over 6 GB.

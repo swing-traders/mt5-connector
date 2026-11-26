@@ -147,7 +147,7 @@ A server-synced read receives `syncing` while its symbol's re-sync is due and un
 - **A stalled store**, one whose first date stands still across three deep reads short of the server's first date, is measured from where it stopped; the history chart's next life measures it again.
 - **The quote floor**, the tick series' floor `ranges` reports, is the earlier of the first real tick and the spread floor: the first M1 bar from the M1 floor on that records a spread.
 - **The era spread rule.** Each minute of a tick read from the spread floor on, before the first real tick's minute, whose M1 bar the terminal holds is answered with the ticks MT5's "Every tick" mode generates from that bar, by the fitted rules ([The EA](#the-ea)), with the bar's own spread, zero included. Where the server holds no real ticks, the generator extends to the window's end. At or after the first real tick's minute, a positive-volume M1 bar with no tick of any kind fails the read with `ea_error` naming the minute. A minute holding any real tick is answered with the venue's ticks, unchanged.
-- **Every history read is served on the history chart** by blocking reads, one request at a time, busy to the hub between calls under one bound. A bar read settles when two identical calls agree, a tick read when a call answers without a loading error; a read not settled within the bound answers `syncing` and is asked again.
+- **Every history read is served on the history chart** by blocking reads, one request at a time, busy to the hub between calls and during row construction under one bound. A bar read settles when two identical calls agree, a tick read when a call answers without a loading error; a read not settled within the bound answers `syncing` and is asked again.
 - A bar read names its timeframe from `M1` to `W1`: a month has no fixed period, so `MN1` is refused.
 - A window that starts after it ends, or after the terminal's time — the spawner's latest server-time sample, advanced by its age — is answered `invalid_window` by the hub, judged in true UTC before the window is widened to its broker bounds.
 - A window about a clock change is read in the broker window holding every stamp that reads into it — a skipped hour's stamps read at the offset before the change, a repeated hour's at either pass — and answered with those stamps alone.
@@ -319,12 +319,16 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 
 1. Starts Xvfb at 1920x1080, and x11vnc in a debug image.
 2. **Restores the baked state,** before any Wine process of the run starts, since Wine reads its registry as it does. `rsync` copies `/opt/mt5-baked` back, comparing files by content: `terminal/` over the terminal directory and `metaquotes/` over the AppData tree, each deleting whatever the baked copy does not hold, `Bases` excluded, and the three registry files over the Wine prefix's. It is bounded at 40 s. Everything an earlier run of the container wrote — `Config\` with its server list and saved accounts, `Profiles\`, the chart profiles, the logs, the AppData tree, the registry — is undone, `Bases` is never written, and the log says so in one line.
-3. **Fetches the server list.** The terminal logs in only to a trade server its `Config\servers.dat` lists. The entrypoint launches it on the account without the startup script, searches `MT5_SERVER` on the first page of File → Open an Account — which adds the broker's servers — and closes it, which keeps them.
-4. Launches `terminal64.exe /config:<the ini copy> /portable`. `ticks_setup` opens the spawner's chart on the spawner symbol. **Starts the log tail,** `/opt/mt5/tail_logs.py` under the Linux Python, which streams the terminal's journal (`logs\<YYYYMMDD>.log`) and its experts log (`MQL5\logs\<YYYYMMDD>.log`) into the container log from the start of this boot:
+3. **Fetches and verifies the server list.**
+   - Launches the terminal on the account without the startup script and searches `MT5_SERVER` on the first page of File → Open an Account.
+   - Reads the available servers and current selection from File → Login to Trade Account, explicitly selects the exact requested server if present, and cancels without submitting a login.
+   - Searches once. An absent server or a selection failure exits non-zero before the hub starts, with one line naming the requested server and the servers the terminal holds.
+   - Closes the terminal, which keeps the acquired server definitions.
+4. Launches `terminal64.exe /config:<the ini copy> /portable`. `ticks_setup` opens the spawner's chart on the spawner symbol once and publishes its startup result. The first failed chart open exits startup non-zero before the hub starts, with one line naming the symbol and MT5's error code. **Starts the log tail,** `/opt/mt5/tail_logs.py` under the Linux Python, which streams the terminal's journal (`logs\<YYYYMMDD>.log`) and its experts log (`MQL5\logs\<YYYYMMDD>.log`) into the container log from the start of this boot:
    - each line converted from the terminal's UTF-16LE to UTF-8, its byte-order mark and carriage return stripped, and prefixed `terminal:` or `experts:`, its text otherwise written as the terminal wrote it;
    - each log followed onto the next UTC day's file when it appears.
 5. **Adds `127.0.0.1` to the WebRequest allowlist,** which no ini key sets: on the Experts tab of Tools → Options it ticks "Allow WebRequest for listed URL" where unticked, adds `127.0.0.1` to the list, and applies the dialog. The list must then hold that one URL.
-6. Starts the hub (`mt5-connector-hub`, the Linux Python).
+6. Requires the spawner chart's successful startup result, then starts the hub (`mt5-connector-hub`, the Linux Python). Any startup failure exits before the hub starts, naming what failed. Startup has no retry layer; the runtime's container restart policy controls another start.
 7. Supervises Xvfb, the terminal and the hub: the first of them to exit ends the container with its status, and whatever started the container decides whether to start it again. A lost broker session is the terminal's own to recover and ends nothing, and so does a log tail that exits: the log names its status and the tail is restarted, skipping what the logs hold at its first read — so the lines written between the stopped tail's last read and the restart are lost.
 
 **The dialogs are driven by control identity**, by `/opt/mt5/terminal_gui.py` under the Windows Python, through Win32 messages and never a screen position:
@@ -333,11 +337,11 @@ The entrypoint, `/opt/mt5/entrypoint.sh` under `tini`, prints its own steps, pre
 - a dialog is opened by the command id its menu path holds in `terminal64.exe`'s own menu resources;
 - a control is found by its id and class, the Options page by its tab's name.
 
-The WebRequest list's text cannot be read, so its row count confirms the URL. An allowlist retry finding exactly one URL applies it without adding another. The server search and allowlist steps each get three attempts within the same start. Each attempt launches its terminal, waits up to 120 s for its window, and runs its GUI action bounded at 40 s. A failed attempt closes its terminal, killing it if it does not exit within 60 s, before the 5 s retry delay. Each failure names its step, attempt and driver error, including the last window poll's output; the third fails startup. The server's name reaches the driver through `MT5_SERVER` alone.
+The WebRequest list's text cannot be read, so its row count confirms the URL. A list already holding exactly one URL is applied without adding another. The allowlist step launches its terminal, waits up to 120 s for its window, and runs its GUI action bounded at 40 s. Its first failure exits non-zero before the hub starts, with one line naming the failed step and its bound or the driver's diagnostic. A chart-open failure stops the start even while the allowlist is being configured. The server's name reaches the driver through `MT5_SERVER` alone.
 
-Before every attempt, `dismiss-dialogs` lists owned dialogs, closes a recognised terminal update offer and cancels only that step's own dialog: Options or Open an Account. Unknown dialogs are named and left open. A main window that stays disabled also reports its owned dialogs.
+Before each GUI step, `dismiss-dialogs` lists owned dialogs, closes a recognised terminal update offer and cancels only that step's own dialog: Options or Open an Account. Unknown dialogs are named and left open. A main window that stays disabled also reports its owned dialogs.
 
-A terminal window, dialog or control that never appears exhausts its step's attempts and fails the start, naming the step. What the entrypoint cannot see — a server search that found nothing, a refused login, a spawner symbol the broker does not list — ends nothing: no sample verifies the broker clock, so the hub's `/health` stays 503 and it answers every request `not_ready`, logging the missed bootstrap window as critical.
+A terminal window, dialog or control that never appears fails its step, naming it. A search that does not supply the requested server fails immediately. A spawner chart that does not open or accept its template fails startup. A refused login that produces no spawner result reaches the startup bound and exits before the hub starts.
 
 ### Stop
 
@@ -366,9 +370,11 @@ The image bakes the sections without a credential at `/opt/mt5/setup.ini`. At ev
 | `[StartUp]` | `Script` | `ticks_setup` |
 | | `Symbol`, `Period` | the chart the script runs on and `M1`: the script opens the spawner's chart on its symbol, then closes its own. The symbol is `MT5_SPAWNER_SYMBOL` |
 
-The terminal must know the trade server `MT5_SERVER` names — its `Config\servers.dat` lists it — before the login can succeed: a server a fresh install does not know is added by searching for its name once (File → Open an Account), which the image does at every boot.
+The terminal must know the trade server `MT5_SERVER` names before the login can succeed. At every boot the image searches for that name once (File → Open an Account) and verifies it through the Login server dropdown. A missing result exits before the hub starts; container restart is the retry layer.
 
 #### The EA and the startup script
+
+Each initialization of `ticks`, in its spawner, publisher or history role, logs `trading allowed: terminal=<true|false>, expert=<true|false>` from the terminal's and that EA instance's trading permissions.
 
 The wheel carries their source; `python -c "import mt5connector.server, pathlib; print(pathlib.Path(mt5connector.server.__file__).parent / 'mql5')"` prints where it is installed. Each file goes into the terminal's `MQL5\` tree:
 
@@ -612,7 +618,7 @@ The files the build downloads itself are pinned by hash. The base images are pin
 
 ### The image tests
 
-`tests/image/test_mt5_image.py` starts a built image on an account no broker holds when `MT5_IMAGE_TEST` names it, on docker where it is installed and podman otherwise:
+`tests/image/test_mt5_image.py` starts a built image on a made-up account and the baked `MetaQuotes-Demo` server when `MT5_IMAGE_TEST` names it, on docker where it is installed and podman otherwise:
 
 ```bash
 MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
@@ -620,7 +626,9 @@ MT5_IMAGE_TEST=localhost/mt5-connector-server pytest tests/image
 
 It pins that:
 
-- a start on that account boots up to the hub, printing the account's password nowhere;
+- a start on that unknown account fails before the hub when no spawner starts, printing the account's password nowhere;
+- a failed native chart result exits startup with its symbol and MT5 error code, before the hub starts;
+- a server absent from the terminal's catalog fails startup with the gate's diagnostic before the hub starts;
 - the logged terminal build matches its copied build file, and the boot pays no full recompile;
 - the copied-terminal build check rejects another build naming both numbers and bounds a missing start at 120 s;
 - the startup ini carries `MaxBars` as `MT5_MAX_BARS` sets it, the terminal's ceiling when it is unset, and an `MT5_MAX_BARS` that is no positive integer fails the start naming it;
@@ -630,12 +638,29 @@ It pins that:
 - the main-window action reports the window;
 - a boot leaves WebRequest allowed for one URL;
 - a restart restores the baked state — a file added under `Config\` or the AppData tree removed, a same-length rewrite of a baked file with its timestamp undone, a value written into the terminal's registry key gone — and leaves `Bases` alone;
-- the terminal's journal and experts log reach the container log as UTF-8 under their prefixes, a journal line naming the login and the server arriving as the terminal wrote it;
 - the driver fails naming a control a dialog lacks;
-- the hub boots and answers `/health` 503, with no spawner connected and no clock verified, on the loopback port the runtime published it at, and the image's healthcheck reaches it and fails on that 503;
+- the standalone hub, launched directly rather than through terminal startup, answers `/health` 503 with no spawner or verified clock, and the image's healthcheck reaches it and fails on that 503;
 - the image declares its healthcheck as the health probe, every 30 s under a 5 s timeout and unhealthy after 3 failures.
 
+GUI and baked-state cases run the image's terminal bootstrap without a hub or startup script. Supervisor and GUI-failure cases pair a native startup-result double with a stubbed hub; authenticated spawner startup is certified by the functional tier.
+
 Its tests of the driver's menu and tab lookups, of the log tail — following the journal onto the next day's file, each line written verbatim as UTF-8 under its prefix, a restarted tail skipping what the logs hold at its first read, a half-written character at a restart or a stop — and of the health probe, passing on HTTP 200 alone and naming a 503 or a hub not listening, run without an image.
+
+### Functional certification
+
+Every certification hub runs with the `unless-stopped` container restart policy. The health gate waits through container restarts within its existing startup bound and reports each observed restart. A hub that never becomes healthy fails the gate with its container name and last startup line; the harness never restarts a container itself.
+
+From the repository root, `just functional` builds the checkout and certifies it on the demo connection in the private `.env`. An alternate file is `just functional /path/to/private.env`. It holds unquoted `NAME=value` lines for `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`; `MT5_SPAWNER_SYMBOL` and `MT5_LIVE_HUB_SYMBOL` are `BTCUSD.a`. No other process may use the demo login during certification.
+
+The command requires Podman and the declared development environment. It verifies the requested server check, HTTP 200 from the hub, the authenticated demo identity, and the EA's native `trading allowed: terminal=true, expert=true` line. It requires a flat login, buys the symbol's minimum market volume, closes that position, retries a failed close once, and confirms no position or order remains. It runs the native terminal-log case from `tests/functional`, the live hub suite with full and capped terminals, and both historical suites with their native capture prerequisites. The final check requires the login to be flat again.
+
+Native tester references and independent floor witnesses are bundled in `tests/fixtures/tickgen-btc`. Their checksums are verified before the image starts. Every certification skip, including a collection skip or expected failure, becomes a named failure. Connection settings are copied to a private temporary environment file, passed through `--env-file`, and removed. Process output is redacted. Containers and capture volumes are removed; only the main history cache persists between runs.
+
+The real-tick acceptance windows come from independent native `CopyTicks` and `CopyRates` reads, with their bounds, counts, compiler result, source hash, and capture checksums recorded under the run's `live/provenance.json`. Every minute's hub ticks must match its independent native capture field for field and in order, including duplicates. Only the two native timestamps are converted through the recorded broker clock. M1 tick volume is not the tick oracle: a bar's volume can differ from its native tick count without creating a failure or a hole. The five-day window starts after the first real tick's minute; the one-minute window is a positive-volume native bar at broker 14:24 within it. Both must end before the native live edge's stability margin. The capped history clone rebuilds M1 at `MT5_MAX_BARS=5000`; native reads must confirm that cap and an M1 first date at least two days after the first real tick. This leaves a full interior day for the unchanged floor-gap assertion.
+
+The `functional` Action runs on a self-hosted Linux X64 runner, with the connection from repository secrets `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`. A dispatch tests its selected commit. A pull-request comment whose first line is exactly `/functional`, from an owner, member, or collaborator, resolves the head at that comment's position in the PR timeline. It refuses subsequent head changes, checks out that exact SHA, and checks the approval again before exposing connection secrets. Comment commands use the workflow controls on the default branch and mark the approved commit's result.
+
+A `v*` tag push certifies that tag's commit before calling the wheel and image publishing workflow. Image publication still requires the image tier, and the release requires both wheels and that image. A direct manual `build-wheel` run produces unpublished wheel artifacts.
 
 ### The live hub tier
 
@@ -646,18 +671,19 @@ Its tests of the driver's menu and tab lookups, of the log tail — following th
 | `MT5_LIVE_HUB_SYMBOL` | the symbol every case reads and trades | — |
 | `MT5_LIVE_HUB_URL` | the hub of container 1, its `MaxBars` the ceiling, which every case but the capped ones reads | `ws://127.0.0.1:9000` |
 | `MT5_LIVE_CAPPED_HUB_URL` | the hub of container 2, its `MaxBars` capped, which the span-cap case and the capped floor's case read; a case that finds no hub there fails naming it | `ws://127.0.0.1:9001` |
+| `MT5_LIVE_PREPARED_DIR` | the native live preparation holding `provenance.json` and its checked captures | — |
 
-Nothing starts a container for it, and no CI runs it. By hand, from the repository root:
+`just functional` starts and synchronizes both containers and runs this tier. By hand, from the repository root:
 
 1. Write a `.env` there, which is never committed: one unquoted `NAME=value` per line, holding nothing the shell interprets, since the container runtime reads each value verbatim and step 4 sources the file. It carries the entrypoint's `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` and `MT5_SPAWNER_SYMBOL`, and the tier's `MT5_LIVE_HUB_SYMBOL`.
-2. Start both containers from the image under test, each with its own history volume. The two terminals log into the same account at once. Container 2's `MaxBars` of 100,000 caps one read's span at about 70 days of M1 periods:
+2. Start both containers from the image under test, each with its own history volume. The two terminals log into the same account at once. Container 2's `MaxBars` of 5,000 caps one read's span at about three days of M1 periods:
 
    ```bash
    image=localhost/mt5-connector-server
    bases="/home/mt5/.wine/drive_c/Program Files/MetaTrader 5/Bases"
    podman run -d --name mt5-live-1 --env-file .env -p 127.0.0.1:9000:9000 \
      -v mt5-live-1-bases:"$bases" --stop-timeout 190 "$image"
-   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=100000 \
+   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=5000 \
      -p 127.0.0.1:9001:9000 -v mt5-live-2-bases:"$bases" --stop-timeout 190 "$image"
    ```
 
@@ -671,9 +697,18 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
 
    A symbol's first history request on a fresh volume waits for its bar store and its whole tick history, possibly hours, while each case waits at most two history bounds per read: the tier runs on volumes that have synced `MT5_LIVE_HUB_SYMBOL` before, which a `ranges` of it on each hub, asked again until it answers, does.
 
-4. Run the tier:
+4. The volume cases require independent native preparation. Replace container 2 with the prepared capped clone, wait for its health, and run the tier:
 
    ```bash
+   podman stop mt5-live-2
+   podman rm mt5-live-2
+   python tests/live/prepare_live.py --image "$image" --seed-container mt5-live-1 \
+     --name mt5-live-input --output "$PWD/scripts/mt5-live-input"
+   podman run -d --name mt5-live-2 --env-file .env -e MT5_MAX_BARS=5000 \
+     -p 127.0.0.1:9001:9000 -v mt5-live-input-capped-bases:"$bases" \
+     --stop-timeout 190 "$image"
+   until curl -fsS http://127.0.0.1:9001/health >/dev/null; do sleep 10; done
+   export MT5_LIVE_PREPARED_DIR="$PWD/scripts/mt5-live-input"
    set -a; . ./.env; set +a
    pytest tests/live -q -rA
    ```
@@ -683,6 +718,7 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
    ```bash
    podman stop mt5-live-1 mt5-live-2
    podman rm mt5-live-1 mt5-live-2
+   python tests/live/prepare_tickgen.py --cleanup --name mt5-live-input
    ```
 
 `docker` takes the same commands.
@@ -691,8 +727,10 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
 
 `tests/live/test_tickgen_history.py` measures the generator of a candidate image against two weeks the strategy tester exported in its "Every tick" mode. A native capture checks real ticks field for field and a later tickless minute's rejection inside the tick era. The file runs on its own, never with the order-placement cases of the live tier, and reads only: it places no order and runs no tester. Its synthesis expectations come from `tests/live/tickgen_oracle.py`, the fitted rules written from their formulas alone, whose worked examples `tests/live/test_tickgen_oracle.py` pins in every test run.
 
+The tick-era-hole case uses the independently captured input in `tests/fixtures/tickgen-gap`. Its native installer creates `BTCUSD.a.GAPTEST` with continuous M1 bars from broker midnight and removes one minute's ticks. Setup waits for the hub's normal history and re-sync completion, reloads the original ticks with the same native installer, removes that minute again, restores the captured M1 bars, and verifies every retained and preceding tick against MT5's frozen post-import reference. The completed re-sync record is retained while the native terminal reloads the input. Another re-sync before the gap answer fails acceptance. Functional certification prepares this input automatically and runs the shortened-cache lane first.
+
 1. Build the candidate image as [Building](#building) states, tagged `localhost/mt5-tickgen-candidate`.
-2. Prepare it from a running container of the image family whose volume has synced the exported symbol, logged into a read-only login. The driver copies that container's history into two volumes of its own, captures the venue's ticks and M1 bars of the mixed window on one with a test-only collector script that calls `CopyTicksRange` and `CopyRates` alone — its terminal rewrites that volume's M1 frame short — starts the candidate's hub on the other and waits until it is healthy with the symbol's ranges settled, then writes `provenance.json` beside the capture. It reads the login from the seed container, which it never changes, and writes no credential:
+2. Prepare it from a running container of the image family whose volume has synced `BTCUSD.a`, logged into the demo connection. The driver copies that container's history into an isolated volume, starts the candidate and waits until it is healthy with its ranges settled, then writes `provenance.json`. The seed is read only, and no connection identity is written:
 
    ```bash
    python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \
@@ -700,26 +738,35 @@ Nothing starts a container for it, and no CI runs it. By hand, from the reposito
      --output scripts/tickgen-acceptance
    ```
 
-3. Run the lane against it:
+3. Prepare the controlled gap on a separate hub, using the same private connection file:
 
    ```bash
-   MT5_LIVE_HUB_SYMBOL=AUDCAD+ MT5_LIVE_HUB_URL=ws://127.0.0.1:21588 \
-   MT5_TICK_EXPORT_DIR=<tester jobs directory> \
+   python tests/live/prepare_gap.py --image localhost/mt5-tickgen-candidate \
+     --name mt5-tickgen-gap --port 21590 --output scripts/tickgen-gap \
+     --env-file /path/to/private.env
+   ```
+
+4. Run the lane against both prepared hubs:
+
+   ```bash
+   MT5_LIVE_HUB_SYMBOL=BTCUSD.a MT5_LIVE_HUB_URL=ws://127.0.0.1:21588 \
+   MT5_TICK_EXPORT_DIR="$PWD/scripts/tickgen-exports" \
    MT5_TICK_RAW_DIR="$PWD/scripts/tickgen-acceptance" MT5_TICK_ACCEPTANCE_REQUIRED=1 \
+   MT5_GAP_PREPARED_DIR="$PWD/scripts/tickgen-gap" \
    python -B -m pytest tests/live/test_tickgen_history.py -q -rA
    ```
 
-   `MT5_TICK_EXPORT_DIR` names the tester's `jobs/` directory holding `ticks-202301/out/` and `ticks-202310/out/`, each with its `bars.csv`, `ticks.csv` and `metadata.csv`, which the lane checks against their recorded hashes. Without `MT5_TICK_ACCEPTANCE_REQUIRED=1` a case whose inputs or hub are missing is skipped; with it, it fails.
+   `MT5_TICK_EXPORT_DIR` names a materialized copy of the bundled native tester exports, holding `ticks-202301/out/` and `ticks-202310/out/`, each with `bars.csv`, `ticks.csv`, and `metadata.csv`. `just functional` materializes these automatically. For a manual lane, run `python -c 'from pathlib import Path; from functional.history import materialize; materialize(Path("scripts/tickgen-exports"))'` first. The lane verifies their registered hashes. Without `MT5_TICK_ACCEPTANCE_REQUIRED=1` a case whose inputs or hub are missing is skipped; with it, it fails.
 
-4. Remove the driver's containers and volumes: `python tests/live/prepare_tickgen.py --cleanup --name mt5-tickgen-acceptance`.
+5. Remove each driver's containers and volumes with `python tests/live/prepare_tickgen.py --cleanup --name <name>`, for both `mt5-tickgen-acceptance` and `mt5-tickgen-gap`.
 
-`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: the collector reads the candidate's own copy, its terminal rewriting that copy's M1 frame cache short, and a further collector run that reads nothing records the M1 frame's first date as a terminal on that copy holds it, before the candidate starts, into `provenance.json`; preparation refuses nothing on it, and the case fails unless that date is after 2023-01-14. `--cleanup` refuses the flag. The case then asks the candidate for the M1 floor, the quote floor and the January 2023 M1 bars a hub on an untouched copy answers:
+`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: it preserves the clone's full `M1.hc` under another name, leaves its `.hcc` store intact, and opens a native M1 chart at `MaxBars=100000` to rebuild the frame and record its first date before the uncapped candidate starts. The case fails unless that date is after the January window. `--cleanup` refuses the flag. The expected M1 floor, quote floor, and January row count come from the independent native tester exports, never a candidate hub:
 
 ```bash
 python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \
   --seed-container <container> --name mt5-tickgen-shortened --port 21589 \
   --output scripts/tickgen-shortened --shorten-cache
-MT5_LIVE_HUB_SYMBOL=AUDCAD+ MT5_LIVE_HUB_URL=ws://127.0.0.1:21589 \
+MT5_LIVE_HUB_SYMBOL=BTCUSD.a MT5_LIVE_HUB_URL=ws://127.0.0.1:21589 \
 MT5_TICK_RAW_DIR="$PWD/scripts/tickgen-shortened" MT5_TICK_ACCEPTANCE_REQUIRED=1 \
 python -B -m pytest tests/live/test_tickgen_shortened_cache.py -q -rA
 python tests/live/prepare_tickgen.py --cleanup --name mt5-tickgen-shortened
