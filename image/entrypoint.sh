@@ -21,8 +21,6 @@ readonly close_wait_seconds=60
 readonly stop_wait_seconds=10
 readonly call_seconds=10
 readonly gui_seconds=40
-readonly step_attempts=3
-readonly step_retry_seconds=5
 readonly MT5_SERVER_SEARCH_STARTED_MARKER="mt5: trade server search started"
 readonly restore_seconds=40
 readonly kill_after_seconds=5
@@ -66,49 +64,6 @@ run_bounded() {
 # window that stops answering would hold it, so it is bounded like any call.
 gui() {
     timeout --kill-after="$kill_after_seconds" "$gui_seconds" "${driver[@]}" "$@"
-}
-
-retried() {
-    local what=$1 own_dialog=$2 ini=$3
-    shift 3
-    local attempt status output detail message
-    for ((attempt = 1; attempt <= step_attempts; attempt++)); do
-        start_terminal "$(config_argument "$ini")"
-        if [[ "$ini" == "$startup_ini" ]]; then
-            process_names[$terminal_pid]=terminal
-            if [[ -z "$tail_pid" ]]; then
-                start_log_tail
-            fi
-        fi
-        if await_terminal_window; then
-            gui dismiss-dialogs "$own_dialog" \
-                || step "the dialog dismissal for $what failed with status $?"
-            status=0
-            output=$(gui "$@" 2>&1) || status=$?
-            end_with_stopped
-            if ((status == 0)); then
-                [[ -z "$output" ]] || printf '%s\n' "$output"
-                return
-            fi
-            case $status in
-                124 | 137) detail="$what did not finish within ${gui_seconds}s" ;;
-                *)
-                    [[ -z "$output" ]] || printf '%s\n' "$output"
-                    detail="${output##*$'\n'}"
-                    detail="${detail#mt5: }"
-                    ;;
-            esac
-        else
-            detail="$await_error"
-        fi
-        message="$what failed (attempt $attempt of $step_attempts): $detail"
-        step "$message"
-        discard_terminal
-        if ((attempt == step_attempts)); then
-            return 1
-        fi
-        sleep "$step_retry_seconds"
-    done
 }
 
 # A slow poll consumes the window's deadline rather than extending it.
@@ -205,17 +160,6 @@ close_terminal() {
     terminal_pid=
 }
 
-discard_terminal() {
-    unset "process_names[$terminal_pid]"
-    if ! request_terminal_close; then
-        step "killing the terminal, still running after ${close_wait_seconds}s"
-        bounded wineserver -k >/dev/null 2>&1 || :
-        kill -KILL "$terminal_pid" 2>/dev/null || :
-    fi
-    wait "$terminal_pid" || :
-    terminal_pid=
-}
-
 # The terminal logs in only to a trade server its server list holds: searching the server's name in
 # the account dialog adds its broker's servers, which the terminal keeps when it closes. A terminal
 # started with no account opens that dialog on its own, so this session starts with one.
@@ -224,7 +168,7 @@ acquire_server_list() {
     start_terminal "$(config_argument "$search_ini")"
     await_terminal_window || fail "$await_error"
     gui dismiss-dialogs "Open an Account" \
-        || step "the dialog dismissal for the server search failed with status $?"
+        || fail "the dialog dismissal for the server search failed with status $?"
     local status=0 output
     output=$(gui search-server 2>&1) || status=$?
     end_with_stopped
@@ -272,7 +216,26 @@ config_argument() {
 # Puts 127.0.0.1 on the Options dialog's WebRequest list, which no ini key sets.
 allow_webrequest() {
     step "adding 127.0.0.1 to the WebRequest allowlist"
-    retried "the WebRequest allowlist" Options "$startup_ini" allow-webrequest 127.0.0.1
+    start_terminal "$(config_argument "$startup_ini")"
+    process_names[$terminal_pid]=terminal
+    start_log_tail
+    await_terminal_window || fail "the WebRequest allowlist: $await_error"
+    local status=0 output detail
+    if output=$(gui dismiss-dialogs Options 2>&1); then
+        output=$(gui allow-webrequest 127.0.0.1 2>&1) || status=$?
+    else
+        status=$?
+    fi
+    end_with_stopped
+    case $status in
+        0) [[ -z "$output" ]] || printf '%s\n' "$output" ;;
+        124 | 137) fail "the WebRequest allowlist did not finish within ${gui_seconds}s" ;;
+        *)
+            detail="${output##*$'\n'}"
+            detail="${detail#mt5: }"
+            fail "the WebRequest allowlist: ${detail:-driver exited with status $status}"
+            ;;
+    esac
 }
 
 refuse_failed_spawner() {

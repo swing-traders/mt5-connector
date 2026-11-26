@@ -60,6 +60,7 @@ New code fails loud:
 - A CLI validates every flag before the job starts — its value, the flags it is combined with, and whatever it names (a symbol, a path, a server) — never at the point of use.
 - Parsers and providers crash on bad input from the terminal or the server, not silently emit a default or a NaN.
 - Lifecycle methods crash if the state transition is wrong — a connect on an already-connected client, a disconnect on one never connected.
+- Any startup failure exits before the hub starts, naming what failed, so the container restarts. Container restart is the only retry layer; startup holds no retry of its own.
 
 Don't add `if x is None: return` to bury a real problem. Find the real cause; either fix it or crash with a useful message.
 

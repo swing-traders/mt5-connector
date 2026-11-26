@@ -77,7 +77,6 @@ await_terminal_window() {
     fi
 }
 end_with_stopped() { :; }
-discard_terminal() { :; }
 close_terminal() { :; }
 sleep() { :; }
 gui() {

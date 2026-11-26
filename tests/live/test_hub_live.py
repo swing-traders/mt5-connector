@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
+import tickgen_capture
 import tickgen_oracle as oracle
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 
@@ -474,51 +475,73 @@ def native_windows():
     for capture, files in recorded["captures"].items():
         for name, digest in files.items():
             assert hashlib.sha256((directory / capture / name).read_bytes()).hexdigest() == digest
-    return recorded["windows"]
+    return directory, recorded
+
+
+def native_tick_minutes(directory, window, clock):
+    grouped = {}
+    for tick in tickgen_capture.load(directory / "raw-live", window).ticks:
+        row = (clock.to_utc(tick[0]), clock.to_utc_msc(tick[1]), *tick[2:])
+        grouped.setdefault(row[1] // 60_000 * MINUTE_S, []).append(row)
+    return grouped
 
 
 @pytest.mark.parametrize("window", ["five-days", "minute-1424"])
-async def test_each_real_tick_minute_has_its_m1_tick_volume_of_bid_flagged_ticks(
+async def test_each_real_tick_minute_matches_the_independent_native_capture(
     session, native_windows, window
 ):
-    start = datetime.fromtimestamp(native_windows[window]["start_utc"], UTC)
-    end = datetime.fromtimestamp(native_windows[window]["end_utc_exclusive"], UTC)
+    directory, recorded = native_windows
+    began = recorded["windows"][window]["start_utc"]
+    ended = recorded["windows"][window]["end_utc_exclusive"]
+    clock = BrokerClock(
+        ZoneInfo(recorded["clock"]["timezone"]),
+        timedelta(hours=recorded["clock"]["offset_hours"]),
+    )
+    native = await asyncio.to_thread(native_tick_minutes, directory, window, clock)
+    assert sum(map(len, native.values())) == recorded["windows"][window]["ticks"]
+    assert native, f"{window}: no native ticks"
     hub_session, _ = session
     held = await ranges(hub_session)
-    if held.first_tick == 0:
-        pytest.skip(f"{SYMBOL}: no real tick history")
-    # Exclude the first real tick's partial minute and the forming minute.
+    assert held.first_tick > 0
     first_full_minute = (held.first_tick + MINUTE_S - 1) // MINUTE_S * MINUTE_S
-    began = max(int(start.timestamp()), first_full_minute)
-    ended = min(int(end.timestamp()), int(time.time()) // MINUTE_S * MINUTE_S)
-    if began >= ended:
-        pytest.skip(f"{SYMBOL}: the window holds no complete minute in the real tick era")
+    assert first_full_minute <= began < ended
+    assert ended <= int(time.time()) // MINUTE_S * MINUTE_S
 
     compared = 0
-    mismatches = []
     for day in range(began, ended, DAY_S):
         until = min(day + DAY_S, ended)
-        bars = await m1_bars(hub_session, day, until - MINUTE_S)
-        ticks = await info_ticks(hub_session, day, until - 1)
-        bid_ticks = ticks[(ticks["flags"] & mirror.TICK_FLAG_BID) != 0]
-        minutes, counts = np.unique(bid_ticks["time_msc"] // 60_000, return_counts=True)
-        by_minute = dict(zip(minutes, counts, strict=True))
-        for bar in bars:
-            opened = int(bar["time"])
-            actual = int(by_minute.get(opened // MINUTE_S, 0))
-            expected = int(bar["tick_volume"])
-            if actual != expected:
-                mismatches.append(
-                    f"{_iso(opened)}: bid-flagged ticks={actual}, tick_volume={expected}"
-                )
-        compared += len(bars)
+        ticks = (
+            await synced(
+                hub_session,
+                Call.COPY_TICKS_RANGE,
+                symbol=SYMBOL,
+                date_from=day,
+                date_to=until - 1,
+                flags=mirror.COPY_TICKS_ALL,
+            )
+        ).result
+        assert np.all(ticks["time_msc"][1:] >= ticks["time_msc"][:-1])
+        answered = {}
+        for tick in ticks:
+            opened = int(tick["time_msc"]) // 60_000 * MINUTE_S
+            answered.setdefault(opened, []).append(
+                tuple(tick[field] for field in tickgen_capture.TICK_FIELDS)
+            )
+        expected = {minute: rows for minute, rows in native.items() if day <= minute < until}
+        assert set(answered) == set(expected), f"{window}: native minute coverage differs"
+        for minute, rows in expected.items():
+            assert answered[minute] == rows, f"{window}: native ticks differ at {_iso(minute)}"
+        compared += len(expected)
         logger.info(
-            "%s: %s to %s: compared %d M1 minutes", SYMBOL, _iso(day), _iso(until), len(bars)
+            "%s: %s to %s: compared %d native tick minutes",
+            SYMBOL,
+            _iso(day),
+            _iso(until),
+            len(expected),
         )
 
-    assert compared > 0, f"{SYMBOL}: no M1 bars in {_iso(began)} to {_iso(ended)}"
-    assert not mismatches, f"{compared} M1 minutes compared; " + "; ".join(mismatches)
-    logger.info("%s: %d M1 minutes compared, no bid-flag count mismatch", SYMBOL, compared)
+    assert compared == len(native)
+    logger.info("%s: %d minutes match native ticks field for field and in order", SYMBOL, compared)
 
 
 async def test_the_ranges_report_every_series_the_m1_floor_a_read_from_1970_begins_at(session):
