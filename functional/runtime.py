@@ -1,5 +1,6 @@
 """Owned Podman containers, redacted process output, and authenticated boot checks."""
 
+import json
 import re
 import subprocess
 import time
@@ -19,15 +20,16 @@ class Runtime:
         self.redact = redact
         self.program = program
         self.containers = []
+        self._restarts = {}
 
-    def command(self, *arguments, timeout=60):
+    def command(self, *arguments, timeout=60, combined=False):
         done = subprocess.run(
             arguments, capture_output=True, text=True, timeout=timeout, errors="replace"
         )
         if done.returncode:
             print(self.redact(done.stdout + done.stderr), flush=True)
             raise RuntimeError(f"{Path(arguments[0]).name} failed with status {done.returncode}")
-        return done.stdout
+        return done.stdout + done.stderr if combined else done.stdout
 
     def stream(self, arguments, *, env=None):
         process = subprocess.Popen(
@@ -64,6 +66,8 @@ class Runtime:
             "run",
             "-d",
             "--no-healthcheck",
+            "--restart",
+            "unless-stopped",
             "--name",
             name,
             "--env-file",
@@ -80,41 +84,61 @@ class Runtime:
         )
         return int(self.command(self.program, "port", name, "9000/tcp").strip().rsplit(":", 1)[1])
 
-    def logs(self, name):
-        return self.command(self.program, "logs", name)
+    def logs(self, name, *, since=None):
+        arguments = [self.program, "logs"]
+        if since is not None:
+            arguments.extend(("--since", since))
+        return self.command(*arguments, name, combined=True)
+
+    def observe(self, name):
+        inspected = json.loads(
+            self.command(self.program, "inspect", "--format", "{{json .}}", name)
+        )
+        count = inspected["RestartCount"]
+        for ordinal in range(self._restarts.get(name, 0) + 1, count + 1):
+            print(f"{name}: restart {ordinal}", flush=True)
+        self._restarts[name] = count
+        return inspected["State"]
 
     def healthy(self, name, port, *, seconds=600):
         deadline = time.monotonic() + seconds
+        last_startup = "no startup output"
         while time.monotonic() < deadline:
-            printed = self.logs(name)
-            if any(
-                message in printed.lower()
-                for message in ("authorization failed", "invalid account", "authorization error")
-            ):
-                raise RuntimeError("the terminal rejected the configured login")
-            running = self.command(
-                self.program, "inspect", "--format", "{{.State.Running}}", name
-            ).strip()
-            if running != "true":
-                raise RuntimeError("the terminal stopped before its hub became healthy")
-            try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/health", timeout=5
-                ) as response:
-                    if response.status == 200:
-                        if SERVER_SELECTED not in printed:
-                            raise RuntimeError("the requested server check did not pass")
-                        return
-            except (urllib.error.URLError, ConnectionError, TimeoutError):
-                pass
-            time.sleep(2)
-        raise RuntimeError("the hub did not log in and become healthy within the startup bound")
+            state = self.observe(name)
+            printed = self.logs(name, since=state["StartedAt"])
+            for line in printed.splitlines():
+                if line.startswith("mt5: "):
+                    last_startup = line
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if state["Running"]:
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/health", timeout=min(5, remaining)
+                    ) as response:
+                        if response.status == 200:
+                            if SERVER_SELECTED not in printed:
+                                raise RuntimeError(
+                                    f"{name}: the requested server check did not pass; "
+                                    f"last startup: {self.redact(last_startup)}"
+                                )
+                            return
+                except (urllib.error.URLError, ConnectionError, TimeoutError):
+                    pass
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        raise RuntimeError(
+            f"{name}: the hub did not become healthy within the startup bound; "
+            f"last startup: {self.redact(last_startup)}"
+        )
 
     def permissions(self, name, *, seconds=90):
         deadline = time.monotonic() + seconds
         reported = None
         while time.monotonic() < deadline:
-            for line in self.logs(name).splitlines():
+            state = self.observe(name)
+            printed = self.logs(name, since=state["StartedAt"]) if state["Running"] else ""
+            for line in printed.splitlines():
                 if line.startswith("experts: "):
                     flags = re.search(
                         r"trading allowed: terminal=(true|false), expert=(true|false)$", line
@@ -131,6 +155,7 @@ class Runtime:
 
     def stop(self, name):
         try:
+            self.observe(name)
             self.command(self.program, "stop", "--time", "190", name, timeout=210)
         finally:
             self.command(self.program, "rm", "-f", "-v", name)

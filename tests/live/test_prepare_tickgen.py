@@ -45,6 +45,25 @@ def test_an_existing_container_named_like_its_compile_container_refuses_before_a
     assert commands == []
 
 
+def test_candidate_uses_production_restarts_and_the_existing_health_bound(monkeypatch, tmp_path):
+    sent = []
+    observed = []
+    env_file = tmp_path / ".env"
+    env_file.write_text("MT5_LOGIN=1\nMT5_PASSWORD=made-up\nMT5_SERVER=test-server\n")
+    monkeypatch.setattr(prepare_tickgen, "podman", lambda *a, **kw: sent.append(a) or "")
+    monkeypatch.setattr(
+        prepare_tickgen.Runtime,
+        "healthy",
+        lambda self, name, port, **kw: observed.append((name, port, kw)),
+    )
+
+    prepare_tickgen.start_candidate("image", "owned", env_file, "history", 9000)
+
+    run = sent[0]
+    assert run[run.index("--restart") + 1] == "unless-stopped"
+    assert observed == [("owned", 9000, {"seconds": prepare_tickgen.HEALTH_BOUND_S})]
+
+
 def test_a_port_outside_the_port_range_is_refused_before_any_command(monkeypatch, commands):
     monkeypatch.setattr(prepare_tickgen, "exists", lambda kind, name: False)
     monkeypatch.setattr(

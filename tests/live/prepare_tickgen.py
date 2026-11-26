@@ -12,14 +12,14 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from tickgen_reference import REFERENCE
 
+from functional.runtime import Runtime
+from functional.settings import Redactor, load
 from mt5connector.client.config import MT5Config
 from mt5connector.client.hub import HubSession
 from mt5connector.wire import calls
@@ -93,6 +93,9 @@ def owned(name: str) -> dict[str, list[str]]:
 def cleanup(name: str) -> None:
     found = owned(name)
     for container in found["containers"]:
+        count = int(podman("inspect", "--format", "{{.RestartCount}}", container).strip())
+        for ordinal in range(1, count + 1):
+            log(f"{container}: restart {ordinal} observed before cleanup")
         podman("stop", "--time", "190", container, check=False)
         podman("rm", "--force", container)
         log(f"removed container {container}")
@@ -332,6 +335,8 @@ def start_candidate(image: str, name: str, env_file: Path, clone: str, port: int
     podman(
         "run",
         "-d",
+        "--restart",
+        "unless-stopped",
         "--name",
         name,
         "--label",
@@ -346,18 +351,7 @@ def start_candidate(image: str, name: str, env_file: Path, clone: str, port: int
         "190",
         image,
     )
-    deadline = time.monotonic() + HEALTH_BOUND_S
-    healthy = False
-    while not healthy:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as answer:
-                healthy = answer.status == 200
-        except (urllib.error.URLError, ConnectionError):
-            healthy = False
-        if not healthy and time.monotonic() > deadline:
-            raise Unprepared(f"the candidate's hub was not healthy within {HEALTH_BOUND_S} s")
-        elif not healthy:
-            time.sleep(POLL_S)
+    Runtime(Redactor(load(env_file))).healthy(name, port, seconds=HEALTH_BOUND_S)
     log("the candidate's hub is healthy")
 
 
