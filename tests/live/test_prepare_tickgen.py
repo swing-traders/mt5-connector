@@ -3,6 +3,7 @@ would create that already exists, and a flag whose value cannot be used."""
 
 import argparse
 import json
+import subprocess
 import sys
 
 import prepare_tickgen
@@ -157,7 +158,6 @@ def test_shortened_cache_preparation_records_the_native_capped_frame(monkeypatch
         },
     )
     monkeypatch.setattr(prepare_tickgen, "clone_history", lambda *args: "private-clone")
-    monkeypatch.setattr(prepare_tickgen, "m1_cache_bytes", lambda *args: 100)
     monkeypatch.setattr(prepare_tickgen, "start_candidate", lambda *args: None)
     monkeypatch.setattr(prepare_tickgen, "sha256", lambda path: "source-hash")
     monkeypatch.setattr(prepare_tickgen, "outcome_m1_first", lambda *args: 1_800_000_000)
@@ -169,6 +169,11 @@ def test_shortened_cache_preparation_records_the_native_capped_frame(monkeypatch
         directory.mkdir()
         return directory
 
+    def m1_cache_bytes(image, clone):
+        if not captured:
+            raise prepare_tickgen.Unprepared("the running seed has not persisted its M1 cache")
+        return 100
+
     async def settled(port):
         return {
             "terminal_build": "test-build",
@@ -178,6 +183,7 @@ def test_shortened_cache_preparation_records_the_native_capped_frame(monkeypatch
         }
 
     monkeypatch.setattr(prepare_tickgen, "collect", collect)
+    monkeypatch.setattr(prepare_tickgen, "m1_cache_bytes", m1_cache_bytes)
     monkeypatch.setattr(prepare_tickgen, "settled", settled)
     prepare_tickgen.prepare(
         argparse.Namespace(
@@ -190,6 +196,51 @@ def test_shortened_cache_preparation_records_the_native_capped_frame(monkeypatch
         )
     )
     prepared = json.loads((tmp_path / "scripts/shortened/provenance.json").read_text())
-    assert captured == [("m1-first", 100_000)]
+    assert captured == [("m1-full", 100_000_000), ("m1-first", 100_000)]
     assert prepared["m1_first_utc"] == 1_800_000_000
     assert prepared["collector_maxbars"] == 100_000
+
+
+@pytest.fixture
+def cache_disk(monkeypatch, tmp_path):
+    def podman(*arguments, **kwargs):
+        done = subprocess.run(
+            ["sh", "-c", arguments[-1].replace("/bases", str(tmp_path))],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode:
+            raise prepare_tickgen.Unprepared(done.stderr)
+        return done.stdout
+
+    monkeypatch.setattr(prepare_tickgen, "podman", podman)
+    return tmp_path
+
+
+@pytest.mark.parametrize("copies", [0, 2])
+def test_a_missing_or_ambiguous_persisted_m1_cache_names_the_requirement(cache_disk, copies):
+    for number in range(copies):
+        cache = cache_disk / f"server-{number}/history/BTCUSD.a/cache"
+        cache.mkdir(parents=True)
+        (cache / "M1.hc").write_bytes(b"native frame")
+    with pytest.raises(
+        prepare_tickgen.Unprepared, match=rf"snapshot.*{copies} persisted BTCUSD.a M1 frame caches"
+    ):
+        prepare_tickgen.m1_cache_bytes("image", "snapshot")
+
+
+def test_an_empty_persisted_m1_cache_is_refused(cache_disk):
+    cache = cache_disk / "server/history/BTCUSD.a/cache"
+    cache.mkdir(parents=True)
+    (cache / "M1.hc").write_bytes(b"")
+    with pytest.raises(prepare_tickgen.Unprepared, match="snapshot.*empty.*BTCUSD.a M1"):
+        prepare_tickgen.m1_cache_bytes("image", "snapshot")
+
+
+def test_retiring_a_persisted_m1_cache_preserves_its_bytes(cache_disk):
+    cache = cache_disk / "server/history/BTCUSD.a/cache"
+    cache.mkdir(parents=True)
+    (cache / "M1.hc").write_bytes(b"native frame")
+    assert prepare_tickgen.retire_m1_cache("image", "snapshot") == len(b"native frame")
+    assert (cache / "M1.hc.full").read_bytes() == b"native frame"

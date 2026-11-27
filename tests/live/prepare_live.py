@@ -76,23 +76,6 @@ def prepare(arguments):
     raw = native.clone_history(
         arguments.image, arguments.name, seed, f"{arguments.name}-native-bases"
     )
-    capped = native.clone_history(
-        arguments.image, arguments.name, seed, f"{arguments.name}-capped-bases"
-    )
-    native.podman(
-        "run",
-        "--rm",
-        "--user",
-        "root",
-        "--entrypoint",
-        "sh",
-        "-v",
-        f"{capped}:/bases",
-        arguments.image,
-        "-c",
-        f"for frame in /bases/*/history/{native.SYMBOL}/cache/M1.hc; "
-        'do mv "$frame" "$frame.full"; done',
-    )
     with tempfile.TemporaryDirectory(prefix="native-live-") as private:
         env_file = Path(private) / ".env"
         write(env_file, settings)
@@ -105,6 +88,11 @@ def prepare(arguments):
             "live",
             output,
         )
+        # MT5 persists period caches on terminal close, not when its native reads settle.
+        capped = native.clone_history(
+            arguments.image, arguments.name, raw, f"{arguments.name}-capped-bases"
+        )
+        native.retire_m1_cache(arguments.image, capped)
         frame = native.collect(
             arguments.image,
             arguments.name,

@@ -208,7 +208,7 @@ def clone_history(image: str, name: str, seed_volume: str, clone: str) -> str:
 
 
 def m1_cache_bytes(image: str, clone: str) -> int:
-    """The size of the symbol's M1 frame cache in the clone."""
+    """The size of the clone's single nonempty persisted M1 frame cache."""
     found = podman(
         "run",
         "--rm",
@@ -220,11 +220,38 @@ def m1_cache_bytes(image: str, clone: str) -> int:
         f"{clone}:/bases:ro",
         image,
         "-c",
-        f"stat -c %s /bases/*/history/{SYMBOL}/cache/M1.hc",
+        f"for cache in /bases/*/history/{SYMBOL}/cache/M1.hc; "
+        'do if [ -f "$cache" ]; then stat -c %s "$cache" || exit; fi; done',
     ).split()
     if len(found) != 1:
-        raise Unprepared(f"{clone} holds {len(found)} {SYMBOL} M1 frame caches")
-    return int(found[0])
+        raise Unprepared(
+            f"{clone} holds {len(found)} persisted {SYMBOL} M1 frame caches (cache/M1.hc); "
+            "expected one after native shutdown"
+        )
+    size = int(found[0])
+    if size <= 0:
+        raise Unprepared(f"{clone} holds an empty persisted {SYMBOL} M1 frame cache (cache/M1.hc)")
+    return size
+
+
+def retire_m1_cache(image: str, clone: str) -> int:
+    """Set aside a closed terminal's persisted M1 cache and return its size."""
+    size = m1_cache_bytes(image, clone)
+    podman(
+        "run",
+        "--rm",
+        "--user",
+        "root",
+        "--entrypoint",
+        "sh",
+        "-v",
+        f"{clone}:/bases",
+        image,
+        "-c",
+        f"for cache in /bases/*/history/{SYMBOL}/cache/M1.hc; "
+        'do mv "$cache" "$cache.full" || exit; done',
+    )
+    return size
 
 
 def collect(
@@ -434,21 +461,16 @@ def prepare(arguments: argparse.Namespace) -> None:
             arguments.image, arguments.name, seed_volume, f"{arguments.name}-bases"
         )
         if arguments.shorten_cache:
-            cloned = m1_cache_bytes(arguments.image, clone)
-            podman(
-                "run",
-                "--rm",
-                "--user",
-                "root",
-                "--entrypoint",
-                "sh",
-                "-v",
-                f"{clone}:/bases",
+            collect(
                 arguments.image,
-                "-c",
-                f"for cache in /bases/*/history/{SYMBOL}/cache/M1.hc; "
-                'do mv "$cache" "$cache.full"; done',
+                arguments.name,
+                env_file,
+                clone,
+                [],
+                "m1-full",
+                output,
             )
+            cloned = retire_m1_cache(arguments.image, clone)
             # MT5 rebuilds the frame when its M1 chart opens at the native cap.
             # The probe must not expand the capped frame before the candidate starts.
             probe = collect(
