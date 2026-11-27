@@ -19,10 +19,9 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from session_double import SessionDouble
+from session_double import SessionDouble, connected_over
 from venue_doubles import SymbolVenue, serve, symbol_info
 
-from mt5connector.client import data
 from mt5connector.client.connection import MT5Connection
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient, _epoch_s
@@ -106,14 +105,6 @@ def make_config(ws_url="ws://127.0.0.1:9000", venue=MT5_VENUE):
     )
 
 
-def make_conn(connected=True):
-    conn = MagicMock()
-    conn.ensure_connected = (
-        MagicMock() if connected else MagicMock(side_effect=MT5ConnectionError("not connected"))
-    )
-    return conn
-
-
 def make_provider(instrument=None):
     """A real MT5InstrumentProvider, whose type NT checks, its config naming `instrument`, answering
     it without the venue."""
@@ -170,7 +161,11 @@ def make_client(
         loop = asyncio.new_event_loop()
 
     config = make_config(ws_url=ws_url, venue=venue)
-    conn = make_conn(connected)
+    conn = connected_over(SessionDouble(config, loop, None, None, MagicMock()), config)
+    if connected:
+        conn.ensure_connected = MagicMock()
+    else:
+        conn.ensure_connected = MagicMock(side_effect=MT5ConnectionError("not connected"))
     provider = make_provider(instrument)
 
     # NautilusTrader requires real component types — MagicMock fails PyCondition checks
@@ -178,16 +173,15 @@ def make_client(
     cache = TestComponentStubs.cache()
     clock = LiveClock()
 
-    with patch.object(data, "HubSession", SessionDouble):
-        client = client_class(
-            loop=loop,
-            connection=conn,
-            msgbus=msgbus,
-            cache=cache,
-            clock=clock,
-            instrument_provider=provider,
-            config=config,
-        )
+    client = client_class(
+        loop=loop,
+        connection=conn,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        instrument_provider=provider,
+        config=config,
+    )
     if not nt_handlers:
         client._handle_data = MagicMock()
         client._handle_quote_ticks = MagicMock()
@@ -302,7 +296,7 @@ class TestConnect:
         c, conn, prov, loop = make_client()
         await c._connect()
         c._handle_data.assert_called()
-        assert c._hub.connected
+        assert c._conn.session.connected
         await c._disconnect()
 
 
@@ -314,15 +308,18 @@ class TestConnect:
 class TestDisconnect:
 
     @pytest.mark.asyncio
-    async def test_disconnect_closes_the_push_channel_and_keeps_what_is_wanted(self):
+    async def test_disconnect_leaves_the_shared_session_and_subscribes_what_was_wanted_again(self):
         c, conn, prov, loop = make_client()
         await c._connect()
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "EURUSDm"
         await c._subscribe_quote_ticks(cmd)
         await c._disconnect()
-        assert not c._hub.connected
-        assert c._hub.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        assert c._conn.session.connected
+        assert c._conn.session.wanted == []
+        await c._connect()
+        assert c._conn.session.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        await c._disconnect()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -337,7 +334,7 @@ class TestSubscribeQuoteTicks:
         cmd = MagicMock()
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
-        assert client._hub.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
+        assert client._conn.session.wanted == [Subscription(Stream.TICKS, "EURUSDm")]
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_symbols(self, client):
@@ -345,7 +342,7 @@ class TestSubscribeQuoteTicks:
             cmd = MagicMock()
             cmd.instrument_id.symbol.value = sym
             await client._subscribe_quote_ticks(cmd)
-        assert client._hub.wanted == [
+        assert client._conn.session.wanted == [
             Subscription(Stream.TICKS, sym) for sym in ["EURUSDm", "XAUUSDm", "BTCUSDm"]
         ]
 
@@ -355,7 +352,7 @@ class TestSubscribeQuoteTicks:
         cmd.instrument_id.symbol.value = "EURUSDm"
         await client._subscribe_quote_ticks(cmd)
         await client._unsubscribe_quote_ticks(cmd)
-        assert client._hub.wanted == []
+        assert client._conn.session.wanted == []
 
     @pytest.mark.asyncio
     async def test_unsubscribe_non_subscribed_does_not_raise(self, client):
@@ -466,7 +463,11 @@ class TestRequestQuoteTicks:
             await recorded._request_quote_ticks(ticks_request(1_752_570_000, 1_752_573_600))
 
         ticks.assert_awaited_once_with(
-            recorded._hub, "EURUSDm", 1_752_570_000, 1_752_573_600, source=calls.Source.TERMINAL
+            recorded._conn.session,
+            "EURUSDm",
+            1_752_570_000,
+            1_752_573_600,
+            source=calls.Source.TERMINAL,
         )
         delivered = recorded._handle_quote_ticks.call_args[0][1]
         assert [tick.ts_event for tick in delivered] == [
@@ -532,7 +533,12 @@ class TestRequestBars:
 
         # Every bar closing in the request opened from two periods before its first close on.
         bars.assert_awaited_once_with(
-            recorded._hub, "EURUSDm", Series.M1, c0 - 120, c1 - 1, source=calls.Source.TERMINAL
+            recorded._conn.session,
+            "EURUSDm",
+            Series.M1,
+            c0 - 120,
+            c1 - 1,
+            source=calls.Source.TERMINAL,
         )
         delivered = recorded._handle_bars.call_args[0][1]
         assert [bar.ts_event for bar in delivered] == [
@@ -802,16 +808,15 @@ def served_client(
     provider = MT5InstrumentProvider(
         conn, venue=MT5_VENUE, clock=LiveClock(), config=provider_config
     )
-    with patch.object(data, "HubSession", SessionDouble):
-        client = client_class(
-            loop=asyncio.get_running_loop(),
-            connection=conn,
-            msgbus=TestComponentStubs.msgbus(),
-            cache=TestComponentStubs.cache(),
-            clock=LiveClock(),
-            instrument_provider=provider,
-            config=make_config(),
-        )
+    client = client_class(
+        loop=asyncio.get_running_loop(),
+        connection=conn,
+        msgbus=TestComponentStubs.msgbus(),
+        cache=TestComponentStubs.cache(),
+        clock=LiveClock(),
+        instrument_provider=provider,
+        config=make_config(),
+    )
     client._handle_data = MagicMock()
     return client, provider
 
@@ -838,7 +843,7 @@ class TestInstrumentsNtNames:
 
         assert handed_ids(client) == ["EURUSD.MT5", "GBPUSD.MT5"]
         assert loaded_ids(provider) == ["EURUSD.MT5", "GBPUSD.MT5"]
-        assert client._hub.connected
+        client._conn.attach_market.assert_called_once()
         await client._disconnect()
 
     @pytest.mark.asyncio
@@ -866,7 +871,7 @@ class TestInstrumentsNtNames:
 
         assert provider.list_all() == []
         client._handle_data.assert_not_called()
-        assert not client._hub.connected
+        client._conn.attach_market.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_symbol_no_config_named_is_loaded_and_answered_on_request(self, terminal):

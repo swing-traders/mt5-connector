@@ -2057,7 +2057,7 @@ async def test_connect_names_an_owed_deal_whose_fill_cannot_be_built(exec_venue)
     with pytest.raises(execution.MT5OrderError, match="deal 7101.*UNLOADED is not loaded"):
         await h.client._connect()
     assert h.events == []
-    assert not h.push.connected
+    assert h.push.wanted == []
     h.venue.history_deals_get.side_effect = history([bracket_deal()])
     await connect_with_events(h)
     assert [(event.client_order_id, event.trade_id) for event in fills(h)] == [

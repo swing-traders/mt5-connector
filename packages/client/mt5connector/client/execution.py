@@ -102,7 +102,8 @@ from mt5connector.client.errors import (
     ResponseLost,
     Syncing,
 )
-from mt5connector.client.hub import SESSION_MARGIN_S, HubSession
+from mt5connector.client.events import DealsRecovery, deal_figures, deals_topic, recovery_topic
+from mt5connector.client.hub import SESSION_MARGIN_S
 from mt5connector.client.parsing import InstrumentAny, finite_decimal
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.push_wire import Stream, Subscription, TransactionType
@@ -373,6 +374,11 @@ _VERDICT_BOUND_S = 30.0
 # A verdict no command awaited is held this long at most: an answer that could still claim it would
 # have come within the command's deadline and the session's margin.
 _UNCLAIMED_S = calls.COMMAND_DEADLINE_S + SESSION_MARGIN_S
+# A deals recovery is a read: one answered later is dropped, and its consumer asks again.
+_RECOVERY_DEADLINE_S = calls.READ_DEADLINE_S + SESSION_MARGIN_S
+# The recovery reads a client has in flight at once: each holds one of its connection's pending
+# slots on the hub, which its orders and fill reads share.
+_RECOVERIES_IN_FLIGHT = 2
 # The outcomes proving the venue never acted on a request.
 _NEVER_ACTED = frozenset({SendOutcome.REFUSED, SendOutcome.NOT_SENT})
 _DEAL_TYPES = {
@@ -453,7 +459,6 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         # symbols quoting the pairs their fee conversions need.
         self._loads = loads
         self._magic = magic_for(self.trader_id)
-        self._hub = HubSession(config, loop, self._on_push_frame, None, self._log)
         self._account_task: asyncio.Task | None = None
         # The task NT runs `_connect` as, while it runs, for a disconnect to end.
         self._connecting: asyncio.Task | None = None
@@ -467,6 +472,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._held: dict[int, _Held] = {}
         self._next_sequence = 0
         self._handlers: set[asyncio.Task] = set()
+        self._recovering: set[asyncio.Task] = set()
         self._account_owed = False
         self._account_due_ns = 0
         self._account_unanswered = False
@@ -474,9 +480,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
     # ── Connect / disconnect ──────────────────────────────────────────────────
 
     async def _connect(self) -> None:
-        """Connects for this trader, refusing an account that is not a tradable hedging session
-        before anything is reported or sent; the trade transactions are subscribed only once the
-        venue is taken in, and a failure after the session connected disconnects it. Raises
+        """Connects for this trader over its connection's session, refusing an account that is not
+        a tradable hedging session before anything is reported or sent; the trade transactions are
+        taken and subscribed only once the venue is taken in, then the outcomes of the commands
+        still outstanding are asked, and a failure after taking them stops taking them. Raises
         MT5ConfigError for such an account or a provider config that names nothing to load,
         MT5OrderError naming a deal whose owed fill cannot be built, RuntimeError on a connected
         client."""
@@ -505,15 +512,18 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                 register_venue_currency(instrument.quote_currency)
 
             self._index_nt_orders()
-            await self._hub.connect()
+            await self._take_in_venue()
+            await self._refresh_account()
+            self._account_unanswered = False
+            # Every transaction the connection held while this client was away arrives here first.
+            self._conn.attach_trades(self._on_push_frame)
             try:
-                await self._take_in_venue()
-                await self._refresh_account()
-                self._account_unanswered = False
-                await self._hub.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+                await self._conn.session.subscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+                self._msgbus.subscribe(topic=recovery_topic(self.venue), handler=self._on_recovery)
             except BaseException:
-                await self._hub.disconnect()
+                await self._stop_taking_trades()
                 raise
+            self._handle(self._conn.session.ask_outstanding())
             self._account_task = self._loop.create_task(
                 self._account_loop(),
                 name="MT5LiveExecutionClient._account_loop",
@@ -523,9 +533,10 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             self._connecting = None
 
     async def _disconnect(self) -> None:
-        """Ends a connect still under way, or stops the account loop; then stops the handling of
-        every pushed transaction and the hub session, and drops the client's view of the venue; the
-        commands the terminal sent stay, for the verdicts the session asks at its next connect.
+        """Ends a connect still under way, which stops taking the trade transactions it took, or
+        stops the account loop and stops taking them; then stops the handling of every pushed
+        transaction and drops the client's view of the venue. The shared session stays connected,
+        and the commands the terminal sent stay in it, for the verdicts asked at the next connect.
         Raises RuntimeError on a client never connected."""
         if self._connecting is not None:
             self._connecting.cancel()
@@ -540,14 +551,11 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             except asyncio.CancelledError:
                 pass
             self._account_task = None
+            await self._stop_taking_trades()
         else:
             raise RuntimeError("execution client: not connected")
         for task in self._handlers:
             task.cancel()
-        await self._hub.unsubscribe(Subscription(Stream.TRADE_TRANSACTIONS))
-        # A connect ended under way has disconnected the session it opened.
-        if self._hub.connected:
-            await self._hub.disconnect()
         self._held.clear()
         self._client_order_ids.clear()
         self._tickets.clear()
@@ -555,6 +563,14 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         self._ended.clear()
         self._unresolved.clear()
         self._log.info("disconnected")
+
+    async def _stop_taking_trades(self) -> None:
+        """Unsubscribes the trade transactions and the recovery topic and leaves the connection to
+        hold each transaction that arrives until the next connect."""
+        if self._msgbus.is_subscribed(topic=recovery_topic(self.venue), handler=self._on_recovery):
+            self._msgbus.unsubscribe(topic=recovery_topic(self.venue), handler=self._on_recovery)
+        await self._conn.session.unsubscribe(Subscription(Stream.TRADE_TRANSACTIONS))
+        self._conn.detach_trades()
 
     def _index_nt_orders(self) -> None:
         """Rebuilds the ticket index from every ticket NT's orders at this venue hold or held as
@@ -644,11 +660,12 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         elif kind == TransactionType.REQUEST:
             self._on_request(request, result)
 
-    def _handle(self, handling) -> None:
+    def _handle(self, handling) -> asyncio.Task:
         """Runs a transaction's handling that reads the venue as a task of its own."""
         task = self._loop.create_task(handling)
         self._handlers.add(task)
         task.add_done_callback(self._handled)
+        return task
 
     def _handled(self, task: asyncio.Task) -> None:
         """Forgets a transaction's handling once it ends, logging the failure it ended in, so the
@@ -756,6 +773,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
             if slot is not None and self._cache.venue_order_id(order.client_order_id) != execution:
                 self._bind_to_execution(order, execution, deal.time_msc * 1_000_000)
             self.generate_order_filled(**fields)
+            self._publish_figures(deal)
             self._account_owed = True
         elif booked is None and fill:
             self._log.info(
@@ -871,7 +889,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         answer may predate the event."""
         self._account_owed = False
         try:
-            answered = await self._hub.request(calls.Call.ACCOUNT_INFO)
+            answered = await self._conn.session.request(calls.Call.ACCOUNT_INFO)
             account = AccountSnapshot.from_mt5(answered.result)
             total = Money(account.balance + account.credit, self.base_currency)
             locked = Money(account.margin, self.base_currency)
@@ -1612,7 +1630,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
         started = self._loop.time()
         while True:
             try:
-                answered = await self._hub.request(calls.Call.ORDER_SEND, request=request)
+                answered = await self._conn.session.request(calls.Call.ORDER_SEND, request=request)
             except NoPublisher as deferred:
                 remaining = _NO_PUBLISHER_BOUND_S - (self._loop.time() - started)
                 await asyncio.sleep(min(deferred.retry_after_s, remaining))
@@ -1722,7 +1740,46 @@ class MT5LiveExecutionClient(LiveExecutionClient):
                     )
                     continue
                 reports.append(await self._fill_report(deal, owner))
+                self._publish_figures(deal)
         return reports
+
+    def _on_recovery(self, recovery: DealsRecovery) -> None:
+        """Recovers the deals of the position a consumer asks for, over this client's session; one
+        asked while `_RECOVERIES_IN_FLIGHT` are read is not read, left to the consumer's re-ask."""
+        if len(self._recovering) < _RECOVERIES_IN_FLIGHT:
+            task = self._handle(self._recover(recovery))
+            self._recovering.add(task)
+            task.add_done_callback(self._recovering.discard)
+        else:
+            self._log.debug(
+                f"position {recovery.position}: {_RECOVERIES_IN_FLIGHT} recoveries in flight, "
+                "left to the next ask"
+            )
+
+    async def _recover(self, recovery: DealsRecovery) -> None:
+        """Publishes the figures of every deal of the recovery's position, read from its symbol's
+        history EA: the whole reply or nothing. A reply refused, malformed or later than the read
+        deadline publishes nothing and is logged once."""
+        try:
+            async with asyncio.timeout(_RECOVERY_DEADLINE_S):
+                deals = await self._read(
+                    calls.Call.HISTORY_DEALS_RECOVER,
+                    position=recovery.position,
+                    symbol=recovery.symbol,
+                )
+            figures = tuple(deal_figures(deal) for deal in deals)
+        except (TimeoutError, MT5ConnectionError, MT5InstrumentError) as failed:
+            self._log.warning(
+                f"position {recovery.position}: its deals were not recovered: {failed!r}"
+            )
+        else:
+            for deal in figures:
+                self._msgbus.publish(topic=deals_topic(self.venue), msg=deal)
+
+    def _publish_figures(self, deal) -> None:
+        """Publishes the figures of a deal a fill or a fill report was built from, so a consumer
+        reads what the deal booked without reading the venue again."""
+        self._msgbus.publish(topic=deals_topic(self.venue), msg=deal_figures(deal))
 
     async def generate_position_status_reports(
         self,
@@ -2221,7 +2278,7 @@ class MT5LiveExecutionClient(LiveExecutionClient):
 
     async def _read(self, call: calls.Call, **arguments: object):
         """A read's result on the hub session, asked again while the hub defers it."""
-        return (await self._hub.deferring(call, **arguments)).result
+        return (await self._conn.session.deferring(call, **arguments)).result
 
     async def _venue_order(self, ticket: int):
         """The venue's order under a ticket — resting, else in its history — or None when it holds

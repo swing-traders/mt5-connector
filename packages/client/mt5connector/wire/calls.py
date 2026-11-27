@@ -55,6 +55,7 @@ class Call(IntEnum):
     COMMISSION_SCHEDULE = 19
     TRADING_SESSIONS = 20
     SYMBOL_MARGIN_RATE = 21
+    HISTORY_DEALS_RECOVER = 22
 
 
 class ArgType(StrEnum):
@@ -275,6 +276,16 @@ CALLS: dict[Call, Row] = {
             mirror.FunctionName.SYMBOL_MARGIN_RATE,
             ChartRole.SPAWNER,
             Wait.READ,
+        ),
+        # A position's deals, read on its symbol's history chart so the read never queues behind an
+        # order on a publisher or an account read on the spawner.
+        Row(
+            Call.HISTORY_DEALS_RECOVER,
+            (Argument("position", ArgType.INTEGER, required=True), _SYMBOL),
+            Shape.STRUCTS,
+            ChartRole.HISTORY,
+            Wait.READ,
+            binary.layout(mirror.STRUCTS[mirror.StructName.TRADE_DEAL]),
         ),
     )
 }

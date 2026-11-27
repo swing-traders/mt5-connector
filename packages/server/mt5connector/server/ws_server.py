@@ -653,7 +653,7 @@ class Hub:
         elif self._requests.asked_by(ws) >= self._settings.pending_bound:
             message = f"{self._settings.pending_bound} requests pending"
             self._error(ws, frame.request_id, 0, ErrorKind.OVERFLOW, message)
-        elif row.role is ChartRole.HISTORY and (
+        elif row.wait is calls.Wait.HISTORY and (
             reason := self._resync.unsettled(
                 symbol, int(time.time()), source, first_tick=self._first_ticks.get(symbol, 0)
             )
@@ -706,7 +706,7 @@ class Hub:
         if ea is not None and self._eas[ea].outbound.queue.qsize() < self._settings.ea_queue_bound:
             results = Results(row, arguments, self._clock, self._repeated_hours)
             pending = self._requests.add(ws, client_id, row, symbol, ea, results)
-            if row.role is ChartRole.HISTORY and not isinstance(ws, _PassRead):
+            if row.wait is calls.Wait.HISTORY and not isinstance(ws, _PassRead):
                 pending.first_download = self._resync.join_first_download(symbol)
             pending.source = source
             count, body = calls.encode_arguments(row, broker_arguments(row, arguments, self._clock))

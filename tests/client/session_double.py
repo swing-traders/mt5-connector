@@ -3,6 +3,7 @@ frames the hub pushes."""
 
 import asyncio
 
+from mt5connector.client.connection import ConnectionState, MT5Connection
 from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls, mirror
 from mt5connector.wire.push_wire import TransactionType
@@ -17,6 +18,7 @@ class SessionDouble:
         self.log = log
         self.wanted = []
         self.connected = False
+        self.outstanding_asked = 0
 
     async def connect(self):
         self.connected = True
@@ -33,6 +35,9 @@ class SessionDouble:
     async def unsubscribe(self, subscription):
         if subscription in self.wanted:
             self.wanted.remove(subscription)
+
+    async def ask_outstanding(self):
+        self.outstanding_asked += 1
 
     def deliver(self, frame):
         """Hands the frame to the owner as the session does, logging one the owner fails on."""
@@ -85,6 +90,19 @@ class ExecSession(SessionDouble):
             result = getattr(self.venue, call.name.lower())(**arguments)
         await asyncio.sleep(0)
         return Answered(result, 0)
+
+
+def connected_over(session: SessionDouble, config, *, account=None) -> MT5Connection:
+    """A real connection, connected over a session double as its one hub session: the double hands
+    every frame and reconnect to the connection, which hands them on to the client each concerns."""
+    connection = MT5Connection(config)
+    session.on_frame = connection._on_frame
+    session.on_reconnect = connection._on_reconnect
+    session.connected = True
+    connection._session = session
+    connection._login_account = account
+    connection._state = ConnectionState.CONNECTED
+    return connection
 
 
 def zeroed(layout: binary.Layout) -> dict[str, object]:

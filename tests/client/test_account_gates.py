@@ -5,8 +5,7 @@ its orders."""
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
-from functools import partial
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from exec_harness import account_id_of
@@ -30,8 +29,14 @@ from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from session_double import ExecSession
-from venue_doubles import SymbolVenue, account_info, serve, symbol_info, trade_position
+from session_double import ExecSession, connected_over
+from venue_doubles import (
+    OneSession,
+    SymbolVenue,
+    account_info,
+    symbol_info,
+    trade_position,
+)
 
 from mt5connector.client import connection, execution
 from mt5connector.client.config import MT5Config
@@ -41,6 +46,7 @@ from mt5connector.client.errors import MT5ConfigError, MT5ConnectionError, MT5In
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import calls, mirror
+from mt5connector.wire.push_wire import Stream, Subscription
 
 EURUSD_ONLY = InstrumentProviderConfig(load_ids=frozenset({InstrumentId.from_str("EURUSD.MT5")}))
 
@@ -88,26 +94,25 @@ def _client(
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
-    conn = MagicMock(spec=MT5Connection)
-    conn.account_info.return_value = AccountSnapshot.from_mt5(raw_account)
-    conn.terminal_info.return_value = {
-        "connected": True,
-        "trade_allowed": terminal_trade_allowed,
-    }
+    session = OneSession(served, SymbolVenue(), _config(venue), loop, MagicMock())
+    conn = connected_over(session, _config(venue))
+    conn.account_info = AsyncMock(return_value=AccountSnapshot.from_mt5(raw_account))
+    conn.terminal_info = AsyncMock(
+        return_value={"connected": True, "trade_allowed": terminal_trade_allowed}
+    )
     served.account_info.return_value = raw_account
     clock = LiveClock()
-    with patch.object(execution, "HubSession", partial(ExecSession, served)):
-        client = MT5LiveExecutionClient(
-            loop=loop,
-            connection=conn,
-            account=AccountSnapshot.from_mt5(raw_account),
-            msgbus=MessageBus(trader_id=TraderId(trader_id), clock=clock),
-            cache=TestComponentStubs.cache(),
-            clock=clock,
-            instrument_provider=_provider(instruments),
-            config=_config(venue),
-            loads=InstrumentProviderConfig(load_ids=frozenset()),
-        )
+    client = MT5LiveExecutionClient(
+        loop=loop,
+        connection=conn,
+        account=AccountSnapshot.from_mt5(raw_account),
+        msgbus=MessageBus(trader_id=TraderId(trader_id), clock=clock),
+        cache=TestComponentStubs.cache(),
+        clock=clock,
+        instrument_provider=_provider(instruments),
+        config=_config(venue),
+        loads=InstrumentProviderConfig(load_ids=frozenset()),
+    )
     client.generate_account_state = MagicMock()
     return client
 
@@ -249,7 +254,7 @@ async def test_a_non_hedging_account_fails_the_connect_naming_both_modes_before_
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
     assert client._account_task is None
-    assert not client._hub.connected
+    assert Subscription(Stream.TRADE_TRANSACTIONS) not in client._conn.session.wanted
 
 
 async def test_a_hedging_account_connects(venue):
@@ -257,7 +262,7 @@ async def test_a_hedging_account_connects(venue):
     await client._connect()
     client.generate_account_state.assert_called_once()
     assert not client._account_task.done()
-    assert client._hub.connected
+    assert Subscription(Stream.TRADE_TRANSACTIONS) in client._conn.session.wanted
     await _stop_account_loop(client)
 
 
@@ -273,14 +278,14 @@ async def test_a_read_only_session_fails_the_connect_before_anything_runs(venue)
     venue.positions_get.assert_not_called()
     venue.order_send.assert_not_called()
     assert client._account_task is None
-    assert not client._hub.connected
+    assert Subscription(Stream.TRADE_TRANSACTIONS) not in client._conn.session.wanted
 
 
 async def test_a_session_the_account_and_terminal_both_allow_to_trade_connects(venue):
     client = _client(venue, account_info(trade_allowed=True), terminal_trade_allowed=True)
     await client._connect()
     assert not client._account_task.done()
-    assert client._hub.connected
+    assert Subscription(Stream.TRADE_TRANSACTIONS) in client._conn.session.wanted
     await _stop_account_loop(client)
 
 
@@ -336,22 +341,22 @@ async def test_the_account_keeps_one_balance_in_its_currency(venue):
     states = []
     msgbus.subscribe(topic="events.account.*", handler=states.append)
     account = account_info(login=7654321, currency="EUR")
-    conn = MagicMock(spec=MT5Connection)
-    conn.account_info.return_value = AccountSnapshot.from_mt5(account)
-    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    session = ExecSession(venue, _config(), asyncio.get_running_loop(), None, None, MagicMock())
+    conn = connected_over(session, _config())
+    conn.account_info = AsyncMock(return_value=AccountSnapshot.from_mt5(account))
+    conn.terminal_info = AsyncMock(return_value={"connected": True, "trade_allowed": True})
     venue.account_info.return_value = account
-    with patch.object(execution, "HubSession", partial(ExecSession, venue)):
-        client = MT5LiveExecutionClient(
-            loop=asyncio.get_running_loop(),
-            connection=conn,
-            account=AccountSnapshot.from_mt5(account),
-            msgbus=msgbus,
-            cache=cache,
-            clock=clock,
-            instrument_provider=_provider(()),
-            config=_config(),
-            loads=InstrumentProviderConfig(load_ids=frozenset()),
-        )
+    client = MT5LiveExecutionClient(
+        loop=asyncio.get_running_loop(),
+        connection=conn,
+        account=AccountSnapshot.from_mt5(account),
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        instrument_provider=_provider(()),
+        config=_config(),
+        loads=InstrumentProviderConfig(load_ids=frozenset()),
+    )
     try:
         await client._connect()
         [state] = states
@@ -388,7 +393,7 @@ async def test_the_settlement_currency_registers_and_a_base_only_code_does_not(v
 def _serve_symbols(conn, symbols: SymbolVenue, account) -> None:
     """Hands the connection's hub session reads to `symbols`, its account `account`."""
     symbols.account = account
-    serve(conn, symbols)
+    conn.session.symbols = symbols
 
 
 @pytest.fixture
@@ -523,10 +528,11 @@ def terminal():
 def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProviderConfig):
     """A client over a real provider whose config is `provider_config`, its hub session answered by
     `venue` and its connection's session's reads by `symbols`."""
-    conn = MagicMock(spec=MT5Connection)
-    _serve_symbols(conn, symbols, account_info())
-    conn.account_info.return_value = AccountSnapshot.from_mt5(account_info())
-    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    symbols.account = account_info()
+    session = OneSession(venue, symbols, _config(), asyncio.get_running_loop(), MagicMock())
+    conn = connected_over(session, _config())
+    conn.account_info = AsyncMock(return_value=AccountSnapshot.from_mt5(account_info()))
+    conn.terminal_info = AsyncMock(return_value={"connected": True, "trade_allowed": True})
     clock = LiveClock()
     msgbus = MessageBus(trader_id=TraderId("TESTER-001"), clock=clock)
     cache = TestComponentStubs.cache()
@@ -534,18 +540,17 @@ def _served_client(venue, symbols: SymbolVenue, provider_config: InstrumentProvi
     provider = MT5InstrumentProvider(
         connection=conn, venue=MT5_VENUE, clock=clock, config=provider_config
     )
-    with patch.object(execution, "HubSession", partial(ExecSession, venue)):
-        client = MT5LiveExecutionClient(
-            loop=asyncio.get_running_loop(),
-            connection=conn,
-            account=AccountSnapshot.from_mt5(account_info()),
-            msgbus=msgbus,
-            cache=cache,
-            clock=clock,
-            instrument_provider=provider,
-            config=_config(),
-            loads=provider_config,
-        )
+    client = MT5LiveExecutionClient(
+        loop=asyncio.get_running_loop(),
+        connection=conn,
+        account=AccountSnapshot.from_mt5(account_info()),
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        instrument_provider=provider,
+        config=_config(),
+        loads=provider_config,
+    )
     client.generate_account_state = MagicMock(wraps=client.generate_account_state)
     return client, provider
 
@@ -573,7 +578,7 @@ async def test_connect_refuses_a_provider_config_that_names_nothing(
     with pytest.raises(MT5ConfigError, match="instrument_provider"):
         await client._connect()
     assert provider.list_all() == []
-    assert not client._hub.connected
+    assert Subscription(Stream.TRADE_TRANSACTIONS) not in client._conn.session.wanted
     client.generate_account_state.assert_not_called()
 
 
