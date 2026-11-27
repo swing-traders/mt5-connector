@@ -1,4 +1,7 @@
+import argparse
 import json
+import shutil
+import subprocess
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
@@ -70,3 +73,79 @@ def test_an_unusable_native_cap_fails_before_candidate_tests(native_capture, out
             frame,
             BrokerClock(ZoneInfo("America/New_York"), timedelta(hours=7)),
         )
+
+
+@pytest.mark.parametrize("persisted", [False, True], ids=["fresh-seed", "persisted-seed"])
+def test_a_seed_is_capped_from_the_closed_native_capture(
+    monkeypatch, tmp_path, native_capture, persisted
+):
+    captured, frame = native_capture
+    live_outcome = (captured / "outcome.txt").read_text()
+    capped_outcome = (frame / "outcome.txt").read_text()
+    seed = tmp_path / "seed"
+    history = seed / "server/history/BTCUSD.a"
+    history.mkdir(parents=True)
+    (history / "2026.hcc").write_bytes(b"settled bar store")
+    if persisted:
+        (history / "cache").mkdir()
+        (history / "cache/M1.hc").write_bytes(b"previous seed cache")
+    volumes = {"seed": seed}
+    monkeypatch.setattr(prepare_live.native, "CHECKOUT", tmp_path)
+    source = tmp_path / "tests/live/tickgen_raw.mq5"
+    source.parent.mkdir(parents=True)
+    source.write_text("native collector")
+    monkeypatch.setattr(prepare_live.native, "seed_settings", lambda name: ({}, "seed"))
+    monkeypatch.setattr(
+        prepare_live.native, "compile_sources", lambda *args: {"tickgen_raw": "clean"}
+    )
+
+    def clone_history(image, name, source, clone):
+        destination = tmp_path / clone
+        shutil.copytree(volumes[source], destination)
+        volumes[clone] = destination
+        return clone
+
+    def collect(image, name, env_file, clone, windows, capture, output, *, maxbars=100_000_000):
+        cache = volumes[clone] / "server/history/BTCUSD.a/cache"
+        directory = output / f"raw-{capture}"
+        directory.mkdir()
+        if capture == "live":
+            cache.mkdir(exist_ok=True)
+            (cache / "M1.hc").write_bytes(b"native cache persisted on close")
+            (directory / "outcome.txt").write_text(live_outcome)
+        else:
+            assert (cache / "M1.hc.full").read_bytes() == b"native cache persisted on close"
+            assert maxbars == prepare_live.CAP
+            (cache / "M1.hc").write_bytes(b"rebuilt capped cache")
+            (directory / "outcome.txt").write_text(capped_outcome)
+        return directory
+
+    def podman(*arguments):
+        if arguments[0] == "image":
+            return "image-id"
+        volume = arguments[arguments.index("-v") + 1].split(":")[0]
+        done = subprocess.run(
+            ["sh", "-c", arguments[-1].replace("/bases", str(volumes[volume]))],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode:
+            raise prepare_live.native.Unprepared(done.stderr)
+        return done.stdout
+
+    monkeypatch.setattr(prepare_live.native, "clone_history", clone_history)
+    monkeypatch.setattr(prepare_live.native, "collect", collect)
+    monkeypatch.setattr(prepare_live.native, "podman", podman)
+    output = tmp_path / "scripts/live"
+    prepare_live.prepare(
+        argparse.Namespace(image="image", seed_container="seed", name="probe", output=output)
+    )
+    recorded = json.loads((output / "provenance.json").read_text())
+    assert recorded["capped_volume"] == "probe-capped-bases"
+    assert (history / "2026.hcc").read_bytes() == b"settled bar store"
+    if persisted:
+        assert (history / "cache/M1.hc").read_bytes() == b"previous seed cache"
+    assert (
+        volumes["probe-native-bases"] / "server/history/BTCUSD.a/cache/M1.hc"
+    ).read_bytes() == b"native cache persisted on close"
