@@ -760,7 +760,7 @@ The tick-era-hole case uses the independently captured input in `tests/fixtures/
 
 5. Remove each driver's containers and volumes with `python tests/live/prepare_tickgen.py --cleanup --name <name>`, for both `mt5-tickgen-acceptance` and `mt5-tickgen-gap`.
 
-`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: it preserves the clone's full `M1.hc` under another name, leaves its `.hcc` store intact, and opens a native M1 chart at `MaxBars=100000` to rebuild the frame and record its first date before the uncapped candidate starts. The case fails unless that date is after the January window. `--cleanup` refuses the flag. The expected M1 floor, quote floor, and January row count come from the independent native tester exports, never a candidate hub:
+`tests/live/test_tickgen_shortened_cache.py` checks that a frame cache cut shorter than the store never floors a series. Its preparation adds `--shorten-cache`: it runs and closes a native terminal on the clone so its `M1.hc` is written to disk, preserves that full `M1.hc` under another name, leaves its `.hcc` store intact, and opens a native M1 chart at `MaxBars=100000` to rebuild the frame and record its first date before the uncapped candidate starts. The case fails unless that date is after the January window. `--cleanup` refuses the flag. The expected M1 floor, quote floor, and January row count come from the independent native tester exports, never a candidate hub:
 
 ```bash
 python -B tests/live/prepare_tickgen.py --image localhost/mt5-tickgen-candidate \
