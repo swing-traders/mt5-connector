@@ -26,6 +26,8 @@ SPAWNER_CALLS = {
 }
 # The symbol's history, which the history EA reads in its own thread.
 HISTORY_CALLS = {Call.COPY_RATES_RANGE, Call.COPY_TICKS_RANGE, Call.RANGES}
+# A position's deals, which the history EA answers at once.
+HISTORY_DEALS_CALLS = {Call.HISTORY_DEALS_RECOVER}
 PUBLISHER_CALLS = {Call.SYMBOL_INFO, Call.SYMBOL_INFO_TICK, Call.ORDER_SEND, Call.OUTCOMES}
 HUB_CALLS = {Call.COMMISSION_SCHEDULE, Call.TRADING_SESSIONS}
 
@@ -80,7 +82,7 @@ def test_margin_rates_decode_in_the_eight_terminal_order_kinds_order():
     assert result.sell_stop_limit_maintenance == 16.0
 
 
-def test_the_registry_serves_the_seventeen_calls():
+def test_the_registry_serves_the_eighteen_calls():
     assert {call.name.lower() for call in calls.CALLS} == {
         "account_info",
         "terminal_info",
@@ -99,6 +101,7 @@ def test_the_registry_serves_the_seventeen_calls():
         "commission_schedule",
         "trading_sessions",
         "symbol_margin_rate",
+        "history_deals_recover",
     }
 
 
@@ -110,7 +113,7 @@ def test_each_call_is_served_by_the_role_the_design_gives_it():
     assert served == {
         ChartRole.SPAWNER: SPAWNER_CALLS,
         ChartRole.PUBLISHER: PUBLISHER_CALLS,
-        ChartRole.HISTORY: HISTORY_CALLS,
+        ChartRole.HISTORY: HISTORY_CALLS | HISTORY_DEALS_CALLS,
         None: HUB_CALLS,
     }
 
@@ -166,6 +169,10 @@ def test_a_command_waits_under_the_command_deadline_the_history_under_its_own_th
             [("symbol", ArgType.STRING, True), ("request_ids", ArgType.REQUEST_IDS, True)],
         ),
         (Call.RANGES, [("symbol", ArgType.STRING, True)]),
+        (
+            Call.HISTORY_DEALS_RECOVER,
+            [("position", ArgType.INTEGER, True), ("symbol", ArgType.STRING, True)],
+        ),
         (Call.ACCOUNT_INFO, []),
     ],
     ids=lambda value: value.name.lower() if isinstance(value, Call) else "",
@@ -205,6 +212,7 @@ def test_a_hub_argument_travels_after_the_eas_and_never_reaches_a_row_the_ea_rea
         (Call.POSITIONS_GET, calls.Shape.STRUCTS, "TradePosition"),
         (Call.HISTORY_ORDERS_GET, calls.Shape.STRUCTS, "TradeOrder"),
         (Call.HISTORY_DEALS_GET, calls.Shape.STRUCTS, "TradeDeal"),
+        (Call.HISTORY_DEALS_RECOVER, calls.Shape.STRUCTS, "TradeDeal"),
         (Call.ORDER_SEND, calls.Shape.STRUCT, "MqlTradeResult"),
         (Call.OUTCOMES, calls.Shape.TRANSACTIONS, None),
         (Call.SYMBOL_INFO_TICK, calls.Shape.TICK, None),
@@ -276,8 +284,9 @@ def test_a_terminal_info_drops_the_member_no_mql5_property_backs_and_a_result_it
         (Call.ORDER_SEND, {"request": calls.trade_request({"symbol": "US500#"})}, "US500#"),
         (Call.POSITIONS_GET, {"symbol": "EURUSD"}, None),
         (Call.RANGES, {"symbol": "GBPUSD"}, "GBPUSD"),
+        (Call.HISTORY_DEALS_RECOVER, {"position": 9001, "symbol": "AUDCAD"}, "AUDCAD"),
     ],
-    ids=["read", "history", "command", "spawner", "ranges"],
+    ids=["read", "history", "command", "spawner", "ranges", "recovery"],
 )
 def test_a_request_is_routed_by_its_calls_symbol(call, arguments, symbol):
     assert calls.routed_symbol(calls.CALLS[call], arguments) == symbol

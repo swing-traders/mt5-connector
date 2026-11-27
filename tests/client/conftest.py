@@ -46,6 +46,7 @@ def exec_venue():
             "positions_get",
             "history_orders_get",
             "history_deals_get",
+            "history_deals_recover",
             "symbol_info_tick",
             "order_send",
         ]
@@ -54,6 +55,7 @@ def exec_venue():
     venue.orders_get.return_value = ()
     venue.positions_get.return_value = ()
     venue.history_deals_get.return_value = ()
+    venue.history_deals_recover.return_value = ()
     venue.history_orders_get.return_value = ()
     venue.symbol_info_tick.return_value = tick(bid=1.085, ask=1.0852)
     venue.order_send.return_value = trade_result()

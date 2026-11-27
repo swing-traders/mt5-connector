@@ -510,9 +510,36 @@ async def test_a_newest_month_without_ended_bars_is_verified_without_a_tick_read
             await ea.close()
 
 
+async def test_a_positions_deals_read_reaches_the_history_ea_while_its_resync_is_due(
+    tmp_path, clock, run_server
+):
+    # The resync gates the symbol's bars and ticks; a position's deals read no series.
+    month_file(tmp_path)
+    async with run_server(history_store=tmp_path) as port, verified(port):
+        ea = await FakeEa.connect(port, ChartRole.HISTORY, "EURUSD")
+        consumer = await Consumer.connect(port)
+        try:
+            await consumer.ask(1, calls.Call.HISTORY_DEALS_RECOVER, position=9001, symbol="EURUSD")
+            request = await ea.request()
+            # The resync's own measurement may reach the EA first.
+            while request.call != calls.Call.HISTORY_DEALS_RECOVER:
+                request = await ea.request()
+            assert arguments_of(request) == (
+                calls.Call.HISTORY_DEALS_RECOVER,
+                {"position": 9001, "symbol": "EURUSD"},
+            )
+            await ea.send(answer(request.request_id, calls.Call.HISTORY_DEALS_RECOVER, []))
+            reply = await consumer.received()
+            assert reply.error is None
+            assert calls.read_hub_result(calls.CALLS[calls.Call.HISTORY_DEALS_RECOVER], reply) == []
+        finally:
+            await consumer.close()
+            await ea.close()
+
+
 @pytest.mark.parametrize(
     "call",
-    [call for call, row in calls.CALLS.items() if row.role is ChartRole.HISTORY],
+    [call for call, row in calls.CALLS.items() if row.wait is calls.Wait.HISTORY],
 )
 @pytest.mark.parametrize("source", [None, 0], ids=["default-source", "explicit-server-source"])
 async def test_a_due_history_request_is_answered_syncing_and_reaches_no_ea(

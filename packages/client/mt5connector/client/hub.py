@@ -132,8 +132,11 @@ class HubSession:
         on_frame: Callable[[binary.Ticks | binary.Bar | binary.TradeTransaction], None],
         on_reconnect: Callable[[], None] | None,
         log: Logger,
+        *,
+        reconnects: bool = True,
     ) -> None:
         self._config = config
+        self._reconnects_on_loss = reconnects
         self._loop = loop
         self._on_frame = on_frame
         self._on_reconnect = on_reconnect
@@ -158,19 +161,32 @@ class HubSession:
 
     async def connect(self) -> None:
         """Connects to the hub, says hello, subscribes everything wanted and asks the outcomes of
-        the commands still outstanding; NT's client reconnects with backoff from then on, and a
-        connect that fails or is cancelled once its socket is open disconnects it. Raises
-        RuntimeError on a connected session."""
+        the commands still outstanding; NT's client reconnects with backoff from then on unless the
+        session was built not to reconnect, and a connect that fails or is cancelled once its
+        socket is open disconnects it. Raises RuntimeError on a connected session."""
         if self._ws is not None:
             raise RuntimeError("hub session: already connected")
-        config = WebSocketConfig(
-            url=self._config.ws_url,
-            headers=[],
-            heartbeat=PING_INTERVAL_S,
-            reconnect_delay_initial_ms=int(self._config.reconnect_initial_delay_s * 1000),
-            reconnect_delay_max_ms=int(self._config.reconnect_max_delay_s * 1000),
-            reconnect_backoff_factor=RECONNECT_MULTIPLIER,
-        )
+        if self._reconnects_on_loss:
+            config = WebSocketConfig(
+                url=self._config.ws_url,
+                headers=[],
+                heartbeat=PING_INTERVAL_S,
+                reconnect_delay_initial_ms=int(self._config.reconnect_initial_delay_s * 1000),
+                reconnect_delay_max_ms=int(self._config.reconnect_max_delay_s * 1000),
+                reconnect_backoff_factor=RECONNECT_MULTIPLIER,
+            )
+        else:
+            # NT checks the attempt cap before it dials, so a cap of none never dials again; None
+            # delays would only take NT's defaults.
+            config = WebSocketConfig(
+                url=self._config.ws_url,
+                headers=[],
+                heartbeat=PING_INTERVAL_S,
+                reconnect_delay_initial_ms=int(self._config.reconnect_initial_delay_s * 1000),
+                reconnect_delay_max_ms=int(self._config.reconnect_max_delay_s * 1000),
+                reconnect_backoff_factor=RECONNECT_MULTIPLIER,
+                reconnect_max_attempts=0,
+            )
         self._ws = await WebSocketClient.connect(
             self._loop,
             config,
@@ -182,7 +198,7 @@ class HubSession:
         except BaseException:
             await self.disconnect()
             raise
-        self._track(self._loop.create_task(self._ask_outstanding()))
+        self._track(self._loop.create_task(self.ask_outstanding()))
 
     async def disconnect(self) -> None:
         """Closes the connection, failing every request in flight; the subscriptions stay wanted.
@@ -287,11 +303,12 @@ class HubSession:
                 self._greeting.set()
 
     async def _send(self, raw: bytes) -> None:
-        """Sends a frame; one the connection drops is lost with it, and the reconnect resends the
-        wanted set and fails every request in flight. NT's client turns a reconnected socket active
-        before it calls back, and sends a frame it held through the outage at once, so that frame
-        can precede the hello: the hub refuses it and closes, and the reconnect that follows starts
-        over."""
+        """Sends a frame, logging one NT's client refuses. It refuses at once while it holds the
+        connection not active, and the request that frame carried ends at its own deadline; a frame
+        it accepts before it notices a dropped link goes to its writer, which may hold it and send
+        it on the reconnected socket. NT's client turns a reconnected socket active before it calls
+        back, so a frame sent then can precede the hello: the hub refuses it and closes, and the
+        reconnect that follows starts over."""
         try:
             await self._ws.send(raw)
         except (WebSocketClientError, RuntimeError) as exc:
@@ -429,9 +446,11 @@ class HubSession:
 
     async def _resume(self) -> None:
         await self._send_wanted()
-        await self._ask_outstanding()
+        await self.ask_outstanding()
 
-    async def _ask_outstanding(self) -> None:
+    async def ask_outstanding(self) -> None:
+        """Asks each symbol's publisher for the outcomes of the commands not yet settled, handing
+        the owner each transaction that settles one."""
         symbols: dict[str, list[int]] = {}
         for request_id, symbol in self._outstanding.items():
             symbols.setdefault(symbol, []).append(request_id)

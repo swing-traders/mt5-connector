@@ -3,6 +3,8 @@ serving an instrument provider's reads, for the client's tests to feed it a venu
 
 from unittest.mock import MagicMock
 
+from session_double import ExecSession
+
 from mt5connector.client.errors import EaError
 from mt5connector.client.hub import Answered, HubSession
 from mt5connector.wire import binary, calls, mirror
@@ -264,6 +266,36 @@ class SymbolVenue:
             return Answered(self.margin_rates.get(symbol, symbol_margin_rates()), 0)
         else:
             raise ValueError(f"{call.name.lower()}: not a call an instrument provider asks")
+
+
+# The calls only an instrument provider asks; every other call is the execution client's.
+_PROVIDER_CALLS = frozenset(
+    {
+        Call.SYMBOLS_GET,
+        Call.SYMBOL_INFO,
+        Call.SYMBOL_INFO_TICK,
+        Call.COMMISSION_SCHEDULE,
+        Call.TRADING_SESSIONS,
+        Call.SYMBOL_MARGIN_RATE,
+    }
+)
+
+
+class OneSession(ExecSession):
+    """A connection's one hub session, answering the provider's reads from `symbols` and the
+    execution client's from `venue`."""
+
+    account_info = HubSession.account_info
+
+    def __init__(self, venue, symbols: SymbolVenue, config, loop, log) -> None:
+        super().__init__(venue, config, loop, None, None, log)
+        self.symbols = symbols
+
+    async def request(self, call: calls.Call, **arguments) -> Answered:
+        if call in _PROVIDER_CALLS:
+            return await self.symbols.request(call, **arguments)
+        else:
+            return await super().request(call, **arguments)
 
 
 def serve(conn: MagicMock, venue: SymbolVenue) -> None:

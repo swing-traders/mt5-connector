@@ -885,6 +885,34 @@ void ServeSymbol(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &
     }
 }
 
+// ── The history EA's calls that answer at once: its symbol's deals ───────────────────────────────
+
+// Every deal of a position on this chart's symbol.
+void AnswerPositionDeals(RequestArguments &arguments, Answer &answer)
+{
+    const string symbol = arguments.String(HUB_ARG_HISTORY_DEALS_RECOVER_SYMBOL);
+    if (symbol != _Symbol)
+        answer.Fail(StringFormat("the deals of '%s' are not this chart's", symbol),
+                    ERR_INVALID_PARAMETER);
+    else if (HistorySelectByPosition(arguments.Integer(HUB_ARG_HISTORY_DEALS_RECOVER_POSITION)))
+        AnswerSelectedDeals(answer);
+    else
+        answer.Fail("HistorySelectByPosition failed", GetLastError());
+}
+
+void ServeDeals(const ENUM_HUB_CALL call, RequestArguments &arguments, Answer &answer)
+{
+    switch (call)
+    {
+    case HUB_CALL_HISTORY_DEALS_RECOVER:
+        AnswerPositionDeals(arguments, answer);
+        break;
+    default:
+        answer.Fail("the call is not served by this EA's role", ERR_FUNCTION_NOT_ALLOWED);
+        break;
+    }
+}
+
 // Serves a call that answers at once, by its role.
 void Serve(const ulong requestId, const ENUM_HUB_CALL call, RequestArguments &arguments)
 {
@@ -897,6 +925,9 @@ void Serve(const ulong requestId, const ENUM_HUB_CALL call, RequestArguments &ar
         break;
     case ROLE_PUBLISHER:
         ServeSymbol(call, arguments, answer);
+        break;
+    case ROLE_HISTORY:
+        ServeDeals(call, arguments, answer);
         break;
     }
     SendAnswer(requestId, answer, GetLastError());

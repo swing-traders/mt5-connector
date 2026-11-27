@@ -81,7 +81,8 @@ async def test_connect_subscribes_the_accounts_trade_transactions_on_the_push_ch
     assert h.push.connected
     assert h.push.wanted == [Subscription(Stream.TRADE_TRANSACTIONS)]
     await h.client._disconnect()
-    assert not h.push.connected
+    assert h.push.connected
+    assert h.push.wanted == []
 
 
 async def test_connect_takes_in_the_venue_on_its_session_before_subscribing_its_transactions(
@@ -112,14 +113,18 @@ async def test_a_disconnect_drops_the_transaction_subscription_the_next_connect_
     assert h.push.wanted == [Subscription(Stream.TRADE_TRANSACTIONS)]
 
 
-async def test_a_connect_whose_take_in_fails_disconnects_its_session(exec_venue):
+async def test_a_connect_whose_take_in_fails_takes_no_transactions_and_leaves_the_session(
+    exec_venue,
+):
     h = build(exec_venue)
     exec_venue.history_deals_get.side_effect = errors.EaError("history_deals_get: failed", 4401)
 
     with pytest.raises(errors.EaError):
         await h.client._connect()
 
-    assert not h.push.connected
+    assert h.push.connected
+    assert h.push.wanted == []
+    assert h.conn._on_trades is None
     assert h.client._account_task is None
 
 

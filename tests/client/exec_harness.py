@@ -4,9 +4,8 @@ session, recording what the client emits and logs."""
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
-from functools import partial
 from hashlib import sha256
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -30,12 +29,12 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
-from session_double import ExecSession, deal_added, verdict_of
+from session_double import ExecSession, connected_over, deal_added, verdict_of
 from venue_doubles import account_info, trade_deal, trade_order, trade_position
 
 from mt5connector.client import execution
 from mt5connector.client.config import MT5Config
-from mt5connector.client.connection import AccountSnapshot, MT5Connection
+from mt5connector.client.connection import AccountSnapshot
 from mt5connector.client.execution import MT5LiveExecutionClient
 from mt5connector.client.providers import MT5InstrumentProvider
 from mt5connector.wire import mirror
@@ -271,9 +270,13 @@ def build(venue, *, instruments=None, account=None, cache=None, loads=None, **se
     if loads is None:
         loads = InstrumentProviderConfig(load_ids=frozenset(item.id for item in loaded.values()))
 
-    conn = MagicMock(spec=MT5Connection)
-    conn.account_info.return_value = AccountSnapshot.from_mt5(account or account_info())
-    conn.terminal_info.return_value = {"connected": True, "trade_allowed": True}
+    loop = asyncio.get_running_loop()
+    push = ExecSession(venue, config(**settings), loop, None, None, None)
+    conn = connected_over(
+        push, config(**settings), account=AccountSnapshot.from_mt5(account or account_info())
+    )
+    conn.account_info = AsyncMock(return_value=AccountSnapshot.from_mt5(account or account_info()))
+    conn.terminal_info = AsyncMock(return_value={"connected": True, "trade_allowed": True})
     venue.account_info.return_value = account or account_info()
 
     provider = MagicMock(spec=MT5InstrumentProvider)
@@ -282,20 +285,21 @@ def build(venue, *, instruments=None, account=None, cache=None, loads=None, **se
     provider.get_instrument.side_effect = loaded.get
     provider.find.side_effect = {item.id: item for item in loaded.values()}.get
 
-    with patch.object(execution, "HubSession", partial(ExecSession, venue)):
-        client = RecordedExecClient(
-            loop=asyncio.get_running_loop(),
-            connection=conn,
-            account=AccountSnapshot.from_mt5(account or account_info()),
-            msgbus=msgbus,
-            cache=cache,
-            clock=clock,
-            instrument_provider=provider,
-            config=config(**settings),
-            loads=loads,
-        )
+    client = RecordedExecClient(
+        loop=loop,
+        connection=conn,
+        account=AccountSnapshot.from_mt5(account or account_info()),
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        instrument_provider=provider,
+        config=config(**settings),
+        loads=loads,
+    )
     factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
-    return Harness(client, client._hub, venue, conn, cache, factory, ledger, loaded)
+    # The session double logs where the client does, as its own session did.
+    push.log = push._log = client.recorded_log
+    return Harness(client, push, venue, conn, cache, factory, ledger, loaded)
 
 
 def _history_holding(deal, venue):

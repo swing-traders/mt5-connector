@@ -2,8 +2,10 @@
 reports it.
 
 State: where the connection is in its lifecycle, and while connected, its hub session, which lives
-on the loop the connection was connected on, and the account as its login reported it. A lost hub
-leaves the connection connected: NT's client reconnects its session."""
+on the loop the connection was connected on, and the account as its login reported it; the data
+client and the execution client attached to it, and the trade transactions that arrived while no
+execution client was attached, in arrival order. A lost hub leaves the connection connected: NT's
+client reconnects its session unless the connection was built not to."""
 
 from __future__ import annotations
 
@@ -24,10 +26,12 @@ from mt5connector.client.errors import (
     Syncing,
 )
 from mt5connector.client.hub import HubSession
-from mt5connector.wire import mirror
+from mt5connector.wire import binary, mirror
 from mt5connector.wire.binary import ErrorKind
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from mt5connector.client.config import MT5Config
 
 logger = logging.getLogger(__name__)
@@ -160,13 +164,19 @@ def _finite(value: float, field: str) -> Decimal:
 
 class MT5Connection:
     """The connection to the MT5 terminal behind one hub, shared by the clients of one account: its
-    lifecycle and the hub session its reads ride."""
+    lifecycle, the one hub session every read and stream of those clients rides, and the hand-out of
+    that session's frames to the client each concerns."""
 
-    def __init__(self, config: MT5Config) -> None:
+    def __init__(self, config: MT5Config, *, reconnects: bool = True) -> None:
         self._config = config
+        self._reconnects = reconnects
         self._state = ConnectionState.DISCONNECTED
         self._session: HubSession | None = None
         self._login_account: AccountSnapshot | None = None
+        self._on_market: Callable[[binary.Ticks | binary.Bar], None] | None = None
+        self._on_market_reconnect: Callable[[], None] | None = None
+        self._on_trades: Callable[[binary.TradeTransaction], None] | None = None
+        self._held_trades: list[binary.TradeTransaction] = []
 
     # ── Core lifecycle ────────────────────────────────────────────────────────
 
@@ -179,7 +189,12 @@ class MT5Connection:
             raise RuntimeError(f"MT5 not disconnected (state={self._state.name})")
         self._state = ConnectionState.CONNECTING
         session = HubSession(
-            self._config, asyncio.get_running_loop(), _unsubscribed, None, _SessionLog()
+            self._config,
+            asyncio.get_running_loop(),
+            self._on_frame,
+            self._on_reconnect,
+            _SessionLog(),
+            reconnects=self._reconnects,
         )
         try:
             account = await self._logged_in(session)
@@ -219,6 +234,66 @@ class MT5Connection:
         if self._state != ConnectionState.CONNECTED:
             raise RuntimeError(f"MT5 not connected (state={self._state.name})")
         return self._session
+
+    # ── The clients its frames reach ──────────────────────────────────────────
+
+    def attach_market(
+        self,
+        on_frame: Callable[[binary.Ticks | binary.Bar], None],
+        on_reconnect: Callable[[], None],
+    ) -> None:
+        """Hands the data client every tick and bar frame and every reconnect from now on; raises
+        RuntimeError while one is attached."""
+        if self._on_market is not None:
+            raise RuntimeError("MT5Connection: a data client is already attached")
+        self._on_market = on_frame
+        self._on_market_reconnect = on_reconnect
+
+    def detach_market(self) -> None:
+        """Stops handing the data client frames; raises RuntimeError when none is attached."""
+        if self._on_market is None:
+            raise RuntimeError("MT5Connection: no data client is attached")
+        self._on_market = None
+        self._on_market_reconnect = None
+
+    def attach_trades(self, on_frame: Callable[[binary.TradeTransaction], None]) -> None:
+        """Hands the execution client every trade transaction held while none was attached, in
+        arrival order, then each one that arrives; raises RuntimeError while one is attached."""
+        if self._on_trades is not None:
+            raise RuntimeError("MT5Connection: an execution client is already attached")
+        self._on_trades = on_frame
+        held = self._held_trades
+        self._held_trades = []
+        for frame in held:
+            try:
+                on_frame(frame)
+            except Exception:
+                logger.exception("MT5Connection: a held TradeTransaction frame failed")
+
+    def detach_trades(self) -> None:
+        """Holds each trade transaction from now on until an execution client attaches; raises
+        RuntimeError when none is attached."""
+        if self._on_trades is None:
+            raise RuntimeError("MT5Connection: no execution client is attached")
+        self._on_trades = None
+
+    def _on_frame(self, frame: binary.Ticks | binary.Bar | binary.TradeTransaction) -> None:
+        """Hands a frame to the client it concerns; a trade transaction no client takes is held for
+        the next attach. Raises ValueError for a market frame no data client takes, which the
+        session logs as a failed frame."""
+        if isinstance(frame, binary.TradeTransaction):
+            if self._on_trades is None:
+                self._held_trades.append(frame)
+            else:
+                self._on_trades(frame)
+        elif self._on_market is None:
+            raise ValueError(f"a {type(frame).__name__} frame no data client takes")
+        else:
+            self._on_market(frame)
+
+    def _on_reconnect(self) -> None:
+        if self._on_market_reconnect is not None:
+            self._on_market_reconnect()
 
     # ── Data accessors ────────────────────────────────────────────────────────
 
@@ -317,10 +392,6 @@ def _deferral(deferred: Deferred) -> ErrorKind:
         return ErrorKind.SYNCING
     else:
         return ErrorKind.NO_PUBLISHER
-
-
-def _unsubscribed(frame: object) -> None:
-    raise ValueError(f"a {type(frame).__name__} frame on the connection's session")
 
 
 class _SessionLog:

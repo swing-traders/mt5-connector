@@ -26,9 +26,8 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
-from session_double import SessionDouble
+from session_double import SessionDouble, connected_over
 
-from mt5connector.client import data
 from mt5connector.client.config import MT5Config
 from mt5connector.client.constants import MT5_VENUE
 from mt5connector.client.data import MT5DataClient
@@ -89,7 +88,7 @@ class RecordedDataClient(MT5DataClient):
 class Client:
     """A data client over the push double, its clock at `now` and what it hands NT recorded."""
 
-    def __init__(self, now):
+    def __init__(self, now, *, attached=True):
         self.clock = TestClock()
         self.clock.set_time(now * SECOND_NS)
         provider = MT5InstrumentProvider.__new__(MT5InstrumentProvider)
@@ -104,18 +103,23 @@ class Client:
             server="Broker-Demo",
             ws_url="ws://127.0.0.1:9000",
         )
-        with patch.object(data, "HubSession", SessionDouble):
-            self.client = RecordedDataClient(
-                asyncio.get_running_loop(),
-                MagicMock(),
-                TestComponentStubs.msgbus(),
-                TestComponentStubs.cache(),
-                self.clock,
-                provider,
-                config,
-            )
+        self.push = SessionDouble(config, asyncio.get_running_loop(), None, None, MagicMock())
+        self.client = RecordedDataClient(
+            asyncio.get_running_loop(),
+            connected_over(self.push, config),
+            TestComponentStubs.msgbus(),
+            TestComponentStubs.cache(),
+            self.clock,
+            provider,
+            config,
+        )
         self.client._handle_data = MagicMock()
-        self.push = self.client._hub
+        self.push.log = self.client.recorded_log
+        if attached:
+            # The connection hands the client its frames as its connect has it do.
+            self.client._conn.attach_market(
+                self.client._on_push_frame, self.client._on_push_reconnect
+            )
 
     def handed(self) -> list:
         return [call.args[0] for call in self.client._handle_data.call_args_list]
@@ -219,15 +223,14 @@ async def settle():
 # ── Subscriptions ────────────────────────────────────────────────────────────
 
 
-async def test_connect_hands_nt_the_instruments_its_provider_holds_and_connects_the_push_channel():
-    c = Client(NINE)
+async def test_connect_hands_nt_the_instruments_its_provider_holds_and_takes_the_sessions_ticks():
+    c = Client(NINE, attached=False)
 
     await c.client._connect()
 
-    assert c.push.connected
     assert [item.id for item in c.handed()] == [EURUSD]
     await c.client._disconnect()
-    assert not c.push.connected
+    assert c.push.connected
 
 
 async def test_quotes_and_marks_share_the_symbols_tick_stream_until_neither_is_subscribed():
@@ -507,7 +510,7 @@ async def test_a_failed_read_back_is_an_error_and_the_held_bars_go_on(failed):
         await until(lambda: c.bars())
 
     history_bars.assert_awaited_once_with(
-        c.client._hub, "EURUSD", Series.M1, NINE - 89, NINE + 179, source=Source.TERMINAL
+        c.push, "EURUSD", Series.M1, NINE - 89, NINE + 179, source=Source.TERMINAL
     )
     assert opens(c) == [NINE + 180]
     (error,) = c.client._log.error.call_args_list

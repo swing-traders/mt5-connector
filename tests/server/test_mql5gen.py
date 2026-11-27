@@ -423,7 +423,12 @@ def test_each_role_serves_the_calls_the_registry_gives_it(text):
         f"ROLE_{role.name}": {row.call.name for row in calls.CALLS.values() if row.role is role}
         for role in ChartRole
     }
-    assert serves["ROLE_HISTORY"] == {"COPY_RATES_RANGE", "COPY_TICKS_RANGE", "RANGES"}
+    assert serves["ROLE_HISTORY"] == {
+        "COPY_RATES_RANGE",
+        "COPY_TICKS_RANGE",
+        "RANGES",
+        "HISTORY_DEALS_RECOVER",
+    }
     assert serves["ROLE_PUBLISHER"] == {"SYMBOL_INFO", "SYMBOL_INFO_TICK", "ORDER_SEND", "OUTCOMES"}
 
 
